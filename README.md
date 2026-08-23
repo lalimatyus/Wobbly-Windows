@@ -6,7 +6,7 @@ The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
 
 ## ⚠️ IMPORTANT ⚠️
 
-Since this mod hooks itself into `dwm.exe`, you have to add it globally into Windhawk:
+Since this mod hooks itself into `dwm.exe`, you have to add it globally in Windhawk:
 
 ![Tutorial](/dwm.gif)
 
@@ -22,7 +22,7 @@ It was mostly tested and made on `Windows 11 23H2`, where it works great, and it
 
 ## Known Issues
 
-* Some windows act weird/jumpy on 26H2. (This happens on other builds too but it's less common)
+* Some windows act weird/jumpy on 25H2/26H2. (This happens on other builds too but it's less common)
 * Not working/completely breaking with multiple desktops
 * Sometimes when dragging windows through multiple monitors, the window can have a weird offset
 
