@@ -25,6 +25,7 @@ It was mostly tested and made on `Windows 11 23H2`, where it works great, and it
 * Some windows act weird/jumpy on 25H2/26H2. (This happens on other builds too but it's less common)
 * Not working/completely breaking with multiple desktops
 * Sometimes when dragging windows through multiple monitors, the window can have a weird offset
+* ARM64 isn't supported yet; the mod safely refuses to initialize on ARM64 systems.
 
 ## Feedback
 
