@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.56
+// @version         0.57
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -350,6 +350,9 @@ std::atomic<void*> g_visualProxyVtable = nullptr;
 std::atomic<void*> g_matrixTransformProxyVtable = nullptr;
 std::atomic<void*> g_dwmCompositor = nullptr;
 std::atomic<void*> g_desktopManager = nullptr;
+void* g_topLevelWindowVtableSymbol = nullptr;
+void* g_visualProxyVtableSymbol = nullptr;
+void* g_matrixTransformProxyVtableSymbol = nullptr;
 size_t g_visualProxyOffset = SIZE_MAX;
 size_t g_topLevelWindowWindowDataOffset = SIZE_MAX;
 static bool IsDwmObjectPointerValid(void* object, std::atomic<void*>& expectedVtable);
@@ -2231,6 +2234,18 @@ static bool InitializeDwmHooks()
          reinterpret_cast<void**>(&g_desktopManagerAdvanceTimelinesOriginal),
          reinterpret_cast<void*>(AdvanceTimelinesHook),
          true},
+        {{L"const CTopLevelWindow::`vftable'", L"??_7CTopLevelWindow@@6B@"},
+         &g_topLevelWindowVtableSymbol,
+         nullptr,
+         true},
+        {{L"const CVisualProxy::`vftable'", L"??_7CVisualProxy@@6B@"},
+         &g_visualProxyVtableSymbol,
+         nullptr,
+         true},
+        {{L"const CMatrixTransformProxy::`vftable'", L"??_7CMatrixTransformProxy@@6B@"},
+         &g_matrixTransformProxyVtableSymbol,
+         nullptr,
+         true},
         {{L"private: static void __cdecl CDesktopManager::HandleThreadMessage("
            L"unsigned int,unsigned __int64,__int64)",
           L"?HandleThreadMessage@CDesktopManager@@CAXI_K_J@Z"},
@@ -2259,6 +2274,27 @@ static bool InitializeDwmHooks()
     keepValid(g_getCanvasRootVisualProxy);
     keepValid(g_topLevelWindowGetRootVisual);
     keepValid(g_topLevelWindowGetWindowData);
+    auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
+    {
+        if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
+        {
+            return false;
+        }
+        void** functions = static_cast<void**>(symbol);
+        for (int i = 0; i < 3; i++)
+        {
+            if (!IsDwmFunctionPointerValid(functions[i]))
+            {
+                return false;
+            }
+        }
+        target.store(symbol, std::memory_order_release);
+        return true;
+    };
+    bool hasExactTopLevelWindowVtable =
+        cacheVtableSymbol(g_topLevelWindowVtableSymbol, g_topLevelWindowVtable);
+    cacheVtableSymbol(g_visualProxyVtableSymbol, g_visualProxyVtable);
+    cacheVtableSymbol(g_matrixTransformProxyVtableSymbol, g_matrixTransformProxyVtable);
     if ((g_getSyncedWindowDataByHwndLong && g_getSyncedWindowDataByHwndVoid) ||
         (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat))
     {
@@ -2315,6 +2351,11 @@ static bool InitializeDwmHooks()
     {
         Wh_Log(L"DWM compatibility: missing core symbol: "
                L"CWindowList::GetSyncedWindowDataByHwnd");
+        missingCoreFunction = true;
+    }
+    if (!hasExactTopLevelWindowVtable)
+    {
+        Wh_Log(L"DWM compatibility: missing core symbol: CTopLevelWindow::vftable");
         missingCoreFunction = true;
     }
     if (missingCoreFunction)
@@ -2411,10 +2452,11 @@ static bool InitializeDwmHooks()
         Wh_Log(L"DWM compatibility: compositor discovery deferred to the first scene timeline");
     }
     Wh_Log(L"DWM startup cache ready: timestamp=0x%08X imageSize=0x%X "
-           L"HWND=0x%zx TLW=0x%zx TLW3D=0x%zx TLWData=0x%zx sceneHooks=%s%s",
+           L"HWND=0x%zx TLW=0x%zx TLW3D=0x%zx TLWData=0x%zx "
+           L"TLWVtable=%p sceneHooks=%s%s",
            g_dwmModuleLayout.timeDateStamp, g_dwmModuleLayout.sizeOfImage, g_windowDataHwndOffset,
            g_windowDataTopLevelWindowOffset, g_windowDataTopLevelWindow3DOffset,
-           g_topLevelWindowWindowDataOffset,
+           g_topLevelWindowWindowDataOffset, g_topLevelWindowVtableSymbol,
            hasForceUpdateScene ? L"ForceUpdateScene " : L"",
            hasUpdateScene ? L"UpdateScene" : L"");
     if (!WindhawkUtils::SetFunctionHook(g_topLevelWindowConstructorFunction,
@@ -4946,6 +4988,31 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
         return;
     }
+    if (!slot.transformAttached)
+    {
+        // Don't accumulate invisible deformation while an existing window's
+        // DWM visual is being discovered and bound for the first time.
+        InitializeMesh(slot.mesh, currentMeshWidth, currentMeshHeight);
+        BeginDrag(slot.mesh, localMousePosition);
+        SetMeshResizeMode(slot.mesh, g_realResizing);
+        if (g_realResizing)
+        {
+            UpdateResizeEdges(slot.mesh, g_realDraggedWindowRect, rect);
+            ApplyResizeConstraints(slot.mesh);
+        }
+        slot.previousMesh = slot.mesh;
+        slot.identityApplied = false;
+        slot.meshIdentityPending = false;
+        slot.meshRevision++;
+        ReleaseSRWLockExclusive(&g_animationSlotsLock);
+        g_dragStartMousePosition = mousePosition;
+        g_dragStartLocalMouse = localMousePosition;
+        g_lastDraggedWindowRect = rect;
+        g_lastDraggedWindowZoomed = IsZoomed(hwnd) != FALSE;
+        g_lastMousePosition = mousePosition;
+        RequestDwmScenePass(hwnd);
+        return;
+    }
     bool startedInteractiveStateThrob = false;
     if (g_moveTypeKnown && !g_realResizing && !g_dragStartedWindowZoomed && mouseAtMonitorTopEdge &&
         (!g_interactiveWindowStateThrob || !g_interactiveWindowStateMaximizing))
@@ -6178,7 +6245,7 @@ BOOL Wh_ModInit()
     g_existingWindowBackfillMapped.store(0, std::memory_order_release);
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
-    Wh_Log(L"Wobbly Windows 0.56: initializing");
+    Wh_Log(L"Wobbly Windows 0.57: initializing");
     InitializeDpiSupport();
     LoadSettings();
     if (!InitializeDwmHooks())
