@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.57
+// @version         0.64
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -239,7 +239,6 @@ std::atomic<HWND> g_pendingMaximizedStateWindow = nullptr;
 std::atomic_bool g_maximizedStateCheckQueued = false;
 static constexpr UINT WM_WOBBLY_MAXIMIZED_CHANGE = WM_APP + 0x31A;
 static constexpr UINT WM_WOBBLY_NATIVE_WINDOW_TRANSITION = WM_APP + 0x31B;
-static constexpr UINT WM_WOBBLY_DWM_SCENE_WAKE = WM_APP + 0x31C;
 static constexpr LPARAM NATIVE_TRANSITION_TARGET_IS_WORK_AREA = 0x01;
 static constexpr LPARAM NATIVE_TRANSITION_SOURCE_IS_WORK_AREA = 0x02;
 static constexpr LPARAM NATIVE_TRANSITION_WINDOW_IS_ZOOMED = 0x04;
@@ -258,12 +257,8 @@ std::atomic_bool g_realDragging = false;
 std::atomic<HWND> g_realDraggedWindow = nullptr;
 using OnPositionChange_t = void(__cdecl*)(void* pThis, void* pWindowData, bool unknown);
 OnPositionChange_t g_onPositionChangeOriginal = nullptr;
-using GetSyncedWindowDataByHwndLong_t = long(__cdecl*)(void* pThis, HWND hwnd,
-                                                       void** windowData);
-using GetSyncedWindowDataByHwndVoid_t = void(__cdecl*)(void* pThis, HWND hwnd,
-                                                       void** windowData);
-GetSyncedWindowDataByHwndLong_t g_getSyncedWindowDataByHwndLong = nullptr;
-GetSyncedWindowDataByHwndVoid_t g_getSyncedWindowDataByHwndVoid = nullptr;
+using FindWindowDataByHwnd_t = void*(__cdecl*)(void* pThis, HWND hwnd);
+FindWindowDataByHwnd_t g_findWindowDataByHwnd = nullptr;
 using GetSyncedWindowDataLong_t = long(__cdecl*)(void* pThis, void* dwmWindow, bool synchronize,
                                                  void** windowData);
 using GetSyncedWindowDataVoid_t = void(__cdecl*)(void* pThis, void* dwmWindow, bool synchronize,
@@ -285,8 +280,6 @@ POINT g_lastMousePosition = {};
 bool g_hasLastMousePosition = false;
 POINT g_dragStartMousePosition = {};
 Vec2 g_dragStartLocalMouse = {0.0, 0.0};
-using CVisualGetVisualProxyForStructure_t = void*(__cdecl*)(void* pThis);
-CVisualGetVisualProxyForStructure_t g_cVisualGetVisualProxyForStructure = nullptr;
 using CTopLevelWindowGetVisualProxy_t = void*(__cdecl*)(void* pThis);
 CTopLevelWindowGetVisualProxy_t g_getCanvasRootVisualProxy = nullptr;
 using CTopLevelWindowGetWindowData_t = void*(__cdecl*)(void* pThis);
@@ -332,17 +325,19 @@ CDesktopManagerAdvanceTimelines_t g_desktopManagerAdvanceTimelinesOriginal = nul
 using CDesktopManagerHandleThreadMessage_t =
     void(__cdecl*)(UINT message, UINT_PTR wParam, INT_PTR lParam);
 CDesktopManagerHandleThreadMessage_t g_desktopManagerHandleThreadMessageOriginal = nullptr;
+using CDesktopManagerPostStartAnimations_t = long(__cdecl*)(void* pThis);
+CDesktopManagerPostStartAnimations_t g_desktopManagerPostStartAnimations = nullptr;
 void* g_desktopManagerInstanceAddress = nullptr;
-void* g_cCompositorAddRefFunction = nullptr;
-void* g_cCompositorReleaseFunction = nullptr;
+void* g_desktopManagerInitializeFunction = nullptr;
+void* g_cCompositorCreateFunction = nullptr;
 using CTopLevelWindow3DDestructor_t = void(__cdecl*)(void* pThis);
 CTopLevelWindow3DDestructor_t g_topLevelWindow3DDestructorOriginal = nullptr;
 using CTopLevelWindowDestructor_t = void(__cdecl*)(void* pThis);
 CTopLevelWindowDestructor_t g_topLevelWindowDestructorOriginal = nullptr;
 using EnsureTopLevelWindow_t = long(__cdecl*)(void* pThis, void* windowData);
 EnsureTopLevelWindow_t g_ensureTopLevelWindowFunction = nullptr;
-// Learn vftables from verified live objects when DIA omits uDWM data symbols.
 std::atomic<void*> g_desktopManagerVtable = nullptr;
+std::atomic<void*> g_windowListVtable = nullptr;
 std::atomic<void*> g_compositorVtable = nullptr;
 std::atomic<void*> g_topLevelWindowVtable = nullptr;
 std::atomic<void*> g_topLevelWindow3DVtable = nullptr;
@@ -350,12 +345,18 @@ std::atomic<void*> g_visualProxyVtable = nullptr;
 std::atomic<void*> g_matrixTransformProxyVtable = nullptr;
 std::atomic<void*> g_dwmCompositor = nullptr;
 std::atomic<void*> g_desktopManager = nullptr;
+void* g_desktopManagerVtableSymbol = nullptr;
+void* g_windowListVtableSymbol = nullptr;
 void* g_topLevelWindowVtableSymbol = nullptr;
 void* g_visualProxyVtableSymbol = nullptr;
 void* g_matrixTransformProxyVtableSymbol = nullptr;
+size_t g_desktopManagerCompositorOffset = SIZE_MAX;
+size_t g_desktopManagerThreadIdOffset = SIZE_MAX;
 size_t g_visualProxyOffset = SIZE_MAX;
 size_t g_topLevelWindowWindowDataOffset = SIZE_MAX;
 static bool IsDwmObjectPointerValid(void* object, std::atomic<void*>& expectedVtable);
+static bool HasExactDwmVtableTrusted(void* object,
+                                    std::atomic<void*>& expectedVtable);
 
 struct DwmAddressRange
 {
@@ -384,7 +385,6 @@ struct DwmWindowObjectMapping
     void* topLevelWindow;
     void* topLevelWindow3D;
     ULONGLONG lastSeen;
-    bool topLevelWindowDestroyed;
 };
 
 DwmWindowObjectMapping g_dwmWindowMappings[MAX_DWM_WINDOW_MAPPINGS] = {};
@@ -394,9 +394,11 @@ std::atomic<unsigned int> g_existingWindowBackfillCount = 0;
 std::atomic<unsigned int> g_existingWindowBackfillIndex = 0;
 std::atomic<unsigned int> g_existingWindowBackfillMapped = 0;
 std::atomic<DWORD> g_dwmSceneThreadId = 0;
+static constexpr UINT WM_DWM_SCENE_WAKE = WM_USER + 1;
+static constexpr UINT_PTR DWM_SCENE_WAKE_WPARAM = 0x574F42424C59574BULL;
+static constexpr INT_PTR DWM_SCENE_WAKE_LPARAM = 0x5343454E4557414BULL;
 std::atomic_bool g_dwmPrivateCallsDisabled = false;
 std::atomic_bool g_dwmThreadMismatchLogged = false;
-std::atomic<ULONGLONG> g_nextDwmObjectDiscoveryAttempt = 0;
 std::atomic<unsigned int> g_dwmObjectDiscoveryFailureCount = 0;
 
 struct MilMatrix3x2D
@@ -419,21 +421,11 @@ struct D2DMatrix3x2F
     float dy;
 };
 
-static bool HasSyncedWindowDataByHwnd()
+static void* FindWindowDataByHwnd(void* windowList, HWND hwnd)
 {
-    return g_getSyncedWindowDataByHwndLong || g_getSyncedWindowDataByHwndVoid;
-}
-
-static bool GetSyncedWindowDataByHwndCompat(void* windowList, HWND hwnd, void** windowData)
-{
-    *windowData = nullptr;
-    if (g_getSyncedWindowDataByHwndVoid)
-    {
-        g_getSyncedWindowDataByHwndVoid(windowList, hwnd, windowData);
-        return *windowData != nullptr;
-    }
-    return g_getSyncedWindowDataByHwndLong &&
-           g_getSyncedWindowDataByHwndLong(windowList, hwnd, windowData) >= 0 && *windowData;
+    return windowList && hwnd && g_findWindowDataByHwnd
+               ? g_findWindowDataByHwnd(windowList, hwnd)
+               : nullptr;
 }
 
 static bool HasSyncedWindowData()
@@ -481,34 +473,24 @@ static long UpdateMatrixTransformProxy(void* proxy, const MilMatrix3x2D& matrix)
 
 static void* GetTopLevelVisualProxy(void* topLevelWindow)
 {
-    if (!topLevelWindow)
+    if (!IsDwmObjectPointerValid(topLevelWindow, g_topLevelWindowVtable) ||
+        !g_topLevelWindowGetRootVisual || g_visualProxyOffset == SIZE_MAX)
     {
         return nullptr;
     }
-    if (g_cVisualGetVisualProxyForStructure)
+    constexpr int completeWindowRoot = 0;
+    void* rootVisual = g_topLevelWindowGetRootVisual(topLevelWindow, completeWindowRoot);
+    if (!rootVisual)
     {
-        return g_cVisualGetVisualProxyForStructure(topLevelWindow);
+        return nullptr;
     }
-    // Newer builds inline CVisual::GetVisualProxyForStructure. Resolve the
-    // complete window root first, then read the proxy field from that CVisual.
-    if (g_topLevelWindowGetRootVisual && g_visualProxyOffset != SIZE_MAX)
+    const BYTE* proxyField = static_cast<const BYTE*>(rootVisual) + g_visualProxyOffset;
+    if (IsReadableMemory(proxyField, sizeof(void*)))
     {
-        constexpr int completeWindowRoot = 0;
-        void* rootVisual =
-            g_topLevelWindowGetRootVisual(topLevelWindow, completeWindowRoot);
-        if (!rootVisual)
+        void* proxy = *reinterpret_cast<void* const*>(proxyField);
+        if (IsDwmObjectPointerValid(proxy, g_visualProxyVtable))
         {
-            return nullptr;
-        }
-        const BYTE* proxyField =
-            static_cast<const BYTE*>(rootVisual) + g_visualProxyOffset;
-        if (IsReadableMemory(proxyField, sizeof(void*)))
-        {
-            void* proxy = *reinterpret_cast<void* const*>(proxyField);
-            if (IsDwmObjectPointerValid(proxy, g_visualProxyVtable))
-            {
-                return proxy;
-            }
+            return proxy;
         }
     }
     return nullptr;
@@ -534,9 +516,7 @@ struct WindowAnimationSlot
     WobbleMesh mesh;
     void* matrixTransformProxy;
     void* boundTopLevelVisualProxy;
-    void* boundTransitionVisualProxy;
     bool transformAttached;
-    bool transitionTransformAttached;
     ULONGLONG transformRebindRevision;
     ULONGLONG submittedTransformRebindRevision;
     ULONGLONG meshRevision;
@@ -583,15 +563,16 @@ using SetThreadInformation_t = BOOL(WINAPI*)(HANDLE thread,
                                              THREAD_INFORMATION_CLASS informationClass,
                                              void* information, DWORD informationSize);
 
-static bool IsReadableMemory(const void* address, size_t size);
 static bool ResolveDwmWindowObjects(void* windowData, void** topLevelWindow,
                                     void** topLevelWindow3D);
 static void* FindWindowDataForTopLevelWindow3D(void* topLevelWindow3D);
 static long __cdecl ForceUpdateSceneHook(void* pThis);
 static long __cdecl UpdateSceneHook(void* pThis);
 static void __cdecl AdvanceTimelinesHook(void* pThis, double currentTime);
-static void __cdecl DesktopManagerHandleThreadMessageHook(UINT message, UINT_PTR wParam,
+static void __cdecl DesktopManagerHandleThreadMessageHook(UINT message,
+                                                          UINT_PTR wParam,
                                                           INT_PTR lParam);
+static long __cdecl EnsureTopLevelWindowHook(void* pThis, void* windowData);
 static void __cdecl TopLevelWindowDestructorHook(void* pThis);
 static void __cdecl TopLevelWindow3DDestructorHook(void* pThis);
 static void ApplyAnimationSlotTransform(int slotIndex, double interpolationAlpha);
@@ -785,6 +766,38 @@ static LPARAM EncodeWindowTransitionDirection(const RECT& sourceRect, const RECT
     return directionFlags;
 }
 
+static LPARAM BuildWindowTransitionFlags(HWND hwnd, const RECT& targetRect)
+{
+    if (!hwnd)
+    {
+        return 0;
+    }
+    RECT sourceRect = {};
+    bool hasSourceRect = GetWindowRect(hwnd, &sourceRect) != FALSE;
+    LPARAM flags = 0;
+    if (IsApproximatelyMonitorWorkArea(targetRect))
+    {
+        flags |= NATIVE_TRANSITION_TARGET_IS_WORK_AREA;
+    }
+    else if (IsApproximatelySnapLayoutTarget(targetRect))
+    {
+        flags |= NATIVE_TRANSITION_TARGET_IS_SNAP_LAYOUT;
+    }
+    if (hasSourceRect)
+    {
+        flags |= EncodeWindowTransitionDirection(sourceRect, targetRect);
+        if (IsApproximatelyMonitorWorkArea(sourceRect))
+        {
+            flags |= NATIVE_TRANSITION_SOURCE_IS_WORK_AREA;
+        }
+    }
+    if (IsZoomed(hwnd))
+    {
+        flags |= NATIVE_TRANSITION_WINDOW_IS_ZOOMED;
+    }
+    return flags;
+}
+
 static Vec2 DecodeWindowTransitionDirection(LPARAM transitionFlags)
 {
     Vec2 direction = {};
@@ -838,8 +851,11 @@ static long __cdecl WindowTransitionChangeHook(void* pThis, void* dwmWindow, int
                                                const RECT& rect3, const RECT& rect4,
                                                const RECT& rect5)
 {
+    if (HasExactDwmVtableTrusted(pThis, g_windowListVtable))
+    {
+        g_windowListForSceneWake.store(pThis, std::memory_order_release);
+    }
     HWND hwnd = nullptr;
-    LPARAM transitionFlags = 0;
     if (pThis && dwmWindow && HasSyncedWindowData())
     {
         void* windowData = nullptr;
@@ -849,33 +865,8 @@ static long __cdecl WindowTransitionChangeHook(void* pThis, void* dwmWindow, int
             hwnd = GetHwndFromWindowData(windowData);
         }
     }
-    if (hwnd)
-    {
-        RECT sourceRect = {};
-        bool hasSourceRect = GetWindowRect(hwnd, &sourceRect) != FALSE;
-        if (IsApproximatelyMonitorWorkArea(targetRect))
-        {
-            transitionFlags |= NATIVE_TRANSITION_TARGET_IS_WORK_AREA;
-        }
-        else if (IsApproximatelySnapLayoutTarget(targetRect))
-        {
-            transitionFlags |= NATIVE_TRANSITION_TARGET_IS_SNAP_LAYOUT;
-        }
-        if (hasSourceRect)
-        {
-            transitionFlags |= EncodeWindowTransitionDirection(sourceRect, targetRect);
-        }
-        if (hasSourceRect && IsApproximatelyMonitorWorkArea(sourceRect))
-        {
-            transitionFlags |= NATIVE_TRANSITION_SOURCE_IS_WORK_AREA;
-        }
-        if (IsZoomed(hwnd))
-        {
-            transitionFlags |= NATIVE_TRANSITION_WINDOW_IS_ZOOMED;
-        }
-    }
     // Queue before the native transition timeline starts.
-    QueueNativeWindowTransition(hwnd, transitionFlags);
+    QueueNativeWindowTransition(hwnd, BuildWindowTransitionFlags(hwnd, targetRect));
     return g_windowTransitionChangeOriginal(pThis, dwmWindow, transitionTarget, targetRect, rect2,
                                             rect3, rect4, rect5);
 }
@@ -884,7 +875,6 @@ static long __cdecl StartAnimationForMaximizeSnapTransitionHook(void* pThis, int
                                                                 const RECT& targetRect)
 {
     HWND hwnd = nullptr;
-    LPARAM transitionFlags = 0;
     if (pThis)
     {
         void* windowData = FindWindowDataForTopLevelWindow3D(pThis);
@@ -892,45 +882,18 @@ static long __cdecl StartAnimationForMaximizeSnapTransitionHook(void* pThis, int
         {
             hwnd = GetHwndFromWindowData(windowData);
         }
-        if (hwnd)
-        {
-            RECT sourceRect = {};
-            bool hasSourceRect = GetWindowRect(hwnd, &sourceRect) != FALSE;
-            if (IsApproximatelyMonitorWorkArea(targetRect))
-            {
-                transitionFlags |= NATIVE_TRANSITION_TARGET_IS_WORK_AREA;
-            }
-            else if (IsApproximatelySnapLayoutTarget(targetRect))
-            {
-                transitionFlags |= NATIVE_TRANSITION_TARGET_IS_SNAP_LAYOUT;
-            }
-            if (hasSourceRect)
-            {
-                transitionFlags |= EncodeWindowTransitionDirection(sourceRect, targetRect);
-            }
-            if (hasSourceRect && IsApproximatelyMonitorWorkArea(sourceRect))
-            {
-                transitionFlags |= NATIVE_TRANSITION_SOURCE_IS_WORK_AREA;
-            }
-            if (IsZoomed(hwnd))
-            {
-                transitionFlags |= NATIVE_TRANSITION_WINDOW_IS_ZOOMED;
-            }
-        }
     }
-    long result =
-        g_startAnimationForMaximizeSnapTransitionOriginal(pThis, animationType, targetRect);
-    if (result >= 0)
-    {
-        QueueNativeWindowTransition(hwnd, transitionFlags);
-    }
-    return result;
+    // Seed the wobble before uDWM starts its own maximize/restore timeline.
+    QueueNativeWindowTransition(hwnd, BuildWindowTransitionFlags(hwnd, targetRect));
+    return g_startAnimationForMaximizeSnapTransitionOriginal(pThis, animationType, targetRect);
 }
 
 static void __cdecl OnPositionChangeHook(void* pThis, void* pWindowData, bool unknown)
 {
-    // CWindowList has process lifetime and can safely wake idle scene passes.
-    g_windowListForSceneWake.store(pThis, std::memory_order_release);
+    if (HasExactDwmVtableTrusted(pThis, g_windowListVtable))
+    {
+        g_windowListForSceneWake.store(pThis, std::memory_order_release);
+    }
     g_onPositionChangeOriginal(pThis, pWindowData, unknown);
     if (!pWindowData || g_unloading.load(std::memory_order_acquire) ||
         g_dwmPrivateCallsDisabled.load(std::memory_order_acquire))
@@ -947,6 +910,10 @@ static void __cdecl OnPositionChangeHook(void* pThis, void* pWindowData, bool un
 
 static void __cdecl CheckForMaximizedChangeHook(void* pThis, void* pWindowData)
 {
+    if (HasExactDwmVtableTrusted(pThis, g_windowListVtable))
+    {
+        g_windowListForSceneWake.store(pThis, std::memory_order_release);
+    }
     g_checkForMaximizedChangeOriginal(pThis, pWindowData);
     if (!pWindowData)
     {
@@ -1099,84 +1066,49 @@ static bool IsDwmFunctionPointerValid(const void* function)
     return function && IsDwmExecutableAddress(function);
 }
 
+static bool HasExactDwmVtableTrusted(void* object, std::atomic<void*>& expectedVtable)
+{
+    void* expected = expectedVtable.load(std::memory_order_acquire);
+    return object && expected && *reinterpret_cast<void**>(object) == expected;
+}
+
 static bool IsDwmObjectPointerValid(void* object, std::atomic<void*>& expectedVtable)
 {
-    // This one coarse heap probe rejects obvious invalid pointers. Object
-    // lifetime hooks are the real guard; vtable/function checks below use the
-    // cached uDWM image ranges and don't issue more VirtualQuery calls.
-    if (!object || !IsReadableMemory(object, sizeof(void*)))
+    void* knownVtable = expectedVtable.load(std::memory_order_acquire);
+    if (!knownVtable || !object || !IsReadableMemory(object, sizeof(void*)))
     {
         return false;
     }
     void* actualVtable = *reinterpret_cast<void**>(object);
-    if (!actualVtable || !IsDwmImageAddress(actualVtable, sizeof(void*) * 3))
-    {
-        return false;
-    }
-    void** virtualFunctions = static_cast<void**>(actualVtable);
-    for (int i = 0; i < 3; i++)
-    {
-        if (!IsDwmFunctionPointerValid(virtualFunctions[i]))
-        {
-            return false;
-        }
-    }
-    void* knownVtable = expectedVtable.load(std::memory_order_acquire);
-    if (!knownVtable)
-    {
-        void* expected = nullptr;
-        expectedVtable.compare_exchange_strong(expected, actualVtable, std::memory_order_acq_rel,
-                                               std::memory_order_acquire);
-        knownVtable = expectedVtable.load(std::memory_order_acquire);
-    }
     return actualVtable == knownVtable;
 }
 
-static bool IsDwmObjectPointerStructurallyValid(void* object, void** vtable)
+static bool LearnDwmVtableFromTrustedObject(void* object,
+                                            std::atomic<void*>& targetVtable)
 {
-    *vtable = nullptr;
     if (!object || !IsReadableMemory(object, sizeof(void*)))
     {
         return false;
     }
     void* candidateVtable = *reinterpret_cast<void**>(object);
-    if (!candidateVtable || !IsDwmImageAddress(candidateVtable, sizeof(void*) * 3))
+    if (!IsDwmImageAddress(candidateVtable, sizeof(void*) * 3) ||
+        !IsReadableMemory(candidateVtable, sizeof(void*) * 3))
     {
         return false;
     }
-    void** virtualFunctions = static_cast<void**>(candidateVtable);
+    void** functions = static_cast<void**>(candidateVtable);
     for (int i = 0; i < 3; i++)
     {
-        if (!IsDwmFunctionPointerValid(virtualFunctions[i]))
+        if (!IsDwmFunctionPointerValid(functions[i]))
         {
             return false;
         }
     }
-    *vtable = candidateVtable;
-    return true;
-}
-
-static bool DwmObjectVtableContains(void* object, void* function)
-{
-    void* vtable = nullptr;
-    if (!IsDwmFunctionPointerValid(function) ||
-        !IsDwmObjectPointerStructurallyValid(object, &vtable))
-    {
-        return false;
-    }
-    void** virtualFunctions = static_cast<void**>(vtable);
-    for (int i = 0; i < 24; i++)
-    {
-        if (!IsDwmImageAddress(&virtualFunctions[i], sizeof(void*)))
-        {
-            break;
-        }
-        if (virtualFunctions[i] == function)
-        {
-            return true;
-        }
-    }
-    return false;
+    void* expected = nullptr;
+    targetVtable.compare_exchange_strong(expected, candidateVtable,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire);
+    return targetVtable.load(std::memory_order_acquire) == candidateVtable;
 }
 
 static size_t FindOffsetFromFunction(void* function, size_t defaultValue)
@@ -1218,17 +1150,91 @@ static size_t FindOffsetFromFunction(void* function, size_t defaultValue)
     return defaultValue;
 }
 
-static size_t FindReturnedPointerOffset(void* function)
+static size_t FindDesktopManagerThreadIdOffset(void* function)
 {
     if (!IsDwmFunctionPointerValid(function))
     {
         return SIZE_MAX;
     }
-    static const std::regex pattern(
-        R"(mov rax, (?:qword ptr )?\[r[a-z0-9]+\+0x([0-9a-f]{1,8})\])",
+    std::string thisAliases[8] = {"rcx"};
+    unsigned int aliasCount = 1;
+    auto isThisAlias = [&](const std::string& name)
+    {
+        for (unsigned int i = 0; i < aliasCount; i++)
+        {
+            if (thisAliases[i] == name)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto addThisAlias = [&](const std::string& name)
+    {
+        if (!isThisAlias(name) && aliasCount < ARRAYSIZE(thisAliases))
+        {
+            thisAliases[aliasCount++] = name;
+        }
+    };
+    static const std::regex movePattern(R"(^mov (r[a-z0-9]+), (r[a-z0-9]+)$)",
+                                        std::regex_constants::icase);
+    static const std::regex loadPattern(
+        R"(^mov (?:e[a-z0-9]+|r[0-9]+d), (?:dword ptr )?\[(r[a-z0-9]+)\s*\+\s*0x([0-9a-f]{1,8})\]$)",
+        std::regex_constants::icase);
+    static const std::regex wakeMessagePattern(R"(^mov edx, 0x0*400$)",
+                                               std::regex_constants::icase);
+    BYTE* instruction = static_cast<BYTE*>(function);
+    size_t candidate = SIZE_MAX;
+    size_t bytesRead = 0;
+    for (int i = 0; i < 64 && bytesRead < 512; i++)
+    {
+        WH_DISASM_RESULT result = {};
+        if (!IsDwmExecutableAddress(instruction) || !Wh_Disasm(instruction, &result) ||
+            result.length == 0)
+        {
+            break;
+        }
+        std::string text = result.text;
+        std::smatch match;
+        if (std::regex_match(text, match, movePattern) && isThisAlias(match[2].str()))
+        {
+            addThisAlias(match[1].str());
+        }
+        else if (std::regex_match(text, match, loadPattern) &&
+                 isThisAlias(match[1].str()))
+        {
+            size_t offset = std::stoull(match[2].str(), nullptr, 16);
+            if (offset >= sizeof(void*) && offset <= 0x1000 && offset % sizeof(DWORD) == 0)
+            {
+                candidate = offset;
+            }
+        }
+        else if (std::regex_match(text, wakeMessagePattern))
+        {
+            return candidate;
+        }
+        if (text == "ret")
+        {
+            break;
+        }
+        instruction += result.length;
+        bytesRead += result.length;
+    }
+    return SIZE_MAX;
+}
+
+static size_t FindVisualProxyOffsetFromCanvasGetter(void* function)
+{
+    if (!IsDwmFunctionPointerValid(function))
+    {
+        return SIZE_MAX;
+    }
+    static const std::regex loadPattern(
+        R"(^mov (r[a-z0-9]+), (?:qword ptr )?\[(r[a-z0-9]+)\+0x([0-9a-f]{1,8})\]$)",
         std::regex_constants::icase);
     BYTE* instruction = static_cast<BYTE*>(function);
     size_t candidate = SIZE_MAX;
+    std::string visualRegister;
     size_t bytesRead = 0;
     for (int i = 0; i < 32 && bytesRead < 256; i++)
     {
@@ -1238,13 +1244,26 @@ static size_t FindReturnedPointerOffset(void* function)
         {
             break;
         }
-        std::string_view text = result.text;
-        std::match_results<std::string_view::const_iterator> match;
-        if (std::regex_match(text.begin(), text.end(), match, pattern))
+        std::string text = result.text;
+        std::smatch match;
+        if (std::regex_match(text, match, loadPattern))
         {
-            size_t offset = std::stoull(match[1].str(), nullptr, 16);
-            if (offset <= 0x100 && offset % sizeof(void*) == 0)
+            const std::string destination = match[1].str();
+            const std::string base = match[2].str();
+            size_t offset = std::stoull(match[3].str(), nullptr, 16);
+            if (base == "rcx" && offset >= 0x80 && offset <= 0x400 &&
+                offset % sizeof(void*) == 0)
             {
+                visualRegister = destination;
+            }
+            else if (!visualRegister.empty() && destination == "rax" &&
+                     base == visualRegister && offset <= 0x80 &&
+                     offset % sizeof(void*) == 0)
+            {
+                if (candidate != SIZE_MAX && candidate != offset)
+                {
+                    return SIZE_MAX;
+                }
                 candidate = offset;
             }
         }
@@ -1256,6 +1275,123 @@ static size_t FindReturnedPointerOffset(void* function)
         bytesRead += result.length;
     }
     return candidate;
+}
+
+static size_t FindDesktopManagerCompositorOffset(void* initializeFunction,
+                                                 void* compositorCreateFunction)
+{
+    if (!IsDwmFunctionPointerValid(initializeFunction) ||
+        !IsDwmFunctionPointerValid(compositorCreateFunction))
+    {
+        return SIZE_MAX;
+    }
+    enum class RegisterKind
+    {
+        Unknown,
+        This,
+        MemberAddress
+    };
+    struct RegisterState
+    {
+        std::string name;
+        RegisterKind kind;
+        size_t offset;
+    };
+    RegisterState registers[16] = {{"rcx", RegisterKind::This, 0}};
+    unsigned int registerCount = 1;
+    auto findRegister = [&](const std::string& name) -> RegisterState*
+    {
+        for (unsigned int i = 0; i < registerCount; i++)
+        {
+            if (registers[i].name == name)
+            {
+                return &registers[i];
+            }
+        }
+        if (registerCount >= ARRAYSIZE(registers))
+        {
+            return nullptr;
+        }
+        registers[registerCount] = {name, RegisterKind::Unknown, 0};
+        return &registers[registerCount++];
+    };
+    auto clearVolatileRegisters = [&]
+    {
+        for (const char* name : {"rcx", "rdx", "r8", "r9", "r10", "r11"})
+        {
+            if (RegisterState* state = findRegister(name))
+            {
+                state->kind = RegisterKind::Unknown;
+                state->offset = 0;
+            }
+        }
+    };
+    static const std::regex movePattern(R"(^mov (r[a-z0-9]+), (r[a-z0-9]+)$)",
+                                        std::regex_constants::icase);
+    static const std::regex leaPattern(
+        R"(^lea (r[a-z0-9]+), \[(r[a-z0-9]+)\+0x([0-9a-f]{1,8})\]$)",
+        std::regex_constants::icase);
+    static const std::regex callPattern(R"(^call 0x([0-9a-f]+)$)",
+                                        std::regex_constants::icase);
+    BYTE* instruction = static_cast<BYTE*>(initializeFunction);
+    size_t bytesRead = 0;
+    for (int i = 0; i < 1024 && bytesRead < 4096; i++)
+    {
+        WH_DISASM_RESULT result = {};
+        if (!IsDwmExecutableAddress(instruction) || !Wh_Disasm(instruction, &result) ||
+            result.length == 0)
+        {
+            break;
+        }
+        std::string text = result.text;
+        std::smatch match;
+        if (std::regex_match(text, match, movePattern))
+        {
+            RegisterState* destination = findRegister(match[1].str());
+            RegisterState* source = findRegister(match[2].str());
+            if (destination && source)
+            {
+                destination->kind = source->kind;
+                destination->offset = source->offset;
+            }
+        }
+        else if (std::regex_match(text, match, leaPattern))
+        {
+            RegisterState* destination = findRegister(match[1].str());
+            RegisterState* base = findRegister(match[2].str());
+            size_t offset = std::stoull(match[3].str(), nullptr, 16);
+            if (destination)
+            {
+                destination->kind = base && base->kind == RegisterKind::This
+                                        ? RegisterKind::MemberAddress
+                                        : RegisterKind::Unknown;
+                destination->offset = offset;
+            }
+        }
+        else if (std::regex_match(text, match, callPattern))
+        {
+            uintptr_t target = std::stoull(match[1].str(), nullptr, 16);
+            if (target == reinterpret_cast<uintptr_t>(compositorCreateFunction))
+            {
+                RegisterState* argument = findRegister("rcx");
+                if (argument && argument->kind == RegisterKind::MemberAddress &&
+                    argument->offset >= sizeof(void*) && argument->offset <= 0x400 &&
+                    argument->offset % sizeof(void*) == 0)
+                {
+                    return argument->offset;
+                }
+                return SIZE_MAX;
+            }
+            clearVolatileRegisters();
+        }
+        if (text == "ret")
+        {
+            break;
+        }
+        instruction += result.length;
+        bytesRead += result.length;
+    }
+    return SIZE_MAX;
 }
 
 static bool FindConstructorWindowDataOffsets(void* function, size_t* windowDataTopLevelOffset,
@@ -1565,7 +1701,6 @@ static void ClearDwmWindowMappingByWindowData(void* windowData)
         if (g_dwmWindowMappings[i].windowData == windowData)
         {
             g_dwmWindowMappings[i] = {};
-            break;
         }
     }
     ReleaseSRWLockExclusive(&g_dwmWindowMappingsLock);
@@ -1585,9 +1720,7 @@ static void* ClearDwmWindowMappingByTopLevelWindow(void* topLevelWindow)
         {
             windowData = mapping.windowData;
             mapping.topLevelWindow = nullptr;
-            mapping.topLevelWindowDestroyed = true;
             mapping.lastSeen = GetTickCount64();
-            break;
         }
     }
     ReleaseSRWLockExclusive(&g_dwmWindowMappingsLock);
@@ -1607,11 +1740,10 @@ static void ClearDwmWindowMappingByTopLevelWindow3D(void* topLevelWindow3D)
         if (mapping.topLevelWindow3D == topLevelWindow3D)
         {
             mapping.topLevelWindow3D = nullptr;
-            if (!mapping.topLevelWindow && !mapping.topLevelWindowDestroyed)
+            if (!mapping.topLevelWindow)
             {
                 mapping = {};
             }
-            break;
         }
     }
     ReleaseSRWLockExclusive(&g_dwmWindowMappingsLock);
@@ -1631,10 +1763,16 @@ static void RegisterDwmWindowMapping(void* windowData, void* topLevelWindow, voi
     for (int i = 0; i < MAX_DWM_WINDOW_MAPPINGS; i++)
     {
         DwmWindowObjectMapping& mapping = g_dwmWindowMappings[i];
+        if ((topLevelWindow && mapping.windowData != windowData &&
+             mapping.topLevelWindow == topLevelWindow) ||
+            (topLevelWindow3D && mapping.windowData != windowData &&
+             mapping.topLevelWindow3D == topLevelWindow3D))
+        {
+            mapping = {};
+        }
         if (mapping.windowData == windowData)
         {
             targetIndex = i;
-            break;
         }
         if (!mapping.windowData && targetIndex < 0)
         {
@@ -1651,12 +1789,18 @@ static void RegisterDwmWindowMapping(void* windowData, void* topLevelWindow, voi
         targetIndex = oldestIndex;
         g_dwmWindowMappings[targetIndex] = {};
     }
+    for (int i = 0; i < MAX_DWM_WINDOW_MAPPINGS; i++)
+    {
+        if (i != targetIndex && g_dwmWindowMappings[i].windowData == windowData)
+        {
+            g_dwmWindowMappings[i] = {};
+        }
+    }
     DwmWindowObjectMapping& mapping = g_dwmWindowMappings[targetIndex];
     mapping.windowData = windowData;
     if (topLevelWindow)
     {
         mapping.topLevelWindow = topLevelWindow;
-        mapping.topLevelWindowDestroyed = false;
     }
     if (topLevelWindow3D)
     {
@@ -1720,7 +1864,6 @@ static bool ResolveDwmWindowObjects(void* windowData, void** topLevelWindow,
     {
         return false;
     }
-    bool topLevelWindowDestroyed = false;
     AcquireSRWLockShared(&g_dwmWindowMappingsLock);
     for (int i = 0; i < MAX_DWM_WINDOW_MAPPINGS; i++)
     {
@@ -1729,7 +1872,6 @@ static bool ResolveDwmWindowObjects(void* windowData, void** topLevelWindow,
         {
             *topLevelWindow = mapping.topLevelWindow;
             *topLevelWindow3D = mapping.topLevelWindow3D;
-            topLevelWindowDestroyed = mapping.topLevelWindowDestroyed;
             break;
         }
     }
@@ -1742,8 +1884,7 @@ static bool ResolveDwmWindowObjects(void* windowData, void** topLevelWindow,
     {
         *topLevelWindow3D = nullptr;
     }
-    if (!*topLevelWindow && !topLevelWindowDestroyed &&
-        g_windowDataTopLevelWindowOffset != SIZE_MAX)
+    if (!*topLevelWindow && g_windowDataTopLevelWindowOffset != SIZE_MAX)
     {
         BYTE* fieldAddress = static_cast<BYTE*>(windowData) + g_windowDataTopLevelWindowOffset;
         if (IsReadableMemory(fieldAddress, sizeof(void*)))
@@ -1800,11 +1941,7 @@ static void* __cdecl TopLevelWindowConstructorHook(void* pThis, void* windowData
 {
     void* result = g_topLevelWindowConstructorOriginal(pThis, windowData, unknown);
     void* constructedObject = result ? result : pThis;
-    void* constructorVtable = nullptr;
-    // A base constructor can temporarily expose its own vtable. Check the
-    // object structurally here and latch the final vtable on the scene thread.
-    if (windowData &&
-        IsDwmObjectPointerStructurallyValid(constructedObject, &constructorVtable))
+    if (windowData && IsDwmObjectPointerValid(constructedObject, g_topLevelWindowVtable))
     {
         RegisterDwmWindowMapping(windowData, constructedObject, nullptr);
         MarkAnimationSlotForDwmObjectRefresh(windowData);
@@ -1816,7 +1953,9 @@ static void __cdecl TopLevelWindow3DSetWindowDataHook(void* pThis, void* windowD
 {
     g_topLevelWindow3DSetWindowDataOriginal(pThis, windowData);
     ClearDwmWindowMappingByTopLevelWindow3D(pThis);
-    if (windowData && IsDwmObjectPointerValid(pThis, g_topLevelWindow3DVtable))
+    if (windowData &&
+        (IsDwmObjectPointerValid(pThis, g_topLevelWindow3DVtable) ||
+         LearnDwmVtableFromTrustedObject(pThis, g_topLevelWindow3DVtable)))
     {
         RegisterDwmWindowMapping(windowData, nullptr, pThis);
         MarkAnimationSlotForDwmObjectRefresh(windowData);
@@ -1827,6 +1966,23 @@ static void __cdecl WindowDataDestructorHook(void* pThis)
 {
     ClearDwmWindowMappingByWindowData(pThis);
     g_windowDataDestructorOriginal(pThis);
+}
+
+static long __cdecl EnsureTopLevelWindowHook(void* pThis, void* windowData)
+{
+    long result = g_ensureTopLevelWindowFunction(pThis, windowData);
+    if (result >= 0 && windowData &&
+        HasExactDwmVtableTrusted(pThis, g_windowListVtable))
+    {
+        g_windowListForSceneWake.store(pThis, std::memory_order_release);
+        void* topLevelWindow = nullptr;
+        void* topLevelWindow3D = nullptr;
+        if (ResolveDwmWindowObjects(windowData, &topLevelWindow, &topLevelWindow3D))
+        {
+            MarkAnimationSlotForDwmObjectRefresh(windowData);
+        }
+    }
+    return result;
 }
 
 static void __cdecl TopLevelWindowDestructorHook(void* pThis)
@@ -1927,7 +2083,6 @@ static bool RegisterDwmSceneThread(bool authoritative)
             g_desktopManager.store(nullptr, std::memory_order_release);
             g_dwmCompositor.store(nullptr, std::memory_order_release);
             g_windowListForSceneWake.store(nullptr, std::memory_order_release);
-            g_nextDwmObjectDiscoveryAttempt.store(0, std::memory_order_release);
             g_dwmObjectDiscoveryFailureCount.store(0, std::memory_order_release);
             g_sceneSubmittedSerial.store(
                 g_sceneRequestedSerial.load(std::memory_order_acquire),
@@ -1951,64 +2106,76 @@ static bool IsOnDwmSceneThread()
            !g_dwmPrivateCallsDisabled.load(std::memory_order_acquire);
 }
 
-static void* FindCompositorInDesktopManager(void* manager, size_t* compositorOffset)
+static void RearmAnimationSlotsForCompositorChange()
 {
-    // No compositor accessor is published on the supported PDBs. Require one
-    // unique object whose vtable contains both CCompositor ref-count methods.
-    *compositorOffset = SIZE_MAX;
-    void* managerVtable = nullptr;
-    if (!IsDwmObjectPointerStructurallyValid(manager, &managerVtable) ||
-        !IsDwmFunctionPointerValid(g_cCompositorAddRefFunction) ||
-        !IsDwmFunctionPointerValid(g_cCompositorReleaseFunction))
+    unsigned int abandoned = 0;
+    bool hasActiveSlots = false;
+    AcquireSRWLockExclusive(&g_animationSlotsLock);
+    for (WindowAnimationSlot& slot : g_animationSlots)
     {
-        return nullptr;
-    }
-    void* compositor = nullptr;
-    unsigned int matches = 0;
-    for (size_t offset = sizeof(void*); offset <= 0x180; offset += sizeof(void*))
-    {
-        BYTE* fieldAddress = static_cast<BYTE*>(manager) + offset;
-        if (!IsReadableMemory(fieldAddress, sizeof(void*)))
+        if (!slot.active && !slot.retiring)
         {
-            break;
+            continue;
         }
-        void* candidate = *reinterpret_cast<void**>(fieldAddress);
-        if (DwmObjectVtableContains(candidate, g_cCompositorAddRefFunction) &&
-            DwmObjectVtableContains(candidate, g_cCompositorReleaseFunction) &&
-            candidate != compositor)
+        if (slot.matrixTransformProxy)
         {
-            compositor = candidate;
-            *compositorOffset = offset;
-            matches++;
+            slot.matrixTransformProxy = nullptr;
+            abandoned++;
         }
+        slot.boundTopLevelVisualProxy = nullptr;
+        slot.transformAttached = false;
+        slot.identityApplied = false;
+        slot.transformRebindRevision++;
+        slot.proxyCreationPending = slot.active;
+        hasActiveSlots = hasActiveSlots || slot.active;
     }
-    if (matches != 1)
+    WakeAllConditionVariable(&g_animationSlotsCondition);
+    ReleaseSRWLockExclusive(&g_animationSlotsLock);
+    if (abandoned)
     {
-        return nullptr;
+        g_abandonedProxyCount.fetch_add(abandoned, std::memory_order_acq_rel);
     }
-    return compositor;
+    if (hasActiveSlots)
+    {
+        g_sceneRequestedSerial.fetch_add(1, std::memory_order_acq_rel);
+    }
 }
 
 static bool CacheDwmObjectsFromDesktopManager(void* manager)
 {
-    void* cachedManager = g_desktopManager.load(std::memory_order_acquire);
-    void* cachedCompositor = g_dwmCompositor.load(std::memory_order_acquire);
-    if (cachedManager == manager && cachedCompositor)
-    {
-        return true;
-    }
-    size_t compositorOffset = SIZE_MAX;
-    void* compositor = FindCompositorInDesktopManager(manager, &compositorOffset);
-    if (!IsDwmObjectPointerValid(manager, g_desktopManagerVtable) ||
-        !IsDwmObjectPointerValid(compositor, g_compositorVtable))
+    void* expectedManagerVtable = g_desktopManagerVtable.load(std::memory_order_acquire);
+    if (g_desktopManagerCompositorOffset == SIZE_MAX || !manager ||
+        !expectedManagerVtable || *reinterpret_cast<void**>(manager) != expectedManagerVtable)
     {
         return false;
     }
+    BYTE* compositorField =
+        static_cast<BYTE*>(manager) + g_desktopManagerCompositorOffset;
+    void* compositor = *reinterpret_cast<void**>(compositorField);
+    void* cachedManager = g_desktopManager.load(std::memory_order_acquire);
+    void* cachedCompositor = g_dwmCompositor.load(std::memory_order_acquire);
+    if (cachedManager == manager && cachedCompositor == compositor && cachedCompositor)
+    {
+        return true;
+    }
+    if (!IsDwmObjectPointerValid(compositor, g_compositorVtable) &&
+        !LearnDwmVtableFromTrustedObject(compositor, g_compositorVtable))
+    {
+        if (g_dwmCompositor.exchange(nullptr, std::memory_order_acq_rel))
+        {
+            RearmAnimationSlotsForCompositorChange();
+        }
+        g_desktopManager.store(manager, std::memory_order_release);
+        return false;
+    }
+    if (cachedCompositor && cachedCompositor != compositor)
+    {
+        RearmAnimationSlotsForCompositorChange();
+    }
     g_desktopManager.store(manager, std::memory_order_release);
     g_dwmCompositor.store(compositor, std::memory_order_release);
-    Wh_Log(L"DWM objects verified automatically: CDesktopManager=%p "
-           L"CCompositor=%p compositorOffset=0x%zx",
-           manager, compositor, compositorOffset);
+    Wh_Log(L"DWM objects verified: CDesktopManager=%p CCompositor=%p offset=0x%zx",
+           manager, compositor, g_desktopManagerCompositorOffset);
     return true;
 }
 
@@ -2022,6 +2189,11 @@ static void* FindDwmCompositor()
         return nullptr;
     }
     void* desktopManager = *static_cast<void**>(g_desktopManagerInstanceAddress);
+    if (!IsReadableMemory(desktopManager, sizeof(void*)))
+    {
+        Wh_Log(L"DWM startup discovery: desktop manager object unavailable");
+        return nullptr;
+    }
     if (!CacheDwmObjectsFromDesktopManager(desktopManager))
     {
         Wh_Log(L"DWM startup discovery: singleton object validation failed");
@@ -2056,18 +2228,10 @@ static bool InitializeDwmHooks()
          reinterpret_cast<void**>(&g_onPositionChangeOriginal),
          reinterpret_cast<void*>(OnPositionChangeHook),
          true},
-        {{L"public: long __cdecl CWindowList::GetSyncedWindowDataByHwnd("
-           L"struct HWND__ *,class CWindowData * *)",
-          L"?GetSyncedWindowDataByHwnd@CWindowList@@"
-           L"QEAAJPEAUHWND__@@PEAPEAVCWindowData@@@Z"},
-         reinterpret_cast<void**>(&g_getSyncedWindowDataByHwndLong),
-         nullptr,
-         true},
-        {{L"public: void __cdecl CWindowList::GetSyncedWindowDataByHwnd("
-           L"struct HWND__ *,class CWindowData * *)",
-          L"?GetSyncedWindowDataByHwnd@CWindowList@@"
-           L"QEAAXPEAUHWND__@@PEAPEAVCWindowData@@@Z"},
-         reinterpret_cast<void**>(&g_getSyncedWindowDataByHwndVoid),
+        {{L"public: class CWindowData * __cdecl "
+           L"CWindowList::FindWindowDataByHwnd(struct HWND__ *)",
+          L"?FindWindowDataByHwnd@CWindowList@@QEAAPEAVCWindowData@@PEAUHWND__@@@Z"},
+         reinterpret_cast<void**>(&g_findWindowDataByHwnd),
          nullptr,
          true},
         {{L"public: long __cdecl CWindowList::GetSyncedWindowData("
@@ -2107,12 +2271,6 @@ static bool InitializeDwmHooks()
            L"AEBUtagRECT@@@Z"},
          reinterpret_cast<void**>(&g_startAnimationForMaximizeSnapTransitionOriginal),
          reinterpret_cast<void*>(StartAnimationForMaximizeSnapTransitionHook),
-         true},
-        {{L"public: virtual class CVisualProxy * __cdecl "
-           L"CVisual::GetVisualProxyForStructure(void)",
-          L"?GetVisualProxyForStructure@CVisual@@UEAAPEAVCVisualProxy@@XZ"},
-         reinterpret_cast<void**>(&g_cVisualGetVisualProxyForStructure),
-         nullptr,
          true},
         {{L"public: class CVisualProxy * __cdecl "
            L"CTopLevelWindow::GetCanvasRootVisualProxy(void)",
@@ -2174,14 +2332,25 @@ static bool InitializeDwmHooks()
          &g_desktopManagerInstanceAddress,
          nullptr,
          true},
-        {{L"public: virtual unsigned long __cdecl CCompositor::AddRef(void)",
-          L"?AddRef@CCompositor@@UEAAKXZ"},
-         &g_cCompositorAddRefFunction,
+        {{L"private: long __cdecl CDesktopManager::Initialize(struct IUnknown *)",
+          L"?Initialize@CDesktopManager@@AEAAJPEAUIUnknown@@@Z"},
+         &g_desktopManagerInitializeFunction,
          nullptr,
          true},
-        {{L"public: virtual unsigned long __cdecl CCompositor::Release(void)",
-          L"?Release@CCompositor@@UEAAKXZ"},
-         &g_cCompositorReleaseFunction,
+        {{L"public: static long __cdecl CCompositor::Create(class CCompositor * *)",
+          L"?Create@CCompositor@@SAJPEAPEAV1@@Z"},
+         &g_cCompositorCreateFunction,
+         nullptr,
+         true},
+        {{L"private: static void __cdecl "
+           L"CDesktopManager::HandleThreadMessage(unsigned int,unsigned __int64,__int64)",
+          L"?HandleThreadMessage@CDesktopManager@@CAXI_K_J@Z"},
+         reinterpret_cast<void**>(&g_desktopManagerHandleThreadMessageOriginal),
+         reinterpret_cast<void*>(DesktopManagerHandleThreadMessageHook),
+         true},
+        {{L"public: long __cdecl CDesktopManager::PostStartAnimations(void)",
+           L"?PostStartAnimations@CDesktopManager@@QEAAJXZ"},
+         reinterpret_cast<void**>(&g_desktopManagerPostStartAnimations),
          nullptr,
          true},
         {{L"private: __cdecl CTopLevelWindow::CTopLevelWindow(class CWindowData *,bool)",
@@ -2211,7 +2380,7 @@ static bool InitializeDwmHooks()
           L"?EnsureTopLevelWindow@CWindowList@@"
            L"AEAAJPEAVCWindowData@@@Z"},
          reinterpret_cast<void**>(&g_ensureTopLevelWindowFunction),
-         nullptr,
+         reinterpret_cast<void*>(EnsureTopLevelWindowHook),
          true},
         {{L"protected: virtual __cdecl CTopLevelWindow3D::~CTopLevelWindow3D(void)",
           L"public: virtual __cdecl CTopLevelWindow3D::~CTopLevelWindow3D(void)",
@@ -2238,6 +2407,14 @@ static bool InitializeDwmHooks()
          &g_topLevelWindowVtableSymbol,
          nullptr,
          true},
+        {{L"const CDesktopManager::`vftable'", L"??_7CDesktopManager@@6B@"},
+         &g_desktopManagerVtableSymbol,
+         nullptr,
+         true},
+        {{L"const CWindowList::`vftable'", L"??_7CWindowList@@6B@"},
+         &g_windowListVtableSymbol,
+         nullptr,
+         true},
         {{L"const CVisualProxy::`vftable'", L"??_7CVisualProxy@@6B@"},
          &g_visualProxyVtableSymbol,
          nullptr,
@@ -2245,12 +2422,6 @@ static bool InitializeDwmHooks()
         {{L"const CMatrixTransformProxy::`vftable'", L"??_7CMatrixTransformProxy@@6B@"},
          &g_matrixTransformProxyVtableSymbol,
          nullptr,
-         true},
-        {{L"private: static void __cdecl CDesktopManager::HandleThreadMessage("
-           L"unsigned int,unsigned __int64,__int64)",
-          L"?HandleThreadMessage@CDesktopManager@@CAXI_K_J@Z"},
-         reinterpret_cast<void**>(&g_desktopManagerHandleThreadMessageOriginal),
-         reinterpret_cast<void*>(DesktopManagerHandleThreadMessageHook),
          true}};
     if (!WindhawkUtils::HookSymbols(udwm, udwmDllHooks, ARRAYSIZE(udwmDllHooks)))
     {
@@ -2264,16 +2435,15 @@ static bool InitializeDwmHooks()
             function = nullptr;
         }
     };
-    keepValid(g_getSyncedWindowDataByHwndLong);
-    keepValid(g_getSyncedWindowDataByHwndVoid);
+    keepValid(g_findWindowDataByHwnd);
     keepValid(g_getSyncedWindowDataLong);
     keepValid(g_getSyncedWindowDataVoid);
     keepValid(g_cMatrixTransformProxyUpdate);
     keepValid(g_cMatrixTransformProxyUpdateFloat);
-    keepValid(g_cVisualGetVisualProxyForStructure);
     keepValid(g_getCanvasRootVisualProxy);
     keepValid(g_topLevelWindowGetRootVisual);
     keepValid(g_topLevelWindowGetWindowData);
+    keepValid(g_desktopManagerPostStartAnimations);
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
@@ -2291,12 +2461,17 @@ static bool InitializeDwmHooks()
         target.store(symbol, std::memory_order_release);
         return true;
     };
+    bool hasExactDesktopManagerVtable =
+        cacheVtableSymbol(g_desktopManagerVtableSymbol, g_desktopManagerVtable);
+    bool hasExactWindowListVtable =
+        cacheVtableSymbol(g_windowListVtableSymbol, g_windowListVtable);
     bool hasExactTopLevelWindowVtable =
         cacheVtableSymbol(g_topLevelWindowVtableSymbol, g_topLevelWindowVtable);
-    cacheVtableSymbol(g_visualProxyVtableSymbol, g_visualProxyVtable);
-    cacheVtableSymbol(g_matrixTransformProxyVtableSymbol, g_matrixTransformProxyVtable);
-    if ((g_getSyncedWindowDataByHwndLong && g_getSyncedWindowDataByHwndVoid) ||
-        (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat))
+    bool hasExactVisualProxyVtable =
+        cacheVtableSymbol(g_visualProxyVtableSymbol, g_visualProxyVtable);
+    bool hasExactMatrixProxyVtable =
+        cacheVtableSymbol(g_matrixTransformProxyVtableSymbol, g_matrixTransformProxyVtable);
+    if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
         return false;
@@ -2323,16 +2498,26 @@ static bool InitializeDwmHooks()
         {L"CCompositor::CreateProxy<CMatrixTransformProxy>",
          reinterpret_cast<void*>(g_createMatrixTransformProxy)},
         {L"CBaseObject::Release", reinterpret_cast<void*>(g_cBaseObjectRelease)},
-        {L"CCompositor::AddRef", g_cCompositorAddRefFunction},
-        {L"CCompositor::Release", g_cCompositorReleaseFunction},
+        {L"CWindowList::FindWindowDataByHwnd",
+         reinterpret_cast<void*>(g_findWindowDataByHwnd)},
+        {L"CDesktopManager::Initialize", g_desktopManagerInitializeFunction},
+        {L"CCompositor::Create", g_cCompositorCreateFunction},
+        {L"CDesktopManager::HandleThreadMessage",
+         reinterpret_cast<void*>(g_desktopManagerHandleThreadMessageOriginal)},
+        {L"CDesktopManager::PostStartAnimations",
+         reinterpret_cast<void*>(g_desktopManagerPostStartAnimations)},
+        {L"CDesktopManager::AdvanceTimelines",
+         reinterpret_cast<void*>(g_desktopManagerAdvanceTimelinesOriginal)},
+        {L"CTopLevelWindow::GetCanvasRootVisualProxy",
+         reinterpret_cast<void*>(g_getCanvasRootVisualProxy)},
+        {L"CTopLevelWindow::GetRootVisualNoAddRef",
+         reinterpret_cast<void*>(g_topLevelWindowGetRootVisual)},
         {L"CTopLevelWindow::CTopLevelWindow",
          reinterpret_cast<void*>(g_topLevelWindowConstructorFunction)},
         {L"CTopLevelWindow::~CTopLevelWindow",
          reinterpret_cast<void*>(g_topLevelWindowDestructorOriginal)},
         {L"CWindowList::EnsureTopLevelWindow",
-         reinterpret_cast<void*>(g_ensureTopLevelWindowFunction)},
-        {L"CDesktopManager::HandleThreadMessage",
-         reinterpret_cast<void*>(g_desktopManagerHandleThreadMessageOriginal)}};
+         reinterpret_cast<void*>(g_ensureTopLevelWindowFunction)}};
     bool missingCoreFunction = false;
     for (const RequiredDwmFunction& function : requiredFunctions)
     {
@@ -2342,36 +2527,49 @@ static bool InitializeDwmHooks()
             missingCoreFunction = true;
         }
     }
-    bool hasSyncedWindowDataByHwnd =
-        IsDwmFunctionPointerValid(
-            reinterpret_cast<void*>(g_getSyncedWindowDataByHwndLong)) ||
-        IsDwmFunctionPointerValid(
-            reinterpret_cast<void*>(g_getSyncedWindowDataByHwndVoid));
-    if (!hasSyncedWindowDataByHwnd)
+    struct RequiredDwmVtable
     {
-        Wh_Log(L"DWM compatibility: missing core symbol: "
-               L"CWindowList::GetSyncedWindowDataByHwnd");
-        missingCoreFunction = true;
-    }
-    if (!hasExactTopLevelWindowVtable)
+        const wchar_t* name;
+        bool available;
+    };
+    RequiredDwmVtable requiredVtables[] = {
+        {L"CDesktopManager", hasExactDesktopManagerVtable},
+        {L"CWindowList", hasExactWindowListVtable},
+        {L"CTopLevelWindow", hasExactTopLevelWindowVtable},
+        {L"CVisualProxy", hasExactVisualProxyVtable},
+        {L"CMatrixTransformProxy", hasExactMatrixProxyVtable}};
+    for (const RequiredDwmVtable& vtable : requiredVtables)
     {
-        Wh_Log(L"DWM compatibility: missing core symbol: CTopLevelWindow::vftable");
-        missingCoreFunction = true;
+        if (!vtable.available)
+        {
+            Wh_Log(L"DWM compatibility: missing core vftable: %s", vtable.name);
+            missingCoreFunction = true;
+        }
     }
     if (missingCoreFunction)
     {
         return false;
     }
-    void* visualProxyOffsetSource =
-        IsDwmFunctionPointerValid(
-            reinterpret_cast<void*>(g_cVisualGetVisualProxyForStructure))
-            ? reinterpret_cast<void*>(g_cVisualGetVisualProxyForStructure)
-            : reinterpret_cast<void*>(g_getCanvasRootVisualProxy);
-    g_visualProxyOffset = FindReturnedPointerOffset(visualProxyOffsetSource);
-    if (!g_cVisualGetVisualProxyForStructure &&
-        (!g_topLevelWindowGetRootVisual || g_visualProxyOffset == SIZE_MAX))
+    Wh_Log(L"DWM compatibility: compositor vftable is verified from its exact member");
+    g_visualProxyOffset = FindVisualProxyOffsetFromCanvasGetter(
+        reinterpret_cast<void*>(g_getCanvasRootVisualProxy));
+    if (g_visualProxyOffset == SIZE_MAX)
     {
         Wh_Log(L"DWM compatibility: full-window root visual path could not be derived");
+        return false;
+    }
+    g_desktopManagerCompositorOffset = FindDesktopManagerCompositorOffset(
+        g_desktopManagerInitializeFunction, g_cCompositorCreateFunction);
+    if (g_desktopManagerCompositorOffset == SIZE_MAX)
+    {
+        Wh_Log(L"DWM compatibility: compositor member could not be proven from PDB functions");
+        return false;
+    }
+    g_desktopManagerThreadIdOffset = FindDesktopManagerThreadIdOffset(
+        reinterpret_cast<void*>(g_desktopManagerPostStartAnimations));
+    if (g_desktopManagerThreadIdOffset == SIZE_MAX)
+    {
+        Wh_Log(L"DWM compatibility: message-thread member could not be derived");
         return false;
     }
     bool hasMatrixUpdate =
@@ -2428,16 +2626,14 @@ static bool InitializeDwmHooks()
         g_windowDataTopLevelWindow3DOffset = SIZE_MAX;
         Wh_Log(L"DWM compatibility: existing-window transition mapping unavailable");
     }
-    const wchar_t* visualProxyPath =
-        g_cVisualGetVisualProxyForStructure ? L"structure" : L"root-structure";
-    Wh_Log(L"DWM compatibility ABI: HWND lookup=%s transition lookup=%s "
-           L"matrix=%s visual=%s proxyOffset=0x%zx",
-           g_getSyncedWindowDataByHwndVoid ? L"void" : L"HRESULT",
+    Wh_Log(L"DWM compatibility ABI: HWND lookup=pointer transition lookup=%s "
+           L"matrix=%s visual=root proxyOffset=0x%zx compositorOffset=0x%zx "
+           L"threadIdOffset=0x%zx",
            g_getSyncedWindowDataVoid
                ? L"void"
                : (g_getSyncedWindowDataLong ? L"HRESULT" : L"unavailable"),
-           g_cMatrixTransformProxyUpdate ? L"double" : L"float", visualProxyPath,
-           g_visualProxyOffset);
+           g_cMatrixTransformProxyUpdate ? L"double" : L"float", g_visualProxyOffset,
+           g_desktopManagerCompositorOffset, g_desktopManagerThreadIdOffset);
     void* compositor = FindDwmCompositor();
     g_dwmCompositor.store(compositor, std::memory_order_release);
     bool canDiscoverCompositorFromTimeline = IsDwmFunctionPointerValid(
@@ -2476,7 +2672,8 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         return;
     }
     void* windowList = g_windowListForSceneWake.load(std::memory_order_acquire);
-    if (!windowList || !HasSyncedWindowDataByHwnd() || !g_cVisualProxySetTransform)
+    if (!IsDwmObjectPointerValid(windowList, g_windowListVtable) ||
+        !g_findWindowDataByHwnd || !g_cVisualProxySetTransform)
     {
         return;
     }
@@ -2488,18 +2685,16 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         ULONGLONG rebindRevision = 0;
         void* matrixTransformProxy = nullptr;
         void* previouslyBoundVisualProxy = nullptr;
-        void* previouslyBoundTransitionVisualProxy = nullptr;
         bool previouslyAttached = false;
-        bool previouslyTransitionAttached = false;
         bool bindingPending = false;
-        bool windowStateThrob = false;
         AcquireSRWLockExclusive(&g_animationSlotsLock);
         WindowAnimationSlot& slot = g_animationSlots[i];
         bindingPending = !slot.transformAttached ||
                          slot.transformRebindRevision != slot.submittedTransformRebindRevision;
         bool periodicValidation = validateCurrentVisuals && now >= slot.nextVisualValidation;
+        bool forceNativeTransitionRebind = validateCurrentVisuals && slot.windowStateThrob;
         if (slot.active && slot.hwnd && slot.matrixTransformProxy &&
-            (bindingPending || periodicValidation))
+            (bindingPending || periodicValidation || forceNativeTransitionRebind))
         {
             slot.hookUsers++;
             slot.nextVisualValidation = now + 250;
@@ -2508,45 +2703,29 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             rebindRevision = slot.transformRebindRevision;
             matrixTransformProxy = slot.matrixTransformProxy;
             previouslyBoundVisualProxy = slot.boundTopLevelVisualProxy;
-            previouslyBoundTransitionVisualProxy = slot.boundTransitionVisualProxy;
             previouslyAttached = slot.transformAttached;
-            previouslyTransitionAttached = slot.transitionTransformAttached;
-            windowStateThrob = slot.windowStateThrob;
         }
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
         if (!matrixTransformProxy)
         {
             continue;
         }
-        void* windowData = nullptr;
-        GetSyncedWindowDataByHwndCompat(windowList, hwnd, &windowData);
+        void* windowData = FindWindowDataByHwnd(windowList, hwnd);
         void* topLevelWindow = nullptr;
         void* topLevelWindow3D = nullptr;
         void* topLevelVisualProxy = nullptr;
-        void* transitionVisualProxy = nullptr;
         if (windowData && GetHwndFromWindowData(windowData) == hwnd)
         {
-            ResolveDwmWindowObjects(windowData, &topLevelWindow, &topLevelWindow3D);
+            if (!ResolveDwmWindowObjects(windowData, &topLevelWindow, &topLevelWindow3D) &&
+                g_ensureTopLevelWindowFunction(windowList, windowData) >= 0)
+            {
+                ResolveDwmWindowObjects(windowData, &topLevelWindow, &topLevelWindow3D);
+            }
             if (topLevelWindow)
             {
                 topLevelVisualProxy = GetTopLevelVisualProxy(topLevelWindow);
-                if (!IsDwmObjectPointerValid(topLevelVisualProxy, g_visualProxyVtable))
-                {
-                    topLevelVisualProxy = nullptr;
-                }
-            }
-            if (windowStateThrob && topLevelWindow3D &&
-                g_cVisualGetVisualProxyForStructure)
-            {
-                transitionVisualProxy = g_cVisualGetVisualProxyForStructure(topLevelWindow3D);
-                if (!IsDwmObjectPointerValid(transitionVisualProxy, g_visualProxyVtable))
-                {
-                    transitionVisualProxy = nullptr;
-                }
             }
         }
-        bool forceNativeTransitionRebind =
-            windowStateThrob && (bindingPending || periodicValidation);
         bool topLevelBindingAttempted =
             topLevelVisualProxy &&
             (bindingPending || topLevelVisualProxy != previouslyBoundVisualProxy ||
@@ -2556,21 +2735,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         {
             bindResult = g_cVisualProxySetTransform(topLevelVisualProxy, matrixTransformProxy);
         }
-        long transitionBindResult = E_FAIL;
-        bool transitionBindingAttempted =
-            windowStateThrob && transitionVisualProxy &&
-            transitionVisualProxy != topLevelVisualProxy &&
-            (forceNativeTransitionRebind || !previouslyTransitionAttached ||
-             previouslyBoundTransitionVisualProxy != transitionVisualProxy || bindingPending);
-        if (transitionBindingAttempted)
-        {
-            transitionBindResult =
-                g_cVisualProxySetTransform(transitionVisualProxy, matrixTransformProxy);
-        }
         bool logBinding = false;
-        bool logTransitionSurface = transitionBindingAttempted && transitionBindResult >= 0 &&
-                                    (!previouslyTransitionAttached ||
-                                     previouslyBoundTransitionVisualProxy != transitionVisualProxy);
         AcquireSRWLockExclusive(&g_animationSlotsLock);
         WindowAnimationSlot& currentSlot = g_animationSlots[i];
         if (currentSlot.active && currentSlot.generation == generation &&
@@ -2594,13 +2759,6 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                 currentSlot.transformAttached = false;
                 currentSlot.boundTopLevelVisualProxy = nullptr;
             }
-            if (transitionBindingAttempted && transitionBindResult >= 0)
-            {
-                currentSlot.transitionTransformAttached = true;
-                currentSlot.boundTransitionVisualProxy = transitionVisualProxy;
-                logBinding = logBinding || !previouslyTransitionAttached ||
-                             previouslyBoundTransitionVisualProxy != transitionVisualProxy;
-            }
         }
         if (currentSlot.hookUsers > 0)
         {
@@ -2615,16 +2773,9 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         {
             Wh_Log(L"TRANSFORM BOUND FROM SCENE: Slot=%d HWND=%p "
                    L"CWindowData=%p CTopLevelWindow=%p "
-                   L"VisualProxy=%p TransitionProxy=%p "
-                   L"MatrixProxy=%p",
+                   L"VisualProxy=%p MatrixProxy=%p",
                    i, hwnd, windowData, topLevelWindow, topLevelVisualProxy,
-                   transitionVisualProxy, matrixTransformProxy);
-        }
-        if (logTransitionSurface)
-        {
-            Wh_Log(L"WINDOW STATE TRANSITION SURFACE BOUND FROM SCENE: "
-                   L"HWND=%p CTopLevelWindow3D=%p VisualProxy=%p",
-                   hwnd, topLevelWindow3D, transitionVisualProxy);
+                   matrixTransformProxy);
         }
     }
 }
@@ -2638,7 +2789,8 @@ static void BackfillExistingDwmWindowMappings()
     void* windowList = g_windowListForSceneWake.load(std::memory_order_acquire);
     unsigned int count = g_existingWindowBackfillCount.load(std::memory_order_acquire);
     unsigned int index = g_existingWindowBackfillIndex.load(std::memory_order_acquire);
-    if (!windowList || !HasSyncedWindowDataByHwnd() || index >= count)
+    if (!IsDwmObjectPointerValid(windowList, g_windowListVtable) ||
+        !g_findWindowDataByHwnd || index >= count)
     {
         return;
     }
@@ -2647,16 +2799,24 @@ static void BackfillExistingDwmWindowMappings()
     while (index < count && processed++ < windowsPerPass)
     {
         HWND hwnd = g_existingWindowBackfill[index++];
-        void* windowData = nullptr;
-        if (!IsWindow(hwnd) ||
-            !GetSyncedWindowDataByHwndCompat(windowList, hwnd, &windowData) ||
+        if (!IsWindow(hwnd))
+        {
+            continue;
+        }
+        void* windowData = FindWindowDataByHwnd(windowList, hwnd);
+        if (!windowData ||
             (g_windowDataHwndOffset != SIZE_MAX && GetHwndFromWindowData(windowData) != hwnd))
         {
             continue;
         }
         void* topLevelWindow = nullptr;
         void* topLevelWindow3D = nullptr;
-        if (ResolveDwmWindowObjects(windowData, &topLevelWindow, &topLevelWindow3D))
+        bool mapped = ResolveDwmWindowObjects(windowData, &topLevelWindow, &topLevelWindow3D);
+        if (!mapped && g_ensureTopLevelWindowFunction(windowList, windowData) >= 0)
+        {
+            mapped = ResolveDwmWindowObjects(windowData, &topLevelWindow, &topLevelWindow3D);
+        }
+        if (mapped)
         {
             g_existingWindowBackfillMapped.fetch_add(1, std::memory_order_relaxed);
         }
@@ -2717,7 +2877,10 @@ static void BindAnimationTransformsAfterNativeScene()
 
 static long __cdecl ForceUpdateSceneHook(void* pThis)
 {
-    g_windowListForSceneWake.store(pThis, std::memory_order_release);
+    if (HasExactDwmVtableTrusted(pThis, g_windowListVtable))
+    {
+        g_windowListForSceneWake.store(pThis, std::memory_order_release);
+    }
     bool canSubmit = RegisterDwmSceneThread(g_desktopManagerAdvanceTimelinesOriginal == nullptr);
     bool outermostPass = canSubmit && !g_insideWobblyScenePass;
     if (outermostPass)
@@ -2736,7 +2899,10 @@ static long __cdecl ForceUpdateSceneHook(void* pThis)
 
 static long __cdecl UpdateSceneHook(void* pThis)
 {
-    g_windowListForSceneWake.store(pThis, std::memory_order_release);
+    if (HasExactDwmVtableTrusted(pThis, g_windowListVtable))
+    {
+        g_windowListForSceneWake.store(pThis, std::memory_order_release);
+    }
     bool canSubmit = RegisterDwmSceneThread(g_desktopManagerAdvanceTimelinesOriginal == nullptr);
     bool outermostPass = canSubmit && !g_insideWobblyScenePass;
     if (outermostPass)
@@ -2756,42 +2922,21 @@ static long __cdecl UpdateSceneHook(void* pThis)
 static void __cdecl AdvanceTimelinesHook(void* pThis, double currentTime)
 {
     bool canSubmit = RegisterDwmSceneThread(true);
-    if (canSubmit && !g_dwmCompositor.load(std::memory_order_acquire))
+    if (canSubmit)
     {
-        constexpr unsigned int maxDiscoveryFailures = 5;
-        ULONGLONG now = GetTickCount64();
-        ULONGLONG nextAttempt =
-            g_nextDwmObjectDiscoveryAttempt.load(std::memory_order_acquire);
-        if (now >= nextAttempt &&
-            g_nextDwmObjectDiscoveryAttempt.compare_exchange_strong(
-                nextAttempt, now + 1000, std::memory_order_acq_rel,
-                std::memory_order_acquire))
+        if (CacheDwmObjectsFromDesktopManager(pThis))
         {
-            if (CacheDwmObjectsFromDesktopManager(pThis))
+            g_dwmObjectDiscoveryFailureCount.store(0, std::memory_order_release);
+        }
+        else
+        {
+            unsigned int failures =
+                g_dwmObjectDiscoveryFailureCount.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (failures == 1 || failures % 600 == 0)
             {
-                g_dwmObjectDiscoveryFailureCount.store(0, std::memory_order_release);
+                Wh_Log(L"DWM compositor temporarily unavailable; retrying (%u)", failures);
             }
-            else
-            {
-                unsigned int failures =
-                    g_dwmObjectDiscoveryFailureCount.fetch_add(1,
-                                                               std::memory_order_acq_rel) +
-                    1;
-                if (failures >= maxDiscoveryFailures)
-                {
-                    Wh_Log(L"DWM compatibility: compositor discovery failed %u times; "
-                           L"private calls disabled for this session",
-                           failures);
-                    g_dwmPrivateCallsDisabled.store(true, std::memory_order_release);
-                    canSubmit = false;
-                }
-                else
-                {
-                    Wh_Log(L"DWM compatibility: compositor discovery failed; "
-                           L"retry %u/%u scheduled",
-                           failures, maxDiscoveryFailures);
-                }
-            }
+            canSubmit = false;
         }
     }
     // Serial comparison prevents coalesced scene passes from stranding work.
@@ -2812,35 +2957,55 @@ static void __cdecl AdvanceTimelinesHook(void* pThis, double currentTime)
     }
 }
 
-static void __cdecl DesktopManagerHandleThreadMessageHook(UINT message, UINT_PTR wParam,
+static void __cdecl DesktopManagerHandleThreadMessageHook(UINT message,
+                                                          UINT_PTR wParam,
                                                           INT_PTR lParam)
 {
-    if (message != WM_WOBBLY_DWM_SCENE_WAKE)
+    if (message != WM_DWM_SCENE_WAKE || wParam != DWM_SCENE_WAKE_WPARAM ||
+        lParam != DWM_SCENE_WAKE_LPARAM)
     {
         g_desktopManagerHandleThreadMessageOriginal(message, wParam, lParam);
         return;
     }
-
-    if (!RegisterDwmSceneThread(false) || g_insideWobblyScenePass)
+    if (!RegisterDwmSceneThread(true) || g_insideWobblyScenePass)
     {
         g_sceneWakeScheduled.store(false, std::memory_order_release);
+        g_sceneWakePostTimestamp.store(0, std::memory_order_release);
         return;
     }
 
     g_insideWobblyScenePass = true;
     SubmitPendingWobblySceneWork();
+    BindPendingAnimationSlotTransforms(false);
+
     void* windowList = g_windowListForSceneWake.load(std::memory_order_acquire);
-    if (windowList)
+    bool nativeSceneUpdated = false;
+    if (IsDwmObjectPointerValid(windowList, g_windowListVtable))
     {
         if (g_windowListForceUpdateSceneOriginal)
         {
             g_windowListForceUpdateSceneOriginal(windowList);
+            nativeSceneUpdated = true;
         }
         else if (g_windowListUpdateSceneOriginal)
         {
             g_windowListUpdateSceneOriginal(windowList);
+            nativeSceneUpdated = true;
         }
-        BindAnimationTransformsAfterNativeScene();
+    }
+    else
+    {
+        void* manager = g_desktopManager.load(std::memory_order_acquire);
+        if (HasExactDwmVtableTrusted(manager, g_desktopManagerVtable) &&
+            g_desktopManagerPostStartAnimations)
+        {
+            g_desktopManagerPostStartAnimations(manager);
+        }
+    }
+    if (nativeSceneUpdated)
+    {
+        // uDWM can replace the root transform while maximizing or restoring.
+        BindPendingAnimationSlotTransforms(true);
     }
     g_insideWobblyScenePass = false;
 }
@@ -3277,7 +3442,6 @@ static void LogMeshSummary(const WobbleMesh& mesh, const wchar_t* prefix)
 static WobblySettings GetSettingsSnapshot();
 static void UpdateAnimationFrame();
 static void RetireAnimationSlot(int slotIndex);
-static void FinalizeRetiringSlots();
 static void StopAllAnimations();
 static void MarkObservedWindowTransitionPending(HWND hwnd, bool expectedZoomed);
 static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild);
@@ -3584,10 +3748,27 @@ static bool PostPendingDwmSceneWake(HWND hwnd, bool forceRepost)
         // Serial numbers make watchdog reposts idempotent.
         g_sceneWakeScheduled.store(true, std::memory_order_release);
     }
+    void* manager = g_desktopManager.load(std::memory_order_acquire);
     DWORD sceneThreadId = g_dwmSceneThreadId.load(std::memory_order_acquire);
-    if (sceneThreadId != 0 &&
-        PostThreadMessageW(sceneThreadId, WM_WOBBLY_DWM_SCENE_WAKE,
-                           reinterpret_cast<WPARAM>(hwnd), 0))
+    if (!sceneThreadId && HasExactDwmVtableTrusted(manager, g_desktopManagerVtable) &&
+        g_desktopManagerThreadIdOffset != SIZE_MAX)
+    {
+        BYTE* threadIdField = static_cast<BYTE*>(manager) + g_desktopManagerThreadIdOffset;
+        if (IsReadableMemory(threadIdField, sizeof(DWORD)))
+        {
+            sceneThreadId = *reinterpret_cast<DWORD*>(threadIdField);
+        }
+    }
+    if (sceneThreadId &&
+        PostThreadMessageW(sceneThreadId, WM_DWM_SCENE_WAKE,
+                           DWM_SCENE_WAKE_WPARAM, DWM_SCENE_WAKE_LPARAM))
+    {
+        g_sceneWakePostTimestamp.store(GetTickCount64(), std::memory_order_release);
+        return true;
+    }
+    if (HasExactDwmVtableTrusted(manager, g_desktopManagerVtable) &&
+        g_desktopManagerPostStartAnimations &&
+        g_desktopManagerPostStartAnimations(manager) >= 0)
     {
         g_sceneWakePostTimestamp.store(GetTickCount64(), std::memory_order_release);
         return true;
@@ -3759,8 +3940,6 @@ static void RetireAnimationSlot(int slotIndex)
         slot.freeStepPending = false;
         slot.transformAttached = false;
         slot.boundTopLevelVisualProxy = nullptr;
-        slot.transitionTransformAttached = false;
-        slot.boundTransitionVisualProxy = nullptr;
         slot.proxyCreationPending = false;
         if (slot.matrixTransformProxy)
         {
@@ -3887,7 +4066,9 @@ static bool CreateMatrixTransformProxy(void** matrixTransformProxy)
 {
     *matrixTransformProxy = nullptr;
     void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
-    if (!IsOnDwmSceneThread() || !compositor || !g_createMatrixTransformProxy)
+    if (!IsOnDwmSceneThread() ||
+        !HasExactDwmVtableTrusted(compositor, g_compositorVtable) ||
+        !g_createMatrixTransformProxy)
     {
         return false;
     }
@@ -3957,7 +4138,6 @@ static void EnsurePendingMatrixTransformProxies()
             {
                 currentSlot.matrixTransformProxy = matrixTransformProxy;
                 currentSlot.transformAttached = false;
-                currentSlot.transitionTransformAttached = false;
                 currentSlot.transformRebindRevision++;
                 currentSlot.identityApplied = true;
                 currentSlot.privateCallFailureCount = 0;
@@ -4150,8 +4330,6 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
         slot.previousMesh = slot.mesh;
         slot.transformAttached = false;
         slot.boundTopLevelVisualProxy = nullptr;
-        slot.transitionTransformAttached = false;
-        slot.boundTransitionVisualProxy = nullptr;
         slot.transformRebindRevision++;
         slot.submittedTransformRebindRevision = 0;
         slot.meshIdentityPending = false;
@@ -4203,9 +4381,7 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
     slot.mesh = mesh;
     slot.matrixTransformProxy = nullptr;
     slot.boundTopLevelVisualProxy = nullptr;
-    slot.boundTransitionVisualProxy = nullptr;
     slot.transformAttached = false;
-    slot.transitionTransformAttached = false;
     slot.transformRebindRevision = 1;
     slot.submittedTransformRebindRevision = 0;
     slot.meshRevision = 1;
@@ -4980,6 +5156,9 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         static_cast<double>(currentWidth) * (g_realResizing ? g_resizeCoordinateScale : 1.0);
     double currentMeshHeight =
         static_cast<double>(currentHeight) * (g_realResizing ? g_resizeCoordinateScale : 1.0);
+    static ULONGLONG lastDebugLogTimestamp = 0;
+    ULONGLONG debugLogTimestamp = GetTickCount64();
+    bool logMesh = debugLogTimestamp - lastDebugLogTimestamp >= 250;
     WobbleMesh debugMesh = {};
     AcquireSRWLockExclusive(&g_animationSlotsLock);
     WindowAnimationSlot& slot = g_animationSlots[slotIndex];
@@ -5093,19 +5272,20 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     slot.identityApplied = false;
     slot.meshIdentityPending = false;
     slot.meshRevision++;
-    debugMesh = slot.mesh;
+    if (logMesh)
+    {
+        debugMesh = slot.mesh;
+    }
     ReleaseSRWLockExclusive(&g_animationSlotsLock);
     g_lastDraggedWindowRect = rect;
     g_lastDraggedWindowZoomed = windowZoomed;
     g_lastMousePosition = mousePosition;
     g_moveEventCounter++;
-    static ULONGLONG lastDebugLogTimestamp = 0;
-    ULONGLONG debugLogTimestamp = GetTickCount64();
     if (operationDetectedThisEvent)
     {
         Wh_Log(L"Operation detected: %s", g_realResizing ? L"RESIZE" : L"MOVE");
     }
-    if (debugLogTimestamp - lastDebugLogTimestamp >= 250)
+    if (logMesh)
     {
         lastDebugLogTimestamp = debugLogTimestamp;
         Wh_Log(L"%s #%u Delta=(%.2f,%.2f)", g_realResizing ? L"RESIZE" : L"MOVE",
@@ -5362,7 +5542,18 @@ static void RememberObservedWindowState(HWND hwnd)
                                 GetTickCount64(),
                                 0,
                                 0,
-                                0};
+                                 0};
+}
+
+static int EnsureObservedWindowState(HWND hwnd)
+{
+    int index = FindObservedWindowState(hwnd);
+    if (index < 0)
+    {
+        RememberObservedWindowState(hwnd);
+        index = FindObservedWindowState(hwnd);
+    }
+    return index;
 }
 
 static void CancelWindowStateThrobForWindow(HWND hwnd)
@@ -5387,12 +5578,7 @@ static void CancelWindowStateThrobForWindow(HWND hwnd)
 
 static void ResetObservedSnapStateForInteractiveMove(HWND hwnd)
 {
-    int index = FindObservedWindowState(hwnd);
-    if (index < 0)
-    {
-        RememberObservedWindowState(hwnd);
-        index = FindObservedWindowState(hwnd);
-    }
+    int index = EnsureObservedWindowState(hwnd);
     if (index < 0)
     {
         return;
@@ -5463,12 +5649,7 @@ static void HandleMinimizeLifecycle(HWND hwnd, bool minimizing)
 
 static void MarkObservedWindowTransitionPending(HWND hwnd, bool expectedZoomed)
 {
-    int index = FindObservedWindowState(hwnd);
-    if (index < 0)
-    {
-        RememberObservedWindowState(hwnd);
-        index = FindObservedWindowState(hwnd);
-    }
+    int index = EnsureObservedWindowState(hwnd);
     if (index < 0)
     {
         return;
@@ -5482,12 +5663,7 @@ static void MarkObservedWindowTransitionPending(HWND hwnd, bool expectedZoomed)
 
 static void MarkObservedSnapTransition(HWND hwnd)
 {
-    int index = FindObservedWindowState(hwnd);
-    if (index < 0)
-    {
-        RememberObservedWindowState(hwnd);
-        index = FindObservedWindowState(hwnd);
-    }
+    int index = EnsureObservedWindowState(hwnd);
     if (index < 0)
     {
         return;
@@ -5572,12 +5748,7 @@ static void HandleNativeWindowTransitionStart(HWND hwnd, LPARAM transitionFlags)
     {
         return;
     }
-    int index = FindObservedWindowState(hwnd);
-    if (index < 0)
-    {
-        RememberObservedWindowState(hwnd);
-        index = FindObservedWindowState(hwnd);
-    }
+    int index = EnsureObservedWindowState(hwnd);
     ULONGLONG now = GetTickCount64();
     if (index >= 0 && (g_observedWindows[index].iconic ||
                        now <= g_observedWindows[index].suppressStateThrobUntil))
@@ -5908,7 +6079,6 @@ static bool InitializeWindowEventHooks()
         return false;
     }
     RememberObservedWindowState(GetForegroundWindow());
-    QueueExistingWindowBackfill();
     Wh_Log(L"Window event hooks initialized");
     return true;
 }
@@ -6221,12 +6391,12 @@ static void LoadSettings()
 BOOL Wh_ModInit()
 {
     g_unloading.store(false, std::memory_order_release);
+    g_desktopManagerThreadIdOffset = SIZE_MAX;
     g_dwmSceneThreadId.store(0, std::memory_order_release);
     g_dwmCompositor.store(nullptr, std::memory_order_release);
     g_desktopManager.store(nullptr, std::memory_order_release);
     g_dwmPrivateCallsDisabled.store(false, std::memory_order_release);
     g_dwmThreadMismatchLogged.store(false, std::memory_order_release);
-    g_nextDwmObjectDiscoveryAttempt.store(0, std::memory_order_release);
     g_dwmObjectDiscoveryFailureCount.store(0, std::memory_order_release);
     g_sceneWakeScheduled.store(false, std::memory_order_release);
     g_sceneRequestedSerial.store(0, std::memory_order_release);
@@ -6245,7 +6415,7 @@ BOOL Wh_ModInit()
     g_existingWindowBackfillMapped.store(0, std::memory_order_release);
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
-    Wh_Log(L"Wobbly Windows 0.57: initializing");
+    Wh_Log(L"Wobbly Windows 0.64: initializing");
     InitializeDpiSupport();
     LoadSettings();
     if (!InitializeDwmHooks())
@@ -6263,6 +6433,13 @@ BOOL Wh_ModInit()
     }
     Wh_Log(L"Wobbly Windows: initialized successfully");
     return TRUE;
+}
+
+void Wh_ModAfterInit()
+{
+    // Windhawk activates detours after Wh_ModInit returns. Queue the first
+    // scene pass only now so already-open windows cannot miss the wake.
+    QueueExistingWindowBackfill();
 }
 
 void Wh_ModSettingsChanged()
