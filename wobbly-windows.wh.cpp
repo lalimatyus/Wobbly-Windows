@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.64
+// @version         0.65
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -171,6 +171,7 @@ IsGhostWindow_t g_isGhostWindowOriginal = nullptr;
 size_t g_windowDataHwndOffset = SIZE_MAX;
 size_t g_windowDataTopLevelWindowOffset = SIZE_MAX;
 size_t g_windowDataTopLevelWindow3DOffset = SIZE_MAX;
+size_t g_topLevelWindow3DWindowDataOffset = SIZE_MAX;
 static bool IsReadableMemory(const void* address, size_t size);
 
 static HWND GetHwndFromWindowData(void* windowData)
@@ -348,6 +349,7 @@ std::atomic<void*> g_desktopManager = nullptr;
 void* g_desktopManagerVtableSymbol = nullptr;
 void* g_windowListVtableSymbol = nullptr;
 void* g_topLevelWindowVtableSymbol = nullptr;
+void* g_topLevelWindow3DVtableSymbol = nullptr;
 void* g_visualProxyVtableSymbol = nullptr;
 void* g_matrixTransformProxyVtableSymbol = nullptr;
 size_t g_desktopManagerCompositorOffset = SIZE_MAX;
@@ -357,6 +359,10 @@ size_t g_topLevelWindowWindowDataOffset = SIZE_MAX;
 static bool IsDwmObjectPointerValid(void* object, std::atomic<void*>& expectedVtable);
 static bool HasExactDwmVtableTrusted(void* object,
                                     std::atomic<void*>& expectedVtable);
+static bool LearnDwmVtableFromTrustedObject(void* object,
+                                            std::atomic<void*>& targetVtable);
+static void RegisterDwmWindowMapping(void* windowData, void* topLevelWindow,
+                                     void* topLevelWindow3D);
 
 struct DwmAddressRange
 {
@@ -496,6 +502,25 @@ static void* GetTopLevelVisualProxy(void* topLevelWindow)
     return nullptr;
 }
 
+static void* GetTransitionVisualProxy(void* topLevelWindow3D)
+{
+    if (!HasExactDwmVtableTrusted(topLevelWindow3D, g_topLevelWindow3DVtable) ||
+        g_visualProxyOffset == SIZE_MAX)
+    {
+        return nullptr;
+    }
+    // The exact vftable identifies the primary CRenderDataVisual/CVisual base;
+    // reuse the proxy field offset derived from a PDB-resolved CVisual getter.
+    const BYTE* proxyField =
+        static_cast<const BYTE*>(topLevelWindow3D) + g_visualProxyOffset;
+    if (!IsReadableMemory(proxyField, sizeof(void*)))
+    {
+        return nullptr;
+    }
+    void* proxy = *reinterpret_cast<void* const*>(proxyField);
+    return IsDwmObjectPointerValid(proxy, g_visualProxyVtable) ? proxy : nullptr;
+}
+
 static constexpr int MAX_ANIMATION_SLOTS = 6;
 static constexpr ULONGLONG DWM_SCENE_STALL_TIMEOUT_MS = 3000;
 static constexpr ULONGLONG DWM_UNLOAD_CLEANUP_TIMEOUT_MS = 3000;
@@ -516,7 +541,9 @@ struct WindowAnimationSlot
     WobbleMesh mesh;
     void* matrixTransformProxy;
     void* boundTopLevelVisualProxy;
+    void* boundTransitionVisualProxy;
     bool transformAttached;
+    bool transitionTransformAttached;
     ULONGLONG transformRebindRevision;
     ULONGLONG submittedTransformRebindRevision;
     ULONGLONG meshRevision;
@@ -872,15 +899,30 @@ static long __cdecl WindowTransitionChangeHook(void* pThis, void* dwmWindow, int
 }
 
 static long __cdecl StartAnimationForMaximizeSnapTransitionHook(void* pThis, int animationType,
-                                                                const RECT& targetRect)
+                                                                 const RECT& targetRect)
 {
     HWND hwnd = nullptr;
-    if (pThis)
+    if (pThis &&
+        (IsDwmObjectPointerValid(pThis, g_topLevelWindow3DVtable) ||
+         LearnDwmVtableFromTrustedObject(pThis, g_topLevelWindow3DVtable)))
     {
         void* windowData = FindWindowDataForTopLevelWindow3D(pThis);
-        if (windowData && g_windowDataHwndOffset != SIZE_MAX)
+        if (!windowData && g_topLevelWindow3DWindowDataOffset != SIZE_MAX)
+        {
+            BYTE* windowDataField =
+                static_cast<BYTE*>(pThis) + g_topLevelWindow3DWindowDataOffset;
+            if (IsReadableMemory(windowDataField, sizeof(void*)))
+            {
+                windowData = *reinterpret_cast<void**>(windowDataField);
+            }
+        }
+        if (windowData)
         {
             hwnd = GetHwndFromWindowData(windowData);
+            if (hwnd)
+            {
+                RegisterDwmWindowMapping(windowData, nullptr, pThis);
+            }
         }
     }
     // Seed the wobble before uDWM starts its own maximize/restore timeline.
@@ -1212,6 +1254,86 @@ static size_t FindDesktopManagerThreadIdOffset(void* function)
         else if (std::regex_match(text, wakeMessagePattern))
         {
             return candidate;
+        }
+        if (text == "ret")
+        {
+            break;
+        }
+        instruction += result.length;
+        bytesRead += result.length;
+    }
+    return SIZE_MAX;
+}
+
+static size_t FindStoredWindowDataOffset(void* function)
+{
+    if (!IsDwmFunctionPointerValid(function))
+    {
+        return SIZE_MAX;
+    }
+    std::string thisAliases[8] = {"rcx"};
+    std::string dataAliases[8] = {"rdx"};
+    unsigned int thisAliasCount = 1;
+    unsigned int dataAliasCount = 1;
+    auto contains = [](const std::string* aliases, unsigned int count,
+                       const std::string& name)
+    {
+        for (unsigned int i = 0; i < count; i++)
+        {
+            if (aliases[i] == name)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto addAlias = [&](std::string* aliases, unsigned int& count,
+                        const std::string& name)
+    {
+        if (!contains(aliases, count, name) && count < 8)
+        {
+            aliases[count++] = name;
+        }
+    };
+    static const std::regex movePattern(R"(^mov (r[a-z0-9]+), (r[a-z0-9]+)$)",
+                                        std::regex_constants::icase);
+    static const std::regex storePattern(
+        R"(^mov (?:qword ptr )?\[(r[a-z0-9]+)\s*\+\s*0x([0-9a-f]{1,8})\], (r[a-z0-9]+)$)",
+        std::regex_constants::icase);
+    BYTE* instruction = static_cast<BYTE*>(function);
+    size_t bytesRead = 0;
+    for (int i = 0; i < 64 && bytesRead < 512; i++)
+    {
+        WH_DISASM_RESULT result = {};
+        if (!IsDwmExecutableAddress(instruction) || !Wh_Disasm(instruction, &result) ||
+            result.length == 0)
+        {
+            break;
+        }
+        std::string text = result.text;
+        std::smatch match;
+        if (std::regex_match(text, match, movePattern))
+        {
+            const std::string destination = match[1].str();
+            const std::string source = match[2].str();
+            if (contains(thisAliases, thisAliasCount, source))
+            {
+                addAlias(thisAliases, thisAliasCount, destination);
+            }
+            if (contains(dataAliases, dataAliasCount, source))
+            {
+                addAlias(dataAliases, dataAliasCount, destination);
+            }
+        }
+        else if (std::regex_match(text, match, storePattern) &&
+                 contains(thisAliases, thisAliasCount, match[1].str()) &&
+                 contains(dataAliases, dataAliasCount, match[3].str()))
+        {
+            size_t offset = std::stoull(match[2].str(), nullptr, 16);
+            if (offset >= sizeof(void*) && offset <= 0x1000 && offset % sizeof(void*) == 0)
+            {
+                return offset;
+            }
         }
         if (text == "ret")
         {
@@ -2123,7 +2245,9 @@ static void RearmAnimationSlotsForCompositorChange()
             abandoned++;
         }
         slot.boundTopLevelVisualProxy = nullptr;
+        slot.boundTransitionVisualProxy = nullptr;
         slot.transformAttached = false;
+        slot.transitionTransformAttached = false;
         slot.identityApplied = false;
         slot.transformRebindRevision++;
         slot.proxyCreationPending = slot.active;
@@ -2407,6 +2531,10 @@ static bool InitializeDwmHooks()
          &g_topLevelWindowVtableSymbol,
          nullptr,
          true},
+        {{L"??_7CTopLevelWindow3D@@6BCRenderDataVisual@@@"},
+         &g_topLevelWindow3DVtableSymbol,
+         nullptr,
+         true},
         {{L"const CDesktopManager::`vftable'", L"??_7CDesktopManager@@6B@"},
          &g_desktopManagerVtableSymbol,
          nullptr,
@@ -2467,6 +2595,8 @@ static bool InitializeDwmHooks()
         cacheVtableSymbol(g_windowListVtableSymbol, g_windowListVtable);
     bool hasExactTopLevelWindowVtable =
         cacheVtableSymbol(g_topLevelWindowVtableSymbol, g_topLevelWindowVtable);
+    bool hasExactTopLevelWindow3DVtable =
+        cacheVtableSymbol(g_topLevelWindow3DVtableSymbol, g_topLevelWindow3DVtable);
     bool hasExactVisualProxyVtable =
         cacheVtableSymbol(g_visualProxyVtableSymbol, g_visualProxyVtable);
     bool hasExactMatrixProxyVtable =
@@ -2486,8 +2616,10 @@ static bool InitializeDwmHooks()
            g_windowTransitionChangeOriginal && HasSyncedWindowData() ? L"available"
                                                                      : L"unavailable",
            g_startAnimationForMaximizeSnapTransitionOriginal
-               ? L"available"
-               : L"unavailable; using finalized-state fallback");
+                ? L"available"
+                : L"unavailable; using finalized-state fallback");
+    Wh_Log(L"Native transition visual: %s",
+           hasExactTopLevelWindow3DVtable ? L"verified" : L"deferred to trusted hook");
     struct RequiredDwmFunction
     {
         const wchar_t* name;
@@ -2612,6 +2744,12 @@ static bool InitializeDwmHooks()
         Wh_Log(L"DWM compatibility: conflicting CTopLevelWindow mapping offsets");
         return false;
     }
+    g_topLevelWindow3DWindowDataOffset = FindStoredWindowDataOffset(
+        reinterpret_cast<void*>(g_topLevelWindow3DSetWindowDataOriginal));
+    if (g_topLevelWindow3DWindowDataOffset == SIZE_MAX)
+    {
+        Wh_Log(L"DWM compatibility: early transition reverse mapping unavailable");
+    }
     size_t pairedTopLevelWindowOffset = SIZE_MAX;
     size_t pairedTopLevelWindow3DOffset = SIZE_MAX;
     if (FindWindowDataTopLevelOffsets(reinterpret_cast<void*>(g_ensureTopLevelWindowFunction),
@@ -2628,12 +2766,13 @@ static bool InitializeDwmHooks()
     }
     Wh_Log(L"DWM compatibility ABI: HWND lookup=pointer transition lookup=%s "
            L"matrix=%s visual=root proxyOffset=0x%zx compositorOffset=0x%zx "
-           L"threadIdOffset=0x%zx",
+           L"threadIdOffset=0x%zx TLW3DDataOffset=0x%zx",
            g_getSyncedWindowDataVoid
                ? L"void"
                : (g_getSyncedWindowDataLong ? L"HRESULT" : L"unavailable"),
            g_cMatrixTransformProxyUpdate ? L"double" : L"float", g_visualProxyOffset,
-           g_desktopManagerCompositorOffset, g_desktopManagerThreadIdOffset);
+           g_desktopManagerCompositorOffset, g_desktopManagerThreadIdOffset,
+           g_topLevelWindow3DWindowDataOffset);
     void* compositor = FindDwmCompositor();
     g_dwmCompositor.store(compositor, std::memory_order_release);
     bool canDiscoverCompositorFromTimeline = IsDwmFunctionPointerValid(
@@ -2684,12 +2823,16 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         ULONGLONG generation = 0;
         ULONGLONG rebindRevision = 0;
         void* matrixTransformProxy = nullptr;
-        void* previouslyBoundVisualProxy = nullptr;
-        bool previouslyAttached = false;
+        void* previouslyBoundTopLevelVisualProxy = nullptr;
+        void* previouslyBoundTransitionVisualProxy = nullptr;
+        bool previouslyTopLevelAttached = false;
+        bool previouslyTransitionAttached = false;
+        bool windowStateThrob = false;
         bool bindingPending = false;
         AcquireSRWLockExclusive(&g_animationSlotsLock);
         WindowAnimationSlot& slot = g_animationSlots[i];
         bindingPending = !slot.transformAttached ||
+                         (slot.windowStateThrob && !slot.transitionTransformAttached) ||
                          slot.transformRebindRevision != slot.submittedTransformRebindRevision;
         bool periodicValidation = validateCurrentVisuals && now >= slot.nextVisualValidation;
         bool forceNativeTransitionRebind = validateCurrentVisuals && slot.windowStateThrob;
@@ -2702,8 +2845,11 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             generation = slot.generation;
             rebindRevision = slot.transformRebindRevision;
             matrixTransformProxy = slot.matrixTransformProxy;
-            previouslyBoundVisualProxy = slot.boundTopLevelVisualProxy;
-            previouslyAttached = slot.transformAttached;
+            previouslyBoundTopLevelVisualProxy = slot.boundTopLevelVisualProxy;
+            previouslyBoundTransitionVisualProxy = slot.boundTransitionVisualProxy;
+            previouslyTopLevelAttached = slot.transformAttached;
+            previouslyTransitionAttached = slot.transitionTransformAttached;
+            windowStateThrob = slot.windowStateThrob;
         }
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
         if (!matrixTransformProxy)
@@ -2714,6 +2860,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         void* topLevelWindow = nullptr;
         void* topLevelWindow3D = nullptr;
         void* topLevelVisualProxy = nullptr;
+        void* transitionVisualProxy = nullptr;
         if (windowData && GetHwndFromWindowData(windowData) == hwnd)
         {
             if (!ResolveDwmWindowObjects(windowData, &topLevelWindow, &topLevelWindow3D) &&
@@ -2725,15 +2872,31 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             {
                 topLevelVisualProxy = GetTopLevelVisualProxy(topLevelWindow);
             }
+            if (windowStateThrob && topLevelWindow3D)
+            {
+                transitionVisualProxy = GetTransitionVisualProxy(topLevelWindow3D);
+            }
         }
         bool topLevelBindingAttempted =
             topLevelVisualProxy &&
-            (bindingPending || topLevelVisualProxy != previouslyBoundVisualProxy ||
+            (bindingPending || topLevelVisualProxy != previouslyBoundTopLevelVisualProxy ||
              forceNativeTransitionRebind);
-        long bindResult = E_FAIL;
+        bool transitionBindingAttempted =
+            transitionVisualProxy && transitionVisualProxy != topLevelVisualProxy &&
+            (bindingPending ||
+             transitionVisualProxy != previouslyBoundTransitionVisualProxy ||
+             forceNativeTransitionRebind);
+        long topLevelBindResult = E_FAIL;
+        long transitionBindResult = E_FAIL;
         if (topLevelBindingAttempted)
         {
-            bindResult = g_cVisualProxySetTransform(topLevelVisualProxy, matrixTransformProxy);
+            topLevelBindResult =
+                g_cVisualProxySetTransform(topLevelVisualProxy, matrixTransformProxy);
+        }
+        if (transitionBindingAttempted)
+        {
+            transitionBindResult =
+                g_cVisualProxySetTransform(transitionVisualProxy, matrixTransformProxy);
         }
         bool logBinding = false;
         AcquireSRWLockExclusive(&g_animationSlotsLock);
@@ -2746,18 +2909,39 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                 currentSlot.transformAttached = false;
                 currentSlot.boundTopLevelVisualProxy = nullptr;
             }
-            else if (topLevelBindingAttempted && bindResult >= 0)
+            else if (topLevelBindingAttempted && topLevelBindResult >= 0)
             {
                 currentSlot.transformAttached = true;
                 currentSlot.boundTopLevelVisualProxy = topLevelVisualProxy;
                 currentSlot.submittedTransformRebindRevision = rebindRevision;
-                logBinding = !previouslyAttached ||
-                             previouslyBoundVisualProxy != topLevelVisualProxy;
+                logBinding = !previouslyTopLevelAttached ||
+                             previouslyBoundTopLevelVisualProxy != topLevelVisualProxy;
             }
             else if (topLevelBindingAttempted)
             {
                 currentSlot.transformAttached = false;
                 currentSlot.boundTopLevelVisualProxy = nullptr;
+            }
+            if (!windowStateThrob || !transitionVisualProxy ||
+                transitionVisualProxy == topLevelVisualProxy)
+            {
+                currentSlot.transitionTransformAttached =
+                    transitionVisualProxy && transitionVisualProxy == topLevelVisualProxy &&
+                    currentSlot.transformAttached;
+                currentSlot.boundTransitionVisualProxy =
+                    currentSlot.transitionTransformAttached ? transitionVisualProxy : nullptr;
+            }
+            else if (transitionBindingAttempted && transitionBindResult >= 0)
+            {
+                currentSlot.transitionTransformAttached = true;
+                currentSlot.boundTransitionVisualProxy = transitionVisualProxy;
+                logBinding = logBinding || !previouslyTransitionAttached ||
+                             previouslyBoundTransitionVisualProxy != transitionVisualProxy;
+            }
+            else if (transitionBindingAttempted)
+            {
+                currentSlot.transitionTransformAttached = false;
+                currentSlot.boundTransitionVisualProxy = nullptr;
             }
         }
         if (currentSlot.hookUsers > 0)
@@ -2773,9 +2957,9 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         {
             Wh_Log(L"TRANSFORM BOUND FROM SCENE: Slot=%d HWND=%p "
                    L"CWindowData=%p CTopLevelWindow=%p "
-                   L"VisualProxy=%p MatrixProxy=%p",
+                   L"VisualProxy=%p TransitionProxy=%p MatrixProxy=%p",
                    i, hwnd, windowData, topLevelWindow, topLevelVisualProxy,
-                   matrixTransformProxy);
+                   transitionVisualProxy, matrixTransformProxy);
         }
     }
 }
@@ -3939,7 +4123,9 @@ static void RetireAnimationSlot(int slotIndex)
         slot.dragging = false;
         slot.freeStepPending = false;
         slot.transformAttached = false;
+        slot.transitionTransformAttached = false;
         slot.boundTopLevelVisualProxy = nullptr;
+        slot.boundTransitionVisualProxy = nullptr;
         slot.proxyCreationPending = false;
         if (slot.matrixTransformProxy)
         {
@@ -4138,6 +4324,7 @@ static void EnsurePendingMatrixTransformProxies()
             {
                 currentSlot.matrixTransformProxy = matrixTransformProxy;
                 currentSlot.transformAttached = false;
+                currentSlot.transitionTransformAttached = false;
                 currentSlot.transformRebindRevision++;
                 currentSlot.identityApplied = true;
                 currentSlot.privateCallFailureCount = 0;
@@ -4288,6 +4475,8 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
             {
                 InitializeMesh(slot.mesh, width, height);
                 slot.windowStateThrob = false;
+                slot.boundTransitionVisualProxy = nullptr;
+                slot.transitionTransformAttached = false;
             }
             BeginDrag(slot.mesh, mousePosition);
             slot.previousMesh = slot.mesh;
@@ -4329,7 +4518,9 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
         BeginDrag(slot.mesh, mousePosition);
         slot.previousMesh = slot.mesh;
         slot.transformAttached = false;
+        slot.transitionTransformAttached = false;
         slot.boundTopLevelVisualProxy = nullptr;
+        slot.boundTransitionVisualProxy = nullptr;
         slot.transformRebindRevision++;
         slot.submittedTransformRebindRevision = 0;
         slot.meshIdentityPending = false;
@@ -4381,7 +4572,9 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
     slot.mesh = mesh;
     slot.matrixTransformProxy = nullptr;
     slot.boundTopLevelVisualProxy = nullptr;
+    slot.boundTransitionVisualProxy = nullptr;
     slot.transformAttached = false;
+    slot.transitionTransformAttached = false;
     slot.transformRebindRevision = 1;
     slot.submittedTransformRebindRevision = 0;
     slot.meshRevision = 1;
@@ -6392,6 +6585,7 @@ BOOL Wh_ModInit()
 {
     g_unloading.store(false, std::memory_order_release);
     g_desktopManagerThreadIdOffset = SIZE_MAX;
+    g_topLevelWindow3DWindowDataOffset = SIZE_MAX;
     g_dwmSceneThreadId.store(0, std::memory_order_release);
     g_dwmCompositor.store(nullptr, std::memory_order_release);
     g_desktopManager.store(nullptr, std::memory_order_release);
@@ -6415,7 +6609,7 @@ BOOL Wh_ModInit()
     g_existingWindowBackfillMapped.store(0, std::memory_order_release);
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
-    Wh_Log(L"Wobbly Windows 0.64: initializing");
+    Wh_Log(L"Wobbly Windows 0.65: initializing");
     InitializeDpiSupport();
     LoadSettings();
     if (!InitializeDwmHooks())
