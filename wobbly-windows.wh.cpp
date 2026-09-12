@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.75
+// @version         0.76
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -285,6 +285,8 @@ using StartAnimationForMaximizeSnapTransition_t = long(__cdecl*)(void* pThis, in
                                                                  const RECT& targetRect);
 StartAnimationForMaximizeSnapTransition_t g_startAnimationForMaximizeSnapTransitionOriginal =
     nullptr;
+using CTopLevelWindow3DStartAnimation_t = long(__cdecl*)(void* pThis, int animationType);
+CTopLevelWindow3DStartAnimation_t g_topLevelWindow3DStartAnimationOriginal = nullptr;
 using WindowTransitionChange_t = long(__cdecl*)(void* pThis, void* dwmWindow, int transitionTarget,
                                                 const RECT& targetRect, const RECT& rect2,
                                                 const RECT& rect3, const RECT& rect4,
@@ -589,7 +591,10 @@ static void* GetTransitionVisualProxy(void* topLevelWindow3D)
         return nullptr;
     }
     void* proxy = *reinterpret_cast<void* const*>(proxyField);
-    return IsDwmObjectPointerValid(proxy, g_visualProxyVtable) ? proxy : nullptr;
+    return IsDwmObjectPointerValid(proxy, g_visualProxyVtable) ||
+                   IsTrustedDwmPolymorphicObject(proxy)
+               ? proxy
+               : nullptr;
 }
 
 static constexpr int MAX_ANIMATION_SLOTS = 6;
@@ -997,36 +1002,61 @@ static long __cdecl WindowTransitionChangeHook(void* pThis, void* dwmWindow, int
                                             rect3, rect4, rect5);
 }
 
+static void* RegisterAnimationTopLevelWindow3D(void* topLevelWindow3D, HWND* hwnd)
+{
+    *hwnd = nullptr;
+    if (!topLevelWindow3D ||
+        (!IsDwmObjectPointerValid(topLevelWindow3D, g_topLevelWindow3DVtable) &&
+         !LearnDwmVtableFromTrustedObject(topLevelWindow3D,
+                                         g_topLevelWindow3DVtable)))
+    {
+        return nullptr;
+    }
+    void* windowData = FindWindowDataForTopLevelWindow3D(topLevelWindow3D);
+    if (!windowData && g_topLevelWindow3DWindowDataOffset != SIZE_MAX)
+    {
+        BYTE* field = static_cast<BYTE*>(topLevelWindow3D) +
+                      g_topLevelWindow3DWindowDataOffset;
+        if (IsReadableMemory(field, sizeof(void*)))
+        {
+            windowData = *reinterpret_cast<void**>(field);
+        }
+    }
+    if (windowData)
+    {
+        *hwnd = GetHwndFromWindowData(windowData);
+        if (*hwnd)
+        {
+            RegisterDwmWindowMapping(windowData, nullptr, topLevelWindow3D);
+        }
+    }
+    return windowData;
+}
+
 static long __cdecl StartAnimationForMaximizeSnapTransitionHook(void* pThis, int animationType,
                                                                  const RECT& targetRect)
 {
     HWND hwnd = nullptr;
-    if (pThis &&
-        (IsDwmObjectPointerValid(pThis, g_topLevelWindow3DVtable) ||
-         LearnDwmVtableFromTrustedObject(pThis, g_topLevelWindow3DVtable)))
-    {
-        void* windowData = FindWindowDataForTopLevelWindow3D(pThis);
-        if (!windowData && g_topLevelWindow3DWindowDataOffset != SIZE_MAX)
-        {
-            BYTE* windowDataField =
-                static_cast<BYTE*>(pThis) + g_topLevelWindow3DWindowDataOffset;
-            if (IsReadableMemory(windowDataField, sizeof(void*)))
-            {
-                windowData = *reinterpret_cast<void**>(windowDataField);
-            }
-        }
-        if (windowData)
-        {
-            hwnd = GetHwndFromWindowData(windowData);
-            if (hwnd)
-            {
-                RegisterDwmWindowMapping(windowData, nullptr, pThis);
-            }
-        }
-    }
+    RegisterAnimationTopLevelWindow3D(pThis, &hwnd);
     // Seed the wobble before uDWM starts its own maximize/restore timeline.
     QueueNativeWindowTransition(hwnd, BuildWindowTransitionFlags(hwnd, targetRect));
     return g_startAnimationForMaximizeSnapTransitionOriginal(pThis, animationType, targetRect);
+}
+
+static long __cdecl TopLevelWindow3DStartAnimationHook(void* pThis, int animationType)
+{
+    HWND hwnd = nullptr;
+    void* windowData = RegisterAnimationTopLevelWindow3D(pThis, &hwnd);
+    long result = g_topLevelWindow3DStartAnimationOriginal(pThis, animationType);
+    if (!g_startAnimationForMaximizeSnapTransitionOriginal && result >= 0 && hwnd)
+    {
+        // 25H2 replaced the specific entry point with this generic one. Don't
+        // infer animation types here; only expose the newly created transition
+        // visual to an already active wobble.
+        MarkAnimationSlotForDwmObjectRefresh(windowData);
+        RequestDwmScenePass(hwnd);
+    }
+    return result;
 }
 
 static void __cdecl OnPositionChangeHook(void* pThis, void* pWindowData, bool unknown)
@@ -2519,8 +2549,15 @@ static bool InitializeDwmHooks()
           L"?StartAnimationForMaximizeSnapTransition@"
            L"CTopLevelWindow3D@@QEAAJW4WindowAnimationType@1@"
            L"AEBUtagRECT@@@Z"},
-         reinterpret_cast<void**>(&g_startAnimationForMaximizeSnapTransitionOriginal),
+        reinterpret_cast<void**>(&g_startAnimationForMaximizeSnapTransitionOriginal),
          reinterpret_cast<void*>(StartAnimationForMaximizeSnapTransitionHook),
+         true},
+        {{L"public: long __cdecl CTopLevelWindow3D::StartAnimation("
+           L"enum CTopLevelWindow3D::WindowAnimationType)",
+          L"?StartAnimation@CTopLevelWindow3D@@"
+           L"QEAAJW4WindowAnimationType@1@@Z"},
+         reinterpret_cast<void**>(&g_topLevelWindow3DStartAnimationOriginal),
+         reinterpret_cast<void*>(TopLevelWindow3DStartAnimationHook),
          true},
         {{L"public: class CVisualProxy * __cdecl "
            L"CTopLevelWindow::GetCanvasRootVisualProxy(void)",
@@ -2694,6 +2731,7 @@ static bool InitializeDwmHooks()
     keepValid(g_getSyncedWindowDataVoid);
     keepValid(g_cMatrixTransformProxyUpdate);
     keepValid(g_cMatrixTransformProxyUpdateFloat);
+    keepValid(g_topLevelWindow3DStartAnimationOriginal);
     keepValid(g_getCanvasRootVisualProxy);
     keepValid(g_topLevelWindowGetRootVisual);
     keepValid(g_topLevelWindowGetWindowData);
@@ -2738,12 +2776,16 @@ static bool InitializeDwmHooks()
         g_getSyncedWindowDataLong = nullptr;
         g_getSyncedWindowDataVoid = nullptr;
     }
+    const wchar_t* animationHook =
+        g_startAnimationForMaximizeSnapTransitionOriginal
+            ? L"specific"
+            : (g_topLevelWindow3DStartAnimationOriginal
+                   ? L"generic-visual-sync"
+                   : L"unavailable; using finalized-state fallback");
     Wh_Log(L"Native maximize/restore hooks: request=%s animation=%s",
            g_windowTransitionChangeOriginal && HasSyncedWindowData() ? L"available"
                                                                      : L"unavailable",
-           g_startAnimationForMaximizeSnapTransitionOriginal
-                ? L"available"
-                : L"unavailable; using finalized-state fallback");
+           animationHook);
     Wh_Log(L"Native transition visual: %s",
            hasExactTopLevelWindow3DVtable && hasExactVisualProxyVtable
                ? L"verified"
@@ -7167,7 +7209,7 @@ BOOL Wh_ModInit()
     g_existingWindowBackfillMapped.store(0, std::memory_order_release);
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
-    Wh_Log(L"Wobbly Windows 0.75: initializing");
+    Wh_Log(L"Wobbly Windows 0.76: initializing");
     InitializeDpiSupport();
     LoadSettings();
     if (!InitializeDwmHooks())
