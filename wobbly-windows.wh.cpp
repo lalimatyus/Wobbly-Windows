@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.71
+// @version         0.72
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -502,33 +502,54 @@ static long UpdateMatrixTransformProxy(void* proxy, const MilMatrix3x2D& matrix)
     return E_NOTIMPL;
 }
 
-static void* GetTopLevelVisualProxy(void* topLevelWindow, void** rootVisualResult = nullptr)
+static void* GetTopLevelVisualProxy(void* topLevelWindow, void** rootVisualResult = nullptr,
+                                    bool* usedCanvasGetter = nullptr)
 {
     if (rootVisualResult)
     {
         *rootVisualResult = nullptr;
     }
-    if (!IsDwmObjectPointerValid(topLevelWindow, g_topLevelWindowVtable) ||
-        !g_topLevelWindowGetRootVisual || g_visualProxyOffset == SIZE_MAX)
+    if (usedCanvasGetter)
+    {
+        *usedCanvasGetter = false;
+    }
+    if (!IsDwmObjectPointerValid(topLevelWindow, g_topLevelWindowVtable))
     {
         return nullptr;
     }
-    constexpr int completeWindowRoot = 0;
-    void* rootVisual = g_topLevelWindowGetRootVisual(topLevelWindow, completeWindowRoot);
-    if (!rootVisual)
+    void* rootVisual = nullptr;
+    if (g_topLevelWindowGetRootVisual && g_visualProxyOffset != SIZE_MAX)
     {
-        return nullptr;
+        constexpr int completeWindowRoot = 0;
+        rootVisual = g_topLevelWindowGetRootVisual(topLevelWindow, completeWindowRoot);
+        if (rootVisualResult)
+        {
+            *rootVisualResult = rootVisual;
+        }
+        if (rootVisual)
+        {
+            const BYTE* proxyField = static_cast<const BYTE*>(rootVisual) + g_visualProxyOffset;
+            if (IsReadableMemory(proxyField, sizeof(void*)))
+            {
+                void* proxy = *reinterpret_cast<void* const*>(proxyField);
+                if (IsDwmObjectPointerValid(proxy, g_visualProxyVtable))
+                {
+                    return proxy;
+                }
+            }
+        }
     }
-    if (rootVisualResult)
+    // Newer builds can keep the proxy outside the root visual's older layout.
+    // Use the exact PDB-resolved accessor and accept only the verified vftable.
+    if (g_getCanvasRootVisualProxy)
     {
-        *rootVisualResult = rootVisual;
-    }
-    const BYTE* proxyField = static_cast<const BYTE*>(rootVisual) + g_visualProxyOffset;
-    if (IsReadableMemory(proxyField, sizeof(void*)))
-    {
-        void* proxy = *reinterpret_cast<void* const*>(proxyField);
+        void* proxy = g_getCanvasRootVisualProxy(topLevelWindow);
         if (IsDwmObjectPointerValid(proxy, g_visualProxyVtable))
         {
+            if (usedCanvasGetter)
+            {
+                *usedCanvasGetter = true;
+            }
             return proxy;
         }
     }
@@ -2878,7 +2899,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
     if (!validWindowList || !g_findWindowDataByHwnd || !g_cVisualProxySetTransform)
     {
         ULONGLONG previous = g_lastBindPrerequisiteLog.load(std::memory_order_acquire);
-        if ((previous == 0 || now - previous >= 2000) &&
+        if (HasAnyAnimationSlots() && (previous == 0 || now - previous >= 2000) &&
             g_lastBindPrerequisiteLog.compare_exchange_strong(
                 previous, now, std::memory_order_acq_rel, std::memory_order_acquire))
         {
@@ -2934,6 +2955,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         void* rootVisual = nullptr;
         void* topLevelVisualProxy = nullptr;
         void* transitionVisualProxy = nullptr;
+        bool usedCanvasGetter = false;
         const wchar_t* bindFailureStage = nullptr;
         HWND mappedHwnd = windowData ? GetHwndFromWindowData(windowData) : nullptr;
         if (!windowData)
@@ -2953,7 +2975,8 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             }
             if (topLevelWindow)
             {
-                topLevelVisualProxy = GetTopLevelVisualProxy(topLevelWindow, &rootVisual);
+                topLevelVisualProxy =
+                    GetTopLevelVisualProxy(topLevelWindow, &rootVisual, &usedCanvasGetter);
                 if (!topLevelVisualProxy)
                 {
                     bindFailureStage = rootVisual ? L"VisualProxy" : L"RootVisual";
@@ -3060,17 +3083,20 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         {
             Wh_Log(L"TRANSFORM BOUND FROM SCENE: Slot=%d HWND=%p "
                    L"CWindowData=%p CTopLevelWindow=%p "
-                   L"VisualProxy=%p TransitionProxy=%p MatrixProxy=%p",
+                   L"VisualProxy=%p VisualSource=%s TransitionProxy=%p MatrixProxy=%p",
                    i, hwnd, windowData, topLevelWindow, topLevelVisualProxy,
+                   usedCanvasGetter ? L"CanvasGetter" : L"RootOffset",
                    transitionVisualProxy, matrixTransformProxy);
         }
         if (logBindingFailure)
         {
             Wh_Log(L"BIND FAILED: Stage=%s Slot=%d HWND=%p WindowList=%p "
                    L"WindowData=%p MappedHWND=%p CTopLevelWindow=%p RootVisual=%p "
-                   L"VisualProxy=%p MatrixProxy=%p SetTransform=0x%08X",
+                   L"VisualProxy=%p MatrixProxy=%p SetTransformAttempted=%d "
+                   L"SetTransform=0x%08X",
                    bindFailureStage, i, hwnd, windowList, windowData, mappedHwnd,
                    topLevelWindow, rootVisual, topLevelVisualProxy, matrixTransformProxy,
+                   topLevelBindingAttempted,
                    static_cast<unsigned int>(topLevelBindResult));
         }
     }
@@ -7088,7 +7114,7 @@ BOOL Wh_ModInit()
     g_existingWindowBackfillMapped.store(0, std::memory_order_release);
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
-    Wh_Log(L"Wobbly Windows 0.71: initializing");
+    Wh_Log(L"Wobbly Windows 0.72: initializing");
     InitializeDpiSupport();
     LoadSettings();
     if (!InitializeDwmHooks())
