@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.74
+// @version         0.75
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4116,13 +4116,6 @@ static MonitorEdgeState GetPointMonitorEdgeState(const POINT& point)
     return result;
 }
 
-static bool IsPointAtMonitorTopEdge(const POINT& point)
-{
-    MonitorEdgeState edgeState = GetPointMonitorEdgeState(point);
-    // A corner belongs to a diagonal Snap zone, not to full-screen maximize.
-    return edgeState.top && !edgeState.side;
-}
-
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy)
 {
     if (!IsOnDwmSceneThread() ||
@@ -5667,7 +5660,8 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     {
         return;
     }
-    bool mouseAtMonitorTopEdge = IsPointAtMonitorTopEdge(mousePosition);
+    MonitorEdgeState mouseEdgeState = GetPointMonitorEdgeState(mousePosition);
+    bool mouseAtMonitorTopEdge = mouseEdgeState.top && !mouseEdgeState.side;
     double movementX = static_cast<double>(mousePosition.x - g_dragStartMousePosition.x);
     double movementY = static_cast<double>(mousePosition.y - g_dragStartMousePosition.y);
     double windowDeltaX = static_cast<double>(rect.left - g_lastDraggedWindowRect.left) *
@@ -5741,21 +5735,36 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         return;
     }
     bool startedInteractiveStateThrob = false;
-    if (slot.settings.windowStateWobbleEnabled && g_moveTypeKnown && !g_realResizing &&
-        !g_dragStartedWindowZoomed && mouseAtMonitorTopEdge &&
-        (!g_interactiveWindowStateThrob || !g_interactiveWindowStateMaximizing))
+    auto startInteractiveStateThrob = [&](bool maximizing, Vec2 direction)
     {
-        // Start maximize wobble at the Aero Snap trigger.
         InitializeMesh(slot.mesh, static_cast<double>(currentWidth),
                        static_cast<double>(currentHeight));
-        ApplyWindowStateThrob(slot.mesh, true, true, slot.settings, {0.0, -1.0});
+        ApplyWindowStateThrob(slot.mesh, maximizing, true, slot.settings, direction);
         ClearWindowStateThrobConstraints(slot.mesh);
         BeginDrag(slot.mesh, localMousePosition);
         slot.previousMesh = slot.mesh;
         slot.windowStateThrob = true;
         g_interactiveWindowStateThrob = true;
-        g_interactiveWindowStateMaximizing = true;
+        g_interactiveWindowStateMaximizing = maximizing;
         startedInteractiveStateThrob = true;
+    };
+    bool canStartInteractiveStateThrob = slot.settings.windowStateWobbleEnabled &&
+                                         g_moveTypeKnown && !g_realResizing &&
+                                         !g_dragStartedWindowZoomed;
+    if (canStartInteractiveStateThrob && mouseAtMonitorTopEdge &&
+        (!g_interactiveWindowStateThrob || !g_interactiveWindowStateMaximizing))
+    {
+        // Start maximize wobble as soon as Aero Snap activates.
+        startInteractiveStateThrob(true, {0.0, -1.0});
+    }
+    else if (canStartInteractiveStateThrob && mouseEdgeState.side &&
+             (!g_interactiveWindowStateThrob || g_interactiveWindowStateMaximizing))
+    {
+        // Older builds expose this through a native transition hook; newer ones
+        // can publish it late, so seed side/corner Snap directly from the edge.
+        startInteractiveStateThrob(true, mouseEdgeState.direction);
+        // False distinguishes side Snap from the already-seeded top-edge pulse.
+        g_interactiveWindowStateMaximizing = false;
     }
     else if (g_realResizing)
     {
@@ -7158,7 +7167,7 @@ BOOL Wh_ModInit()
     g_existingWindowBackfillMapped.store(0, std::memory_order_release);
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
-    Wh_Log(L"Wobbly Windows 0.74: initializing");
+    Wh_Log(L"Wobbly Windows 0.75: initializing");
     InitializeDpiSupport();
     LoadSettings();
     if (!InitializeDwmHooks())
