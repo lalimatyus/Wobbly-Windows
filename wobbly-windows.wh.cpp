@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.70
+// @version         0.71
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -90,6 +90,7 @@ The physics presets and edge-locking behavior are based on KDE Plasma/KWin's Wob
 
 */
 // ==/WindhawkModSettings==
+
 
 #include <windows.h>
 #include <algorithm>
@@ -501,8 +502,12 @@ static long UpdateMatrixTransformProxy(void* proxy, const MilMatrix3x2D& matrix)
     return E_NOTIMPL;
 }
 
-static void* GetTopLevelVisualProxy(void* topLevelWindow)
+static void* GetTopLevelVisualProxy(void* topLevelWindow, void** rootVisualResult = nullptr)
 {
+    if (rootVisualResult)
+    {
+        *rootVisualResult = nullptr;
+    }
     if (!IsDwmObjectPointerValid(topLevelWindow, g_topLevelWindowVtable) ||
         !g_topLevelWindowGetRootVisual || g_visualProxyOffset == SIZE_MAX)
     {
@@ -513,6 +518,10 @@ static void* GetTopLevelVisualProxy(void* topLevelWindow)
     if (!rootVisual)
     {
         return nullptr;
+    }
+    if (rootVisualResult)
+    {
+        *rootVisualResult = rootVisual;
     }
     const BYTE* proxyField = static_cast<const BYTE*>(rootVisual) + g_visualProxyOffset;
     if (IsReadableMemory(proxyField, sizeof(void*)))
@@ -578,6 +587,7 @@ struct WindowAnimationSlot
     ULONGLONG nextVisualValidation;
     bool identityApplied;
     ULONGLONG lastMatrixErrorLog;
+    ULONGLONG lastBindFailureLog;
     unsigned int privateCallFailureCount;
 };
 
@@ -601,6 +611,7 @@ std::atomic<ULONGLONG> g_lastFallbackInvalidationTimestamp = 0;
 std::atomic<unsigned int> g_abandonedProxyCount = 0;
 std::atomic<void*> g_windowListForSceneWake = nullptr;
 std::atomic_bool g_sceneOwnershipResetPending = false;
+std::atomic<ULONGLONG> g_lastBindPrerequisiteLog = 0;
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -2862,12 +2873,22 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         return;
     }
     void* windowList = g_windowListForSceneWake.load(std::memory_order_acquire);
-    if (!IsDwmObjectPointerValid(windowList, g_windowListVtable) ||
-        !g_findWindowDataByHwnd || !g_cVisualProxySetTransform)
+    ULONGLONG now = GetTickCount64();
+    bool validWindowList = IsDwmObjectPointerValid(windowList, g_windowListVtable);
+    if (!validWindowList || !g_findWindowDataByHwnd || !g_cVisualProxySetTransform)
     {
+        ULONGLONG previous = g_lastBindPrerequisiteLog.load(std::memory_order_acquire);
+        if ((previous == 0 || now - previous >= 2000) &&
+            g_lastBindPrerequisiteLog.compare_exchange_strong(
+                previous, now, std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            Wh_Log(L"BIND PIPELINE UNAVAILABLE: WindowList=%p Valid=%d "
+                   L"FindWindowData=%p SetTransform=%p",
+                   windowList, validWindowList, g_findWindowDataByHwnd,
+                   g_cVisualProxySetTransform);
+        }
         return;
     }
-    ULONGLONG now = GetTickCount64();
     for (int i = 0; i < MAX_ANIMATION_SLOTS; i++)
     {
         HWND hwnd = nullptr;
@@ -2910,9 +2931,20 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         void* windowData = FindWindowDataByHwnd(windowList, hwnd);
         void* topLevelWindow = nullptr;
         void* topLevelWindow3D = nullptr;
+        void* rootVisual = nullptr;
         void* topLevelVisualProxy = nullptr;
         void* transitionVisualProxy = nullptr;
-        if (windowData && GetHwndFromWindowData(windowData) == hwnd)
+        const wchar_t* bindFailureStage = nullptr;
+        HWND mappedHwnd = windowData ? GetHwndFromWindowData(windowData) : nullptr;
+        if (!windowData)
+        {
+            bindFailureStage = L"WindowData";
+        }
+        else if (mappedHwnd != hwnd)
+        {
+            bindFailureStage = L"HwndMismatch";
+        }
+        else
         {
             if (!ResolveDwmWindowObjects(windowData, &topLevelWindow, &topLevelWindow3D) &&
                 g_ensureTopLevelWindowFunction(windowList, windowData) >= 0)
@@ -2921,7 +2953,15 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             }
             if (topLevelWindow)
             {
-                topLevelVisualProxy = GetTopLevelVisualProxy(topLevelWindow);
+                topLevelVisualProxy = GetTopLevelVisualProxy(topLevelWindow, &rootVisual);
+                if (!topLevelVisualProxy)
+                {
+                    bindFailureStage = rootVisual ? L"VisualProxy" : L"RootVisual";
+                }
+            }
+            else
+            {
+                bindFailureStage = L"TopLevelWindow";
             }
             if (windowStateThrob && topLevelWindow3D)
             {
@@ -2943,6 +2983,10 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         {
             topLevelBindResult =
                 g_cVisualProxySetTransform(topLevelVisualProxy, matrixTransformProxy);
+            if (topLevelBindResult < 0)
+            {
+                bindFailureStage = L"SetTransform";
+            }
         }
         if (transitionBindingAttempted)
         {
@@ -2950,6 +2994,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                 g_cVisualProxySetTransform(transitionVisualProxy, matrixTransformProxy);
         }
         bool logBinding = false;
+        bool logBindingFailure = false;
         AcquireSRWLockExclusive(&g_animationSlotsLock);
         WindowAnimationSlot& currentSlot = g_animationSlots[i];
         if (currentSlot.active && currentSlot.generation == generation &&
@@ -2972,6 +3017,13 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             {
                 currentSlot.transformAttached = false;
                 currentSlot.boundTopLevelVisualProxy = nullptr;
+            }
+            if (bindingPending && !currentSlot.transformAttached && bindFailureStage &&
+                (currentSlot.lastBindFailureLog == 0 ||
+                 now - currentSlot.lastBindFailureLog >= 1000))
+            {
+                currentSlot.lastBindFailureLog = now;
+                logBindingFailure = true;
             }
             if (!windowStateThrob || !transitionVisualProxy ||
                 transitionVisualProxy == topLevelVisualProxy)
@@ -3011,6 +3063,15 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                    L"VisualProxy=%p TransitionProxy=%p MatrixProxy=%p",
                    i, hwnd, windowData, topLevelWindow, topLevelVisualProxy,
                    transitionVisualProxy, matrixTransformProxy);
+        }
+        if (logBindingFailure)
+        {
+            Wh_Log(L"BIND FAILED: Stage=%s Slot=%d HWND=%p WindowList=%p "
+                   L"WindowData=%p MappedHWND=%p CTopLevelWindow=%p RootVisual=%p "
+                   L"VisualProxy=%p MatrixProxy=%p SetTransform=0x%08X",
+                   bindFailureStage, i, hwnd, windowList, windowData, mappedHwnd,
+                   topLevelWindow, rootVisual, topLevelVisualProxy, matrixTransformProxy,
+                   static_cast<unsigned int>(topLevelBindResult));
         }
     }
 }
@@ -4660,6 +4721,7 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
             slot.freeStepPending = false;
             slot.nextWindowValidation = GetTickCount64() + 250;
             slot.nextVisualValidation = 0;
+            slot.lastBindFailureLog = 0;
             slot.order = ++g_animationOrderCounter;
             slot.identityApplied = false;
             slot.meshIdentityPending = false;
@@ -4705,6 +4767,7 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
         slot.identityApplied = false;
         slot.nextWindowValidation = GetTickCount64() + 250;
         slot.nextVisualValidation = 0;
+        slot.lastBindFailureLog = 0;
         slot.order = ++g_animationOrderCounter;
         slot.meshRevision++;
         slotIndex = i;
@@ -4762,6 +4825,7 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
     slot.nextVisualValidation = 0;
     slot.identityApplied = false;
     slot.lastMatrixErrorLog = 0;
+    slot.lastBindFailureLog = 0;
     slot.privateCallFailureCount = 0;
     ReleaseSRWLockExclusive(&g_animationSlotsLock);
     return slotIndex;
@@ -7017,13 +7081,14 @@ BOOL Wh_ModInit()
     g_lastFallbackInvalidationTimestamp.store(0, std::memory_order_release);
     g_abandonedProxyCount.store(0, std::memory_order_release);
     g_sceneOwnershipResetPending.store(false, std::memory_order_release);
+    g_lastBindPrerequisiteLog.store(0, std::memory_order_release);
     g_windowStateThrobSuppressedUntil.store(0, std::memory_order_release);
     g_existingWindowBackfillCount.store(0, std::memory_order_release);
     g_existingWindowBackfillIndex.store(0, std::memory_order_release);
     g_existingWindowBackfillMapped.store(0, std::memory_order_release);
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
-    Wh_Log(L"Wobbly Windows 0.70: initializing");
+    Wh_Log(L"Wobbly Windows 0.71: initializing");
     InitializeDpiSupport();
     LoadSettings();
     if (!InitializeDwmHooks())
