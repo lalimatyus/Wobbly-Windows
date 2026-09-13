@@ -19,15 +19,10 @@ It was mostly tested and made on `Windows 11 23H2`, where it works great, and it
 * Change the wobbliness of the windows from 5 presets
 * Enable advanced mode to change each parameter independently, instead of a preset
 * Fluid wobble animations for dragging, snapping and even resizing windows
-* Calculated as a 4x4 mesh for smooth movement
+* Uses a 4x4 spring simulation fitted to a smooth whole-window transform
 
 ## Known Issues
 
-* Some windows act weird/jumpy on 25H2/26H2. (This happens on other builds too but it's less common)
-* Virtual desktop switching isn't supported yet. The wobble can become missing or visually
-  incorrect after switching desktops; DWM itself should remain operational. Disable and re-enable
-  the mod to reset the effect if this happens.
-* Sometimes when dragging windows through multiple monitors, the window can have a weird offset
 * ARM64 isn't supported yet; the mod safely refuses to initialize on ARM64 systems.
 
 ## Feedback
