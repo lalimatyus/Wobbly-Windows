@@ -11,8 +11,10 @@ Since this mod runs in `dwm.exe`, add `dwm.exe` to Windhawk's
 
 ![Tutorial](https://raw.githubusercontent.com/lalimatyus/Wobbly-Windows/refs/heads/main/dwm.gif)
 
-This mod is currently in **beta**, so things can occasionally break and it might not work on every Windows 11 build.
-It was mostly tested and made on `Windows 11 23H2`, where it works great, and it was also tested on `25H2` and on `Insider Preview 26H2`.
+This mod runs inside `dwm.exe` and has been tested on Windows 11 `23H2`, `25H2`
+and `Insider Preview 26H2`; `24H2` is currently unverified. If the required private
+uDWM symbols or validated object layouts aren't available, the mod refuses to
+initialize instead of using unverified addresses.
 
 ## Features
 
@@ -24,6 +26,8 @@ It was mostly tested and made on `Windows 11 23H2`, where it works great, and it
 ## Known Issues
 
 * ARM64 isn't supported yet; the mod safely refuses to initialize on ARM64 systems.
+* If DWM stops servicing its scene thread while the mod is being disabled or updated,
+  a transformed window can remain deformed until DWM recreates its visual.
 
 ## Feedback
 
