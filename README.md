@@ -19,7 +19,7 @@ initialize instead of using unverified addresses.
 ## Features
 
 * Change the wobbliness of the windows from 5 presets
-* Enable advanced mode to change each parameter independently, instead of a preset
+* Enable custom physics to change each parameter independently, instead of a preset
 * Fluid wobble animations for dragging, snapping and even resizing windows
 * Uses a 4x4 spring simulation fitted to a smooth whole-window transform
 
