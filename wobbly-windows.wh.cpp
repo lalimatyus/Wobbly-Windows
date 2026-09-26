@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.122
+// @version         0.123
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -442,6 +442,8 @@ std::atomic<void*> g_visualProxyVtable = nullptr;
 std::atomic<void*> g_redirectVisualProxyVtable = nullptr;
 std::atomic<void*> g_containerVisualProxyVtable = nullptr;
 std::atomic<void*> g_matrixTransformProxyVtable = nullptr;
+std::atomic<void*> g_bitmapSourceProxyVtable = nullptr;
+std::atomic<void*> g_visualSurfaceProxyVtable = nullptr;
 std::atomic<void*> g_dwmCompositor = nullptr;
 std::atomic<void*> g_desktopManager = nullptr;
 void* g_desktopManagerVtableSymbol = nullptr;
@@ -453,6 +455,8 @@ void* g_visualProxyVtableSymbol = nullptr;
 void* g_redirectVisualProxyVtableSymbol = nullptr;
 void* g_containerVisualProxyVtableSymbol = nullptr;
 void* g_matrixTransformProxyVtableSymbol = nullptr;
+void* g_bitmapSourceProxyVtableSymbol = nullptr;
+void* g_visualSurfaceProxyVtableSymbol = nullptr;
 size_t g_desktopManagerCompositorOffset = SIZE_MAX;
 size_t g_desktopManagerThreadIdOffset = SIZE_MAX;
 size_t g_canvasVisualOwnerOffset = SIZE_MAX;
@@ -741,6 +745,8 @@ std::atomic_bool g_sceneOwnershipResetPending = false;
 std::atomic<ULONGLONG> g_lastBindPrerequisiteLog = 0;
 std::atomic_bool g_nativeMeshCanaryPending = false;
 std::atomic_bool g_nativeMeshCanarySucceeded = false;
+std::atomic_bool g_meshSourceProbePending = false;
+std::atomic_bool g_meshSourceProbeCompleted = false;
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -767,6 +773,7 @@ static void RestorePendingAnimationIdentities();
 static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
 static void RunNativeMeshCanary();
+static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwnd);
 static bool HasAnyAnimationSlots();
 static int GetPointIndex(int x, int y);
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy);
@@ -2851,6 +2858,14 @@ static bool InitializeDwmHooks()
         {{L"const CMatrixTransformProxy::`vftable'"},
          &g_matrixTransformProxyVtableSymbol,
          nullptr,
+         true},
+        {{L"const CBitmapSourceProxy::`vftable'"},
+         &g_bitmapSourceProxyVtableSymbol,
+         nullptr,
+         true},
+        {{L"const CVisualSurfaceProxy::`vftable'"},
+         &g_visualSurfaceProxyVtableSymbol,
+         nullptr,
          true}};
     if (!WindhawkUtils::HookSymbols(udwm, udwmDllHooks, ARRAYSIZE(udwmDllHooks)))
     {
@@ -2927,6 +2942,13 @@ static bool InitializeDwmHooks()
         hasExactVisualProxyVtable || hasExactRedirectProxyVtable || hasExactContainerProxyVtable;
     bool hasExactMatrixProxyVtable =
         cacheVtableSymbol(g_matrixTransformProxyVtableSymbol, g_matrixTransformProxyVtable);
+    bool hasExactBitmapSourceProxyVtable =
+        cacheVtableSymbol(g_bitmapSourceProxyVtableSymbol, g_bitmapSourceProxyVtable);
+    bool hasExactVisualSurfaceProxyVtable =
+        cacheVtableSymbol(g_visualSurfaceProxyVtableSymbol, g_visualSurfaceProxyVtable);
+    Wh_Log(L"True 4x4 source probe: bitmap=%s visualSurface=%s",
+           hasExactBitmapSourceProxyVtable ? L"available" : L"unavailable",
+           hasExactVisualSurfaceProxyVtable ? L"available" : L"unavailable");
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
@@ -3135,6 +3157,128 @@ static bool InitializeDwmHooks()
     return true;
 }
 
+enum class MeshSourceKind
+{
+    None,
+    Bitmap,
+    VisualSurface,
+};
+
+static MeshSourceKind GetMeshSourceKind(void* object)
+{
+    if (!object || !IsReadableMemory(object, sizeof(void*)))
+    {
+        return MeshSourceKind::None;
+    }
+    void* vtable = *reinterpret_cast<void**>(object);
+    if (vtable == g_bitmapSourceProxyVtable.load(std::memory_order_acquire))
+    {
+        return MeshSourceKind::Bitmap;
+    }
+    if (vtable == g_visualSurfaceProxyVtable.load(std::memory_order_acquire))
+    {
+        return MeshSourceKind::VisualSurface;
+    }
+    return MeshSourceKind::None;
+}
+
+static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwnd)
+{
+    if (!g_meshSourceProbePending.load(std::memory_order_acquire) ||
+        !IsOnDwmSceneThread() || !topLevelWindow || !visualProxy)
+    {
+        return;
+    }
+    g_meshSourceProbePending.store(false, std::memory_order_release);
+
+    struct ProbeResult
+    {
+        void* source;
+        const wchar_t* owner;
+        size_t outerOffset;
+        size_t innerOffset;
+        MeshSourceKind kind;
+    } result = {};
+
+    auto scanMembers = [&](void* object, size_t bytes, const wchar_t* owner,
+                           size_t outerOffset)
+    {
+        for (size_t offset = 0; offset + sizeof(void*) <= bytes; offset += sizeof(void*))
+        {
+            void* candidate = ReadPointerMember(object, offset);
+            MeshSourceKind kind = GetMeshSourceKind(candidate);
+            if (kind != MeshSourceKind::None)
+            {
+                result = {candidate, owner, outerOffset, offset, kind};
+                return true;
+            }
+        }
+        return false;
+    };
+
+    constexpr size_t completeWindowRoot = 0;
+    void* rootVisual = g_topLevelWindowGetRootVisual
+                           ? g_topLevelWindowGetRootVisual(topLevelWindow,
+                                                          completeWindowRoot)
+                           : nullptr;
+    if (!scanMembers(visualProxy, 0x200, L"VisualProxy", SIZE_MAX) &&
+        !scanMembers(rootVisual, 0x400, L"RootVisual", SIZE_MAX))
+    {
+        struct ScanRoot
+        {
+            void* object;
+            size_t bytes;
+            const wchar_t* name;
+        } roots[] = {{visualProxy, 0x200, L"VisualProxy"},
+                     {rootVisual, 0x400, L"RootVisual"}};
+        for (const ScanRoot& root : roots)
+        {
+            if (!root.object)
+            {
+                continue;
+            }
+            for (size_t offset = 0;
+                 offset + sizeof(void*) <= root.bytes && !result.source;
+                 offset += sizeof(void*))
+            {
+                void* child = ReadPointerMember(root.object, offset);
+                if (!child || child == root.object || child == visualProxy ||
+                    child == rootVisual || !IsReadableMemory(child, sizeof(void*)))
+                {
+                    continue;
+                }
+                void* childVtable = *reinterpret_cast<void**>(child);
+                if (!IsDwmImageAddress(childVtable, sizeof(void*)))
+                {
+                    continue;
+                }
+                scanMembers(child, 0x200, root.name, offset);
+            }
+            if (result.source)
+            {
+                break;
+            }
+        }
+    }
+
+    g_meshSourceProbeCompleted.store(true, std::memory_order_release);
+    if (result.source)
+    {
+        Wh_Log(L"True 4x4 source probe: found kind=%s HWND=%p source=%p "
+               L"owner=%s outer=0x%zx inner=0x%zx",
+               result.kind == MeshSourceKind::VisualSurface ? L"VisualSurface"
+                                                            : L"BitmapSource",
+               hwnd, result.source, result.owner, result.outerOffset,
+               result.innerOffset);
+    }
+    else
+    {
+        Wh_Log(L"True 4x4 source probe: no exact live source HWND=%p root=%p "
+               L"visualProxy=%p",
+               hwnd, rootVisual, visualProxy);
+    }
+}
+
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
 {
     if (!IsOnDwmSceneThread() || g_unloading.load(std::memory_order_acquire) ||
@@ -3228,6 +3372,10 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             {
                 topLevelVisualProxy = GetTopLevelVisualProxy(topLevelWindow,
                                                              &visualSource);
+                if (topLevelVisualProxy)
+                {
+                    RunMeshSourceProbe(topLevelWindow, topLevelVisualProxy, hwnd);
+                }
                 if (!topLevelVisualProxy)
                 {
                     bindFailureStage = L"VisualProxy";
@@ -3486,6 +3634,12 @@ static void RunNativeMeshCanary()
     }
     bool succeeded = result >= 0 && groupProxy && meshProxy;
     g_nativeMeshCanarySucceeded.store(succeeded, std::memory_order_release);
+    if (succeeded &&
+        (g_bitmapSourceProxyVtable.load(std::memory_order_acquire) ||
+         g_visualSurfaceProxyVtable.load(std::memory_order_acquire)))
+    {
+        g_meshSourceProbePending.store(true, std::memory_order_release);
+    }
     Wh_Log(L"True 4x4 mesh canary: %s stage=%s result=0x%08X vertices=%u indices=%u",
            succeeded ? L"passed" : L"failed", stage,
            static_cast<unsigned int>(result), GRID_POINT_COUNT,
@@ -7494,6 +7648,8 @@ BOOL Wh_ModInit()
     g_lastBindPrerequisiteLog.store(0, std::memory_order_release);
     g_nativeMeshCanaryPending.store(false, std::memory_order_release);
     g_nativeMeshCanarySucceeded.store(false, std::memory_order_release);
+    g_meshSourceProbePending.store(false, std::memory_order_release);
+    g_meshSourceProbeCompleted.store(false, std::memory_order_release);
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
@@ -7540,6 +7696,7 @@ void Wh_ModBeforeUninit()
 {
     g_unloading.store(true, std::memory_order_release);
     g_nativeMeshCanaryPending.store(false, std::memory_order_release);
+    g_meshSourceProbePending.store(false, std::memory_order_release);
     Wh_Log(L"Preparing to unload");
     // Restore scene resources before Windhawk removes the hooks.
     StopWindowEventThread();
