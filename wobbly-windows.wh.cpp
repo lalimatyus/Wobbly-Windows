@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.124
+// @version         0.125
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -403,6 +403,9 @@ using CVisualProxySetContent_t = long(__cdecl*)(void* pThis,
 using CVisualProxyInsertChild_t = long(__cdecl*)(void* pThis, void* child,
                                                  void* reference, bool insertAbove);
 using CVisualProxyRemoveChild_t = long(__cdecl*)(void* pThis, void* child);
+using CVisualSetContent_t = long(__cdecl*)(void* pThis, void* content);
+using CVisualSetParent_t = long(__cdecl*)(void* pThis, void* parent);
+using CVisualRemoveSelfFromParent_t = long(__cdecl*)(void* pThis);
 CMeshGeometry2dProxyUpdate_t g_meshGeometry2dProxyUpdate = nullptr;
 CCompositorCreateMeshGeometry2dProxy_t g_createMeshGeometry2dProxy = nullptr;
 CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
@@ -412,6 +415,9 @@ CRenderDataVisualAddInstruction_t g_renderDataVisualAddInstruction = nullptr;
 CVisualProxySetContent_t g_visualProxySetContentOriginal = nullptr;
 CVisualProxyInsertChild_t g_visualProxyInsertChildOriginal = nullptr;
 CVisualProxyRemoveChild_t g_visualProxyRemoveChildOriginal = nullptr;
+CVisualSetContent_t g_visualSetContentOriginal = nullptr;
+CVisualSetParent_t g_visualSetParentOriginal = nullptr;
+CVisualRemoveSelfFromParent_t g_visualRemoveSelfFromParentOriginal = nullptr;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
@@ -764,6 +770,7 @@ struct ObservedVisualProxy
     std::atomic<void*> content;
 };
 ObservedVisualProxy g_observedVisualProxies[OBSERVED_VISUAL_PROXY_COUNT] = {};
+ObservedVisualProxy g_observedVisuals[OBSERVED_VISUAL_PROXY_COUNT] = {};
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -795,6 +802,9 @@ static long __cdecl VisualProxySetContentHook(void* pThis, const void* content);
 static long __cdecl VisualProxyInsertChildHook(void* pThis, void* child,
                                                void* reference, bool insertAbove);
 static long __cdecl VisualProxyRemoveChildHook(void* pThis, void* child);
+static long __cdecl VisualSetContentHook(void* pThis, void* content);
+static long __cdecl VisualSetParentHook(void* pThis, void* parent);
+static long __cdecl VisualRemoveSelfFromParentHook(void* pThis);
 static bool HasAnyAnimationSlots();
 static int GetPointIndex(int x, int y);
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy);
@@ -2426,20 +2436,21 @@ static void __cdecl TopLevelWindow3DDestructorHook(void* pThis)
     g_topLevelWindow3DDestructorOriginal(pThis);
 }
 
-static ObservedVisualProxy* FindObservedVisualProxy(void* proxy, bool create)
+static ObservedVisualProxy* FindObservedNode(ObservedVisualProxy* table,
+                                             void* object, bool create)
 {
-    if (!proxy)
+    if (!object)
     {
         return nullptr;
     }
-    uintptr_t hash = reinterpret_cast<uintptr_t>(proxy) >> 4;
+    uintptr_t hash = reinterpret_cast<uintptr_t>(object) >> 4;
     hash ^= hash >> 17;
     for (unsigned int probe = 0; probe < OBSERVED_VISUAL_PROXY_PROBES; probe++)
     {
         ObservedVisualProxy& entry =
-            g_observedVisualProxies[(hash + probe) % OBSERVED_VISUAL_PROXY_COUNT];
+            table[(hash + probe) % OBSERVED_VISUAL_PROXY_COUNT];
         void* observed = entry.proxy.load(std::memory_order_acquire);
-        if (observed == proxy)
+        if (observed == object)
         {
             return &entry;
         }
@@ -2451,20 +2462,30 @@ static ObservedVisualProxy* FindObservedVisualProxy(void* proxy, bool create)
             }
             void* expected = nullptr;
             if (entry.proxy.compare_exchange_strong(
-                    expected, proxy, std::memory_order_acq_rel,
+                    expected, object, std::memory_order_acq_rel,
                     std::memory_order_acquire))
             {
                 entry.parent.store(nullptr, std::memory_order_relaxed);
                 entry.content.store(nullptr, std::memory_order_relaxed);
                 return &entry;
             }
-            if (expected == proxy)
+            if (expected == object)
             {
                 return &entry;
             }
         }
     }
     return nullptr;
+}
+
+static ObservedVisualProxy* FindObservedVisualProxy(void* proxy, bool create)
+{
+    return FindObservedNode(g_observedVisualProxies, proxy, create);
+}
+
+static ObservedVisualProxy* FindObservedVisual(void* visual, bool create)
+{
+    return FindObservedNode(g_observedVisuals, visual, create);
 }
 
 static bool IsObservedMeshSource(void* content)
@@ -2522,6 +2543,50 @@ static long __cdecl VisualProxyRemoveChildHook(void* pThis, void* child)
             entry->parent.compare_exchange_strong(
                 expected, nullptr, std::memory_order_acq_rel,
                 std::memory_order_acquire);
+        }
+    }
+    return result;
+}
+
+static long __cdecl VisualSetContentHook(void* pThis, void* content)
+{
+    long result = g_visualSetContentOriginal(pThis, content);
+    if (result >= 0 && !g_unloading.load(std::memory_order_acquire))
+    {
+        if (ObservedVisualProxy* entry = FindObservedVisual(pThis, true))
+        {
+            entry->content.store(content, std::memory_order_release);
+        }
+        if (IsObservedMeshSource(content))
+        {
+            g_meshSourceProbePending.store(true, std::memory_order_release);
+        }
+    }
+    return result;
+}
+
+static long __cdecl VisualSetParentHook(void* pThis, void* parent)
+{
+    long result = g_visualSetParentOriginal(pThis, parent);
+    if (result >= 0 && !g_unloading.load(std::memory_order_acquire))
+    {
+        if (ObservedVisualProxy* entry = FindObservedVisual(pThis, true))
+        {
+            entry->parent.store(parent, std::memory_order_release);
+        }
+        FindObservedVisual(parent, true);
+    }
+    return result;
+}
+
+static long __cdecl VisualRemoveSelfFromParentHook(void* pThis)
+{
+    long result = g_visualRemoveSelfFromParentOriginal(pThis);
+    if (result >= 0)
+    {
+        if (ObservedVisualProxy* entry = FindObservedVisual(pThis, false))
+        {
+            entry->parent.store(nullptr, std::memory_order_release);
         }
     }
     return result;
@@ -2898,6 +2963,21 @@ static bool InitializeDwmHooks()
          &g_visualProxyRemoveChildOriginal,
          VisualProxyRemoveChildHook,
          true},
+        {{L"public: virtual long __cdecl CVisual::SetContent("
+           L"class CResourceProxy *)"},
+         &g_visualSetContentOriginal,
+         VisualSetContentHook,
+         true},
+        {{L"public: virtual long __cdecl CVisual::SetParent(class CVisual *)",
+          L"public: virtual long __cdecl CVisual::SetParent("
+           L"class CContainerVisual *)"},
+         &g_visualSetParentOriginal,
+         VisualSetParentHook,
+         true},
+        {{L"public: long __cdecl CVisual::RemoveSelfFromParent(void)"},
+         &g_visualRemoveSelfFromParentOriginal,
+         VisualRemoveSelfFromParentHook,
+         true},
         {{L"public: unsigned long __cdecl CBaseObject::Release(void)"},
          &g_cBaseObjectRelease,
          nullptr,
@@ -3035,6 +3115,14 @@ static bool InitializeDwmHooks()
     keepValid(g_visualProxySetContentOriginal);
     keepValid(g_visualProxyInsertChildOriginal);
     keepValid(g_visualProxyRemoveChildOriginal);
+    keepValid(g_visualSetContentOriginal);
+    keepValid(g_visualSetParentOriginal);
+    keepValid(g_visualRemoveSelfFromParentOriginal);
+    Wh_Log(L"True 4x4 observation hooks: proxyContent=%p proxyInsert=%p "
+           L"visualContent=%p visualParent=%p visualRemove=%p",
+           g_visualProxySetContentOriginal, g_visualProxyInsertChildOriginal,
+           g_visualSetContentOriginal, g_visualSetParentOriginal,
+           g_visualRemoveSelfFromParentOriginal);
     bool hasNativeMeshGeometry =
         g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate;
@@ -3365,54 +3453,74 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
     {
         void* proxy;
         size_t depth;
-    } queue[512] = {};
-    unsigned int queueRead = 0;
-    unsigned int queueCount = 1;
-    unsigned int observedContentCount = 0;
-    void* firstObservedContent = nullptr;
-    void* firstObservedContentVtable = nullptr;
-    queue[0] = {visualProxy, 0};
-    while (queueRead < queueCount && !result.source)
+    };
+    struct TreeStats
     {
-        TreeNode current = queue[queueRead++];
-        if (ObservedVisualProxy* entry =
-                FindObservedVisualProxy(current.proxy, false))
+        unsigned int nodes;
+        unsigned int contents;
+        void* firstContent;
+        void* firstVtable;
+    } visualStats = {}, proxyStats = {};
+    auto scanObservedTree = [&](ObservedVisualProxy* table, void* treeRoot,
+                                const wchar_t* owner, TreeStats& stats)
+    {
+        if (!treeRoot || result.source)
         {
-            void* content = entry->content.load(std::memory_order_acquire);
-            if (content)
+            return;
+        }
+        TreeNode queue[512] = {{treeRoot, 0}};
+        unsigned int queueRead = 0;
+        unsigned int queueCount = 1;
+        while (queueRead < queueCount && !result.source)
+        {
+            TreeNode current = queue[queueRead++];
+            if (ObservedVisualProxy* entry =
+                    FindObservedNode(table, current.proxy, false))
             {
-                observedContentCount++;
-                if (!firstObservedContent && IsReadableMemory(content, sizeof(void*)))
+                void* content = entry->content.load(std::memory_order_acquire);
+                if (content)
                 {
-                    firstObservedContent = content;
-                    firstObservedContentVtable = *reinterpret_cast<void**>(content);
+                    stats.contents++;
+                    if (!stats.firstContent &&
+                        IsReadableMemory(content, sizeof(void*)))
+                    {
+                        stats.firstContent = content;
+                        stats.firstVtable = *reinterpret_cast<void**>(content);
+                    }
+                }
+                MeshSourceKind kind = GetMeshSourceKind(content);
+                if (kind != MeshSourceKind::None)
+                {
+                    result = {content, owner, current.depth, SIZE_MAX, kind};
+                    break;
                 }
             }
-            MeshSourceKind kind = GetMeshSourceKind(content);
-            if (kind != MeshSourceKind::None)
+            for (unsigned int index = 0; index < OBSERVED_VISUAL_PROXY_COUNT;
+                 index++)
             {
-                result = {content, L"ObservedTree", current.depth, SIZE_MAX, kind};
-                break;
+                ObservedVisualProxy& entry = table[index];
+                if (entry.parent.load(std::memory_order_acquire) != current.proxy)
+                {
+                    continue;
+                }
+                void* child = entry.proxy.load(std::memory_order_acquire);
+                bool duplicate = false;
+                for (unsigned int i = 0; i < queueCount; i++)
+                {
+                    duplicate |= queue[i].proxy == child;
+                }
+                if (!duplicate && child && queueCount < ARRAYSIZE(queue))
+                {
+                    queue[queueCount++] = {child, current.depth + 1};
+                }
             }
         }
-        for (ObservedVisualProxy& entry : g_observedVisualProxies)
-        {
-            if (entry.parent.load(std::memory_order_acquire) != current.proxy)
-            {
-                continue;
-            }
-            void* child = entry.proxy.load(std::memory_order_acquire);
-            bool duplicate = false;
-            for (unsigned int i = 0; i < queueCount; i++)
-            {
-                duplicate |= queue[i].proxy == child;
-            }
-            if (!duplicate && child && queueCount < ARRAYSIZE(queue))
-            {
-                queue[queueCount++] = {child, current.depth + 1};
-            }
-        }
-    }
+        stats.nodes = queueCount;
+    };
+    scanObservedTree(g_observedVisuals, rootVisual, L"ObservedVisualTree",
+                     visualStats);
+    scanObservedTree(g_observedVisualProxies, visualProxy,
+                     L"ObservedProxyTree", proxyStats);
 
     if (!result.source && !scanMembers(visualProxy, 0x200, L"VisualProxy", SIZE_MAX) &&
         !scanMembers(rootVisual, 0x400, L"RootVisual", SIZE_MAX))
@@ -3458,19 +3566,23 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
     if (result.source)
     {
         Wh_Log(L"True 4x4 source probe: found kind=%s HWND=%p source=%p "
-               L"owner=%s outer=0x%zx inner=0x%zx nodes=%u",
+               L"owner=%s outer=0x%zx inner=0x%zx visualNodes=%u "
+               L"proxyNodes=%u",
                result.kind == MeshSourceKind::VisualSurface ? L"VisualSurface"
                                                             : L"BitmapSource",
                hwnd, result.source, result.owner, result.outerOffset,
-               result.innerOffset, queueCount);
+               result.innerOffset, visualStats.nodes, proxyStats.nodes);
     }
     else
     {
         Wh_Log(L"True 4x4 source probe: no exact live source HWND=%p root=%p "
-               L"visualProxy=%p nodes=%u contents=%u firstContent=%p "
-               L"firstVtable=%p",
-               hwnd, rootVisual, visualProxy, queueCount, observedContentCount,
-               firstObservedContent, firstObservedContentVtable);
+               L"visualProxy=%p visualNodes=%u visualContents=%u "
+               L"visualFirst=%p visualVtable=%p proxyNodes=%u "
+               L"proxyContents=%u proxyFirst=%p proxyVtable=%p",
+               hwnd, rootVisual, visualProxy, visualStats.nodes,
+               visualStats.contents, visualStats.firstContent,
+               visualStats.firstVtable, proxyStats.nodes, proxyStats.contents,
+               proxyStats.firstContent, proxyStats.firstVtable);
     }
 }
 
@@ -7845,12 +7957,17 @@ BOOL Wh_ModInit()
     g_nativeMeshCanarySucceeded.store(false, std::memory_order_release);
     g_meshSourceProbePending.store(false, std::memory_order_release);
     g_meshSourceProbeCompleted.store(false, std::memory_order_release);
-    for (ObservedVisualProxy& entry : g_observedVisualProxies)
+    auto resetObservedNodes = [](ObservedVisualProxy* table)
     {
-        entry.content.store(nullptr, std::memory_order_relaxed);
-        entry.parent.store(nullptr, std::memory_order_relaxed);
-        entry.proxy.store(nullptr, std::memory_order_relaxed);
-    }
+        for (unsigned int index = 0; index < OBSERVED_VISUAL_PROXY_COUNT; index++)
+        {
+            table[index].content.store(nullptr, std::memory_order_relaxed);
+            table[index].parent.store(nullptr, std::memory_order_relaxed);
+            table[index].proxy.store(nullptr, std::memory_order_relaxed);
+        }
+    };
+    resetObservedNodes(g_observedVisualProxies);
+    resetObservedNodes(g_observedVisuals);
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
