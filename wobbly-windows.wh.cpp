@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.115
+// @version         0.118
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -373,6 +373,55 @@ using CVisualProxySetTransform_t = long(__cdecl*)(void* pThis, void* transform);
 CVisualProxySetTransform_t g_cVisualProxySetTransform = nullptr;
 using CCompositorCreateMatrixTransformProxy_t = long(__cdecl*)(void* pThis, void** transformProxy);
 CCompositorCreateMatrixTransformProxy_t g_createMatrixTransformProxy = nullptr;
+struct D2DPoint3F
+{
+    float x;
+    float y;
+    float z;
+};
+struct D2DPoint2F
+{
+    float x;
+    float y;
+};
+using CMeshGeometry2dProxyUpdate_t = long(__cdecl*)(
+    void* pThis, int mode, const D2DPoint3F* positions,
+    const D2DPoint2F* textureCoordinates, unsigned int vertexCount,
+    const unsigned int* indices, unsigned int indexCount);
+using CCompositorCreateMeshGeometry2dProxy_t = long(__cdecl*)(void* pThis,
+                                                               void** meshProxy);
+using CCompositorCreateGeometry2dGroupProxy_t = long(__cdecl*)(void* pThis,
+                                                                void** groupProxy);
+using CGeometry2dGroupProxyUpdate_t = long(__cdecl*)(void* pThis, void* meshProxy);
+using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(void* geometryGroupProxy,
+                                                       void* bitmapSourceProxy,
+                                                       void** instruction);
+using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void* pThis,
+                                                          void* instruction);
+using CVisualCloneVisualTree_t = long(__cdecl*)(void* pThis, void** clone,
+                                                 int cloneOptions);
+using CContainerVisualAddChild_t = long(__cdecl*)(void* pThis, void* child,
+                                                   bool insertAtTop);
+using CVisualGetTransformParent_t = void*(__cdecl*)(void* pThis);
+using CVisualSetParent_t = long(__cdecl*)(void* pThis, void* parent);
+using CVisualConnectToParent_t = long(__cdecl*)(void* pThis, bool connectAtTop);
+using CVisualSetOpacity_t = void(__cdecl*)(void* pThis, double opacity);
+using CVisualRemoveSelfFromParent_t = long(__cdecl*)(void* pThis);
+using CVisualProxySetClip_t = long(__cdecl*)(void* pThis, void* geometryProxy);
+CMeshGeometry2dProxyUpdate_t g_meshGeometry2dProxyUpdate = nullptr;
+CCompositorCreateMeshGeometry2dProxy_t g_createMeshGeometry2dProxy = nullptr;
+CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
+CGeometry2dGroupProxyUpdate_t g_geometry2dGroupProxyUpdate = nullptr;
+CDrawMesh2DInstructionCreate_t g_drawMesh2DInstructionCreate = nullptr;
+CRenderDataVisualAddInstruction_t g_renderDataVisualAddInstruction = nullptr;
+CVisualCloneVisualTree_t g_visualCloneVisualTree = nullptr;
+CContainerVisualAddChild_t g_containerVisualAddChild = nullptr;
+CVisualGetTransformParent_t g_visualGetTransformParent = nullptr;
+CVisualSetParent_t g_visualSetParent = nullptr;
+CVisualConnectToParent_t g_visualConnectToParent = nullptr;
+CVisualSetOpacity_t g_visualSetOpacity = nullptr;
+CVisualRemoveSelfFromParent_t g_visualRemoveSelfFromParent = nullptr;
+CVisualProxySetClip_t g_visualProxySetClip = nullptr;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
@@ -708,6 +757,10 @@ std::atomic<unsigned int> g_abandonedProxyCount = 0;
 std::atomic<void*> g_windowListForSceneWake = nullptr;
 std::atomic_bool g_sceneOwnershipResetPending = false;
 std::atomic<ULONGLONG> g_lastBindPrerequisiteLog = 0;
+std::atomic_bool g_nativeMeshCanaryPending = false;
+std::atomic_bool g_nativeMeshCanarySucceeded = false;
+std::atomic_bool g_visualCloneCanaryPending = false;
+std::atomic_bool g_visualCloneCanarySucceeded = false;
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -733,6 +786,8 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly = false
 static void RestorePendingAnimationIdentities();
 static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
+static void RunNativeMeshCanary();
+static void RunVisualCloneCanary(void* topLevelWindow, HWND hwnd);
 static bool HasAnyAnimationSlots();
 static int GetPointIndex(int x, int y);
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy);
@@ -2680,6 +2735,85 @@ static bool InitializeDwmHooks()
          &g_createMatrixTransformProxy,
          nullptr,
          true},
+        {{L"public: long __cdecl CMeshGeometry2dProxy::Update("
+           L"int,struct D2D_POINT_3F const *,struct D2D_POINT_2F const *,"
+           L"unsigned int,unsigned int const *,unsigned int)",
+          L"public: long __cdecl CMeshGeometry2dProxy::Update("
+           L"int,struct MilPoint3F const *,struct MilPoint2D const *,"
+           L"unsigned int,unsigned int const *,unsigned int)"},
+         &g_meshGeometry2dProxyUpdate,
+         nullptr,
+         true},
+        {{L"public: long __cdecl CCompositor::CreateMeshGeometry2dProxy("
+           L"class CMeshGeometry2dProxy * *)",
+          L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CMeshGeometry2dProxy>(class CMeshGeometry2dProxy * *)"},
+         &g_createMeshGeometry2dProxy,
+         nullptr,
+         true},
+        {{L"public: long __cdecl CCompositor::CreateGeometry2dGroupProxy("
+           L"class CGeometry2dGroupProxy * *)",
+          L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CGeometry2dGroupProxy>(class CGeometry2dGroupProxy * *)"},
+         &g_createGeometry2dGroupProxy,
+         nullptr,
+         true},
+        {{L"public: long __cdecl CGeometry2dGroupProxy::Update("
+           L"class CMeshGeometry2dProxy const *)"},
+         &g_geometry2dGroupProxyUpdate,
+         nullptr,
+         true},
+        {{L"public: static long __cdecl CDrawMesh2DInstruction::Create("
+           L"class CGeometry2dGroupProxy *,class CBitmapSourceProxy *,"
+           L"class CDrawMesh2DInstruction * *)"},
+         &g_drawMesh2DInstructionCreate,
+         nullptr,
+         true},
+        {{L"public: long __cdecl CRenderDataVisual::AddInstruction("
+           L"class CRenderDataInstruction *)"},
+         &g_renderDataVisualAddInstruction,
+         nullptr,
+         true},
+        {{L"public: virtual long __cdecl CVisual::CloneVisualTree("
+           L"class CVisual * *,enum CloneOptions)"},
+         &g_visualCloneVisualTree,
+         nullptr,
+         true},
+        {{L"public: long __cdecl CContainerVisual::AddChild("
+           L"class CVisual *,bool)"},
+         &g_containerVisualAddChild,
+         nullptr,
+         true},
+        {{L"public: virtual class CVisual * __cdecl "
+           L"CVisual::GetTransformParent(void)const",
+          L"public: virtual class CVisual * __cdecl "
+           L"CVisual::GetTransformParent(void)const "},
+         &g_visualGetTransformParent,
+         nullptr,
+         true},
+        {{L"public: virtual long __cdecl CVisual::SetParent(class CVisual *)",
+          L"public: virtual long __cdecl "
+           L"CVisual::SetParent(class CContainerVisual *)"},
+         &g_visualSetParent,
+         nullptr,
+         true},
+        {{L"public: long __cdecl CVisual::ConnectToParent(bool)"},
+         &g_visualConnectToParent,
+         nullptr,
+         true},
+        {{L"public: virtual void __cdecl CVisual::SetOpacity(double)"},
+         &g_visualSetOpacity,
+         nullptr,
+         true},
+        {{L"public: long __cdecl CVisual::RemoveSelfFromParent(void)"},
+         &g_visualRemoveSelfFromParent,
+         nullptr,
+         true},
+        {{L"public: long __cdecl CVisualProxy::SetClip("
+           L"class CBaseGeometryProxy *)"},
+         &g_visualProxySetClip,
+         nullptr,
+         true},
         {{L"public: unsigned long __cdecl CBaseObject::Release(void)"},
          &g_cBaseObjectRelease,
          nullptr,
@@ -2800,6 +2934,43 @@ static bool InitializeDwmHooks()
     keepValid(g_topLevelWindowGetRootVisual);
     keepValid(g_topLevelWindowGetWindowData);
     keepValid(g_desktopManagerPostStartAnimations);
+    keepValid(g_meshGeometry2dProxyUpdate);
+    keepValid(g_createMeshGeometry2dProxy);
+    keepValid(g_createGeometry2dGroupProxy);
+    keepValid(g_geometry2dGroupProxyUpdate);
+    keepValid(g_drawMesh2DInstructionCreate);
+    keepValid(g_renderDataVisualAddInstruction);
+    keepValid(g_visualCloneVisualTree);
+    keepValid(g_containerVisualAddChild);
+    keepValid(g_visualGetTransformParent);
+    keepValid(g_visualSetParent);
+    keepValid(g_visualConnectToParent);
+    keepValid(g_visualSetOpacity);
+    keepValid(g_visualRemoveSelfFromParent);
+    keepValid(g_visualProxySetClip);
+    bool hasNativeMeshGeometry =
+        g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
+        g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate;
+    bool hasMeshBitmapRenderer =
+        hasNativeMeshGeometry && g_drawMesh2DInstructionCreate &&
+        g_renderDataVisualAddInstruction;
+    const wchar_t* liveSubdivisionRoute =
+        g_visualCloneVisualTree && g_visualProxySetClip && g_containerVisualAddChild
+            ? L"available:add-child"
+            : (g_visualCloneVisualTree && g_visualProxySetClip &&
+                       g_visualGetTransformParent && g_visualSetParent &&
+                       g_visualConnectToParent
+                   ? L"available:parent-connect"
+                   : L"unavailable");
+    Wh_Log(L"True 4x4 live probe details: clone=%p clip=%p addChild=%p "
+           L"getParent=%p setParent=%p connect=%p",
+           g_visualCloneVisualTree, g_visualProxySetClip, g_containerVisualAddChild,
+           g_visualGetTransformParent, g_visualSetParent, g_visualConnectToParent);
+    Wh_Log(L"True 4x4 mesh probe: geometry=%s bitmapRenderer=%s liveSubdivision=%s "
+           L"(rendering remains on stable affine fallback)",
+           hasNativeMeshGeometry ? L"available" : L"unavailable",
+           hasMeshBitmapRenderer ? L"available" : L"unavailable",
+           liveSubdivisionRoute);
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
@@ -3045,6 +3216,87 @@ static bool InitializeDwmHooks()
     return true;
 }
 
+static void RunVisualCloneCanary(void* topLevelWindow, HWND hwnd)
+{
+    if (!g_visualCloneCanaryPending.load(std::memory_order_acquire) ||
+        !IsOnDwmSceneThread() || !topLevelWindow)
+    {
+        return;
+    }
+    if (!g_visualCloneVisualTree || !g_visualGetTransformParent ||
+        !g_visualSetParent || !g_visualConnectToParent || !g_visualSetOpacity ||
+        !g_visualRemoveSelfFromParent || !g_cBaseObjectRelease ||
+        !g_topLevelWindowGetRootVisual || g_visualProxyOffset == SIZE_MAX)
+    {
+        return;
+    }
+
+    constexpr int completeWindowRoot = 0;
+    void* rootVisual = g_topLevelWindowGetRootVisual(topLevelWindow,
+                                                     completeWindowRoot);
+    void* parent = rootVisual ? g_visualGetTransformParent(rootVisual) : nullptr;
+    if (!rootVisual || !parent)
+    {
+        return;
+    }
+
+    // One shot only: after entering private DWM clone/parent code, a failure is
+    // diagnostic and must not be retried on every frame or every window.
+    g_visualCloneCanaryPending.store(false, std::memory_order_release);
+    const wchar_t* stage = L"Clone";
+    long result = E_FAIL;
+    long cleanupResult = E_FAIL;
+    void* clone = nullptr;
+    void* cloneProxy = nullptr;
+    bool parentSet = false;
+    bool connected = false;
+
+    constexpr int defaultCloneOptions = 0;
+    result = g_visualCloneVisualTree(rootVisual, &clone, defaultCloneOptions);
+    if (result >= 0 && clone)
+    {
+        // Make the clone invisible before it can enter the live scene graph.
+        stage = L"SetOpacity";
+        g_visualSetOpacity(clone, 0.0);
+        stage = L"SetParent";
+        result = g_visualSetParent(clone, parent);
+        parentSet = result >= 0;
+    }
+    if (result >= 0 && clone)
+    {
+        stage = L"Connect";
+        result = g_visualConnectToParent(clone, true);
+        connected = result >= 0;
+    }
+    if (connected)
+    {
+        stage = L"VerifyProxy";
+        cloneProxy = ReadPointerMember(clone, g_visualProxyOffset);
+        if (!IsVisualProxyPointerValid(cloneProxy))
+        {
+            result = E_NOINTERFACE;
+        }
+    }
+
+    if (parentSet)
+    {
+        cleanupResult = g_visualRemoveSelfFromParent(clone);
+    }
+    if (clone)
+    {
+        g_cBaseObjectRelease(clone);
+    }
+
+    bool succeeded = connected && result >= 0 && cloneProxy && cleanupResult >= 0;
+    g_visualCloneCanarySucceeded.store(succeeded, std::memory_order_release);
+    Wh_Log(L"True 4x4 visual clone canary: %s stage=%s result=0x%08X "
+           L"cleanup=0x%08X HWND=%p root=%p clone=%p parent=%p proxy=%p",
+           succeeded ? L"passed" : L"failed", stage,
+           static_cast<unsigned int>(result),
+           static_cast<unsigned int>(cleanupResult), hwnd, rootVisual, clone,
+           parent, cloneProxy);
+}
+
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
 {
     if (!IsOnDwmSceneThread() || g_unloading.load(std::memory_order_acquire) ||
@@ -3138,6 +3390,10 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             {
                 topLevelVisualProxy = GetTopLevelVisualProxy(topLevelWindow,
                                                              &visualSource);
+                if (topLevelVisualProxy)
+                {
+                    RunVisualCloneCanary(topLevelWindow, hwnd);
+                }
                 if (!topLevelVisualProxy)
                 {
                     bindFailureStage = L"VisualProxy";
@@ -3312,6 +3568,102 @@ static void BackfillExistingDwmWindowMappings()
     }
 }
 
+static void RunNativeMeshCanary()
+{
+    if (!g_nativeMeshCanaryPending.load(std::memory_order_acquire) ||
+        !IsOnDwmSceneThread())
+    {
+        return;
+    }
+    void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
+    if (!IsDwmObjectPointerValid(compositor, g_compositorVtable))
+    {
+        return;
+    }
+    // Consume the one-shot canary before entering private DWM code. A failure
+    // keeps the stable affine renderer active and is never retried in-process.
+    g_nativeMeshCanaryPending.store(false, std::memory_order_release);
+    long result = E_NOINTERFACE;
+    const wchar_t* stage = L"Prerequisites";
+    void* meshProxy = nullptr;
+    void* groupProxy = nullptr;
+    if (g_createMeshGeometry2dProxy && g_meshGeometry2dProxyUpdate &&
+        g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate &&
+        g_cBaseObjectRelease)
+    {
+        D2DPoint3F positions[GRID_POINT_COUNT] = {};
+        D2DPoint2F textureCoordinates[GRID_POINT_COUNT] = {};
+        unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
+        for (int y = 0; y < GRID_HEIGHT; y++)
+        {
+            for (int x = 0; x < GRID_WIDTH; x++)
+            {
+                int index = GetPointIndex(x, y);
+                float px = static_cast<float>(x) / (GRID_WIDTH - 1);
+                float py = static_cast<float>(y) / (GRID_HEIGHT - 1);
+                positions[index] = {px, py, 0.0f};
+                textureCoordinates[index] = {px, py};
+            }
+        }
+        unsigned int indexCount = 0;
+        for (int y = 0; y < GRID_HEIGHT - 1; y++)
+        {
+            for (int x = 0; x < GRID_WIDTH - 1; x++)
+            {
+                unsigned int topLeft = GetPointIndex(x, y);
+                unsigned int topRight = GetPointIndex(x + 1, y);
+                unsigned int bottomLeft = GetPointIndex(x, y + 1);
+                unsigned int bottomRight = GetPointIndex(x + 1, y + 1);
+                indices[indexCount++] = topLeft;
+                indices[indexCount++] = bottomLeft;
+                indices[indexCount++] = topRight;
+                indices[indexCount++] = topRight;
+                indices[indexCount++] = bottomLeft;
+                indices[indexCount++] = bottomRight;
+            }
+        }
+        stage = L"CreateMesh";
+        result = g_createMeshGeometry2dProxy(compositor, &meshProxy);
+        if (result >= 0 && meshProxy)
+        {
+            stage = L"UpdateMesh";
+            result = g_meshGeometry2dProxyUpdate(
+                meshProxy, 0, positions, textureCoordinates, GRID_POINT_COUNT,
+                indices, indexCount);
+        }
+        if (result >= 0)
+        {
+            stage = L"CreateGroup";
+            result = g_createGeometry2dGroupProxy(compositor, &groupProxy);
+        }
+        if (result >= 0 && groupProxy)
+        {
+            stage = L"UpdateGroup";
+            result = g_geometry2dGroupProxyUpdate(groupProxy, meshProxy);
+        }
+    }
+    if (groupProxy)
+    {
+        g_cBaseObjectRelease(groupProxy);
+    }
+    if (meshProxy)
+    {
+        g_cBaseObjectRelease(meshProxy);
+    }
+    bool succeeded = result >= 0 && groupProxy && meshProxy;
+    g_nativeMeshCanarySucceeded.store(succeeded, std::memory_order_release);
+    if (succeeded && g_visualCloneVisualTree && g_visualGetTransformParent &&
+        g_visualSetParent && g_visualConnectToParent && g_visualSetOpacity &&
+        g_visualRemoveSelfFromParent && g_visualProxyOffset != SIZE_MAX)
+    {
+        g_visualCloneCanaryPending.store(true, std::memory_order_release);
+    }
+    Wh_Log(L"True 4x4 mesh canary: %s stage=%s result=0x%08X vertices=%u indices=%u",
+           succeeded ? L"passed" : L"failed", stage,
+           static_cast<unsigned int>(result), GRID_POINT_COUNT,
+           (GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6);
+}
+
 static void SubmitPendingWobblySceneWork()
 {
     if (!IsOnDwmSceneThread())
@@ -3327,6 +3679,7 @@ static void SubmitPendingWobblySceneWork()
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
     {
+        RunNativeMeshCanary();
         BackfillExistingDwmWindowMappings();
         EnsurePendingMatrixTransformProxies();
         for (int i = 0; i < MAX_ANIMATION_SLOTS; i++)
@@ -3351,7 +3704,8 @@ static void SubmitPendingWobblySceneWork()
 
 static bool HasPendingWobblySceneWork()
 {
-    return g_sceneRequestedSerial.load(std::memory_order_acquire) >
+    return g_nativeMeshCanaryPending.load(std::memory_order_acquire) ||
+           g_sceneRequestedSerial.load(std::memory_order_acquire) >
                g_sceneSubmittedSerial.load(std::memory_order_acquire) ||
            g_existingWindowBackfillIndex.load(std::memory_order_acquire) <
                g_existingWindowBackfillCount.load(std::memory_order_acquire) ||
@@ -7310,6 +7664,10 @@ BOOL Wh_ModInit()
     g_abandonedProxyCount.store(0, std::memory_order_release);
     g_sceneOwnershipResetPending.store(false, std::memory_order_release);
     g_lastBindPrerequisiteLog.store(0, std::memory_order_release);
+    g_nativeMeshCanaryPending.store(false, std::memory_order_release);
+    g_nativeMeshCanarySucceeded.store(false, std::memory_order_release);
+    g_visualCloneCanaryPending.store(false, std::memory_order_release);
+    g_visualCloneCanarySucceeded.store(false, std::memory_order_release);
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
@@ -7338,6 +7696,12 @@ void Wh_ModAfterInit()
     // Windhawk activates detours after Wh_ModInit returns. Queue the first
     // scene pass only now so already-open windows cannot miss the wake.
     QueueExistingWindowBackfill();
+    if (g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
+        g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate)
+    {
+        g_nativeMeshCanaryPending.store(true, std::memory_order_release);
+        RequestDwmScenePass();
+    }
 }
 
 void Wh_ModSettingsChanged()
@@ -7349,6 +7713,8 @@ void Wh_ModSettingsChanged()
 void Wh_ModBeforeUninit()
 {
     g_unloading.store(true, std::memory_order_release);
+    g_nativeMeshCanaryPending.store(false, std::memory_order_release);
+    g_visualCloneCanaryPending.store(false, std::memory_order_release);
     Wh_Log(L"Preparing to unload");
     // Restore scene resources before Windhawk removes the hooks.
     StopWindowEventThread();
