@@ -2,12 +2,12 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.121
+// @version         0.122
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
 // @architecture    amd64
-// @compilerOptions -lwevtapi -lgdi32
+// @compilerOptions -lwevtapi
 // @license         GPL-3.0-only
 // ==/WindhawkMod==
 
@@ -398,33 +398,12 @@ using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(void* geometryGroupProxy,
                                                        void** instruction);
 using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void* pThis,
                                                           void* instruction);
-using CVisualCloneVisualTree_t = long(__cdecl*)(void* pThis, void** clone,
-                                                 int cloneOptions);
-using CContainerVisualAddChild_t = long(__cdecl*)(void* pThis, void* child,
-                                                   bool insertAtTop);
-using CVisualGetTransformParent_t = void*(__cdecl*)(void* pThis);
-using CVisualSetParent_t = long(__cdecl*)(void* pThis, void* parent);
-using CVisualConnectToParent_t = long(__cdecl*)(void* pThis, bool connectAtTop);
-using CVisualSetOpacity_t = void(__cdecl*)(void* pThis, double opacity);
-using CVisualRemoveSelfFromParent_t = long(__cdecl*)(void* pThis);
-using CVisualProxySetClip_t = long(__cdecl*)(void* pThis, void* geometryProxy);
-using ResourceHelperCreateGeometryFromHRGN_t = long(__cdecl*)(HRGN region,
-                                                               void** geometryProxy);
 CMeshGeometry2dProxyUpdate_t g_meshGeometry2dProxyUpdate = nullptr;
 CCompositorCreateMeshGeometry2dProxy_t g_createMeshGeometry2dProxy = nullptr;
 CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
 CGeometry2dGroupProxyUpdate_t g_geometry2dGroupProxyUpdate = nullptr;
 CDrawMesh2DInstructionCreate_t g_drawMesh2DInstructionCreate = nullptr;
 CRenderDataVisualAddInstruction_t g_renderDataVisualAddInstruction = nullptr;
-CVisualCloneVisualTree_t g_visualCloneVisualTree = nullptr;
-CContainerVisualAddChild_t g_containerVisualAddChild = nullptr;
-CVisualGetTransformParent_t g_visualGetTransformParent = nullptr;
-CVisualSetParent_t g_visualSetParent = nullptr;
-CVisualConnectToParent_t g_visualConnectToParent = nullptr;
-CVisualSetOpacity_t g_visualSetOpacity = nullptr;
-CVisualRemoveSelfFromParent_t g_visualRemoveSelfFromParent = nullptr;
-CVisualProxySetClip_t g_visualProxySetClip = nullptr;
-ResourceHelperCreateGeometryFromHRGN_t g_createGeometryFromHRGN = nullptr;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
@@ -762,29 +741,6 @@ std::atomic_bool g_sceneOwnershipResetPending = false;
 std::atomic<ULONGLONG> g_lastBindPrerequisiteLog = 0;
 std::atomic_bool g_nativeMeshCanaryPending = false;
 std::atomic_bool g_nativeMeshCanarySucceeded = false;
-static constexpr unsigned int SUBDIVISION_TRIANGLE_COUNT =
-    (GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 2;
-struct SubdivisionCanaryPiece
-{
-    void* clone;
-    void* cloneProxy;
-    void* clipProxy;
-    void* matrixProxy;
-    bool parentSet;
-    bool clipApplied;
-};
-struct SubdivisionCanaryState
-{
-    SubdivisionCanaryPiece pieces[SUBDIVISION_TRIANGLE_COUNT];
-    HWND hwnd;
-    unsigned int pieceCount;
-    unsigned int framesRemaining;
-};
-std::atomic_bool g_subdivisionCanaryPending = false;
-std::atomic_bool g_subdivisionCanarySucceeded = false;
-std::atomic_bool g_subdivisionCanaryActive = false;
-std::atomic_bool g_subdivisionCleanupRequested = false;
-SubdivisionCanaryState g_subdivisionCanary = {};
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -811,8 +767,6 @@ static void RestorePendingAnimationIdentities();
 static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
 static void RunNativeMeshCanary();
-static void RunSubdivisionCanary(void* topLevelWindow, HWND hwnd);
-static void ServiceSubdivisionCanary(bool forceCleanup = false);
 static bool HasAnyAnimationSlots();
 static int GetPointIndex(int x, int y);
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy);
@@ -2800,51 +2754,6 @@ static bool InitializeDwmHooks()
          &g_renderDataVisualAddInstruction,
          nullptr,
          true},
-        {{L"public: virtual long __cdecl CVisual::CloneVisualTree("
-           L"class CVisual * *,enum CloneOptions)"},
-         &g_visualCloneVisualTree,
-         nullptr,
-         true},
-        {{L"public: long __cdecl CContainerVisual::AddChild("
-           L"class CVisual *,bool)"},
-         &g_containerVisualAddChild,
-         nullptr,
-         true},
-        {{L"public: virtual class CVisual * __cdecl "
-           L"CVisual::GetTransformParent(void)const",
-          L"public: virtual class CVisual * __cdecl "
-           L"CVisual::GetTransformParent(void)const "},
-         &g_visualGetTransformParent,
-         nullptr,
-         true},
-        {{L"public: virtual long __cdecl CVisual::SetParent(class CVisual *)",
-          L"public: virtual long __cdecl "
-           L"CVisual::SetParent(class CContainerVisual *)"},
-         &g_visualSetParent,
-         nullptr,
-         true},
-        {{L"public: long __cdecl CVisual::ConnectToParent(bool)"},
-         &g_visualConnectToParent,
-         nullptr,
-         true},
-        {{L"public: virtual void __cdecl CVisual::SetOpacity(double)"},
-         &g_visualSetOpacity,
-         nullptr,
-         true},
-        {{L"public: long __cdecl CVisual::RemoveSelfFromParent(void)"},
-         &g_visualRemoveSelfFromParent,
-         nullptr,
-         true},
-        {{L"public: long __cdecl CVisualProxy::SetClip("
-            L"class CBaseGeometryProxy *)"},
-         &g_visualProxySetClip,
-         nullptr,
-         true},
-        {{L"public: static long __cdecl ResourceHelper::CreateGeometryFromHRGN("
-            L"struct HRGN__ *,class CRgnGeometryProxy * *)"},
-         &g_createGeometryFromHRGN,
-         nullptr,
-         true},
         {{L"public: unsigned long __cdecl CBaseObject::Release(void)"},
          &g_cBaseObjectRelease,
          nullptr,
@@ -2971,41 +2880,16 @@ static bool InitializeDwmHooks()
     keepValid(g_geometry2dGroupProxyUpdate);
     keepValid(g_drawMesh2DInstructionCreate);
     keepValid(g_renderDataVisualAddInstruction);
-    keepValid(g_visualCloneVisualTree);
-    keepValid(g_containerVisualAddChild);
-    keepValid(g_visualGetTransformParent);
-    keepValid(g_visualSetParent);
-    keepValid(g_visualConnectToParent);
-    keepValid(g_visualSetOpacity);
-    keepValid(g_visualRemoveSelfFromParent);
-    keepValid(g_visualProxySetClip);
-    keepValid(g_createGeometryFromHRGN);
     bool hasNativeMeshGeometry =
         g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate;
     bool hasMeshBitmapRenderer =
         hasNativeMeshGeometry && g_drawMesh2DInstructionCreate &&
         g_renderDataVisualAddInstruction;
-    const wchar_t* liveSubdivisionRoute =
-        g_visualCloneVisualTree && g_visualProxySetClip &&
-                g_createGeometryFromHRGN && g_containerVisualAddChild
-            ? L"available:add-child"
-            : (g_visualCloneVisualTree && g_visualProxySetClip &&
-                       g_createGeometryFromHRGN &&
-                       g_visualGetTransformParent && g_visualSetParent &&
-                       g_visualConnectToParent
-                   ? L"available:parent-connect"
-                   : L"unavailable");
-    Wh_Log(L"True 4x4 live probe details: clone=%p clip=%p region=%p addChild=%p "
-           L"getParent=%p setParent=%p connect=%p",
-           g_visualCloneVisualTree, g_visualProxySetClip, g_createGeometryFromHRGN,
-           g_containerVisualAddChild, g_visualGetTransformParent, g_visualSetParent,
-           g_visualConnectToParent);
-    Wh_Log(L"True 4x4 mesh probe: geometry=%s bitmapRenderer=%s liveSubdivision=%s "
+    Wh_Log(L"True 4x4 mesh probe: geometry=%s bitmapRenderer=%s "
            L"(rendering remains on stable affine fallback)",
            hasNativeMeshGeometry ? L"available" : L"unavailable",
-           hasMeshBitmapRenderer ? L"available" : L"unavailable",
-           liveSubdivisionRoute);
+           hasMeshBitmapRenderer ? L"available" : L"unavailable");
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
@@ -3251,223 +3135,6 @@ static bool InitializeDwmHooks()
     return true;
 }
 
-static bool CleanupSubdivisionCanaryState(SubdivisionCanaryState& state)
-{
-    bool succeeded = true;
-    for (unsigned int i = 0; i < state.pieceCount; i++)
-    {
-        SubdivisionCanaryPiece& piece = state.pieces[i];
-        if (piece.clone)
-        {
-            g_visualSetOpacity(piece.clone, 0.0);
-        }
-        if (piece.clipApplied && piece.cloneProxy)
-        {
-            succeeded &= g_visualProxySetClip(piece.cloneProxy, nullptr) >= 0;
-        }
-        if (piece.parentSet && piece.clone)
-        {
-            succeeded &= g_visualRemoveSelfFromParent(piece.clone) >= 0;
-        }
-        if (piece.clone) g_cBaseObjectRelease(piece.clone);
-        if (piece.clipProxy) g_cBaseObjectRelease(piece.clipProxy);
-        if (piece.matrixProxy) g_cBaseObjectRelease(piece.matrixProxy);
-    }
-    state = {};
-    return succeeded;
-}
-
-static void ServiceSubdivisionCanary(bool forceCleanup)
-{
-    if (!IsOnDwmSceneThread() ||
-        !g_subdivisionCanaryActive.load(std::memory_order_acquire))
-    {
-        return;
-    }
-    bool cleanupRequested = forceCleanup ||
-        g_subdivisionCleanupRequested.load(std::memory_order_acquire);
-    if (!cleanupRequested && g_subdivisionCanary.framesRemaining-- > 0)
-    {
-        return;
-    }
-
-    HWND hwnd = g_subdivisionCanary.hwnd;
-    unsigned int pieceCount = g_subdivisionCanary.pieceCount;
-    bool succeeded = CleanupSubdivisionCanaryState(g_subdivisionCanary);
-    g_subdivisionCleanupRequested.store(false, std::memory_order_release);
-    g_subdivisionCanaryActive.store(false, std::memory_order_release);
-    g_subdivisionCanarySucceeded.store(succeeded, std::memory_order_release);
-    Wh_Log(L"True 4x4 subdivision canary: %s stage=Cleanup HWND=%p pieces=%u",
-           succeeded ? L"passed" : L"failed", hwnd, pieceCount);
-}
-
-static void RunSubdivisionCanary(void* topLevelWindow, HWND hwnd)
-{
-    if (!g_subdivisionCanaryPending.load(std::memory_order_acquire) ||
-        g_subdivisionCanaryActive.load(std::memory_order_acquire) ||
-        !IsOnDwmSceneThread() || !topLevelWindow)
-    {
-        return;
-    }
-    if (!g_visualCloneVisualTree || !g_visualGetTransformParent ||
-        !g_visualSetParent || !g_visualConnectToParent || !g_visualSetOpacity ||
-        !g_visualRemoveSelfFromParent || !g_cBaseObjectRelease ||
-        !g_visualProxySetClip || !g_createGeometryFromHRGN ||
-        !g_topLevelWindowGetRootVisual || !g_cVisualProxySetTransform ||
-        !g_createMatrixTransformProxy || !HasMatrixTransformUpdate() ||
-        g_visualProxyOffset == SIZE_MAX)
-    {
-        return;
-    }
-
-    constexpr int completeWindowRoot = 0;
-    void* rootVisual = g_topLevelWindowGetRootVisual(topLevelWindow,
-                                                     completeWindowRoot);
-    void* parent = rootVisual ? g_visualGetTransformParent(rootVisual) : nullptr;
-    if (!rootVisual || !parent)
-    {
-        return;
-    }
-
-    RECT windowRect = {};
-    if (!GetWindowRect(hwnd, &windowRect))
-    {
-        return;
-    }
-    LONG width = windowRect.right - windowRect.left;
-    LONG height = windowRect.bottom - windowRect.top;
-    if (width < GRID_WIDTH - 1 || height < GRID_HEIGHT - 1)
-    {
-        return;
-    }
-
-    // Build every resource while invisible. The original window remains the
-    // only visible layer in this scalability/lifetime canary.
-    g_subdivisionCanaryPending.store(false, std::memory_order_release);
-    SubdivisionCanaryState state = {};
-    state.hwnd = hwnd;
-    state.framesRemaining = 12;
-    const wchar_t* stage = L"CreateRegion";
-    long result = S_OK;
-    unsigned int failedPiece = 0;
-    constexpr int defaultCloneOptions = 0;
-    MilMatrix3x2D identity = {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
-
-    for (int y = 0; y < GRID_HEIGHT - 1 && result >= 0; y++)
-    {
-        LONG y0 = height * y / (GRID_HEIGHT - 1);
-        LONG y1 = height * (y + 1) / (GRID_HEIGHT - 1);
-        for (int x = 0; x < GRID_WIDTH - 1 && result >= 0; x++)
-        {
-            LONG x0 = width * x / (GRID_WIDTH - 1);
-            LONG x1 = width * (x + 1) / (GRID_WIDTH - 1);
-            for (int triangleIndex = 0; triangleIndex < 2 && result >= 0;
-                 triangleIndex++)
-            {
-                failedPiece = state.pieceCount;
-                SubdivisionCanaryPiece& piece =
-                    state.pieces[state.pieceCount++];
-                POINT triangle[3] = {};
-                if (triangleIndex == 0)
-                {
-                    triangle[0] = {x0, y0};
-                    triangle[1] = {x0, y1};
-                    triangle[2] = {x1, y0};
-                }
-                else
-                {
-                    triangle[0] = {x1, y0};
-                    triangle[1] = {x0, y1};
-                    triangle[2] = {x1, y1};
-                }
-
-                stage = L"CreateRegion";
-                HRGN region =
-                    CreatePolygonRgn(triangle, ARRAYSIZE(triangle), WINDING);
-                if (!region)
-                {
-                    DWORD error = GetLastError();
-                    result = HRESULT_FROM_WIN32(error ? error : ERROR_INVALID_DATA);
-                    break;
-                }
-                stage = L"CreateClipGeometry";
-                result = g_createGeometryFromHRGN(region, &piece.clipProxy);
-                DeleteObject(region);
-                if (result < 0 || !piece.clipProxy)
-                {
-                    if (result >= 0) result = E_NOINTERFACE;
-                    break;
-                }
-
-                stage = L"Clone";
-                result = g_visualCloneVisualTree(rootVisual, &piece.clone,
-                                                 defaultCloneOptions);
-                if (result < 0 || !piece.clone)
-                {
-                    if (result >= 0) result = E_NOINTERFACE;
-                    break;
-                }
-                g_visualSetOpacity(piece.clone, 0.0);
-
-                stage = L"SetParent";
-                result = g_visualSetParent(piece.clone, parent);
-                piece.parentSet = result >= 0;
-                if (result < 0) break;
-
-                stage = L"Connect";
-                result = g_visualConnectToParent(piece.clone, true);
-                if (result < 0) break;
-
-                stage = L"VerifyProxy";
-                piece.cloneProxy =
-                    ReadPointerMember(piece.clone, g_visualProxyOffset);
-                if (!IsVisualProxyPointerValid(piece.cloneProxy))
-                {
-                    result = E_NOINTERFACE;
-                    break;
-                }
-
-                stage = L"SetClip";
-                result = g_visualProxySetClip(piece.cloneProxy, piece.clipProxy);
-                piece.clipApplied = result >= 0;
-                if (result < 0) break;
-
-                stage = L"CreateTransform";
-                if (!CreateMatrixTransformProxy(&piece.matrixProxy))
-                {
-                    result = E_FAIL;
-                    break;
-                }
-                stage = L"UpdateTransform";
-                result = UpdateMatrixTransformProxy(piece.matrixProxy, identity);
-                if (result < 0) break;
-
-                stage = L"SetTransform";
-                result = g_cVisualProxySetTransform(piece.cloneProxy,
-                                                    piece.matrixProxy);
-            }
-        }
-    }
-
-    if (result >= 0 && state.pieceCount == SUBDIVISION_TRIANGLE_COUNT)
-    {
-        g_subdivisionCanary = state;
-        g_subdivisionCleanupRequested.store(false, std::memory_order_release);
-        g_subdivisionCanaryActive.store(true, std::memory_order_release);
-        Wh_Log(L"True 4x4 subdivision canary: started HWND=%p pieces=%u "
-               L"size=%ldx%ld frames=%u",
-               hwnd, state.pieceCount, width, height, state.framesRemaining);
-        return;
-    }
-
-    bool cleanupSucceeded = CleanupSubdivisionCanaryState(state);
-    g_subdivisionCanarySucceeded.store(false, std::memory_order_release);
-    Wh_Log(L"True 4x4 subdivision canary: failed stage=%s result=0x%08X "
-           L"piece=%u cleanup=%d HWND=%p",
-           stage, static_cast<unsigned int>(result), failedPiece,
-           cleanupSucceeded, hwnd);
-}
-
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
 {
     if (!IsOnDwmSceneThread() || g_unloading.load(std::memory_order_acquire) ||
@@ -3561,10 +3228,6 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             {
                 topLevelVisualProxy = GetTopLevelVisualProxy(topLevelWindow,
                                                              &visualSource);
-                if (topLevelVisualProxy)
-                {
-                    RunSubdivisionCanary(topLevelWindow, hwnd);
-                }
                 if (!topLevelVisualProxy)
                 {
                     bindFailureStage = L"VisualProxy";
@@ -3823,13 +3486,6 @@ static void RunNativeMeshCanary()
     }
     bool succeeded = result >= 0 && groupProxy && meshProxy;
     g_nativeMeshCanarySucceeded.store(succeeded, std::memory_order_release);
-    if (succeeded && g_visualCloneVisualTree && g_visualGetTransformParent &&
-        g_visualSetParent && g_visualConnectToParent && g_visualSetOpacity &&
-        g_visualRemoveSelfFromParent && g_visualProxySetClip &&
-        g_createGeometryFromHRGN && g_visualProxyOffset != SIZE_MAX)
-    {
-        g_subdivisionCanaryPending.store(true, std::memory_order_release);
-    }
     Wh_Log(L"True 4x4 mesh canary: %s stage=%s result=0x%08X vertices=%u indices=%u",
            succeeded ? L"passed" : L"failed", stage,
            static_cast<unsigned int>(result), GRID_POINT_COUNT,
@@ -3847,10 +3503,6 @@ static void SubmitPendingWobblySceneWork()
     g_sceneWakeScheduled.store(false, std::memory_order_release);
     g_sceneWakePostTimestamp.store(0, std::memory_order_release);
     g_scenePassCounter.fetch_add(1, std::memory_order_release);
-    if (g_subdivisionCleanupRequested.load(std::memory_order_acquire))
-    {
-        ServiceSubdivisionCanary(true);
-    }
     // Restore retiring/quiet windows before discovery, creation or normal rendering.
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
@@ -3881,7 +3533,6 @@ static void SubmitPendingWobblySceneWork()
 static bool HasPendingWobblySceneWork()
 {
     return g_nativeMeshCanaryPending.load(std::memory_order_acquire) ||
-           g_subdivisionCleanupRequested.load(std::memory_order_acquire) ||
            g_sceneRequestedSerial.load(std::memory_order_acquire) >
                g_sceneSubmittedSerial.load(std::memory_order_acquire) ||
            g_existingWindowBackfillIndex.load(std::memory_order_acquire) <
@@ -3956,7 +3607,6 @@ static void __cdecl AdvanceTimelinesHook(void* pThis, double currentTime)
         RegisterDwmSceneThread(SceneThreadRegistration::AuthoritativeTimeline);
     if (canSubmit)
     {
-        ServiceSubdivisionCanary(g_unloading.load(std::memory_order_acquire));
         g_lastNativeTimelineTimestamp.store(GetTickCount64(), std::memory_order_release);
         if (g_sceneWakeAwaitingNativeTimeline.exchange(false,
                                                         std::memory_order_acq_rel))
@@ -4021,8 +3671,7 @@ static void __cdecl DesktopManagerHandleThreadMessageHook(UINT message,
         {
         }
     };
-    if (g_unloading.load(std::memory_order_acquire) && !HasAnyAnimationSlots() &&
-        !g_subdivisionCanaryActive.load(std::memory_order_acquire))
+    if (g_unloading.load(std::memory_order_acquire) && !HasAnyAnimationSlots())
     {
         // Cleanup can finish through a native scene pass before this wake arrives.
         acknowledgeWake();
@@ -5109,10 +4758,6 @@ static void BeginSceneStallCleanup(const wchar_t* reason)
     {
         RetireAnimationSlot(slotsToRetire[i]);
     }
-    if (g_subdivisionCanaryActive.load(std::memory_order_acquire))
-    {
-        g_subdivisionCleanupRequested.store(true, std::memory_order_release);
-    }
     // Keep only a low-rate identity retry alive until a scene pass recovers.
     g_animationTargetHz = 10.0;
     g_nextAnimationCounter = {};
@@ -5976,11 +5621,6 @@ static void StopAllAnimations()
     {
         RetireAnimationSlot(slotsToRetire[i]);
     }
-    if (g_subdivisionCanaryActive.load(std::memory_order_acquire))
-    {
-        g_subdivisionCleanupRequested.store(true, std::memory_order_release);
-        sceneCleanupNeeded = true;
-    }
     if (sceneCleanupNeeded)
     {
         // Publish once even during unload, so native scene ticks can also clean up.
@@ -6010,9 +5650,7 @@ static void StopAllAnimations()
         // Wakes carry only an instance token, not pointers; keep their counter
         // intact for late acknowledgments, but don't mistake them for resources.
         bool wakePending = g_sceneWakeOutstanding.load(std::memory_order_acquire) != 0;
-        bool visibleCanaryActive =
-            g_subdivisionCanaryActive.load(std::memory_order_acquire);
-        if (!hookUsers && !retainedProxies && !visibleCanaryActive)
+        if (!hookUsers && !retainedProxies)
         {
             break;
         }
@@ -6020,14 +5658,13 @@ static void StopAllAnimations()
         if (now >= hookWaitDeadline)
         {
             Wh_Log(L"DWM cleanup timeout: pendingIdentities=%u retainedProxies=%u "
-                   L"hookUsers=%u wakePending=%d visibleCanary=%d",
-                   pendingIdentities, retainedProxies, hookUsers, wakePending,
-                   visibleCanaryActive);
+                   L"hookUsers=%u wakePending=%d",
+                   pendingIdentities, retainedProxies, hookUsers, wakePending);
             cleanupTimedOut = true;
             break;
         }
         ULONGLONG lastWakePost = g_sceneWakePostTimestamp.load(std::memory_order_acquire);
-        if ((retainedProxies || visibleCanaryActive) &&
+        if (retainedProxies &&
             (!wakePending || !lastWakePost || now - lastWakePost >= 50))
         {
             PostPendingDwmSceneWake(true);
@@ -7857,11 +7494,6 @@ BOOL Wh_ModInit()
     g_lastBindPrerequisiteLog.store(0, std::memory_order_release);
     g_nativeMeshCanaryPending.store(false, std::memory_order_release);
     g_nativeMeshCanarySucceeded.store(false, std::memory_order_release);
-    g_subdivisionCanaryPending.store(false, std::memory_order_release);
-    g_subdivisionCanarySucceeded.store(false, std::memory_order_release);
-    g_subdivisionCanaryActive.store(false, std::memory_order_release);
-    g_subdivisionCleanupRequested.store(false, std::memory_order_release);
-    g_subdivisionCanary = {};
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
@@ -7908,11 +7540,6 @@ void Wh_ModBeforeUninit()
 {
     g_unloading.store(true, std::memory_order_release);
     g_nativeMeshCanaryPending.store(false, std::memory_order_release);
-    g_subdivisionCanaryPending.store(false, std::memory_order_release);
-    if (g_subdivisionCanaryActive.load(std::memory_order_acquire))
-    {
-        g_subdivisionCleanupRequested.store(true, std::memory_order_release);
-    }
     Wh_Log(L"Preparing to unload");
     // Restore scene resources before Windhawk removes the hooks.
     StopWindowEventThread();
