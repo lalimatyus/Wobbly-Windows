@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.130
+// @version         0.131
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3612,6 +3612,17 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
                 float ty = static_cast<float>(y) / (GRID_HEIGHT - 1);
                 positions[index] = {tx * static_cast<float>(width),
                                     ty * static_cast<float>(height), 0.0f};
+                if (x > 0 && x < GRID_WIDTH - 1 && y > 0 &&
+                    y < GRID_HEIGHT - 1)
+                {
+                    // Keep the perimeter fixed and bend only the four interior
+                    // control points. This isolates true mesh deformation from
+                    // window positioning and clipping behavior.
+                    float horizontalDirection = y == 1 ? 1.0f : -1.0f;
+                    float verticalDirection = x == 1 ? -1.0f : 1.0f;
+                    positions[index].x += horizontalDirection * 24.0f;
+                    positions[index].y += verticalDirection * 16.0f;
+                }
                 textureCoordinates[index] = {tx, ty};
             }
         }
@@ -3713,7 +3724,7 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
     {
         g_cBaseObjectRelease(cachedVisual);
     }
-    Wh_Log(L"True 4x4 visible identity canary: %s stage=%s result=0x%08X "
+    Wh_Log(L"True 4x4 visible warped canary: %s stage=%s result=0x%08X "
            L"HWND=%p clientProxy=%p size=%.0fx%.0f",
            succeeded ? L"attached" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, clientVisualProxy,
@@ -3766,7 +3777,7 @@ static void MaintainVisibleMeshCanary()
     g_visibleMeshCanaryCleanupRequested.store(false,
                                                std::memory_order_release);
     g_visibleMeshCanaryActive.store(false, std::memory_order_release);
-    Wh_Log(L"True 4x4 visible identity canary: detached result=0x%08X HWND=%p",
+    Wh_Log(L"True 4x4 visible warped canary: detached result=0x%08X HWND=%p",
            static_cast<unsigned int>(detachResult), state.hwnd);
 }
 
