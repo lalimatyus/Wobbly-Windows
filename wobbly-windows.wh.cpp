@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.128
+// @version         0.129
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -427,6 +427,7 @@ using CCachedVisualImageProxyUpdate_t = long(__cdecl*)(
     void* pThis, const MilRectF& sourceRect, const MilSizeD& size,
     const void* rectAnimation, const void* sizeAnimation, void* visualProxy,
     int mappingMode);
+using CRenderDataVisualCreate_t = long(__cdecl*)(void** visual);
 CMeshGeometry2dProxyUpdate_t g_meshGeometry2dProxyUpdate = nullptr;
 CCompositorCreateMeshGeometry2dProxy_t g_createMeshGeometry2dProxy = nullptr;
 CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
@@ -445,6 +446,7 @@ CRedirectVisualProxySetRedirectedVisual_t
 CCompositorCreateCachedVisualImageProxy_t
     g_createCachedVisualImageProxy = nullptr;
 CCachedVisualImageProxyUpdate_t g_cachedVisualImageProxyUpdate = nullptr;
+CRenderDataVisualCreate_t g_renderDataVisualCreate = nullptr;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
@@ -3015,6 +3017,11 @@ static bool InitializeDwmHooks()
          &g_renderDataVisualAddInstruction,
          nullptr,
          true},
+        {{L"public: static long __cdecl CRenderDataVisual::Create("
+           L"class CRenderDataVisual * *)"},
+         &g_renderDataVisualCreate,
+         nullptr,
+         true},
         {{L"public: long __cdecl CVisualProxy::SetContent("
            L"class CResourceProxy const *)"},
          &g_visualProxySetContentOriginal,
@@ -3197,6 +3204,7 @@ static bool InitializeDwmHooks()
     keepValid(g_geometry2dGroupProxyUpdate);
     keepValid(g_drawMesh2DInstructionCreate);
     keepValid(g_renderDataVisualAddInstruction);
+    keepValid(g_renderDataVisualCreate);
     keepValid(g_createCachedVisualImageProxy);
     keepValid(g_cachedVisualImageProxyUpdate);
     keepValid(g_visualProxySetContentOriginal);
@@ -3274,11 +3282,15 @@ static bool InitializeDwmHooks()
            hasExactBitmapSourceProxyVtable ? L"available" : L"unavailable",
            hasExactVisualSurfaceProxyVtable ? L"available" : L"unavailable");
     Wh_Log(L"True 4x4 GPU source probe: cachedVisual=%s clientArea=%s "
-           L"create=%s update=%s",
+           L"create=%s update=%s meshInstruction=%s renderVisual=%s",
            hasExactCachedVisualImageProxyVtable ? L"available" : L"unavailable",
            hasExactClientAreaVtable ? L"available" : L"unavailable",
            g_createCachedVisualImageProxy ? L"available" : L"unavailable",
-           g_cachedVisualImageProxyUpdate ? L"available" : L"unavailable");
+           g_cachedVisualImageProxyUpdate ? L"available" : L"unavailable",
+           g_drawMesh2DInstructionCreate ? L"available" : L"unavailable",
+           g_renderDataVisualCreate && g_renderDataVisualAddInstruction
+               ? L"available"
+               : L"unavailable");
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
@@ -3526,11 +3538,19 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy, HWND hwnd)
     long result = E_NOINTERFACE;
     const wchar_t* stage = L"Prerequisites";
     void* cachedVisual = nullptr;
+    void* meshProxy = nullptr;
+    void* groupProxy = nullptr;
+    void* instruction = nullptr;
+    void* renderVisual = nullptr;
     double width = 0.0;
     double height = 0.0;
     if (IsDwmObjectPointerValid(compositor, g_compositorVtable) &&
         IsVisualProxyPointerValid(clientVisualProxy) && expectedVtable &&
         g_createCachedVisualImageProxy && g_cachedVisualImageProxyUpdate &&
+        g_createMeshGeometry2dProxy && g_meshGeometry2dProxyUpdate &&
+        g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate &&
+        g_drawMesh2DInstructionCreate && g_renderDataVisualCreate &&
+        g_renderDataVisualAddInstruction &&
         g_cBaseObjectRelease)
     {
         RECT clientRect = {};
@@ -3561,13 +3581,101 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy, HWND hwnd)
                 cachedVisual, sourceRect, size, nullptr, nullptr,
                 clientVisualProxy, absoluteMappingMode);
         }
+        D2DPoint3F positions[GRID_POINT_COUNT] = {};
+        D2DPoint2F textureCoordinates[GRID_POINT_COUNT] = {};
+        unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
+        for (int y = 0; y < GRID_HEIGHT; y++)
+        {
+            for (int x = 0; x < GRID_WIDTH; x++)
+            {
+                int index = GetPointIndex(x, y);
+                float tx = static_cast<float>(x) / (GRID_WIDTH - 1);
+                float ty = static_cast<float>(y) / (GRID_HEIGHT - 1);
+                positions[index] = {tx * static_cast<float>(width),
+                                    ty * static_cast<float>(height), 0.0f};
+                textureCoordinates[index] = {tx, ty};
+            }
+        }
+        unsigned int indexCount = 0;
+        for (int y = 0; y < GRID_HEIGHT - 1; y++)
+        {
+            for (int x = 0; x < GRID_WIDTH - 1; x++)
+            {
+                unsigned int topLeft = GetPointIndex(x, y);
+                unsigned int topRight = GetPointIndex(x + 1, y);
+                unsigned int bottomLeft = GetPointIndex(x, y + 1);
+                unsigned int bottomRight = GetPointIndex(x + 1, y + 1);
+                indices[indexCount++] = topLeft;
+                indices[indexCount++] = bottomLeft;
+                indices[indexCount++] = topRight;
+                indices[indexCount++] = topRight;
+                indices[indexCount++] = bottomLeft;
+                indices[indexCount++] = bottomRight;
+            }
+        }
+        if (result >= 0)
+        {
+            stage = L"CreateMesh";
+            result = g_createMeshGeometry2dProxy(compositor, &meshProxy);
+        }
+        if (result >= 0 && meshProxy)
+        {
+            stage = L"UpdateMesh";
+            result = g_meshGeometry2dProxyUpdate(
+                meshProxy, 0, positions, textureCoordinates, GRID_POINT_COUNT,
+                indices, indexCount);
+        }
+        if (result >= 0)
+        {
+            stage = L"CreateGroup";
+            result = g_createGeometry2dGroupProxy(compositor, &groupProxy);
+        }
+        if (result >= 0 && groupProxy)
+        {
+            stage = L"UpdateGroup";
+            result = g_geometry2dGroupProxyUpdate(groupProxy, meshProxy);
+        }
+        if (result >= 0)
+        {
+            stage = L"CreateRenderVisual";
+            result = g_renderDataVisualCreate(&renderVisual);
+        }
+        if (result >= 0 && renderVisual)
+        {
+            stage = L"CreateInstruction";
+            result = g_drawMesh2DInstructionCreate(groupProxy, cachedVisual,
+                                                    &instruction);
+        }
+        if (result >= 0 && instruction)
+        {
+            stage = L"AddInstruction";
+            result =
+                g_renderDataVisualAddInstruction(renderVisual, instruction);
+        }
     }
-    bool succeeded = result >= 0 && cachedVisual;
+    bool succeeded = result >= 0 && cachedVisual && meshProxy && groupProxy &&
+                     instruction && renderVisual;
+    if (renderVisual && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(renderVisual);
+    }
+    if (instruction && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(instruction);
+    }
+    if (groupProxy && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(groupProxy);
+    }
+    if (meshProxy && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(meshProxy);
+    }
     if (cachedVisual && g_cBaseObjectRelease)
     {
         g_cBaseObjectRelease(cachedVisual);
     }
-    Wh_Log(L"True 4x4 GPU source canary: %s stage=%s result=0x%08X "
+    Wh_Log(L"True 4x4 GPU mesh canary: %s stage=%s result=0x%08X "
            L"HWND=%p clientProxy=%p size=%.0fx%.0f",
            succeeded ? L"passed" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, clientVisualProxy,
