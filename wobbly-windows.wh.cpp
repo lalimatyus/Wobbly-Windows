@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.131
+// @version         0.132
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3558,6 +3558,9 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
     void* groupProxy = nullptr;
     void* instruction = nullptr;
     void* renderVisual = nullptr;
+    void* renderVisualProxy = nullptr;
+    void* parentVisualProxy = nullptr;
+    bool attachedToStructure = false;
     double width = 0.0;
     double height = 0.0;
     if (IsDwmObjectPointerValid(compositor, g_compositorVtable) &&
@@ -3569,6 +3572,8 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate &&
         g_drawMesh2DInstructionCreate && g_renderDataVisualCreate &&
         g_renderDataVisualAddInstruction && g_visualSetParentOriginal &&
+        g_visualGetVisualProxyForStructure &&
+        g_visualProxyRemoveChildOriginal && g_visualProxyInsertChildOriginal &&
         g_visualRemoveSelfFromParentOriginal &&
         g_cBaseObjectRelease)
     {
@@ -3686,6 +3691,31 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
         {
             stage = L"Attach";
             result = g_visualSetParentOriginal(renderVisual, parentVisual);
+            attachedToStructure = result >= 0;
+        }
+        if (result >= 0)
+        {
+            stage = L"ResolveLayerOrder";
+            renderVisualProxy =
+                g_visualGetVisualProxyForStructure(renderVisual);
+            parentVisualProxy =
+                g_visualGetVisualProxyForStructure(parentVisual);
+            if (!renderVisualProxy || !parentVisualProxy)
+            {
+                result = E_NOINTERFACE;
+            }
+        }
+        if (result >= 0)
+        {
+            stage = L"RemoveForReorder";
+            result = g_visualProxyRemoveChildOriginal(parentVisualProxy,
+                                                       renderVisualProxy);
+        }
+        if (result >= 0)
+        {
+            stage = L"InsertAboveClient";
+            result = g_visualProxyInsertChildOriginal(
+                parentVisualProxy, renderVisualProxy, clientVisualProxy, true);
         }
     }
     bool succeeded = result >= 0 && cachedVisual && meshProxy && groupProxy &&
@@ -3703,6 +3733,11 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
                                                    std::memory_order_release);
         g_visibleMeshCanaryActive.store(true, std::memory_order_release);
         RequestDwmScenePass();
+    }
+    else if (attachedToStructure && renderVisual &&
+             g_visualRemoveSelfFromParentOriginal)
+    {
+        g_visualRemoveSelfFromParentOriginal(renderVisual);
     }
     if (renderVisual && g_cBaseObjectRelease)
     {
@@ -3725,10 +3760,11 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
         g_cBaseObjectRelease(cachedVisual);
     }
     Wh_Log(L"True 4x4 visible warped canary: %s stage=%s result=0x%08X "
-           L"HWND=%p clientProxy=%p size=%.0fx%.0f",
+           L"HWND=%p clientProxy=%p parentProxy=%p meshVisualProxy=%p "
+           L"size=%.0fx%.0f",
            succeeded ? L"attached" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, clientVisualProxy,
-           width, height);
+           parentVisualProxy, renderVisualProxy, width, height);
 }
 
 static void MaintainVisibleMeshCanary()
