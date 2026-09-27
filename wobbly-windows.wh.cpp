@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.126
+// @version         0.127
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -407,6 +407,8 @@ using CVisualSetContent_t = long(__cdecl*)(void* pThis, void* content);
 using CVisualSetParent_t = long(__cdecl*)(void* pThis, void* parent);
 using CVisualRemoveSelfFromParent_t = long(__cdecl*)(void* pThis);
 using CVisualGetVisualProxyForStructure_t = void*(__cdecl*)(void* pThis);
+using CRedirectVisualProxySetRedirectedVisual_t = long(__cdecl*)(void* pThis,
+                                                                 void* visual);
 CMeshGeometry2dProxyUpdate_t g_meshGeometry2dProxyUpdate = nullptr;
 CCompositorCreateMeshGeometry2dProxy_t g_createMeshGeometry2dProxy = nullptr;
 CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
@@ -420,6 +422,8 @@ CVisualSetContent_t g_visualSetContentOriginal = nullptr;
 CVisualSetParent_t g_visualSetParentOriginal = nullptr;
 CVisualRemoveSelfFromParent_t g_visualRemoveSelfFromParentOriginal = nullptr;
 CVisualGetVisualProxyForStructure_t g_visualGetVisualProxyForStructure = nullptr;
+CRedirectVisualProxySetRedirectedVisual_t
+    g_redirectVisualProxySetRedirectedVisualOriginal = nullptr;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
@@ -770,6 +774,7 @@ struct ObservedVisualProxy
     std::atomic<void*> proxy;
     std::atomic<void*> parent;
     std::atomic<void*> content;
+    std::atomic<void*> redirectTarget;
 };
 ObservedVisualProxy g_observedVisualProxies[OBSERVED_VISUAL_PROXY_COUNT] = {};
 ObservedVisualProxy g_observedVisuals[OBSERVED_VISUAL_PROXY_COUNT] = {};
@@ -807,6 +812,8 @@ static long __cdecl VisualProxyRemoveChildHook(void* pThis, void* child);
 static long __cdecl VisualSetContentHook(void* pThis, void* content);
 static long __cdecl VisualSetParentHook(void* pThis, void* parent);
 static long __cdecl VisualRemoveSelfFromParentHook(void* pThis);
+static long __cdecl RedirectVisualProxySetRedirectedVisualHook(void* pThis,
+                                                               void* visual);
 static bool HasAnyAnimationSlots();
 static int GetPointIndex(int x, int y);
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy);
@@ -2469,6 +2476,7 @@ static ObservedVisualProxy* FindObservedNode(ObservedVisualProxy* table,
             {
                 entry.parent.store(nullptr, std::memory_order_relaxed);
                 entry.content.store(nullptr, std::memory_order_relaxed);
+                entry.redirectTarget.store(nullptr, std::memory_order_relaxed);
                 return &entry;
             }
             if (expected == object)
@@ -2590,6 +2598,22 @@ static long __cdecl VisualRemoveSelfFromParentHook(void* pThis)
         {
             entry->parent.store(nullptr, std::memory_order_release);
         }
+    }
+    return result;
+}
+
+static long __cdecl RedirectVisualProxySetRedirectedVisualHook(void* pThis,
+                                                               void* visual)
+{
+    long result =
+        g_redirectVisualProxySetRedirectedVisualOriginal(pThis, visual);
+    if (result >= 0 && !g_unloading.load(std::memory_order_acquire))
+    {
+        if (ObservedVisualProxy* entry = FindObservedVisualProxy(pThis, true))
+        {
+            entry->redirectTarget.store(visual, std::memory_order_release);
+        }
+        g_meshSourceProbePending.store(true, std::memory_order_release);
     }
     return result;
 }
@@ -2965,6 +2989,11 @@ static bool InitializeDwmHooks()
          &g_visualProxyRemoveChildOriginal,
          VisualProxyRemoveChildHook,
          true},
+        {{L"public: long __cdecl CRedirectVisualProxy::SetRedirectedVisual("
+           L"class CVisualProxy *)"},
+         &g_redirectVisualProxySetRedirectedVisualOriginal,
+         RedirectVisualProxySetRedirectedVisualHook,
+         true},
         {{L"public: virtual long __cdecl CVisual::SetContent("
            L"class CResourceProxy *)"},
          &g_visualSetContentOriginal,
@@ -3122,16 +3151,19 @@ static bool InitializeDwmHooks()
     keepValid(g_visualProxySetContentOriginal);
     keepValid(g_visualProxyInsertChildOriginal);
     keepValid(g_visualProxyRemoveChildOriginal);
+    keepValid(g_redirectVisualProxySetRedirectedVisualOriginal);
     keepValid(g_visualSetContentOriginal);
     keepValid(g_visualSetParentOriginal);
     keepValid(g_visualRemoveSelfFromParentOriginal);
     keepValid(g_visualGetVisualProxyForStructure);
     Wh_Log(L"True 4x4 observation hooks: proxyContent=%p proxyInsert=%p "
-           L"visualContent=%p visualParent=%p visualRemove=%p getProxy=%p",
+           L"visualContent=%p visualParent=%p visualRemove=%p getProxy=%p "
+           L"redirect=%p",
            g_visualProxySetContentOriginal, g_visualProxyInsertChildOriginal,
            g_visualSetContentOriginal, g_visualSetParentOriginal,
            g_visualRemoveSelfFromParentOriginal,
-           g_visualGetVisualProxyForStructure);
+           g_visualGetVisualProxyForStructure,
+           g_redirectVisualProxySetRedirectedVisualOriginal);
     bool hasNativeMeshGeometry =
         g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate;
@@ -3470,7 +3502,7 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         void* firstContent;
         void* firstVtable;
     } visualStats = {}, proxyStats = {};
-    struct VisualContentSample
+    struct VisualNodeSample
     {
         void* visual;
         void* visualVtable;
@@ -3478,9 +3510,11 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         void* contentVtable;
         void* visualProxy;
         void* proxyVtable;
+        void* redirectTarget;
+        void* redirectTargetVtable;
         size_t depth;
-    } contentSamples[16] = {};
-    unsigned int contentSampleCount = 0;
+    } nodeSamples[32] = {};
+    unsigned int nodeSampleCount = 0;
     auto scanObservedTree = [&](ObservedVisualProxy* table, void* treeRoot,
                                 const wchar_t* owner, TreeStats& stats)
     {
@@ -3507,30 +3541,52 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                         stats.firstContent = content;
                         stats.firstVtable = *reinterpret_cast<void**>(content);
                     }
-                    if (table == g_observedVisuals &&
-                        contentSampleCount < ARRAYSIZE(contentSamples) &&
-                        IsReadableMemory(current.proxy, sizeof(void*)) &&
-                        IsReadableMemory(content, sizeof(void*)))
+                }
+                if (table == g_observedVisuals &&
+                    nodeSampleCount < ARRAYSIZE(nodeSamples) &&
+                    IsReadableMemory(current.proxy, sizeof(void*)))
+                {
+                    void* visualVtable = *reinterpret_cast<void**>(current.proxy);
+                    void* structureProxy = nullptr;
+                    void* structureProxyVtable = nullptr;
+                    void* redirectTarget = nullptr;
+                    void* redirectTargetVtable = nullptr;
+                    if (IsDwmImageAddress(visualVtable, sizeof(void*)) &&
+                        g_visualGetVisualProxyForStructure)
                     {
-                        void* visualVtable = *reinterpret_cast<void**>(current.proxy);
-                        void* structureProxy = nullptr;
-                        void* structureProxyVtable = nullptr;
-                        if (IsDwmImageAddress(visualVtable, sizeof(void*)) &&
-                            g_visualGetVisualProxyForStructure)
+                        structureProxy =
+                            g_visualGetVisualProxyForStructure(current.proxy);
+                        if (IsReadableMemory(structureProxy, sizeof(void*)))
                         {
-                            structureProxy =
-                                g_visualGetVisualProxyForStructure(current.proxy);
-                            if (IsReadableMemory(structureProxy, sizeof(void*)))
+                            structureProxyVtable =
+                                *reinterpret_cast<void**>(structureProxy);
+                            if (structureProxyVtable ==
+                                g_redirectVisualProxyVtable.load(
+                                    std::memory_order_acquire))
                             {
-                                structureProxyVtable =
-                                    *reinterpret_cast<void**>(structureProxy);
+                                if (ObservedVisualProxy* proxyEntry =
+                                        FindObservedVisualProxy(structureProxy, false))
+                                {
+                                    redirectTarget = proxyEntry->redirectTarget.load(
+                                        std::memory_order_acquire);
+                                    if (IsReadableMemory(redirectTarget,
+                                                         sizeof(void*)))
+                                    {
+                                        redirectTargetVtable =
+                                            *reinterpret_cast<void**>(redirectTarget);
+                                    }
+                                }
                             }
                         }
-                        contentSamples[contentSampleCount++] = {
-                            current.proxy, visualVtable, content,
-                            *reinterpret_cast<void**>(content), structureProxy,
-                            structureProxyVtable, current.depth};
                     }
+                    void* contentVtable =
+                        IsReadableMemory(content, sizeof(void*))
+                            ? *reinterpret_cast<void**>(content)
+                            : nullptr;
+                    nodeSamples[nodeSampleCount++] = {
+                        current.proxy, visualVtable, content, contentVtable,
+                        structureProxy, structureProxyVtable, redirectTarget,
+                        redirectTargetVtable, current.depth};
                 }
                 MeshSourceKind kind = GetMeshSourceKind(content);
                 if (kind != MeshSourceKind::None)
@@ -3607,9 +3663,9 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
     }
 
     g_meshSourceProbeCompleted.store(true, std::memory_order_release);
-    for (unsigned int index = 0; index < contentSampleCount; index++)
+    for (unsigned int index = 0; index < nodeSampleCount; index++)
     {
-        const VisualContentSample& sample = contentSamples[index];
+        const VisualNodeSample& sample = nodeSamples[index];
         const wchar_t* proxyKind = L"Other";
         if (sample.proxyVtable ==
             g_visualProxyVtable.load(std::memory_order_acquire))
@@ -3626,12 +3682,13 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         {
             proxyKind = L"Container";
         }
-        Wh_Log(L"True 4x4 visual content[%u]: depth=%zu visual=%p "
+        Wh_Log(L"True 4x4 visual node[%u]: depth=%zu visual=%p "
                L"visualVtable=%p content=%p contentVtable=%p proxy=%p "
-               L"proxyVtable=%p proxyKind=%s",
+               L"proxyVtable=%p proxyKind=%s redirect=%p redirectVtable=%p",
                index, sample.depth, sample.visual, sample.visualVtable,
                sample.content, sample.contentVtable, sample.visualProxy,
-               sample.proxyVtable, proxyKind);
+               sample.proxyVtable, proxyKind, sample.redirectTarget,
+               sample.redirectTargetVtable);
     }
     if (result.source)
     {
@@ -8033,6 +8090,7 @@ BOOL Wh_ModInit()
         {
             table[index].content.store(nullptr, std::memory_order_relaxed);
             table[index].parent.store(nullptr, std::memory_order_relaxed);
+            table[index].redirectTarget.store(nullptr, std::memory_order_relaxed);
             table[index].proxy.store(nullptr, std::memory_order_relaxed);
         }
     };
