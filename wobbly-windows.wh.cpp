@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.132
+// @version         0.133
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -410,6 +410,7 @@ using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(void* geometryGroupProxy,
                                                        void** instruction);
 using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void* pThis,
                                                           void* instruction);
+using CRenderDataVisualUpdateRenderData_t = long(__cdecl*)(void* pThis);
 using CVisualProxySetContent_t = long(__cdecl*)(void* pThis,
                                                 const void* content);
 using CVisualProxyInsertChild_t = long(__cdecl*)(void* pThis, void* child,
@@ -434,6 +435,7 @@ CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
 CGeometry2dGroupProxyUpdate_t g_geometry2dGroupProxyUpdate = nullptr;
 CDrawMesh2DInstructionCreate_t g_drawMesh2DInstructionCreate = nullptr;
 CRenderDataVisualAddInstruction_t g_renderDataVisualAddInstruction = nullptr;
+CRenderDataVisualUpdateRenderData_t g_renderDataVisualUpdateRenderData = nullptr;
 CVisualProxySetContent_t g_visualProxySetContentOriginal = nullptr;
 CVisualProxyInsertChild_t g_visualProxyInsertChildOriginal = nullptr;
 CVisualProxyRemoveChild_t g_visualProxyRemoveChildOriginal = nullptr;
@@ -3032,6 +3034,11 @@ static bool InitializeDwmHooks()
          &g_renderDataVisualAddInstruction,
          nullptr,
          true},
+        {{L"public: virtual long __cdecl "
+           L"CRenderDataVisual::UpdateRenderData(void)"},
+         &g_renderDataVisualUpdateRenderData,
+         nullptr,
+         true},
         {{L"public: static long __cdecl CRenderDataVisual::Create("
            L"class CRenderDataVisual * *)"},
          &g_renderDataVisualCreate,
@@ -3219,6 +3226,7 @@ static bool InitializeDwmHooks()
     keepValid(g_geometry2dGroupProxyUpdate);
     keepValid(g_drawMesh2DInstructionCreate);
     keepValid(g_renderDataVisualAddInstruction);
+    keepValid(g_renderDataVisualUpdateRenderData);
     keepValid(g_renderDataVisualCreate);
     keepValid(g_createCachedVisualImageProxy);
     keepValid(g_cachedVisualImageProxyUpdate);
@@ -3297,7 +3305,8 @@ static bool InitializeDwmHooks()
            hasExactBitmapSourceProxyVtable ? L"available" : L"unavailable",
            hasExactVisualSurfaceProxyVtable ? L"available" : L"unavailable");
     Wh_Log(L"True 4x4 GPU source probe: cachedVisual=%s clientArea=%s "
-           L"create=%s update=%s meshInstruction=%s renderVisual=%s",
+           L"create=%s update=%s meshInstruction=%s renderVisual=%s "
+           L"publish=%s",
            hasExactCachedVisualImageProxyVtable ? L"available" : L"unavailable",
            hasExactClientAreaVtable ? L"available" : L"unavailable",
            g_createCachedVisualImageProxy ? L"available" : L"unavailable",
@@ -3305,7 +3314,8 @@ static bool InitializeDwmHooks()
            g_drawMesh2DInstructionCreate ? L"available" : L"unavailable",
            g_renderDataVisualCreate && g_renderDataVisualAddInstruction
                ? L"available"
-               : L"unavailable");
+               : L"unavailable",
+           g_renderDataVisualUpdateRenderData ? L"available" : L"unavailable");
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
@@ -3571,7 +3581,8 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
         g_createMeshGeometry2dProxy && g_meshGeometry2dProxyUpdate &&
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate &&
         g_drawMesh2DInstructionCreate && g_renderDataVisualCreate &&
-        g_renderDataVisualAddInstruction && g_visualSetParentOriginal &&
+        g_renderDataVisualAddInstruction && g_renderDataVisualUpdateRenderData &&
+        g_visualSetParentOriginal &&
         g_visualGetVisualProxyForStructure &&
         g_visualProxyRemoveChildOriginal && g_visualProxyInsertChildOriginal &&
         g_visualRemoveSelfFromParentOriginal &&
@@ -3686,6 +3697,11 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
             stage = L"AddInstruction";
             result =
                 g_renderDataVisualAddInstruction(renderVisual, instruction);
+        }
+        if (result >= 0 && renderVisual)
+        {
+            stage = L"PublishRenderData";
+            result = g_renderDataVisualUpdateRenderData(renderVisual);
         }
         if (result >= 0 && renderVisual)
         {
