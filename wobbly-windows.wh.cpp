@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.129
+// @version         0.130
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -795,6 +795,19 @@ std::atomic_bool g_nativeMeshCanarySucceeded = false;
 std::atomic_bool g_meshSourceProbePending = false;
 std::atomic_bool g_meshSourceProbeCompleted = false;
 std::atomic_bool g_cachedVisualImageCanaryCompleted = false;
+struct VisibleMeshCanaryState
+{
+    void* cachedVisual;
+    void* meshProxy;
+    void* groupProxy;
+    void* instruction;
+    void* renderVisual;
+    HWND hwnd;
+    ULONGLONG detachAt;
+};
+VisibleMeshCanaryState g_visibleMeshCanary = {};
+std::atomic_bool g_visibleMeshCanaryActive = false;
+std::atomic_bool g_visibleMeshCanaryCleanupRequested = false;
 static constexpr unsigned int OBSERVED_VISUAL_PROXY_COUNT = 4096;
 static constexpr unsigned int OBSERVED_VISUAL_PROXY_PROBES = 32;
 struct ObservedVisualProxy
@@ -833,7 +846,9 @@ static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
 static void RunNativeMeshCanary();
 static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwnd);
-static void RunCachedVisualImageCanary(void* clientVisualProxy, HWND hwnd);
+static void RunCachedVisualImageCanary(void* clientVisualProxy,
+                                       void* parentVisual, HWND hwnd);
+static void MaintainVisibleMeshCanary();
 static long __cdecl VisualProxySetContentHook(void* pThis, const void* content);
 static long __cdecl VisualProxyInsertChildHook(void* pThis, void* child,
                                                void* reference, bool insertAbove);
@@ -3524,9 +3539,10 @@ static MeshSourceKind GetMeshSourceKind(void* object)
     return MeshSourceKind::None;
 }
 
-static void RunCachedVisualImageCanary(void* clientVisualProxy, HWND hwnd)
+static void RunCachedVisualImageCanary(void* clientVisualProxy,
+                                       void* parentVisual, HWND hwnd)
 {
-    if (!IsOnDwmSceneThread() || !clientVisualProxy ||
+    if (!IsOnDwmSceneThread() || !clientVisualProxy || !parentVisual ||
         g_cachedVisualImageCanaryCompleted.exchange(true,
                                                      std::memory_order_acq_rel))
     {
@@ -3546,11 +3562,14 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy, HWND hwnd)
     double height = 0.0;
     if (IsDwmObjectPointerValid(compositor, g_compositorVtable) &&
         IsVisualProxyPointerValid(clientVisualProxy) && expectedVtable &&
+        IsReadableMemory(parentVisual, sizeof(void*)) &&
+        IsDwmImageAddress(*reinterpret_cast<void**>(parentVisual), sizeof(void*)) &&
         g_createCachedVisualImageProxy && g_cachedVisualImageProxyUpdate &&
         g_createMeshGeometry2dProxy && g_meshGeometry2dProxyUpdate &&
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate &&
         g_drawMesh2DInstructionCreate && g_renderDataVisualCreate &&
-        g_renderDataVisualAddInstruction &&
+        g_renderDataVisualAddInstruction && g_visualSetParentOriginal &&
+        g_visualRemoveSelfFromParentOriginal &&
         g_cBaseObjectRelease)
     {
         RECT clientRect = {};
@@ -3652,9 +3671,28 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy, HWND hwnd)
             result =
                 g_renderDataVisualAddInstruction(renderVisual, instruction);
         }
+        if (result >= 0 && renderVisual)
+        {
+            stage = L"Attach";
+            result = g_visualSetParentOriginal(renderVisual, parentVisual);
+        }
     }
     bool succeeded = result >= 0 && cachedVisual && meshProxy && groupProxy &&
                      instruction && renderVisual;
+    if (succeeded)
+    {
+        g_visibleMeshCanary = {cachedVisual, meshProxy, groupProxy, instruction,
+                               renderVisual, hwnd, GetTickCount64() + 5000};
+        cachedVisual = nullptr;
+        meshProxy = nullptr;
+        groupProxy = nullptr;
+        instruction = nullptr;
+        renderVisual = nullptr;
+        g_visibleMeshCanaryCleanupRequested.store(false,
+                                                   std::memory_order_release);
+        g_visibleMeshCanaryActive.store(true, std::memory_order_release);
+        RequestDwmScenePass();
+    }
     if (renderVisual && g_cBaseObjectRelease)
     {
         g_cBaseObjectRelease(renderVisual);
@@ -3675,11 +3713,61 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy, HWND hwnd)
     {
         g_cBaseObjectRelease(cachedVisual);
     }
-    Wh_Log(L"True 4x4 GPU mesh canary: %s stage=%s result=0x%08X "
+    Wh_Log(L"True 4x4 visible identity canary: %s stage=%s result=0x%08X "
            L"HWND=%p clientProxy=%p size=%.0fx%.0f",
-           succeeded ? L"passed" : L"failed", stage,
+           succeeded ? L"attached" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, clientVisualProxy,
            width, height);
+}
+
+static void MaintainVisibleMeshCanary()
+{
+    if (!IsOnDwmSceneThread() ||
+        !g_visibleMeshCanaryActive.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    bool detach = g_unloading.load(std::memory_order_acquire) ||
+                  g_visibleMeshCanaryCleanupRequested.load(
+                      std::memory_order_acquire) ||
+                  GetTickCount64() >= g_visibleMeshCanary.detachAt;
+    if (!detach)
+    {
+        RequestDwmScenePass();
+        return;
+    }
+    VisibleMeshCanaryState state = g_visibleMeshCanary;
+    g_visibleMeshCanary = {};
+    long detachResult = E_NOINTERFACE;
+    if (state.renderVisual && g_visualRemoveSelfFromParentOriginal)
+    {
+        detachResult = g_visualRemoveSelfFromParentOriginal(state.renderVisual);
+    }
+    if (state.renderVisual && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(state.renderVisual);
+    }
+    if (state.instruction && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(state.instruction);
+    }
+    if (state.groupProxy && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(state.groupProxy);
+    }
+    if (state.meshProxy && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(state.meshProxy);
+    }
+    if (state.cachedVisual && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(state.cachedVisual);
+    }
+    g_visibleMeshCanaryCleanupRequested.store(false,
+                                               std::memory_order_release);
+    g_visibleMeshCanaryActive.store(false, std::memory_order_release);
+    Wh_Log(L"True 4x4 visible identity canary: detached result=0x%08X HWND=%p",
+           static_cast<unsigned int>(detachResult), state.hwnd);
 }
 
 static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwnd)
@@ -3736,6 +3824,7 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
     struct VisualNodeSample
     {
         void* visual;
+        void* parentVisual;
         void* visualVtable;
         void* content;
         void* contentVtable;
@@ -3815,8 +3904,10 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                             ? *reinterpret_cast<void**>(content)
                             : nullptr;
                     nodeSamples[nodeSampleCount++] = {
-                        current.proxy, visualVtable, content, contentVtable,
-                        structureProxy, structureProxyVtable, redirectTarget,
+                        current.proxy,
+                        entry->parent.load(std::memory_order_acquire),
+                        visualVtable, content, contentVtable, structureProxy,
+                        structureProxyVtable, redirectTarget,
                         redirectTargetVtable, current.depth};
                 }
                 MeshSourceKind kind = GetMeshSourceKind(content);
@@ -3913,10 +4004,11 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         {
             proxyKind = L"Container";
         }
-        Wh_Log(L"True 4x4 visual node[%u]: depth=%zu visual=%p "
+        Wh_Log(L"True 4x4 visual node[%u]: depth=%zu visual=%p parent=%p "
                L"visualVtable=%p content=%p contentVtable=%p proxy=%p "
                L"proxyVtable=%p proxyKind=%s redirect=%p redirectVtable=%p",
-               index, sample.depth, sample.visual, sample.visualVtable,
+               index, sample.depth, sample.visual, sample.parentVisual,
+               sample.visualVtable,
                sample.content, sample.contentVtable, sample.visualProxy,
                sample.proxyVtable, proxyKind, sample.redirectTarget,
                sample.redirectTargetVtable);
@@ -3927,7 +4019,8 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
     {
         if (nodeSamples[index].visualVtable == clientAreaVtable)
         {
-            RunCachedVisualImageCanary(nodeSamples[index].visualProxy, hwnd);
+            RunCachedVisualImageCanary(nodeSamples[index].visualProxy,
+                                       nodeSamples[index].parentVisual, hwnd);
             break;
         }
     }
@@ -4332,6 +4425,7 @@ static void SubmitPendingWobblySceneWork()
     g_sceneWakeScheduled.store(false, std::memory_order_release);
     g_sceneWakePostTimestamp.store(0, std::memory_order_release);
     g_scenePassCounter.fetch_add(1, std::memory_order_release);
+    MaintainVisibleMeshCanary();
     // Restore retiring/quiet windows before discovery, creation or normal rendering.
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
@@ -4362,6 +4456,7 @@ static void SubmitPendingWobblySceneWork()
 static bool HasPendingWobblySceneWork()
 {
     return g_nativeMeshCanaryPending.load(std::memory_order_acquire) ||
+           g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
            g_sceneRequestedSerial.load(std::memory_order_acquire) >
                g_sceneSubmittedSerial.load(std::memory_order_acquire) ||
            g_existingWindowBackfillIndex.load(std::memory_order_acquire) <
@@ -6456,6 +6551,13 @@ static void StopAllAnimations()
         g_sceneRequestedSerial.fetch_add(1, std::memory_order_acq_rel);
         PostPendingDwmSceneWake(true);
     }
+    if (g_visibleMeshCanaryActive.load(std::memory_order_acquire))
+    {
+        g_visibleMeshCanaryCleanupRequested.store(true,
+                                                   std::memory_order_release);
+        g_sceneRequestedSerial.fetch_add(1, std::memory_order_acq_rel);
+        PostPendingDwmSceneWake(true);
+    }
     ULONGLONG hookWaitDeadline = GetTickCount64() + DWM_UNLOAD_CLEANUP_TIMEOUT_MS;
     bool cleanupTimedOut = false;
     for (;;)
@@ -6479,7 +6581,9 @@ static void StopAllAnimations()
         // Wakes carry only an instance token, not pointers; keep their counter
         // intact for late acknowledgments, but don't mistake them for resources.
         bool wakePending = g_sceneWakeOutstanding.load(std::memory_order_acquire) != 0;
-        if (!hookUsers && !retainedProxies)
+        bool visibleCanaryActive =
+            g_visibleMeshCanaryActive.load(std::memory_order_acquire);
+        if (!hookUsers && !retainedProxies && !visibleCanaryActive)
         {
             break;
         }
@@ -6493,7 +6597,7 @@ static void StopAllAnimations()
             break;
         }
         ULONGLONG lastWakePost = g_sceneWakePostTimestamp.load(std::memory_order_acquire);
-        if (retainedProxies &&
+        if ((retainedProxies || visibleCanaryActive) &&
             (!wakePending || !lastWakePost || now - lastWakePost >= 50))
         {
             PostPendingDwmSceneWake(true);
@@ -8326,6 +8430,10 @@ BOOL Wh_ModInit()
     g_meshSourceProbePending.store(false, std::memory_order_release);
     g_meshSourceProbeCompleted.store(false, std::memory_order_release);
     g_cachedVisualImageCanaryCompleted.store(false, std::memory_order_release);
+    g_visibleMeshCanary = {};
+    g_visibleMeshCanaryActive.store(false, std::memory_order_release);
+    g_visibleMeshCanaryCleanupRequested.store(false,
+                                               std::memory_order_release);
     auto resetObservedNodes = [](ObservedVisualProxy* table)
     {
         for (unsigned int index = 0; index < OBSERVED_VISUAL_PROXY_COUNT; index++)
@@ -8385,6 +8493,8 @@ void Wh_ModBeforeUninit()
     g_unloading.store(true, std::memory_order_release);
     g_nativeMeshCanaryPending.store(false, std::memory_order_release);
     g_meshSourceProbePending.store(false, std::memory_order_release);
+    g_visibleMeshCanaryCleanupRequested.store(true,
+                                               std::memory_order_release);
     Wh_Log(L"Preparing to unload");
     // Restore scene resources before Windhawk removes the hooks.
     StopWindowEventThread();
