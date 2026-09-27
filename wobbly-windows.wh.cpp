@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.125
+// @version         0.126
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -406,6 +406,7 @@ using CVisualProxyRemoveChild_t = long(__cdecl*)(void* pThis, void* child);
 using CVisualSetContent_t = long(__cdecl*)(void* pThis, void* content);
 using CVisualSetParent_t = long(__cdecl*)(void* pThis, void* parent);
 using CVisualRemoveSelfFromParent_t = long(__cdecl*)(void* pThis);
+using CVisualGetVisualProxyForStructure_t = void*(__cdecl*)(void* pThis);
 CMeshGeometry2dProxyUpdate_t g_meshGeometry2dProxyUpdate = nullptr;
 CCompositorCreateMeshGeometry2dProxy_t g_createMeshGeometry2dProxy = nullptr;
 CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
@@ -418,6 +419,7 @@ CVisualProxyRemoveChild_t g_visualProxyRemoveChildOriginal = nullptr;
 CVisualSetContent_t g_visualSetContentOriginal = nullptr;
 CVisualSetParent_t g_visualSetParentOriginal = nullptr;
 CVisualRemoveSelfFromParent_t g_visualRemoveSelfFromParentOriginal = nullptr;
+CVisualGetVisualProxyForStructure_t g_visualGetVisualProxyForStructure = nullptr;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
@@ -2978,6 +2980,11 @@ static bool InitializeDwmHooks()
          &g_visualRemoveSelfFromParentOriginal,
          VisualRemoveSelfFromParentHook,
          true},
+        {{L"public: virtual class CVisualProxy * __cdecl "
+           L"CVisual::GetVisualProxyForStructure(void)"},
+         &g_visualGetVisualProxyForStructure,
+         nullptr,
+         true},
         {{L"public: unsigned long __cdecl CBaseObject::Release(void)"},
          &g_cBaseObjectRelease,
          nullptr,
@@ -3118,11 +3125,13 @@ static bool InitializeDwmHooks()
     keepValid(g_visualSetContentOriginal);
     keepValid(g_visualSetParentOriginal);
     keepValid(g_visualRemoveSelfFromParentOriginal);
+    keepValid(g_visualGetVisualProxyForStructure);
     Wh_Log(L"True 4x4 observation hooks: proxyContent=%p proxyInsert=%p "
-           L"visualContent=%p visualParent=%p visualRemove=%p",
+           L"visualContent=%p visualParent=%p visualRemove=%p getProxy=%p",
            g_visualProxySetContentOriginal, g_visualProxyInsertChildOriginal,
            g_visualSetContentOriginal, g_visualSetParentOriginal,
-           g_visualRemoveSelfFromParentOriginal);
+           g_visualRemoveSelfFromParentOriginal,
+           g_visualGetVisualProxyForStructure);
     bool hasNativeMeshGeometry =
         g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate;
@@ -3461,6 +3470,17 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         void* firstContent;
         void* firstVtable;
     } visualStats = {}, proxyStats = {};
+    struct VisualContentSample
+    {
+        void* visual;
+        void* visualVtable;
+        void* content;
+        void* contentVtable;
+        void* visualProxy;
+        void* proxyVtable;
+        size_t depth;
+    } contentSamples[16] = {};
+    unsigned int contentSampleCount = 0;
     auto scanObservedTree = [&](ObservedVisualProxy* table, void* treeRoot,
                                 const wchar_t* owner, TreeStats& stats)
     {
@@ -3486,6 +3506,30 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                     {
                         stats.firstContent = content;
                         stats.firstVtable = *reinterpret_cast<void**>(content);
+                    }
+                    if (table == g_observedVisuals &&
+                        contentSampleCount < ARRAYSIZE(contentSamples) &&
+                        IsReadableMemory(current.proxy, sizeof(void*)) &&
+                        IsReadableMemory(content, sizeof(void*)))
+                    {
+                        void* visualVtable = *reinterpret_cast<void**>(current.proxy);
+                        void* structureProxy = nullptr;
+                        void* structureProxyVtable = nullptr;
+                        if (IsDwmImageAddress(visualVtable, sizeof(void*)) &&
+                            g_visualGetVisualProxyForStructure)
+                        {
+                            structureProxy =
+                                g_visualGetVisualProxyForStructure(current.proxy);
+                            if (IsReadableMemory(structureProxy, sizeof(void*)))
+                            {
+                                structureProxyVtable =
+                                    *reinterpret_cast<void**>(structureProxy);
+                            }
+                        }
+                        contentSamples[contentSampleCount++] = {
+                            current.proxy, visualVtable, content,
+                            *reinterpret_cast<void**>(content), structureProxy,
+                            structureProxyVtable, current.depth};
                     }
                 }
                 MeshSourceKind kind = GetMeshSourceKind(content);
@@ -3563,6 +3607,32 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
     }
 
     g_meshSourceProbeCompleted.store(true, std::memory_order_release);
+    for (unsigned int index = 0; index < contentSampleCount; index++)
+    {
+        const VisualContentSample& sample = contentSamples[index];
+        const wchar_t* proxyKind = L"Other";
+        if (sample.proxyVtable ==
+            g_visualProxyVtable.load(std::memory_order_acquire))
+        {
+            proxyKind = L"Visual";
+        }
+        else if (sample.proxyVtable ==
+                 g_redirectVisualProxyVtable.load(std::memory_order_acquire))
+        {
+            proxyKind = L"Redirect";
+        }
+        else if (sample.proxyVtable ==
+                 g_containerVisualProxyVtable.load(std::memory_order_acquire))
+        {
+            proxyKind = L"Container";
+        }
+        Wh_Log(L"True 4x4 visual content[%u]: depth=%zu visual=%p "
+               L"visualVtable=%p content=%p contentVtable=%p proxy=%p "
+               L"proxyVtable=%p proxyKind=%s",
+               index, sample.depth, sample.visual, sample.visualVtable,
+               sample.content, sample.contentVtable, sample.visualProxy,
+               sample.proxyVtable, proxyKind);
+    }
     if (result.source)
     {
         Wh_Log(L"True 4x4 source probe: found kind=%s HWND=%p source=%p "
