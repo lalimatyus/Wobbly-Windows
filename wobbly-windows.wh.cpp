@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.127
+// @version         0.128
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -384,6 +384,18 @@ struct D2DPoint2F
     float x;
     float y;
 };
+struct MilRectF
+{
+    float left;
+    float top;
+    float right;
+    float bottom;
+};
+struct MilSizeD
+{
+    double width;
+    double height;
+};
 using CMeshGeometry2dProxyUpdate_t = long(__cdecl*)(
     void* pThis, int mode, const D2DPoint3F* positions,
     const D2DPoint2F* textureCoordinates, unsigned int vertexCount,
@@ -409,6 +421,12 @@ using CVisualRemoveSelfFromParent_t = long(__cdecl*)(void* pThis);
 using CVisualGetVisualProxyForStructure_t = void*(__cdecl*)(void* pThis);
 using CRedirectVisualProxySetRedirectedVisual_t = long(__cdecl*)(void* pThis,
                                                                  void* visual);
+using CCompositorCreateCachedVisualImageProxy_t = long(__cdecl*)(void* pThis,
+                                                                  void** proxy);
+using CCachedVisualImageProxyUpdate_t = long(__cdecl*)(
+    void* pThis, const MilRectF& sourceRect, const MilSizeD& size,
+    const void* rectAnimation, const void* sizeAnimation, void* visualProxy,
+    int mappingMode);
 CMeshGeometry2dProxyUpdate_t g_meshGeometry2dProxyUpdate = nullptr;
 CCompositorCreateMeshGeometry2dProxy_t g_createMeshGeometry2dProxy = nullptr;
 CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
@@ -424,6 +442,9 @@ CVisualRemoveSelfFromParent_t g_visualRemoveSelfFromParentOriginal = nullptr;
 CVisualGetVisualProxyForStructure_t g_visualGetVisualProxyForStructure = nullptr;
 CRedirectVisualProxySetRedirectedVisual_t
     g_redirectVisualProxySetRedirectedVisualOriginal = nullptr;
+CCompositorCreateCachedVisualImageProxy_t
+    g_createCachedVisualImageProxy = nullptr;
+CCachedVisualImageProxyUpdate_t g_cachedVisualImageProxyUpdate = nullptr;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
@@ -464,6 +485,8 @@ std::atomic<void*> g_containerVisualProxyVtable = nullptr;
 std::atomic<void*> g_matrixTransformProxyVtable = nullptr;
 std::atomic<void*> g_bitmapSourceProxyVtable = nullptr;
 std::atomic<void*> g_visualSurfaceProxyVtable = nullptr;
+std::atomic<void*> g_cachedVisualImageProxyVtable = nullptr;
+std::atomic<void*> g_clientAreaVtable = nullptr;
 std::atomic<void*> g_dwmCompositor = nullptr;
 std::atomic<void*> g_desktopManager = nullptr;
 void* g_desktopManagerVtableSymbol = nullptr;
@@ -477,6 +500,8 @@ void* g_containerVisualProxyVtableSymbol = nullptr;
 void* g_matrixTransformProxyVtableSymbol = nullptr;
 void* g_bitmapSourceProxyVtableSymbol = nullptr;
 void* g_visualSurfaceProxyVtableSymbol = nullptr;
+void* g_cachedVisualImageProxyVtableSymbol = nullptr;
+void* g_clientAreaVtableSymbol = nullptr;
 size_t g_desktopManagerCompositorOffset = SIZE_MAX;
 size_t g_desktopManagerThreadIdOffset = SIZE_MAX;
 size_t g_canvasVisualOwnerOffset = SIZE_MAX;
@@ -767,6 +792,7 @@ std::atomic_bool g_nativeMeshCanaryPending = false;
 std::atomic_bool g_nativeMeshCanarySucceeded = false;
 std::atomic_bool g_meshSourceProbePending = false;
 std::atomic_bool g_meshSourceProbeCompleted = false;
+std::atomic_bool g_cachedVisualImageCanaryCompleted = false;
 static constexpr unsigned int OBSERVED_VISUAL_PROXY_COUNT = 4096;
 static constexpr unsigned int OBSERVED_VISUAL_PROXY_PROBES = 32;
 struct ObservedVisualProxy
@@ -805,6 +831,7 @@ static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
 static void RunNativeMeshCanary();
 static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwnd);
+static void RunCachedVisualImageCanary(void* clientVisualProxy, HWND hwnd);
 static long __cdecl VisualProxySetContentHook(void* pThis, const void* content);
 static long __cdecl VisualProxyInsertChildHook(void* pThis, void* child,
                                                void* reference, bool insertAbove);
@@ -2958,6 +2985,20 @@ static bool InitializeDwmHooks()
          &g_createGeometry2dGroupProxy,
          nullptr,
          true},
+        {{L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CCachedVisualImageProxy>("
+           L"class CCachedVisualImageProxy * *)"},
+         &g_createCachedVisualImageProxy,
+         nullptr,
+         true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Update("
+           L"struct MilRectF const &,struct MilSizeD const &,"
+           L"class CRectResourceProxy const *,"
+           L"class CSizeResourceProxy const *,class CVisualProxy *,"
+           L"enum MilBrushMappingMode::Enum)"},
+         &g_cachedVisualImageProxyUpdate,
+         nullptr,
+         true},
         {{L"public: long __cdecl CGeometry2dGroupProxy::Update("
            L"class CMeshGeometry2dProxy const *)"},
          &g_geometry2dGroupProxyUpdate,
@@ -3119,6 +3160,14 @@ static bool InitializeDwmHooks()
         {{L"const CVisualSurfaceProxy::`vftable'"},
          &g_visualSurfaceProxyVtableSymbol,
          nullptr,
+         true},
+        {{L"const CCachedVisualImageProxy::`vftable'"},
+         &g_cachedVisualImageProxyVtableSymbol,
+         nullptr,
+         true},
+        {{L"const CClientArea::`vftable'"},
+         &g_clientAreaVtableSymbol,
+         nullptr,
          true}};
     if (!WindhawkUtils::HookSymbols(udwm, udwmDllHooks, ARRAYSIZE(udwmDllHooks)))
     {
@@ -3148,6 +3197,8 @@ static bool InitializeDwmHooks()
     keepValid(g_geometry2dGroupProxyUpdate);
     keepValid(g_drawMesh2DInstructionCreate);
     keepValid(g_renderDataVisualAddInstruction);
+    keepValid(g_createCachedVisualImageProxy);
+    keepValid(g_cachedVisualImageProxyUpdate);
     keepValid(g_visualProxySetContentOriginal);
     keepValid(g_visualProxyInsertChildOriginal);
     keepValid(g_visualProxyRemoveChildOriginal);
@@ -3215,9 +3266,19 @@ static bool InitializeDwmHooks()
         cacheVtableSymbol(g_bitmapSourceProxyVtableSymbol, g_bitmapSourceProxyVtable);
     bool hasExactVisualSurfaceProxyVtable =
         cacheVtableSymbol(g_visualSurfaceProxyVtableSymbol, g_visualSurfaceProxyVtable);
+    bool hasExactCachedVisualImageProxyVtable = cacheVtableSymbol(
+        g_cachedVisualImageProxyVtableSymbol, g_cachedVisualImageProxyVtable);
+    bool hasExactClientAreaVtable =
+        cacheVtableSymbol(g_clientAreaVtableSymbol, g_clientAreaVtable);
     Wh_Log(L"True 4x4 source probe: bitmap=%s visualSurface=%s",
            hasExactBitmapSourceProxyVtable ? L"available" : L"unavailable",
            hasExactVisualSurfaceProxyVtable ? L"available" : L"unavailable");
+    Wh_Log(L"True 4x4 GPU source probe: cachedVisual=%s clientArea=%s "
+           L"create=%s update=%s",
+           hasExactCachedVisualImageProxyVtable ? L"available" : L"unavailable",
+           hasExactClientAreaVtable ? L"available" : L"unavailable",
+           g_createCachedVisualImageProxy ? L"available" : L"unavailable",
+           g_cachedVisualImageProxyUpdate ? L"available" : L"unavailable");
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
@@ -3449,6 +3510,68 @@ static MeshSourceKind GetMeshSourceKind(void* object)
         return MeshSourceKind::VisualSurface;
     }
     return MeshSourceKind::None;
+}
+
+static void RunCachedVisualImageCanary(void* clientVisualProxy, HWND hwnd)
+{
+    if (!IsOnDwmSceneThread() || !clientVisualProxy ||
+        g_cachedVisualImageCanaryCompleted.exchange(true,
+                                                     std::memory_order_acq_rel))
+    {
+        return;
+    }
+    void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
+    void* expectedVtable =
+        g_cachedVisualImageProxyVtable.load(std::memory_order_acquire);
+    long result = E_NOINTERFACE;
+    const wchar_t* stage = L"Prerequisites";
+    void* cachedVisual = nullptr;
+    double width = 0.0;
+    double height = 0.0;
+    if (IsDwmObjectPointerValid(compositor, g_compositorVtable) &&
+        IsVisualProxyPointerValid(clientVisualProxy) && expectedVtable &&
+        g_createCachedVisualImageProxy && g_cachedVisualImageProxyUpdate &&
+        g_cBaseObjectRelease)
+    {
+        RECT clientRect = {};
+        if (!GetClientRect(hwnd, &clientRect) || clientRect.right <= clientRect.left ||
+            clientRect.bottom <= clientRect.top)
+        {
+            GetWindowRect(hwnd, &clientRect);
+        }
+        width = static_cast<double>(clientRect.right - clientRect.left);
+        height = static_cast<double>(clientRect.bottom - clientRect.top);
+        MilRectF sourceRect = {0.0f, 0.0f, static_cast<float>(width),
+                               static_cast<float>(height)};
+        MilSizeD size = {width, height};
+        stage = L"Create";
+        result = g_createCachedVisualImageProxy(compositor, &cachedVisual);
+        if (result >= 0 && cachedVisual &&
+            IsReadableMemory(cachedVisual, sizeof(void*)) &&
+            *reinterpret_cast<void**>(cachedVisual) != expectedVtable)
+        {
+            stage = L"Vtable";
+            result = E_NOINTERFACE;
+        }
+        if (result >= 0 && cachedVisual)
+        {
+            stage = L"Update";
+            constexpr int absoluteMappingMode = 0;
+            result = g_cachedVisualImageProxyUpdate(
+                cachedVisual, sourceRect, size, nullptr, nullptr,
+                clientVisualProxy, absoluteMappingMode);
+        }
+    }
+    bool succeeded = result >= 0 && cachedVisual;
+    if (cachedVisual && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(cachedVisual);
+    }
+    Wh_Log(L"True 4x4 GPU source canary: %s stage=%s result=0x%08X "
+           L"HWND=%p clientProxy=%p size=%.0fx%.0f",
+           succeeded ? L"passed" : L"failed", stage,
+           static_cast<unsigned int>(result), hwnd, clientVisualProxy,
+           width, height);
 }
 
 static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwnd)
@@ -3689,6 +3812,16 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                sample.content, sample.contentVtable, sample.visualProxy,
                sample.proxyVtable, proxyKind, sample.redirectTarget,
                sample.redirectTargetVtable);
+    }
+    void* clientAreaVtable = g_clientAreaVtable.load(std::memory_order_acquire);
+    for (unsigned int index = 0;
+         clientAreaVtable && index < nodeSampleCount; index++)
+    {
+        if (nodeSamples[index].visualVtable == clientAreaVtable)
+        {
+            RunCachedVisualImageCanary(nodeSamples[index].visualProxy, hwnd);
+            break;
+        }
     }
     if (result.source)
     {
@@ -8084,6 +8217,7 @@ BOOL Wh_ModInit()
     g_nativeMeshCanarySucceeded.store(false, std::memory_order_release);
     g_meshSourceProbePending.store(false, std::memory_order_release);
     g_meshSourceProbeCompleted.store(false, std::memory_order_release);
+    g_cachedVisualImageCanaryCompleted.store(false, std::memory_order_release);
     auto resetObservedNodes = [](ObservedVisualProxy* table)
     {
         for (unsigned int index = 0; index < OBSERVED_VISUAL_PROXY_COUNT; index++)
