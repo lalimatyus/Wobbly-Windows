@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.142
+// @version         0.143
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -427,6 +427,7 @@ using CVisualProxyRemoveChild_t = long(__cdecl*)(void* pThis, void* child);
 using CVisualSetContent_t = long(__cdecl*)(void* pThis, void* content);
 using CVisualSetParent_t = long(__cdecl*)(void* pThis, void* parent);
 using CVisualRemoveSelfFromParent_t = long(__cdecl*)(void* pThis);
+using CVisualGetTransformParent_t = void*(__cdecl*)(void* pThis);
 using CVisualGetVisualProxyForStructure_t = void*(__cdecl*)(void* pThis);
 using CRedirectVisualProxySetRedirectedVisual_t = long(__cdecl*)(void* pThis,
                                                                  void* visual);
@@ -456,6 +457,7 @@ CVisualProxyRemoveChild_t g_visualProxyRemoveChildOriginal = nullptr;
 CVisualSetContent_t g_visualSetContentOriginal = nullptr;
 CVisualSetParent_t g_visualSetParentOriginal = nullptr;
 CVisualRemoveSelfFromParent_t g_visualRemoveSelfFromParentOriginal = nullptr;
+CVisualGetTransformParent_t g_visualGetTransformParent = nullptr;
 CVisualGetVisualProxyForStructure_t g_visualGetVisualProxyForStructure = nullptr;
 CRedirectVisualProxySetRedirectedVisual_t
     g_redirectVisualProxySetRedirectedVisualOriginal = nullptr;
@@ -3275,6 +3277,11 @@ static bool InitializeDwmHooks()
          &g_visualRemoveSelfFromParentOriginal,
          VisualRemoveSelfFromParentHook,
          true},
+        {{L"public: virtual class CVisual * __cdecl "
+           L"CVisual::GetTransformParent(void)const"},
+         &g_visualGetTransformParent,
+         nullptr,
+         true},
         {{L"public: virtual class CVisualProxy * __cdecl "
            L"CVisual::GetVisualProxyForStructure(void)"},
          &g_visualGetVisualProxyForStructure,
@@ -3437,13 +3444,15 @@ static bool InitializeDwmHooks()
     keepValid(g_visualSetContentOriginal);
     keepValid(g_visualSetParentOriginal);
     keepValid(g_visualRemoveSelfFromParentOriginal);
+    keepValid(g_visualGetTransformParent);
     keepValid(g_visualGetVisualProxyForStructure);
     Wh_Log(L"True 4x4 observation hooks: proxyContent=%p proxyInsert=%p "
-           L"visualContent=%p visualParent=%p visualRemove=%p getProxy=%p "
-           L"redirect=%p",
+           L"visualContent=%p visualParent=%p visualRemove=%p getParent=%p "
+           L"getProxy=%p redirect=%p",
            g_visualProxySetContentOriginal, g_visualProxyInsertChildOriginal,
            g_visualSetContentOriginal, g_visualSetParentOriginal,
            g_visualRemoveSelfFromParentOriginal,
+           g_visualGetTransformParent,
            g_visualGetVisualProxyForStructure,
            g_redirectVisualProxySetRedirectedVisualOriginal);
     bool hasNativeMeshGeometry =
@@ -4419,6 +4428,7 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         MeshSourceKind kind = GetMeshSourceKind(imageProxy);
         int matchedVisualNode = -1;
         unsigned int ancestryDepth = 0;
+        unsigned int nativeParentHops = 0;
         void* currentVisual = renderVisual;
         void* immediateParent = nullptr;
         while (currentVisual && ancestryDepth < 16)
@@ -4441,6 +4451,12 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                                ? visualObservation->parent.load(
                                      std::memory_order_acquire)
                                : nullptr;
+            if (!parent && g_visualGetTransformParent &&
+                IsReadableMemory(currentVisual, sizeof(void*)))
+            {
+                parent = g_visualGetTransformParent(currentVisual);
+                nativeParentHops++;
+            }
             if (ancestryDepth == 0)
             {
                 immediateParent = parent;
@@ -4457,10 +4473,10 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
             observedDrawBitmapSources++;
         }
         Wh_Log(L"True 4x4 observed image source[%u]: targetNode=%d "
-               L"ancestryDepth=%u visual=%p parent=%p instruction=%p "
-               L"image=%p imageVtable=%p kind=%s",
+               L"ancestryDepth=%u nativeParentHops=%u visual=%p parent=%p "
+               L"instruction=%p image=%p imageVtable=%p kind=%s",
                observedImageEntries - 1, matchedVisualNode, ancestryDepth,
-               renderVisual, immediateParent,
+               nativeParentHops, renderVisual, immediateParent,
                observed.instruction.load(std::memory_order_acquire), imageProxy,
                imageVtable,
                kind == MeshSourceKind::VisualSurface
