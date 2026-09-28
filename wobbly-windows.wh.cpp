@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.134
+// @version         0.135
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -430,6 +430,9 @@ using CCachedVisualImageProxyUpdate_t = long(__cdecl*)(
     void* pThis, const MilRectF& sourceRect, const MilSizeD& size,
     const void* rectAnimation, const void* sizeAnimation, void* visualProxy,
     int mappingMode);
+using CCachedVisualImageProxySnapshot_t = long(__cdecl*)(
+    void* pThis, const RECT& sourceRect);
+using CCachedVisualImageProxyFreeze_t = long(__cdecl*)(void* pThis);
 using CRenderDataVisualCreate_t = long(__cdecl*)(void** visual);
 CMeshGeometry2dProxyUpdate_t g_meshGeometry2dProxyUpdate = nullptr;
 CCompositorCreateMeshGeometry2dProxy_t g_createMeshGeometry2dProxy = nullptr;
@@ -450,6 +453,8 @@ CRedirectVisualProxySetRedirectedVisual_t
 CCompositorCreateCachedVisualImageProxy_t
     g_createCachedVisualImageProxy = nullptr;
 CCachedVisualImageProxyUpdate_t g_cachedVisualImageProxyUpdate = nullptr;
+CCachedVisualImageProxySnapshot_t g_cachedVisualImageProxySnapshot = nullptr;
+CCachedVisualImageProxyFreeze_t g_cachedVisualImageProxyFreeze = nullptr;
 CRenderDataVisualCreate_t g_renderDataVisualCreate = nullptr;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
@@ -3020,6 +3025,15 @@ static bool InitializeDwmHooks()
          &g_cachedVisualImageProxyUpdate,
          nullptr,
          true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Snapshot("
+           L"struct tagRECT const &)"},
+         &g_cachedVisualImageProxySnapshot,
+         nullptr,
+         true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Freeze(void)"},
+         &g_cachedVisualImageProxyFreeze,
+         nullptr,
+         true},
         {{L"public: long __cdecl CGeometry2dGroupProxy::Update("
            L"class CMeshGeometry2dProxy const *)"},
          &g_geometry2dGroupProxyUpdate,
@@ -3232,6 +3246,8 @@ static bool InitializeDwmHooks()
     keepValid(g_renderDataVisualCreate);
     keepValid(g_createCachedVisualImageProxy);
     keepValid(g_cachedVisualImageProxyUpdate);
+    keepValid(g_cachedVisualImageProxySnapshot);
+    keepValid(g_cachedVisualImageProxyFreeze);
     keepValid(g_visualProxySetContentOriginal);
     keepValid(g_visualProxyInsertChildOriginal);
     keepValid(g_visualProxyRemoveChildOriginal);
@@ -3307,12 +3323,14 @@ static bool InitializeDwmHooks()
            hasExactBitmapSourceProxyVtable ? L"available" : L"unavailable",
            hasExactVisualSurfaceProxyVtable ? L"available" : L"unavailable");
     Wh_Log(L"True 4x4 GPU source probe: cachedVisual=%s clientArea=%s "
-           L"create=%s update=%s meshInstruction=%s renderVisual=%s "
-           L"publish=%s",
+           L"create=%s update=%s snapshot=%s freeze=%s "
+           L"meshInstruction=%s renderVisual=%s publish=%s",
            hasExactCachedVisualImageProxyVtable ? L"available" : L"unavailable",
            hasExactClientAreaVtable ? L"available" : L"unavailable",
            g_createCachedVisualImageProxy ? L"available" : L"unavailable",
            g_cachedVisualImageProxyUpdate ? L"available" : L"unavailable",
+           g_cachedVisualImageProxySnapshot ? L"available" : L"unavailable",
+           g_cachedVisualImageProxyFreeze ? L"available" : L"unavailable",
            g_drawMesh2DInstructionCreate ? L"available" : L"unavailable",
            g_renderDataVisualCreate && g_renderDataVisualAddInstruction
                ? L"available"
@@ -3580,6 +3598,7 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
         IsReadableMemory(parentVisual, sizeof(void*)) &&
         IsDwmImageAddress(*reinterpret_cast<void**>(parentVisual), sizeof(void*)) &&
         g_createCachedVisualImageProxy && g_cachedVisualImageProxyUpdate &&
+        g_cachedVisualImageProxySnapshot && g_cachedVisualImageProxyFreeze &&
         g_createMeshGeometry2dProxy && g_meshGeometry2dProxyUpdate &&
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate &&
         g_drawMesh2DInstructionCreate && g_renderDataVisualCreate &&
@@ -3618,6 +3637,19 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
                 cachedVisual, sourceRect, size, nullptr, nullptr,
                 clientVisualProxy, absoluteMappingMode);
         }
+        RECT snapshotRect = {0, 0, static_cast<LONG>(width),
+                             static_cast<LONG>(height)};
+        if (result >= 0 && cachedVisual)
+        {
+            stage = L"Snapshot";
+            result =
+                g_cachedVisualImageProxySnapshot(cachedVisual, snapshotRect);
+        }
+        if (result >= 0 && cachedVisual)
+        {
+            stage = L"Freeze";
+            result = g_cachedVisualImageProxyFreeze(cachedVisual);
+        }
         D2DPoint3F positions[GRID_POINT_COUNT] = {};
         MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
         unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
@@ -3638,8 +3670,8 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
                     // window positioning and clipping behavior.
                     float horizontalDirection = y == 1 ? 1.0f : -1.0f;
                     float verticalDirection = x == 1 ? -1.0f : 1.0f;
-                    positions[index].x += horizontalDirection * 24.0f;
-                    positions[index].y += verticalDirection * 16.0f;
+                    positions[index].x += horizontalDirection * 96.0f;
+                    positions[index].y += verticalDirection * 64.0f;
                 }
                 textureCoordinates[index] = {tx, ty};
             }
@@ -3792,13 +3824,14 @@ static void MaintainVisibleMeshCanary()
     {
         return;
     }
-    bool detach = g_unloading.load(std::memory_order_acquire) ||
+    bool forced = g_unloading.load(std::memory_order_acquire) ||
                   g_visibleMeshCanaryCleanupRequested.load(
-                      std::memory_order_acquire) ||
-                  GetTickCount64() >= g_visibleMeshCanary.detachAt;
+                      std::memory_order_acquire);
+    bool detach = forced ||
+                  (!g_realDragging.load(std::memory_order_acquire) &&
+                   GetTickCount64() >= g_visibleMeshCanary.detachAt);
     if (!detach)
     {
-        RequestDwmScenePass();
         return;
     }
     VisibleMeshCanaryState state = g_visibleMeshCanary;
