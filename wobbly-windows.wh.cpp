@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.137
+// @version         0.138
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4120,14 +4120,83 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                sample.proxyVtable, proxyKind, sample.redirectTarget,
                sample.redirectTargetVtable);
     }
-    if (rootVisual && visualProxy)
+    unsigned int nativeSourceCandidates = 0;
+    for (unsigned int visualIndex = 0;
+         visualIndex < nodeSampleCount && nativeSourceCandidates < 8;
+         visualIndex++)
     {
-        // Snapshot and freeze the complete root before adding the mesh as its
-        // topmost child. The frozen source cannot recursively capture the new
-        // child, while the child inherits the window's native transforms.
-        RunCachedVisualImageCanary(visualProxy, rootVisual, nullptr, hwnd,
-                                   true);
+        void* rootContent = nodeSamples[visualIndex].content;
+        if (!rootContent)
+        {
+            continue;
+        }
+        struct ResourceNode
+        {
+            void* object;
+            unsigned int depth;
+            size_t parentOffset;
+        } queue[128] = {{rootContent, 0, SIZE_MAX}};
+        unsigned int queueRead = 0;
+        unsigned int queueCount = 1;
+        while (queueRead < queueCount && nativeSourceCandidates < 8)
+        {
+            ResourceNode current = queue[queueRead++];
+            MeshSourceKind kind = GetMeshSourceKind(current.object);
+            if (kind != MeshSourceKind::None)
+            {
+                nativeSourceCandidates++;
+                Wh_Log(L"True 4x4 native render source[%u]: kind=%s "
+                       L"visualNode=%u depth=%u parentOffset=0x%zx "
+                       L"source=%p vtable=%p",
+                       nativeSourceCandidates - 1,
+                       kind == MeshSourceKind::VisualSurface
+                           ? L"VisualSurface"
+                           : L"BitmapSource",
+                       visualIndex, current.depth, current.parentOffset,
+                       current.object,
+                       *reinterpret_cast<void**>(current.object));
+                if (!result.source)
+                {
+                    result = {current.object, L"RenderContentGraph",
+                              visualIndex, current.parentOffset, kind};
+                }
+                continue;
+            }
+            if (current.depth >= 2)
+            {
+                continue;
+            }
+            for (size_t offset = sizeof(void*); offset < 0x200;
+                 offset += sizeof(void*))
+            {
+                void* child = ReadPointerMember(current.object, offset);
+                if (!child || child == current.object ||
+                    IsDwmImageAddress(child, sizeof(void*)) ||
+                    !IsReadableMemory(child, sizeof(void*)))
+                {
+                    continue;
+                }
+                void* childVtable = *reinterpret_cast<void**>(child);
+                if (!IsDwmImageAddress(childVtable, sizeof(void*)))
+                {
+                    continue;
+                }
+                bool duplicate = false;
+                for (unsigned int i = 0; i < queueCount; i++)
+                {
+                    duplicate |= queue[i].object == child;
+                }
+                if (!duplicate && queueCount < ARRAYSIZE(queue))
+                {
+                    queue[queueCount++] = {child, current.depth + 1,
+                                           offset};
+                }
+            }
+        }
     }
+    Wh_Log(L"True 4x4 native render source probe: HWND=%p candidates=%u "
+           L"visualNodes=%u (read-only, no mesh attached)",
+           hwnd, nativeSourceCandidates, nodeSampleCount);
     if (result.source)
     {
         Wh_Log(L"True 4x4 source probe: found kind=%s HWND=%p source=%p "
