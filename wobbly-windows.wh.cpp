@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.140
+// @version         0.141
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -413,6 +413,9 @@ using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(void* geometryGroupProxy,
                                                        void** instruction);
 using CDrawBitmapInstructionCreate_t = long(__cdecl*)(void* imageProxy,
                                                        void** instruction);
+using CDrawTileImageInstructionCreate_t = long(__cdecl*)(
+    void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
+    float opacity, void** instruction);
 using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void* pThis,
                                                           void* instruction);
 using CRenderDataVisualUpdateRenderData_t = long(__cdecl*)(void* pThis);
@@ -443,6 +446,8 @@ CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
 CGeometry2dGroupProxyUpdate_t g_geometry2dGroupProxyUpdate = nullptr;
 CDrawMesh2DInstructionCreate_t g_drawMesh2DInstructionCreate = nullptr;
 CDrawBitmapInstructionCreate_t g_drawBitmapInstructionCreateOriginal = nullptr;
+CDrawTileImageInstructionCreate_t g_drawTileImageInstructionCreateOriginal =
+    nullptr;
 CRenderDataVisualAddInstruction_t g_renderDataVisualAddInstruction = nullptr;
 CRenderDataVisualUpdateRenderData_t g_renderDataVisualUpdateRenderData = nullptr;
 CVisualProxySetContent_t g_visualProxySetContentOriginal = nullptr;
@@ -847,7 +852,8 @@ ObservedBitmapInstruction
     g_observedBitmapInstructions[OBSERVED_VISUAL_PROXY_COUNT] = {};
 ObservedRenderImage g_observedRenderImages[OBSERVED_VISUAL_PROXY_COUNT] = {};
 std::atomic<unsigned int> g_observedDrawBitmapCreateCount = 0;
-std::atomic<unsigned int> g_observedDrawBitmapMatchedAddCount = 0;
+std::atomic<unsigned int> g_observedDrawTileCreateCount = 0;
+std::atomic<unsigned int> g_observedImageInstructionMatchedAddCount = 0;
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -889,6 +895,9 @@ static long __cdecl VisualSetParentHook(void* pThis, void* parent);
 static long __cdecl VisualRemoveSelfFromParentHook(void* pThis);
 static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
                                                      void** instruction);
+static long __cdecl DrawTileImageInstructionCreateHook(
+    void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
+    float opacity, void** instruction);
 static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                                         void* instruction);
 static long __cdecl RedirectVisualProxySetRedirectedVisualHook(void* pThis,
@@ -2661,6 +2670,26 @@ static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
     return result;
 }
 
+static long __cdecl DrawTileImageInstructionCreateHook(
+    void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
+    float opacity, void** instruction)
+{
+    long result = g_drawTileImageInstructionCreateOriginal(
+        imageProxy, sourceRect, destinationOffset, opacity, instruction);
+    if (result >= 0 && instruction && *instruction && imageProxy &&
+        !g_unloading.load(std::memory_order_acquire))
+    {
+        g_observedDrawTileCreateCount.fetch_add(1,
+                                                 std::memory_order_relaxed);
+        if (ObservedBitmapInstruction* entry = FindObservedImageEntry(
+                g_observedBitmapInstructions, *instruction, true))
+        {
+            entry->imageProxy.store(imageProxy, std::memory_order_release);
+        }
+    }
+    return result;
+}
+
 static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                                         void* instruction)
 {
@@ -2675,7 +2704,7 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                   : nullptr;
         if (imageProxy)
         {
-            g_observedDrawBitmapMatchedAddCount.fetch_add(
+            g_observedImageInstructionMatchedAddCount.fetch_add(
                 1, std::memory_order_relaxed);
             if (ObservedRenderImage* entry = FindObservedImageEntry(
                     g_observedRenderImages, pThis, true))
@@ -3189,6 +3218,13 @@ static bool InitializeDwmHooks()
          &g_drawBitmapInstructionCreateOriginal,
          DrawBitmapInstructionCreateHook,
          true},
+        {{L"public: static long __cdecl CDrawTileImageInstruction::Create("
+           L"class CBaseImageProxy *,struct tagRECT const &,"
+           L"struct tagPOINT const &,float,"
+           L"class CDrawTileImageInstruction * *)"},
+         &g_drawTileImageInstructionCreateOriginal,
+         DrawTileImageInstructionCreateHook,
+         true},
         {{L"public: long __cdecl CRenderDataVisual::AddInstruction("
            L"class CRenderDataInstruction *)"},
          &g_renderDataVisualAddInstruction,
@@ -3386,6 +3422,7 @@ static bool InitializeDwmHooks()
     keepValid(g_geometry2dGroupProxyUpdate);
     keepValid(g_drawMesh2DInstructionCreate);
     keepValid(g_drawBitmapInstructionCreateOriginal);
+    keepValid(g_drawTileImageInstructionCreateOriginal);
     keepValid(g_renderDataVisualAddInstruction);
     keepValid(g_renderDataVisualUpdateRenderData);
     keepValid(g_renderDataVisualCreate);
@@ -3416,12 +3453,14 @@ static bool InitializeDwmHooks()
         hasNativeMeshGeometry && g_drawMesh2DInstructionCreate &&
         g_renderDataVisualAddInstruction;
     Wh_Log(L"True 4x4 mesh probe: geometry=%s bitmapRenderer=%s "
-           L"bitmapObserver=%s "
+           L"bitmapObserver=%s tileObserver=%s "
            L"(rendering remains on stable affine fallback)",
            hasNativeMeshGeometry ? L"available" : L"unavailable",
            hasMeshBitmapRenderer ? L"available" : L"unavailable",
            g_drawBitmapInstructionCreateOriginal ? L"available"
-                                                  : L"unavailable");
+                                                  : L"unavailable",
+           g_drawTileImageInstructionCreateOriginal ? L"available"
+                                                     : L"unavailable");
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
@@ -4384,11 +4423,12 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                    : (kind == MeshSourceKind::Bitmap ? L"BitmapSource"
                                                       : L"BaseImage"));
     }
-    Wh_Log(L"True 4x4 DrawBitmap observation summary: HWND=%p sources=%u "
-           L"created=%u matchedAdds=%u",
+    Wh_Log(L"True 4x4 image instruction observation summary: HWND=%p "
+           L"sources=%u drawBitmap=%u drawTile=%u matchedAdds=%u",
            hwnd, observedDrawBitmapSources,
            g_observedDrawBitmapCreateCount.load(std::memory_order_relaxed),
-           g_observedDrawBitmapMatchedAddCount.load(
+           g_observedDrawTileCreateCount.load(std::memory_order_relaxed),
+           g_observedImageInstructionMatchedAddCount.load(
                std::memory_order_relaxed));
     if (result.source)
     {
