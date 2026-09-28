@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.141
+// @version         0.142
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4400,32 +4400,78 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
            L"visualNodes=%u (read-only, no mesh attached)",
            hwnd, nativeSourceCandidates, nodeSampleCount);
     unsigned int observedDrawBitmapSources = 0;
-    for (unsigned int index = 0; index < nodeSampleCount; index++)
+    unsigned int observedImageEntries = 0;
+    for (unsigned int tableIndex = 0;
+         tableIndex < OBSERVED_VISUAL_PROXY_COUNT && observedImageEntries < 32;
+         tableIndex++)
     {
-        ObservedRenderImage* observed = FindObservedImageEntry(
-            g_observedRenderImages, nodeSamples[index].visual, false);
-        void* imageProxy = observed ? observed->imageProxy.load(
-                                          std::memory_order_acquire)
-                                    : nullptr;
+        ObservedRenderImage& observed = g_observedRenderImages[tableIndex];
+        void* renderVisual =
+            observed.visual.load(std::memory_order_acquire);
+        void* imageProxy =
+            observed.imageProxy.load(std::memory_order_acquire);
         if (!imageProxy || !IsReadableMemory(imageProxy, sizeof(void*)))
         {
             continue;
         }
+        observedImageEntries++;
         void* imageVtable = *reinterpret_cast<void**>(imageProxy);
         MeshSourceKind kind = GetMeshSourceKind(imageProxy);
-        Wh_Log(L"True 4x4 observed DrawBitmap source[%u]: visualNode=%u "
-               L"visual=%p instruction=%p image=%p imageVtable=%p kind=%s",
-               observedDrawBitmapSources++, index, nodeSamples[index].visual,
-               observed->instruction.load(std::memory_order_acquire),
-               imageProxy, imageVtable,
+        int matchedVisualNode = -1;
+        unsigned int ancestryDepth = 0;
+        void* currentVisual = renderVisual;
+        void* immediateParent = nullptr;
+        while (currentVisual && ancestryDepth < 16)
+        {
+            for (unsigned int index = 0; index < nodeSampleCount; index++)
+            {
+                if (nodeSamples[index].visual == currentVisual)
+                {
+                    matchedVisualNode = static_cast<int>(index);
+                    break;
+                }
+            }
+            if (matchedVisualNode >= 0)
+            {
+                break;
+            }
+            ObservedVisualProxy* visualObservation =
+                FindObservedVisual(currentVisual, false);
+            void* parent = visualObservation
+                               ? visualObservation->parent.load(
+                                     std::memory_order_acquire)
+                               : nullptr;
+            if (ancestryDepth == 0)
+            {
+                immediateParent = parent;
+            }
+            if (!parent || parent == currentVisual)
+            {
+                break;
+            }
+            currentVisual = parent;
+            ancestryDepth++;
+        }
+        if (matchedVisualNode >= 0)
+        {
+            observedDrawBitmapSources++;
+        }
+        Wh_Log(L"True 4x4 observed image source[%u]: targetNode=%d "
+               L"ancestryDepth=%u visual=%p parent=%p instruction=%p "
+               L"image=%p imageVtable=%p kind=%s",
+               observedImageEntries - 1, matchedVisualNode, ancestryDepth,
+               renderVisual, immediateParent,
+               observed.instruction.load(std::memory_order_acquire), imageProxy,
+               imageVtable,
                kind == MeshSourceKind::VisualSurface
                    ? L"VisualSurface"
                    : (kind == MeshSourceKind::Bitmap ? L"BitmapSource"
                                                       : L"BaseImage"));
     }
     Wh_Log(L"True 4x4 image instruction observation summary: HWND=%p "
-           L"sources=%u drawBitmap=%u drawTile=%u matchedAdds=%u",
-           hwnd, observedDrawBitmapSources,
+           L"sources=%u observed=%u drawBitmap=%u drawTile=%u "
+           L"matchedAdds=%u",
+           hwnd, observedDrawBitmapSources, observedImageEntries,
            g_observedDrawBitmapCreateCount.load(std::memory_order_relaxed),
            g_observedDrawTileCreateCount.load(std::memory_order_relaxed),
            g_observedImageInstructionMatchedAddCount.load(
