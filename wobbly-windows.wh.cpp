@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.133
+// @version         0.134
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -379,11 +379,13 @@ struct D2DPoint3F
     float y;
     float z;
 };
-struct D2DPoint2F
+struct MilPoint2DValue
 {
-    float x;
-    float y;
+    double x;
+    double y;
 };
+static_assert(sizeof(D2DPoint3F) == 12);
+static_assert(sizeof(MilPoint2DValue) == 16);
 struct MilRectF
 {
     float left;
@@ -398,7 +400,7 @@ struct MilSizeD
 };
 using CMeshGeometry2dProxyUpdate_t = long(__cdecl*)(
     void* pThis, int mode, const D2DPoint3F* positions,
-    const D2DPoint2F* textureCoordinates, unsigned int vertexCount,
+    const MilPoint2DValue* textureCoordinates, unsigned int vertexCount,
     const unsigned int* indices, unsigned int indexCount);
 using CCompositorCreateMeshGeometry2dProxy_t = long(__cdecl*)(void* pThis,
                                                                void** meshProxy);
@@ -3617,7 +3619,7 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
                 clientVisualProxy, absoluteMappingMode);
         }
         D2DPoint3F positions[GRID_POINT_COUNT] = {};
-        D2DPoint2F textureCoordinates[GRID_POINT_COUNT] = {};
+        MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
         unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
         for (int y = 0; y < GRID_HEIGHT; y++)
         {
@@ -4405,7 +4407,7 @@ static void RunNativeMeshCanary()
         g_cBaseObjectRelease)
     {
         D2DPoint3F positions[GRID_POINT_COUNT] = {};
-        D2DPoint2F textureCoordinates[GRID_POINT_COUNT] = {};
+        MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
         unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
         for (int y = 0; y < GRID_HEIGHT; y++)
         {
