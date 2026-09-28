@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.143
+// @version         0.144
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3278,7 +3278,9 @@ static bool InitializeDwmHooks()
          VisualRemoveSelfFromParentHook,
          true},
         {{L"public: virtual class CVisual * __cdecl "
-           L"CVisual::GetTransformParent(void)const"},
+           L"CVisual::GetTransformParent(void)const",
+          L"public: virtual class CVisual * __cdecl "
+           L"CVisual::GetTransformParent(void)const "},
          &g_visualGetTransformParent,
          nullptr,
          true},
@@ -4454,8 +4456,12 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
             if (!parent && g_visualGetTransformParent &&
                 IsReadableMemory(currentVisual, sizeof(void*)))
             {
-                parent = g_visualGetTransformParent(currentVisual);
-                nativeParentHops++;
+                void* visualVtable = *reinterpret_cast<void**>(currentVisual);
+                if (IsDwmImageAddress(visualVtable, sizeof(void*)))
+                {
+                    parent = g_visualGetTransformParent(currentVisual);
+                    nativeParentHops++;
+                }
             }
             if (ancestryDepth == 0)
             {
