@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.135
+// @version         0.136
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -855,8 +855,10 @@ static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
 static void RunNativeMeshCanary();
 static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwnd);
-static void RunCachedVisualImageCanary(void* clientVisualProxy,
-                                       void* parentVisual, HWND hwnd);
+static void RunCachedVisualImageCanary(void* sourceVisualProxy,
+                                       void* hostVisual,
+                                       void* insertionReferenceProxy,
+                                       HWND hwnd, bool wholeWindow);
 static void MaintainVisibleMeshCanary();
 static long __cdecl VisualProxySetContentHook(void* pThis, const void* content);
 static long __cdecl VisualProxyInsertChildHook(void* pThis, void* child,
@@ -3569,10 +3571,12 @@ static MeshSourceKind GetMeshSourceKind(void* object)
     return MeshSourceKind::None;
 }
 
-static void RunCachedVisualImageCanary(void* clientVisualProxy,
-                                       void* parentVisual, HWND hwnd)
+static void RunCachedVisualImageCanary(void* sourceVisualProxy,
+                                       void* hostVisual,
+                                       void* insertionReferenceProxy,
+                                       HWND hwnd, bool wholeWindow)
 {
-    if (!IsOnDwmSceneThread() || !clientVisualProxy || !parentVisual ||
+    if (!IsOnDwmSceneThread() || !sourceVisualProxy || !hostVisual ||
         g_cachedVisualImageCanaryCompleted.exchange(true,
                                                      std::memory_order_acq_rel))
     {
@@ -3594,9 +3598,9 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
     double width = 0.0;
     double height = 0.0;
     if (IsDwmObjectPointerValid(compositor, g_compositorVtable) &&
-        IsVisualProxyPointerValid(clientVisualProxy) && expectedVtable &&
-        IsReadableMemory(parentVisual, sizeof(void*)) &&
-        IsDwmImageAddress(*reinterpret_cast<void**>(parentVisual), sizeof(void*)) &&
+        IsVisualProxyPointerValid(sourceVisualProxy) && expectedVtable &&
+        IsReadableMemory(hostVisual, sizeof(void*)) &&
+        IsDwmImageAddress(*reinterpret_cast<void**>(hostVisual), sizeof(void*)) &&
         g_createCachedVisualImageProxy && g_cachedVisualImageProxyUpdate &&
         g_cachedVisualImageProxySnapshot && g_cachedVisualImageProxyFreeze &&
         g_createMeshGeometry2dProxy && g_meshGeometry2dProxyUpdate &&
@@ -3609,14 +3613,16 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
         g_visualRemoveSelfFromParentOriginal &&
         g_cBaseObjectRelease)
     {
-        RECT clientRect = {};
-        if (!GetClientRect(hwnd, &clientRect) || clientRect.right <= clientRect.left ||
-            clientRect.bottom <= clientRect.top)
+        RECT sourceBounds = {};
+        bool haveBounds = wholeWindow ? GetWindowRect(hwnd, &sourceBounds)
+                                      : GetClientRect(hwnd, &sourceBounds);
+        if (!haveBounds || sourceBounds.right <= sourceBounds.left ||
+            sourceBounds.bottom <= sourceBounds.top)
         {
-            GetWindowRect(hwnd, &clientRect);
+            GetWindowRect(hwnd, &sourceBounds);
         }
-        width = static_cast<double>(clientRect.right - clientRect.left);
-        height = static_cast<double>(clientRect.bottom - clientRect.top);
+        width = static_cast<double>(sourceBounds.right - sourceBounds.left);
+        height = static_cast<double>(sourceBounds.bottom - sourceBounds.top);
         MilRectF sourceRect = {0.0f, 0.0f, static_cast<float>(width),
                                static_cast<float>(height)};
         MilSizeD size = {width, height};
@@ -3635,7 +3641,7 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
             constexpr int absoluteMappingMode = 0;
             result = g_cachedVisualImageProxyUpdate(
                 cachedVisual, sourceRect, size, nullptr, nullptr,
-                clientVisualProxy, absoluteMappingMode);
+                sourceVisualProxy, absoluteMappingMode);
         }
         RECT snapshotRect = {0, 0, static_cast<LONG>(width),
                              static_cast<LONG>(height)};
@@ -3740,7 +3746,7 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
         if (result >= 0 && renderVisual)
         {
             stage = L"Attach";
-            result = g_visualSetParentOriginal(renderVisual, parentVisual);
+            result = g_visualSetParentOriginal(renderVisual, hostVisual);
             attachedToStructure = result >= 0;
         }
         if (result >= 0)
@@ -3749,7 +3755,7 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
             renderVisualProxy =
                 g_visualGetVisualProxyForStructure(renderVisual);
             parentVisualProxy =
-                g_visualGetVisualProxyForStructure(parentVisual);
+                g_visualGetVisualProxyForStructure(hostVisual);
             if (!renderVisualProxy || !parentVisualProxy)
             {
                 result = E_NOINTERFACE;
@@ -3763,9 +3769,10 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
         }
         if (result >= 0)
         {
-            stage = L"InsertAboveClient";
+            stage = L"InsertTopmost";
             result = g_visualProxyInsertChildOriginal(
-                parentVisualProxy, renderVisualProxy, clientVisualProxy, true);
+                parentVisualProxy, renderVisualProxy,
+                insertionReferenceProxy, true);
         }
     }
     bool succeeded = result >= 0 && cachedVisual && meshProxy && groupProxy &&
@@ -3810,11 +3817,13 @@ static void RunCachedVisualImageCanary(void* clientVisualProxy,
         g_cBaseObjectRelease(cachedVisual);
     }
     Wh_Log(L"True 4x4 visible warped canary: %s stage=%s result=0x%08X "
-           L"HWND=%p clientProxy=%p parentProxy=%p meshVisualProxy=%p "
-           L"size=%.0fx%.0f",
+           L"HWND=%p sourceProxy=%p hostProxy=%p referenceProxy=%p "
+           L"meshVisualProxy=%p source=%s size=%.0fx%.0f",
            succeeded ? L"attached" : L"failed", stage,
-           static_cast<unsigned int>(result), hwnd, clientVisualProxy,
-           parentVisualProxy, renderVisualProxy, width, height);
+           static_cast<unsigned int>(result), hwnd, sourceVisualProxy,
+           parentVisualProxy, insertionReferenceProxy, renderVisualProxy,
+           wholeWindow ? L"CompleteWindowRoot" : L"ClientArea", width,
+           height);
 }
 
 static void MaintainVisibleMeshCanary()
@@ -4111,16 +4120,13 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                sample.proxyVtable, proxyKind, sample.redirectTarget,
                sample.redirectTargetVtable);
     }
-    void* clientAreaVtable = g_clientAreaVtable.load(std::memory_order_acquire);
-    for (unsigned int index = 0;
-         clientAreaVtable && index < nodeSampleCount; index++)
+    if (rootVisual && visualProxy)
     {
-        if (nodeSamples[index].visualVtable == clientAreaVtable)
-        {
-            RunCachedVisualImageCanary(nodeSamples[index].visualProxy,
-                                       nodeSamples[index].parentVisual, hwnd);
-            break;
-        }
+        // Snapshot and freeze the complete root before adding the mesh as its
+        // topmost child. The frozen source cannot recursively capture the new
+        // child, while the child inherits the window's native transforms.
+        RunCachedVisualImageCanary(visualProxy, rootVisual, nullptr, hwnd,
+                                   true);
     }
     if (result.source)
     {
