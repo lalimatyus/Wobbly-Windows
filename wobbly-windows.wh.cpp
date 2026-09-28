@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.139
+// @version         0.140
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -846,6 +846,8 @@ struct ObservedRenderImage
 ObservedBitmapInstruction
     g_observedBitmapInstructions[OBSERVED_VISUAL_PROXY_COUNT] = {};
 ObservedRenderImage g_observedRenderImages[OBSERVED_VISUAL_PROXY_COUNT] = {};
+std::atomic<unsigned int> g_observedDrawBitmapCreateCount = 0;
+std::atomic<unsigned int> g_observedDrawBitmapMatchedAddCount = 0;
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -2648,6 +2650,8 @@ static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
     if (result >= 0 && instruction && *instruction && imageProxy &&
         !g_unloading.load(std::memory_order_acquire))
     {
+        g_observedDrawBitmapCreateCount.fetch_add(1,
+                                                   std::memory_order_relaxed);
         if (ObservedBitmapInstruction* entry = FindObservedImageEntry(
                 g_observedBitmapInstructions, *instruction, true))
         {
@@ -2671,6 +2675,8 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                   : nullptr;
         if (imageProxy)
         {
+            g_observedDrawBitmapMatchedAddCount.fetch_add(
+                1, std::memory_order_relaxed);
             if (ObservedRenderImage* entry = FindObservedImageEntry(
                     g_observedRenderImages, pThis, true))
             {
@@ -4265,71 +4271,88 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
          visualIndex < nodeSampleCount && nativeSourceCandidates < 8;
          visualIndex++)
     {
-        void* rootContent = nodeSamples[visualIndex].content;
-        if (!rootContent)
+        ObservedVisualProxy* proxyObservation = FindObservedVisualProxy(
+            nodeSamples[visualIndex].visualProxy, false);
+        void* proxyContent = proxyObservation
+                                 ? proxyObservation->content.load(
+                                       std::memory_order_acquire)
+                                 : nullptr;
+        void* contentRoots[] = {nodeSamples[visualIndex].content,
+                                proxyContent};
+        for (unsigned int contentRootIndex = 0;
+             contentRootIndex < ARRAYSIZE(contentRoots) &&
+             nativeSourceCandidates < 8;
+             contentRootIndex++)
         {
-            continue;
-        }
-        struct ResourceNode
-        {
-            void* object;
-            unsigned int depth;
-            size_t parentOffset;
-        } queue[128] = {{rootContent, 0, SIZE_MAX}};
-        unsigned int queueRead = 0;
-        unsigned int queueCount = 1;
-        while (queueRead < queueCount && nativeSourceCandidates < 8)
-        {
-            ResourceNode current = queue[queueRead++];
-            MeshSourceKind kind = GetMeshSourceKind(current.object);
-            if (kind != MeshSourceKind::None)
-            {
-                nativeSourceCandidates++;
-                Wh_Log(L"True 4x4 native render source[%u]: kind=%s "
-                       L"visualNode=%u depth=%u parentOffset=0x%zx "
-                       L"source=%p vtable=%p",
-                       nativeSourceCandidates - 1,
-                       kind == MeshSourceKind::VisualSurface
-                           ? L"VisualSurface"
-                           : L"BitmapSource",
-                       visualIndex, current.depth, current.parentOffset,
-                       current.object,
-                       *reinterpret_cast<void**>(current.object));
-                if (!result.source)
-                {
-                    result = {current.object, L"RenderContentGraph",
-                              visualIndex, current.parentOffset, kind};
-                }
-                continue;
-            }
-            if (current.depth >= 2)
+            void* rootContent = contentRoots[contentRootIndex];
+            if (!rootContent)
             {
                 continue;
             }
-            for (size_t offset = sizeof(void*); offset < 0x200;
-                 offset += sizeof(void*))
+            struct ResourceNode
             {
-                void* child = ReadPointerMember(current.object, offset);
-                if (!child || child == current.object ||
-                    IsDwmImageAddress(child, sizeof(void*)) ||
-                    !IsReadableMemory(child, sizeof(void*)))
+                void* object;
+                unsigned int depth;
+                size_t parentOffset;
+            } queue[128] = {{rootContent, 0, SIZE_MAX}};
+            unsigned int queueRead = 0;
+            unsigned int queueCount = 1;
+            while (queueRead < queueCount && nativeSourceCandidates < 8)
+            {
+                ResourceNode current = queue[queueRead++];
+                MeshSourceKind kind = GetMeshSourceKind(current.object);
+                if (kind != MeshSourceKind::None)
+                {
+                    nativeSourceCandidates++;
+                    Wh_Log(L"True 4x4 native render source[%u]: kind=%s "
+                           L"visualNode=%u origin=%s depth=%u "
+                           L"parentOffset=0x%zx source=%p vtable=%p",
+                           nativeSourceCandidates - 1,
+                           kind == MeshSourceKind::VisualSurface
+                               ? L"VisualSurface"
+                               : L"BitmapSource",
+                           visualIndex,
+                           contentRootIndex == 0 ? L"VisualContent"
+                                                 : L"ProxyContent",
+                           current.depth, current.parentOffset,
+                           current.object,
+                           *reinterpret_cast<void**>(current.object));
+                    if (!result.source)
+                    {
+                        result = {current.object, L"RenderContentGraph",
+                                  visualIndex, current.parentOffset, kind};
+                    }
+                    continue;
+                }
+                if (current.depth >= 2)
                 {
                     continue;
                 }
-                void* childVtable = *reinterpret_cast<void**>(child);
-                if (!IsDwmImageAddress(childVtable, sizeof(void*)))
+                for (size_t offset = sizeof(void*); offset < 0x200;
+                     offset += sizeof(void*))
                 {
-                    continue;
-                }
-                bool duplicate = false;
-                for (unsigned int i = 0; i < queueCount; i++)
-                {
-                    duplicate |= queue[i].object == child;
-                }
-                if (!duplicate && queueCount < ARRAYSIZE(queue))
-                {
-                    queue[queueCount++] = {child, current.depth + 1,
-                                           offset};
+                    void* child = ReadPointerMember(current.object, offset);
+                    if (!child || child == current.object ||
+                        IsDwmImageAddress(child, sizeof(void*)) ||
+                        !IsReadableMemory(child, sizeof(void*)))
+                    {
+                        continue;
+                    }
+                    void* childVtable = *reinterpret_cast<void**>(child);
+                    if (!IsDwmImageAddress(childVtable, sizeof(void*)))
+                    {
+                        continue;
+                    }
+                    bool duplicate = false;
+                    for (unsigned int i = 0; i < queueCount; i++)
+                    {
+                        duplicate |= queue[i].object == child;
+                    }
+                    if (!duplicate && queueCount < ARRAYSIZE(queue))
+                    {
+                        queue[queueCount++] = {child, current.depth + 1,
+                                               offset};
+                    }
                 }
             }
         }
@@ -4361,8 +4384,12 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                    : (kind == MeshSourceKind::Bitmap ? L"BitmapSource"
                                                       : L"BaseImage"));
     }
-    Wh_Log(L"True 4x4 DrawBitmap observation summary: HWND=%p sources=%u",
-           hwnd, observedDrawBitmapSources);
+    Wh_Log(L"True 4x4 DrawBitmap observation summary: HWND=%p sources=%u "
+           L"created=%u matchedAdds=%u",
+           hwnd, observedDrawBitmapSources,
+           g_observedDrawBitmapCreateCount.load(std::memory_order_relaxed),
+           g_observedDrawBitmapMatchedAddCount.load(
+               std::memory_order_relaxed));
     if (result.source)
     {
         Wh_Log(L"True 4x4 source probe: found kind=%s HWND=%p source=%p "
