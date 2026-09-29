@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.155
+// @version         0.156
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4227,9 +4227,7 @@ static void MaintainVisibleMeshCanary()
     bool forced = g_unloading.load(std::memory_order_acquire) ||
                   g_visibleMeshCanaryCleanupRequested.load(
                       std::memory_order_acquire);
-    bool detach = forced ||
-                  !g_realDragging.load(std::memory_order_acquire) ||
-                  GetTickCount64() >= g_visibleMeshCanary.detachAt;
+    bool detach = forced || GetTickCount64() >= g_visibleMeshCanary.detachAt;
     if (!detach)
     {
         return;
@@ -5155,9 +5153,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
                                                long* addResult)
 {
     if (!IsOnDwmSceneThread() || !renderVisual || !hwnd || !IsWindow(hwnd) ||
-        !imageProxy || !addResult ||
-        !g_realDragging.load(std::memory_order_acquire) ||
-        g_realDraggedWindow.load(std::memory_order_acquire) != hwnd ||
+        GetForegroundWindow() != hwnd || !imageProxy || !addResult ||
         g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
         !g_nativeMeshCanarySucceeded.load(std::memory_order_acquire) ||
         GetMeshSourceKind(imageProxy) != MeshSourceKind::None ||
