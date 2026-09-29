@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.149
+// @version         0.151
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -407,6 +407,8 @@ using CCompositorCreateMeshGeometry2dProxy_t = long(__cdecl*)(void* pThis,
                                                                void** meshProxy);
 using CCompositorCreateGeometry2dGroupProxy_t = long(__cdecl*)(void* pThis,
                                                                 void** groupProxy);
+using CCompositorCreateBitmapSourceProxy_t = long(__cdecl*)(void* pThis,
+                                                             void** bitmapProxy);
 using CGeometry2dGroupProxyUpdate_t = long(__cdecl*)(void* pThis, void* meshProxy);
 using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(void* geometryGroupProxy,
                                                        void* bitmapSourceProxy,
@@ -444,6 +446,7 @@ using CRenderDataVisualCreate_t = long(__cdecl*)(void** visual);
 CMeshGeometry2dProxyUpdate_t g_meshGeometry2dProxyUpdate = nullptr;
 CCompositorCreateMeshGeometry2dProxy_t g_createMeshGeometry2dProxy = nullptr;
 CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
+CCompositorCreateBitmapSourceProxy_t g_createBitmapSourceProxyOriginal = nullptr;
 CGeometry2dGroupProxyUpdate_t g_geometry2dGroupProxyUpdate = nullptr;
 CDrawMesh2DInstructionCreate_t g_drawMesh2DInstructionCreate = nullptr;
 CDrawBitmapInstructionCreate_t g_drawBitmapInstructionCreateOriginal = nullptr;
@@ -812,7 +815,6 @@ std::atomic_bool g_sceneOwnershipResetPending = false;
 std::atomic<ULONGLONG> g_lastBindPrerequisiteLog = 0;
 std::atomic_bool g_nativeMeshCanaryPending = false;
 std::atomic_bool g_nativeMeshCanarySucceeded = false;
-std::atomic_bool g_liveSourceMeshCanaryCompleted = false;
 std::atomic_bool g_meshSourceProbePending = false;
 std::atomic_bool g_meshSourceProbeCompleted = false;
 std::atomic_bool g_cachedVisualImageCanaryCompleted = false;
@@ -854,6 +856,9 @@ struct ObservedRenderImage
 ObservedBitmapInstruction
     g_observedBitmapInstructions[OBSERVED_VISUAL_PROXY_COUNT] = {};
 ObservedRenderImage g_observedRenderImages[OBSERVED_VISUAL_PROXY_COUNT] = {};
+std::atomic<void*>
+    g_observedBitmapSourceProxies[OBSERVED_VISUAL_PROXY_COUNT] = {};
+std::atomic<unsigned int> g_observedBitmapSourceCreateCount = 0;
 std::atomic<unsigned int> g_observedDrawBitmapCreateCount = 0;
 std::atomic<unsigned int> g_observedDrawTileCreateCount = 0;
 std::atomic<unsigned int> g_observedImageInstructionMatchedAddCount = 0;
@@ -883,7 +888,6 @@ static void RestorePendingAnimationIdentities();
 static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
 static void RunNativeMeshCanary();
-static void RunLiveSourceMeshInstructionCanary(void* imageProxy, HWND hwnd);
 static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwnd);
 static void RunCachedVisualImageCanary(void* sourceVisualProxy,
                                        void* hostVisual,
@@ -904,6 +908,8 @@ static long __cdecl DrawTileImageInstructionCreateHook(
     float opacity, void** instruction);
 static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                                         void* instruction);
+static long __cdecl CreateBitmapSourceProxyHook(void* pThis,
+                                                 void** bitmapProxy);
 static long __cdecl RedirectVisualProxySetRedirectedVisualHook(void* pThis,
                                                                void* visual);
 static bool HasAnyAnimationSlots();
@@ -2590,6 +2596,56 @@ static ObservedVisualProxy* FindObservedVisual(void* visual, bool create)
     return FindObservedNode(g_observedVisuals, visual, create);
 }
 
+static bool FindObservedBitmapSourceProxy(void* proxy, bool create)
+{
+    if (!proxy)
+    {
+        return false;
+    }
+    uintptr_t hash = reinterpret_cast<uintptr_t>(proxy) >> 4;
+    hash ^= hash >> 17;
+    for (unsigned int probe = 0; probe < OBSERVED_VISUAL_PROXY_PROBES; probe++)
+    {
+        std::atomic<void*>& entry =
+            g_observedBitmapSourceProxies[(hash + probe) %
+                                          OBSERVED_VISUAL_PROXY_COUNT];
+        void* observed = entry.load(std::memory_order_acquire);
+        if (observed == proxy)
+        {
+            return true;
+        }
+        if (!observed)
+        {
+            if (!create)
+            {
+                return false;
+            }
+            void* expected = nullptr;
+            if (entry.compare_exchange_strong(
+                    expected, proxy, std::memory_order_acq_rel,
+                    std::memory_order_acquire) || expected == proxy)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static long __cdecl CreateBitmapSourceProxyHook(void* pThis,
+                                                 void** bitmapProxy)
+{
+    long result = g_createBitmapSourceProxyOriginal(pThis, bitmapProxy);
+    if (result >= 0 && bitmapProxy && *bitmapProxy &&
+        !g_unloading.load(std::memory_order_acquire))
+    {
+        FindObservedBitmapSourceProxy(*bitmapProxy, true);
+        g_observedBitmapSourceCreateCount.fetch_add(1,
+                                                     std::memory_order_relaxed);
+    }
+    return result;
+}
+
 template <typename Entry>
 static Entry* FindObservedImageEntry(Entry* table, void* key, bool create)
 {
@@ -3183,6 +3239,13 @@ static bool InitializeDwmHooks()
          &g_createGeometry2dGroupProxy,
          nullptr,
          true},
+        {{L"public: long __cdecl CCompositor::CreateBitmapSourceProxy("
+           L"class CBitmapSourceProxy * *)",
+          L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CBitmapSourceProxy>(class CBitmapSourceProxy * *)"},
+         &g_createBitmapSourceProxyOriginal,
+         CreateBitmapSourceProxyHook,
+         true},
         {{L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CCachedVisualImageProxy>("
            L"class CCachedVisualImageProxy * *)"},
@@ -3430,6 +3493,7 @@ static bool InitializeDwmHooks()
     keepValid(g_meshGeometry2dProxyUpdate);
     keepValid(g_createMeshGeometry2dProxy);
     keepValid(g_createGeometry2dGroupProxy);
+    keepValid(g_createBitmapSourceProxyOriginal);
     keepValid(g_geometry2dGroupProxyUpdate);
     keepValid(g_drawMesh2DInstructionCreate);
     keepValid(g_drawBitmapInstructionCreateOriginal);
@@ -3519,9 +3583,13 @@ static bool InitializeDwmHooks()
         g_cachedVisualImageProxyVtableSymbol, g_cachedVisualImageProxyVtable);
     bool hasExactClientAreaVtable =
         cacheVtableSymbol(g_clientAreaVtableSymbol, g_clientAreaVtable);
-    Wh_Log(L"True 4x4 source probe: bitmap=%s visualSurface=%s",
+    Wh_Log(L"True 4x4 source probe: bitmap=%s visualSurface=%s "
+           L"bitmapCreationObserver=%s vtableAlias=%d",
            hasExactBitmapSourceProxyVtable ? L"available" : L"unavailable",
-           hasExactVisualSurfaceProxyVtable ? L"available" : L"unavailable");
+           hasExactVisualSurfaceProxyVtable ? L"available" : L"unavailable",
+           g_createBitmapSourceProxyOriginal ? L"available" : L"unavailable",
+           g_bitmapSourceProxyVtable.load(std::memory_order_acquire) ==
+               g_visualSurfaceProxyVtable.load(std::memory_order_acquire));
     Wh_Log(L"True 4x4 GPU source probe: cachedVisual=%s clientArea=%s "
            L"create=%s update=%s snapshot=%s freeze=%s "
            L"meshInstruction=%s renderVisual=%s publish=%s",
@@ -3749,7 +3817,23 @@ enum class MeshSourceKind
     None,
     Bitmap,
     VisualSurface,
+    AmbiguousProxy,
 };
+
+static const wchar_t* GetMeshSourceKindName(MeshSourceKind kind)
+{
+    switch (kind)
+    {
+    case MeshSourceKind::Bitmap:
+        return L"BitmapSource";
+    case MeshSourceKind::VisualSurface:
+        return L"VisualSurface";
+    case MeshSourceKind::AmbiguousProxy:
+        return L"AmbiguousProxy";
+    default:
+        return L"None";
+    }
+}
 
 static MeshSourceKind GetMeshSourceKind(void* object)
 {
@@ -3757,14 +3841,24 @@ static MeshSourceKind GetMeshSourceKind(void* object)
     {
         return MeshSourceKind::None;
     }
-    void* vtable = *reinterpret_cast<void**>(object);
-    if (vtable == g_bitmapSourceProxyVtable.load(std::memory_order_acquire))
+    if (FindObservedBitmapSourceProxy(object, false))
     {
         return MeshSourceKind::Bitmap;
     }
-    if (vtable == g_visualSurfaceProxyVtable.load(std::memory_order_acquire))
+    void* vtable = *reinterpret_cast<void**>(object);
+    void* bitmapVtable =
+        g_bitmapSourceProxyVtable.load(std::memory_order_acquire);
+    void* visualSurfaceVtable =
+        g_visualSurfaceProxyVtable.load(std::memory_order_acquire);
+    if (visualSurfaceVtable && visualSurfaceVtable != bitmapVtable &&
+        vtable == visualSurfaceVtable)
     {
         return MeshSourceKind::VisualSurface;
+    }
+    if ((bitmapVtable && vtable == bitmapVtable) ||
+        (visualSurfaceVtable && vtable == visualSurfaceVtable))
+    {
+        return MeshSourceKind::AmbiguousProxy;
     }
     return MeshSourceKind::None;
 }
@@ -4100,7 +4194,8 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         {
             void* candidate = ReadPointerMember(object, offset);
             MeshSourceKind kind = GetMeshSourceKind(candidate);
-            if (kind != MeshSourceKind::None)
+            if (kind == MeshSourceKind::Bitmap ||
+                kind == MeshSourceKind::VisualSurface)
             {
                 result = {candidate, owner, outerOffset, offset, kind};
                 return true;
@@ -4216,7 +4311,8 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                         redirectTargetVtable, current.depth};
                 }
                 MeshSourceKind kind = GetMeshSourceKind(content);
-                if (kind != MeshSourceKind::None)
+                if (kind == MeshSourceKind::Bitmap ||
+                    kind == MeshSourceKind::VisualSurface)
                 {
                     result = {content, owner, current.depth, SIZE_MAX, kind};
                     break;
@@ -4319,6 +4415,7 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                sample.redirectTargetVtable);
     }
     unsigned int nativeSourceCandidates = 0;
+    unsigned int exactNativeSources = 0;
     for (unsigned int visualIndex = 0;
          visualIndex < nodeSampleCount && nativeSourceCandidates < 8;
          visualIndex++)
@@ -4356,20 +4453,21 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                 if (kind != MeshSourceKind::None)
                 {
                     nativeSourceCandidates++;
+                    bool exact = kind == MeshSourceKind::Bitmap ||
+                                 kind == MeshSourceKind::VisualSurface;
+                    exactNativeSources += exact;
                     Wh_Log(L"True 4x4 native render source[%u]: kind=%s "
                            L"visualNode=%u origin=%s depth=%u "
-                           L"parentOffset=0x%zx source=%p vtable=%p",
+                           L"parentOffset=0x%zx source=%p vtable=%p exact=%d",
                            nativeSourceCandidates - 1,
-                           kind == MeshSourceKind::VisualSurface
-                               ? L"VisualSurface"
-                               : L"BitmapSource",
+                           GetMeshSourceKindName(kind),
                            visualIndex,
                            contentRootIndex == 0 ? L"VisualContent"
                                                  : L"ProxyContent",
                            current.depth, current.parentOffset,
                            current.object,
-                           *reinterpret_cast<void**>(current.object));
-                    if (!result.source)
+                           *reinterpret_cast<void**>(current.object), exact);
+                    if (exact && !result.source)
                     {
                         result = {current.object, L"RenderContentGraph",
                                   visualIndex, current.parentOffset, kind};
@@ -4410,8 +4508,11 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         }
     }
     Wh_Log(L"True 4x4 native render source probe: HWND=%p candidates=%u "
-           L"visualNodes=%u (read-only, no mesh attached)",
-           hwnd, nativeSourceCandidates, nodeSampleCount);
+           L"exact=%u createdBitmapProxies=%u visualNodes=%u "
+           L"(read-only, no mesh attached)",
+           hwnd, nativeSourceCandidates, exactNativeSources,
+           g_observedBitmapSourceCreateCount.load(std::memory_order_relaxed),
+           nodeSampleCount);
     unsigned int observedDrawBitmapSources = 0;
     unsigned int observedImageEntries = 0;
     for (unsigned int tableIndex = 0;
@@ -4434,10 +4535,6 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         void* sourceWindowData =
             RegisterAnimationTopLevelWindow3D(renderVisual, &sourceHwnd);
         bool sourceOwnerMatches = sourceWindowData && sourceHwnd == hwnd;
-        if (sourceOwnerMatches)
-        {
-            RunLiveSourceMeshInstructionCanary(imageProxy, hwnd);
-        }
         int imageTargetNode = -1;
         const wchar_t* imageMatchedBy = L"none";
         for (unsigned int index = 0; index < nodeSampleCount; index++)
@@ -4572,10 +4669,8 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                renderVisual, immediateParent,
                observed.instruction.load(std::memory_order_acquire), imageProxy,
                imageVtable,
-               kind == MeshSourceKind::VisualSurface
-                   ? L"VisualSurface"
-                   : (kind == MeshSourceKind::Bitmap ? L"BitmapSource"
-                                                      : L"BaseImage"));
+               kind == MeshSourceKind::None ? L"BaseImage"
+                                             : GetMeshSourceKindName(kind));
     }
     Wh_Log(L"True 4x4 image instruction observation summary: HWND=%p "
            L"sources=%u observed=%u drawBitmap=%u drawTile=%u "
@@ -4590,8 +4685,7 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         Wh_Log(L"True 4x4 source probe: found kind=%s HWND=%p source=%p "
                L"owner=%s outer=0x%zx inner=0x%zx visualNodes=%u "
                L"proxyNodes=%u",
-               result.kind == MeshSourceKind::VisualSurface ? L"VisualSurface"
-                                                            : L"BitmapSource",
+               GetMeshSourceKindName(result.kind),
                hwnd, result.source, result.owner, result.outerOffset,
                result.innerOffset, visualStats.nodes, proxyStats.nodes);
     }
@@ -4973,103 +5067,6 @@ static void RunNativeMeshCanary()
            succeeded ? L"passed" : L"failed", stage,
            static_cast<unsigned int>(result), GRID_POINT_COUNT,
            (GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6);
-}
-
-static void RunLiveSourceMeshInstructionCanary(void* imageProxy, HWND hwnd)
-{
-    if (!IsOnDwmSceneThread() || !imageProxy || !hwnd ||
-        g_liveSourceMeshCanaryCompleted.exchange(true,
-                                                  std::memory_order_acq_rel))
-    {
-        return;
-    }
-    void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
-    long result = E_NOINTERFACE;
-    const wchar_t* stage = L"Prerequisites";
-    void* meshProxy = nullptr;
-    void* groupProxy = nullptr;
-    void* instruction = nullptr;
-    if (IsDwmObjectPointerValid(compositor, g_compositorVtable) &&
-        IsReadableMemory(imageProxy, sizeof(void*)) &&
-        g_createMeshGeometry2dProxy && g_meshGeometry2dProxyUpdate &&
-        g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate &&
-        g_drawMesh2DInstructionCreate && g_cBaseObjectRelease)
-    {
-        D2DPoint3F positions[GRID_POINT_COUNT] = {};
-        MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
-        unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
-        for (int y = 0; y < GRID_HEIGHT; y++)
-        {
-            for (int x = 0; x < GRID_WIDTH; x++)
-            {
-                int index = GetPointIndex(x, y);
-                float px = static_cast<float>(x) / (GRID_WIDTH - 1);
-                float py = static_cast<float>(y) / (GRID_HEIGHT - 1);
-                positions[index] = {px, py, 0.0f};
-                textureCoordinates[index] = {px, py};
-            }
-        }
-        unsigned int indexCount = 0;
-        for (int y = 0; y < GRID_HEIGHT - 1; y++)
-        {
-            for (int x = 0; x < GRID_WIDTH - 1; x++)
-            {
-                unsigned int topLeft = GetPointIndex(x, y);
-                unsigned int topRight = GetPointIndex(x + 1, y);
-                unsigned int bottomLeft = GetPointIndex(x, y + 1);
-                unsigned int bottomRight = GetPointIndex(x + 1, y + 1);
-                indices[indexCount++] = topLeft;
-                indices[indexCount++] = bottomLeft;
-                indices[indexCount++] = topRight;
-                indices[indexCount++] = topRight;
-                indices[indexCount++] = bottomLeft;
-                indices[indexCount++] = bottomRight;
-            }
-        }
-        stage = L"CreateMesh";
-        result = g_createMeshGeometry2dProxy(compositor, &meshProxy);
-        if (result >= 0 && meshProxy)
-        {
-            stage = L"UpdateMesh";
-            result = g_meshGeometry2dProxyUpdate(
-                meshProxy, 0, positions, textureCoordinates, GRID_POINT_COUNT,
-                indices, indexCount);
-        }
-        if (result >= 0)
-        {
-            stage = L"CreateGroup";
-            result = g_createGeometry2dGroupProxy(compositor, &groupProxy);
-        }
-        if (result >= 0 && groupProxy)
-        {
-            stage = L"UpdateGroup";
-            result = g_geometry2dGroupProxyUpdate(groupProxy, meshProxy);
-        }
-        if (result >= 0)
-        {
-            stage = L"CreateInstruction";
-            result = g_drawMesh2DInstructionCreate(groupProxy, imageProxy,
-                                                    &instruction);
-        }
-    }
-    bool succeeded = result >= 0 && meshProxy && groupProxy && instruction;
-    if (instruction)
-    {
-        g_cBaseObjectRelease(instruction);
-    }
-    if (groupProxy)
-    {
-        g_cBaseObjectRelease(groupProxy);
-    }
-    if (meshProxy)
-    {
-        g_cBaseObjectRelease(meshProxy);
-    }
-    Wh_Log(L"True 4x4 live source instruction canary: %s stage=%s "
-           L"result=0x%08X HWND=%p image=%p vertices=%u indices=%u",
-           succeeded ? L"passed" : L"failed", stage,
-           static_cast<unsigned int>(result), hwnd, imageProxy,
-           GRID_POINT_COUNT, (GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6);
 }
 
 static void SubmitPendingWobblySceneWork()
@@ -9085,7 +9082,6 @@ BOOL Wh_ModInit()
     g_lastBindPrerequisiteLog.store(0, std::memory_order_release);
     g_nativeMeshCanaryPending.store(false, std::memory_order_release);
     g_nativeMeshCanarySucceeded.store(false, std::memory_order_release);
-    g_liveSourceMeshCanaryCompleted.store(false, std::memory_order_release);
     g_meshSourceProbePending.store(false, std::memory_order_release);
     g_meshSourceProbeCompleted.store(false, std::memory_order_release);
     g_cachedVisualImageCanaryCompleted.store(false, std::memory_order_release);
@@ -9105,6 +9101,11 @@ BOOL Wh_ModInit()
     };
     resetObservedNodes(g_observedVisualProxies);
     resetObservedNodes(g_observedVisuals);
+    for (std::atomic<void*>& proxy : g_observedBitmapSourceProxies)
+    {
+        proxy.store(nullptr, std::memory_order_relaxed);
+    }
+    g_observedBitmapSourceCreateCount.store(0, std::memory_order_relaxed);
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
