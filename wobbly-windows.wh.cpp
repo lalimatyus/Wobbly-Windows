@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.145
+// @version         0.146
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4428,6 +4428,48 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         observedImageEntries++;
         void* imageVtable = *reinterpret_cast<void**>(imageProxy);
         MeshSourceKind kind = GetMeshSourceKind(imageProxy);
+        int imageTargetNode = -1;
+        const wchar_t* imageMatchedBy = L"none";
+        for (unsigned int index = 0; index < nodeSampleCount; index++)
+        {
+            if (nodeSamples[index].visualProxy == imageProxy)
+            {
+                imageTargetNode = static_cast<int>(index);
+                imageMatchedBy = L"VisualProxy";
+                break;
+            }
+            if (nodeSamples[index].content == imageProxy)
+            {
+                imageTargetNode = static_cast<int>(index);
+                imageMatchedBy = L"Content";
+                break;
+            }
+            if (nodeSamples[index].redirectTarget == imageProxy)
+            {
+                imageTargetNode = static_cast<int>(index);
+                imageMatchedBy = L"RedirectTarget";
+                break;
+            }
+        }
+        ObservedVisualProxy* imageObservation =
+            FindObservedVisualProxy(imageProxy, false);
+        void* imageParent =
+            imageObservation
+                ? imageObservation->parent.load(std::memory_order_acquire)
+                : nullptr;
+        void* imageContent =
+            imageObservation
+                ? imageObservation->content.load(std::memory_order_acquire)
+                : nullptr;
+        void* imageRedirect =
+            imageObservation
+                ? imageObservation->redirectTarget.load(std::memory_order_acquire)
+                : nullptr;
+        Wh_Log(L"True 4x4 image proxy source[%u]: targetNode=%d matchedBy=%s "
+               L"image=%p vtable=%p parent=%p content=%p redirect=%p",
+               observedImageEntries - 1, imageTargetNode, imageMatchedBy,
+               imageProxy, imageVtable, imageParent, imageContent,
+               imageRedirect);
         int matchedVisualNode = -1;
         const wchar_t* matchedBy = L"none";
         unsigned int ancestryDepth = 0;
@@ -4505,7 +4547,7 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
             currentVisual = parent;
             ancestryDepth++;
         }
-        if (matchedVisualNode >= 0)
+        if (matchedVisualNode >= 0 || imageTargetNode >= 0)
         {
             observedDrawBitmapSources++;
         }
