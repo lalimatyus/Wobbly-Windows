@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.156
+// @version         0.157
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -821,6 +821,7 @@ std::atomic_bool g_nativeMeshCanaryPending = false;
 std::atomic_bool g_nativeMeshCanarySucceeded = false;
 std::atomic_bool g_liveBaseImageMeshCanaryStarted = false;
 std::atomic_bool g_liveBaseImageMeshCanarySucceeded = false;
+std::atomic_bool g_liveBaseImageMeshAnimationLogged = false;
 std::atomic_bool g_meshSourceProbePending = false;
 std::atomic_bool g_meshSourceProbeCompleted = false;
 std::atomic_bool g_cachedVisualImageCanaryCompleted = false;
@@ -917,6 +918,8 @@ static void RunCachedVisualImageCanary(void* sourceVisualProxy,
                                        void* hostVisual,
                                        void* insertionReferenceProxy,
                                        HWND hwnd, bool wholeWindow);
+static long UpdateNativeMeshGeometry(void* meshProxy,
+                                     const WobbleMesh* mesh = nullptr);
 static void MaintainVisibleMeshCanary();
 static long __cdecl VisualProxySetContentHook(void* pThis, const void* content);
 static long __cdecl VisualProxyInsertChildHook(void* pThis, void* child,
@@ -4217,6 +4220,70 @@ static void RunCachedVisualImageCanary(void* sourceVisualProxy,
            height);
 }
 
+static long UpdateNativeMeshGeometry(void* meshProxy, const WobbleMesh* mesh)
+{
+    if (!meshProxy || !g_meshGeometry2dProxyUpdate ||
+        (mesh && (mesh->width <= 0.0 || mesh->height <= 0.0)))
+    {
+        return E_INVALIDARG;
+    }
+    D2DPoint3F positions[GRID_POINT_COUNT] = {};
+    MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
+    unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
+    for (int y = 0; y < GRID_HEIGHT; y++)
+    {
+        for (int x = 0; x < GRID_WIDTH; x++)
+        {
+            int index = GetPointIndex(x, y);
+            double baseX = static_cast<double>(x) / (GRID_WIDTH - 1);
+            double baseY = static_cast<double>(y) / (GRID_HEIGHT - 1);
+            double renderedX = baseX;
+            double renderedY = baseY;
+            if (mesh)
+            {
+                const WobblePoint& point = mesh->points[index];
+                baseX = point.basePosition.x / mesh->width;
+                baseY = point.basePosition.y / mesh->height;
+                renderedX = point.position.x / mesh->width;
+                renderedY = point.position.y / mesh->height;
+            }
+            if (!std::isfinite(baseX) || !std::isfinite(baseY) ||
+                !std::isfinite(renderedX) || !std::isfinite(renderedY))
+            {
+                return E_INVALIDARG;
+            }
+            constexpr double coordinateLimit = 8.0;
+            renderedX = std::clamp(renderedX, -coordinateLimit,
+                                   coordinateLimit);
+            renderedY = std::clamp(renderedY, -coordinateLimit,
+                                   coordinateLimit);
+            positions[index] = {static_cast<float>(renderedX),
+                                static_cast<float>(renderedY), 0.0f};
+            textureCoordinates[index] = {baseX, baseY};
+        }
+    }
+    unsigned int indexCount = 0;
+    for (int y = 0; y < GRID_HEIGHT - 1; y++)
+    {
+        for (int x = 0; x < GRID_WIDTH - 1; x++)
+        {
+            unsigned int topLeft = GetPointIndex(x, y);
+            unsigned int topRight = GetPointIndex(x + 1, y);
+            unsigned int bottomLeft = GetPointIndex(x, y + 1);
+            unsigned int bottomRight = GetPointIndex(x + 1, y + 1);
+            indices[indexCount++] = topLeft;
+            indices[indexCount++] = bottomLeft;
+            indices[indexCount++] = topRight;
+            indices[indexCount++] = topRight;
+            indices[indexCount++] = bottomLeft;
+            indices[indexCount++] = bottomRight;
+        }
+    }
+    return g_meshGeometry2dProxyUpdate(
+        meshProxy, 0, positions, textureCoordinates, GRID_POINT_COUNT,
+        indices, indexCount);
+}
+
 static void MaintainVisibleMeshCanary()
 {
     if (!IsOnDwmSceneThread() ||
@@ -4238,40 +4305,7 @@ static void MaintainVisibleMeshCanary()
     if (!state.renderVisual && state.meshProxy &&
         g_meshGeometry2dProxyUpdate)
     {
-        D2DPoint3F positions[GRID_POINT_COUNT] = {};
-        MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
-        unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
-        for (int y = 0; y < GRID_HEIGHT; y++)
-        {
-            for (int x = 0; x < GRID_WIDTH; x++)
-            {
-                int index = GetPointIndex(x, y);
-                float px = static_cast<float>(x) / (GRID_WIDTH - 1);
-                float py = static_cast<float>(y) / (GRID_HEIGHT - 1);
-                positions[index] = {px, py, 0.0f};
-                textureCoordinates[index] = {px, py};
-            }
-        }
-        unsigned int indexCount = 0;
-        for (int y = 0; y < GRID_HEIGHT - 1; y++)
-        {
-            for (int x = 0; x < GRID_WIDTH - 1; x++)
-            {
-                unsigned int topLeft = GetPointIndex(x, y);
-                unsigned int topRight = GetPointIndex(x + 1, y);
-                unsigned int bottomLeft = GetPointIndex(x, y + 1);
-                unsigned int bottomRight = GetPointIndex(x + 1, y + 1);
-                indices[indexCount++] = topLeft;
-                indices[indexCount++] = bottomLeft;
-                indices[indexCount++] = topRight;
-                indices[indexCount++] = topRight;
-                indices[indexCount++] = bottomLeft;
-                indices[indexCount++] = bottomRight;
-            }
-        }
-        detachResult = g_meshGeometry2dProxyUpdate(
-            state.meshProxy, 0, positions, textureCoordinates,
-            GRID_POINT_COUNT, indices, indexCount);
+        detachResult = UpdateNativeMeshGeometry(state.meshProxy);
     }
     if (state.renderVisual && g_visualRemoveSelfFromParentOriginal)
     {
@@ -5208,12 +5242,6 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
             float px = static_cast<float>(x) / (GRID_WIDTH - 1);
             float py = static_cast<float>(y) / (GRID_HEIGHT - 1);
             positions[index] = {px, py, 0.0f};
-            if (x > 0 && x < GRID_WIDTH - 1 && y > 0 &&
-                y < GRID_HEIGHT - 1)
-            {
-                positions[index].x += y == 1 ? 0.18f : -0.18f;
-                positions[index].y += x == 1 ? -0.12f : 0.12f;
-            }
             textureCoordinates[index] = {px, py};
         }
     }
@@ -5277,7 +5305,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     {
         *addResult = result;
         g_visibleMeshCanary = {nullptr, meshProxy, groupProxy, meshInstruction,
-                               nullptr, hwnd, GetTickCount64() + 5000};
+                               nullptr, hwnd, GetTickCount64() + 30000};
         meshProxy = nullptr;
         groupProxy = nullptr;
         meshInstruction = nullptr;
@@ -7217,6 +7245,8 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
     }
     struct RenderSnapshot
     {
+        bool retiring;
+        bool dragging;
         ULONGLONG generation;
         ULONGLONG meshRevision;
         HWND hwnd;
@@ -7237,6 +7267,8 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
           (slot.retiring || slot.meshIdentityPending || !slot.mesh.active ||
            g_unloading.load(std::memory_order_acquire)))))
     {
+        snapshot.retiring = slot.retiring;
+        snapshot.dragging = slot.dragging;
         snapshot.generation = slot.generation;
         snapshot.meshRevision = slot.meshRevision;
         snapshot.hwnd = slot.hwnd;
@@ -7290,6 +7322,53 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
                    static_cast<unsigned int>(updateResult));
         }
     };
+    bool nativeMeshTarget =
+        g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
+        !g_visibleMeshCanary.renderVisual &&
+        g_visibleMeshCanary.hwnd == snapshot.hwnd &&
+        g_visibleMeshCanary.meshProxy;
+    if (nativeMeshTarget)
+    {
+        long nativeResult = UpdateNativeMeshGeometry(
+            g_visibleMeshCanary.meshProxy,
+            identityUpdate ? nullptr : &snapshot.mesh);
+        if (nativeResult >= 0)
+        {
+            MilMatrix3x2D identityMatrix = {1.0, 0.0, 0.0, 1.0, 0.0,
+                                            0.0};
+            long matrixResult = UpdateMatrixTransformProxy(
+                snapshot.matrixTransformProxy, identityMatrix);
+            if (matrixResult >= 0)
+            {
+                g_visibleMeshCanary.detachAt = GetTickCount64() + 30000;
+                if (!identityUpdate &&
+                    !g_liveBaseImageMeshAnimationLogged.exchange(
+                        true, std::memory_order_acq_rel))
+                {
+                    Wh_Log(L"True 4x4 native animation active: HWND=%p MeshProxy=%p",
+                           snapshot.hwnd, g_visibleMeshCanary.meshProxy);
+                }
+                if (identityUpdate && snapshot.retiring)
+                {
+                    g_visibleMeshCanaryCleanupRequested.store(
+                        true, std::memory_order_release);
+                    RequestDwmScenePass();
+                }
+                finishUpdate(S_OK, identityUpdate);
+                return;
+            }
+            // Never combine a live native deformation with a stale affine
+            // matrix. Restore the mesh before using the established fallback.
+            UpdateNativeMeshGeometry(g_visibleMeshCanary.meshProxy);
+            nativeResult = matrixResult;
+        }
+        g_visibleMeshCanaryCleanupRequested.store(true,
+                                                   std::memory_order_release);
+        RequestDwmScenePass();
+        Wh_Log(L"True 4x4 native animation update failed for HWND=%p: 0x%08X; "
+               L"using affine fallback",
+               snapshot.hwnd, static_cast<unsigned int>(nativeResult));
+    }
     if (identityUpdate)
     {
         MilMatrix3x2D identityMatrix = {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
@@ -9323,6 +9402,8 @@ BOOL Wh_ModInit()
     g_nativeMeshCanarySucceeded.store(false, std::memory_order_release);
     g_liveBaseImageMeshCanaryStarted.store(false, std::memory_order_release);
     g_liveBaseImageMeshCanarySucceeded.store(false,
+                                              std::memory_order_release);
+    g_liveBaseImageMeshAnimationLogged.store(false,
                                               std::memory_order_release);
     g_meshSourceProbePending.store(false, std::memory_order_release);
     g_meshSourceProbeCompleted.store(false, std::memory_order_release);
