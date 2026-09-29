@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.152
+// @version         0.153
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -851,11 +851,23 @@ struct ObservedBitmapInstruction
     std::atomic<void*> instruction;
     std::atomic<void*> imageProxy;
 };
+enum class MeshSourceKind
+{
+    None,
+    Bitmap,
+    VisualSurface,
+    AmbiguousProxy,
+};
+static MeshSourceKind GetMeshSourceKind(void* object);
 struct ObservedRenderImage
 {
     std::atomic<void*> visual;
     std::atomic<void*> instruction;
     std::atomic<void*> imageProxy;
+    std::atomic<void*> imageVtable;
+    std::atomic<void*> ownerWindowData;
+    std::atomic<HWND> ownerHwnd;
+    std::atomic<int> sourceKind;
 };
 ObservedBitmapInstruction
     g_observedBitmapInstructions[OBSERVED_VISUAL_PROXY_COUNT] = {};
@@ -2737,6 +2749,15 @@ static Entry* FindObservedImageEntry(Entry* table, void* key, bool create)
                 {
                     entry.instruction.store(nullptr,
                                             std::memory_order_relaxed);
+                    entry.imageVtable.store(nullptr,
+                                            std::memory_order_relaxed);
+                    entry.ownerWindowData.store(nullptr,
+                                                std::memory_order_relaxed);
+                    entry.ownerHwnd.store(nullptr,
+                                          std::memory_order_relaxed);
+                    entry.sourceKind.store(
+                        static_cast<int>(MeshSourceKind::None),
+                        std::memory_order_relaxed);
                 }
                 return &entry;
             }
@@ -2807,8 +2828,29 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
             if (ObservedRenderImage* entry = FindObservedImageEntry(
                     g_observedRenderImages, pThis, true))
             {
+                void* imageVtable = nullptr;
+                if (IsReadableMemory(imageProxy, sizeof(void*)))
+                {
+                    void* candidate = *reinterpret_cast<void**>(imageProxy);
+                    if (IsDwmImageAddress(candidate, sizeof(void*)))
+                    {
+                        imageVtable = candidate;
+                    }
+                }
+                HWND ownerHwnd = nullptr;
+                void* ownerWindowData =
+                    RegisterAnimationTopLevelWindow3D(pThis, &ownerHwnd);
                 entry->instruction.store(instruction,
                                          std::memory_order_relaxed);
+                entry->imageVtable.store(imageVtable,
+                                         std::memory_order_relaxed);
+                entry->ownerWindowData.store(ownerWindowData,
+                                             std::memory_order_relaxed);
+                entry->ownerHwnd.store(ownerHwnd,
+                                       std::memory_order_relaxed);
+                entry->sourceKind.store(
+                    static_cast<int>(GetMeshSourceKind(imageProxy)),
+                    std::memory_order_relaxed);
                 entry->imageProxy.store(imageProxy,
                                         std::memory_order_release);
             }
@@ -3862,14 +3904,6 @@ static bool InitializeDwmHooks()
     return true;
 }
 
-enum class MeshSourceKind
-{
-    None,
-    Bitmap,
-    VisualSurface,
-    AmbiguousProxy,
-};
-
 static const wchar_t* GetMeshSourceKindName(MeshSourceKind kind)
 {
     switch (kind)
@@ -4581,16 +4615,18 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
             observed.visual.load(std::memory_order_acquire);
         void* imageProxy =
             observed.imageProxy.load(std::memory_order_acquire);
-        if (!imageProxy || !IsReadableMemory(imageProxy, sizeof(void*)))
+        if (!imageProxy)
         {
             continue;
         }
         observedImageEntries++;
-        void* imageVtable = *reinterpret_cast<void**>(imageProxy);
-        MeshSourceKind kind = GetMeshSourceKind(imageProxy);
-        HWND sourceHwnd = nullptr;
+        void* imageVtable =
+            observed.imageVtable.load(std::memory_order_acquire);
+        MeshSourceKind kind = static_cast<MeshSourceKind>(
+            observed.sourceKind.load(std::memory_order_acquire));
+        HWND sourceHwnd = observed.ownerHwnd.load(std::memory_order_acquire);
         void* sourceWindowData =
-            RegisterAnimationTopLevelWindow3D(renderVisual, &sourceHwnd);
+            observed.ownerWindowData.load(std::memory_order_acquire);
         bool sourceOwnerMatches = sourceWindowData && sourceHwnd == hwnd;
         int imageTargetNode = -1;
         const wchar_t* imageMatchedBy = L"none";
@@ -4636,81 +4672,13 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                imageProxy, imageVtable, sourceHwnd, sourceWindowData,
                sourceOwnerMatches, imageParent, imageContent, imageRedirect);
         int matchedVisualNode = -1;
-        const wchar_t* matchedBy = L"none";
-        unsigned int ancestryDepth = 0;
-        unsigned int nativeParentHops = 0;
-        void* currentVisual = renderVisual;
-        void* immediateParent = nullptr;
-        while (currentVisual && ancestryDepth < 16)
+        for (unsigned int index = 0; index < nodeSampleCount; index++)
         {
-            void* visualVtable = nullptr;
-            bool validVisual = IsReadableMemory(currentVisual, sizeof(void*));
-            if (validVisual)
+            if (nodeSamples[index].visual == renderVisual)
             {
-                visualVtable = *reinterpret_cast<void**>(currentVisual);
-                validVisual = IsDwmImageAddress(visualVtable, sizeof(void*));
-            }
-            void* currentProxy =
-                validVisual && g_visualGetVisualProxyForStructure
-                    ? g_visualGetVisualProxyForStructure(currentVisual)
-                    : nullptr;
-            void* proxyVtable =
-                currentProxy && IsReadableMemory(currentProxy, sizeof(void*))
-                    ? *reinterpret_cast<void**>(currentProxy)
-                    : nullptr;
-            ObservedVisualProxy* proxyObservation =
-                FindObservedVisualProxy(currentProxy, false);
-            void* proxyParent =
-                proxyObservation
-                    ? proxyObservation->parent.load(std::memory_order_acquire)
-                    : nullptr;
-            for (unsigned int index = 0; index < nodeSampleCount; index++)
-            {
-                if (nodeSamples[index].visual == currentVisual)
-                {
-                    matchedVisualNode = static_cast<int>(index);
-                    matchedBy = L"Visual";
-                    break;
-                }
-                if (currentProxy &&
-                    nodeSamples[index].visualProxy == currentProxy)
-                {
-                    matchedVisualNode = static_cast<int>(index);
-                    matchedBy = L"VisualProxy";
-                    break;
-                }
-            }
-            ObservedVisualProxy* visualObservation =
-                FindObservedVisual(currentVisual, false);
-            void* parent = visualObservation
-                               ? visualObservation->parent.load(
-                                     std::memory_order_acquire)
-                               : nullptr;
-            if (!parent && g_visualGetTransformParent && validVisual)
-            {
-                parent = g_visualGetTransformParent(currentVisual);
-                nativeParentHops++;
-            }
-            if (ancestryDepth == 0)
-            {
-                immediateParent = parent;
-            }
-            Wh_Log(L"True 4x4 image ancestry[%u:%u]: visual=%p "
-                   L"visualVtable=%p proxy=%p proxyVtable=%p proxyParent=%p "
-                   L"parent=%p targetNode=%d matchedBy=%s",
-                   observedImageEntries - 1, ancestryDepth, currentVisual,
-                   visualVtable, currentProxy, proxyVtable, proxyParent, parent,
-                   matchedVisualNode, matchedBy);
-            if (matchedVisualNode >= 0)
-            {
+                matchedVisualNode = static_cast<int>(index);
                 break;
             }
-            if (!parent || parent == currentVisual)
-            {
-                break;
-            }
-            currentVisual = parent;
-            ancestryDepth++;
         }
         if (sourceOwnerMatches || matchedVisualNode >= 0 ||
             imageTargetNode >= 0)
@@ -4718,12 +4686,10 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
             observedDrawBitmapSources++;
         }
         Wh_Log(L"True 4x4 observed image source[%u]: targetNode=%d "
-               L"matchedBy=%s ownerHWND=%p ownerMatch=%d ancestryDepth=%u "
-               L"nativeParentHops=%u visual=%p parent=%p instruction=%p "
+               L"ownerHWND=%p ownerMatch=%d visual=%p instruction=%p "
                L"image=%p imageVtable=%p kind=%s",
-               observedImageEntries - 1, matchedVisualNode, matchedBy,
-               sourceHwnd, sourceOwnerMatches, ancestryDepth, nativeParentHops,
-               renderVisual, immediateParent,
+               observedImageEntries - 1, matchedVisualNode, sourceHwnd,
+               sourceOwnerMatches, renderVisual,
                observed.instruction.load(std::memory_order_acquire), imageProxy,
                imageVtable,
                kind == MeshSourceKind::None ? L"BaseImage"
