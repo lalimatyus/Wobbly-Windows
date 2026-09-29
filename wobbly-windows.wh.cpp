@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.146
+// @version         0.147
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4430,6 +4430,8 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         MeshSourceKind kind = GetMeshSourceKind(imageProxy);
         int imageTargetNode = -1;
         const wchar_t* imageMatchedBy = L"none";
+        void* adjustedImageProxy = nullptr;
+        intptr_t imageProxyAdjustment = 0;
         for (unsigned int index = 0; index < nodeSampleCount; index++)
         {
             if (nodeSamples[index].visualProxy == imageProxy)
@@ -4451,8 +4453,69 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                 break;
             }
         }
+        uintptr_t imageAddress = reinterpret_cast<uintptr_t>(imageProxy);
+        void* visualProxyVtable =
+            g_visualProxyVtable.load(std::memory_order_acquire);
+        void* redirectProxyVtable =
+            g_redirectVisualProxyVtable.load(std::memory_order_acquire);
+        void* containerProxyVtable =
+            g_containerVisualProxyVtable.load(std::memory_order_acquire);
+        for (intptr_t adjustment = -64; adjustment <= 64;
+             adjustment += static_cast<intptr_t>(sizeof(void*)))
+        {
+            if ((adjustment < 0 &&
+                 imageAddress < static_cast<uintptr_t>(-adjustment)) ||
+                (adjustment > 0 &&
+                 imageAddress > UINTPTR_MAX -
+                                    static_cast<uintptr_t>(adjustment)))
+            {
+                continue;
+            }
+            uintptr_t candidateAddress =
+                adjustment < 0
+                    ? imageAddress - static_cast<uintptr_t>(-adjustment)
+                    : imageAddress + static_cast<uintptr_t>(adjustment);
+            void* candidate = reinterpret_cast<void*>(candidateAddress);
+            if (!IsReadableMemory(candidate, sizeof(void*)))
+            {
+                continue;
+            }
+            void* candidateVtable = *reinterpret_cast<void**>(candidate);
+            if (candidateVtable != visualProxyVtable &&
+                candidateVtable != redirectProxyVtable &&
+                candidateVtable != containerProxyVtable)
+            {
+                continue;
+            }
+            Wh_Log(L"True 4x4 image proxy adjustment[%u]: offset=%lld "
+                   L"candidate=%p vtable=%p",
+                   observedImageEntries - 1,
+                   static_cast<long long>(adjustment), candidate,
+                   candidateVtable);
+            for (unsigned int index = 0; index < nodeSampleCount; index++)
+            {
+                if (nodeSamples[index].visualProxy == candidate ||
+                    nodeSamples[index].redirectTarget == candidate)
+                {
+                    imageTargetNode = static_cast<int>(index);
+                    imageMatchedBy =
+                        nodeSamples[index].visualProxy == candidate
+                            ? L"AdjustedVisualProxy"
+                            : L"AdjustedRedirectTarget";
+                    adjustedImageProxy = candidate;
+                    imageProxyAdjustment = adjustment;
+                    break;
+                }
+            }
+            if (imageTargetNode >= 0)
+            {
+                break;
+            }
+        }
         ObservedVisualProxy* imageObservation =
-            FindObservedVisualProxy(imageProxy, false);
+            FindObservedVisualProxy(adjustedImageProxy ? adjustedImageProxy
+                                                       : imageProxy,
+                                    false);
         void* imageParent =
             imageObservation
                 ? imageObservation->parent.load(std::memory_order_acquire)
@@ -4466,10 +4529,12 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                 ? imageObservation->redirectTarget.load(std::memory_order_acquire)
                 : nullptr;
         Wh_Log(L"True 4x4 image proxy source[%u]: targetNode=%d matchedBy=%s "
-               L"image=%p vtable=%p parent=%p content=%p redirect=%p",
+               L"image=%p vtable=%p adjusted=%p adjustment=%lld parent=%p "
+               L"content=%p redirect=%p",
                observedImageEntries - 1, imageTargetNode, imageMatchedBy,
-               imageProxy, imageVtable, imageParent, imageContent,
-               imageRedirect);
+               imageProxy, imageVtable, adjustedImageProxy,
+               static_cast<long long>(imageProxyAdjustment), imageParent,
+               imageContent, imageRedirect);
         int matchedVisualNode = -1;
         const wchar_t* matchedBy = L"none";
         unsigned int ancestryDepth = 0;
