@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.151
+// @version         0.152
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -409,6 +409,8 @@ using CCompositorCreateGeometry2dGroupProxy_t = long(__cdecl*)(void* pThis,
                                                                 void** groupProxy);
 using CCompositorCreateBitmapSourceProxy_t = long(__cdecl*)(void* pThis,
                                                              void** bitmapProxy);
+using CCompositorCreateVisualSurfaceProxy_t = long(__cdecl*)(
+    void* pThis, void* sharedHandle, void** surfaceProxy);
 using CGeometry2dGroupProxyUpdate_t = long(__cdecl*)(void* pThis, void* meshProxy);
 using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(void* geometryGroupProxy,
                                                        void* bitmapSourceProxy,
@@ -447,6 +449,8 @@ CMeshGeometry2dProxyUpdate_t g_meshGeometry2dProxyUpdate = nullptr;
 CCompositorCreateMeshGeometry2dProxy_t g_createMeshGeometry2dProxy = nullptr;
 CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
 CCompositorCreateBitmapSourceProxy_t g_createBitmapSourceProxyOriginal = nullptr;
+CCompositorCreateVisualSurfaceProxy_t
+    g_createVisualSurfaceProxyOriginal = nullptr;
 CGeometry2dGroupProxyUpdate_t g_geometry2dGroupProxyUpdate = nullptr;
 CDrawMesh2DInstructionCreate_t g_drawMesh2DInstructionCreate = nullptr;
 CDrawBitmapInstructionCreate_t g_drawBitmapInstructionCreateOriginal = nullptr;
@@ -858,7 +862,10 @@ ObservedBitmapInstruction
 ObservedRenderImage g_observedRenderImages[OBSERVED_VISUAL_PROXY_COUNT] = {};
 std::atomic<void*>
     g_observedBitmapSourceProxies[OBSERVED_VISUAL_PROXY_COUNT] = {};
+std::atomic<void*>
+    g_observedVisualSurfaceProxies[OBSERVED_VISUAL_PROXY_COUNT] = {};
 std::atomic<unsigned int> g_observedBitmapSourceCreateCount = 0;
+std::atomic<unsigned int> g_observedVisualSurfaceCreateCount = 0;
 std::atomic<unsigned int> g_observedDrawBitmapCreateCount = 0;
 std::atomic<unsigned int> g_observedDrawTileCreateCount = 0;
 std::atomic<unsigned int> g_observedImageInstructionMatchedAddCount = 0;
@@ -910,6 +917,9 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                                         void* instruction);
 static long __cdecl CreateBitmapSourceProxyHook(void* pThis,
                                                  void** bitmapProxy);
+static long __cdecl CreateVisualSurfaceProxyHook(void* pThis,
+                                                  void* sharedHandle,
+                                                  void** surfaceProxy);
 static long __cdecl RedirectVisualProxySetRedirectedVisualHook(void* pThis,
                                                                void* visual);
 static bool HasAnyAnimationSlots();
@@ -2596,7 +2606,8 @@ static ObservedVisualProxy* FindObservedVisual(void* visual, bool create)
     return FindObservedNode(g_observedVisuals, visual, create);
 }
 
-static bool FindObservedBitmapSourceProxy(void* proxy, bool create)
+static bool FindObservedExactSourceProxy(std::atomic<void*>* table,
+                                          void* proxy, bool create)
 {
     if (!proxy)
     {
@@ -2607,8 +2618,7 @@ static bool FindObservedBitmapSourceProxy(void* proxy, bool create)
     for (unsigned int probe = 0; probe < OBSERVED_VISUAL_PROXY_PROBES; probe++)
     {
         std::atomic<void*>& entry =
-            g_observedBitmapSourceProxies[(hash + probe) %
-                                          OBSERVED_VISUAL_PROXY_COUNT];
+            table[(hash + probe) % OBSERVED_VISUAL_PROXY_COUNT];
         void* observed = entry.load(std::memory_order_acquire);
         if (observed == proxy)
         {
@@ -2632,6 +2642,18 @@ static bool FindObservedBitmapSourceProxy(void* proxy, bool create)
     return false;
 }
 
+static bool FindObservedBitmapSourceProxy(void* proxy, bool create)
+{
+    return FindObservedExactSourceProxy(g_observedBitmapSourceProxies, proxy,
+                                         create);
+}
+
+static bool FindObservedVisualSurfaceProxy(void* proxy, bool create)
+{
+    return FindObservedExactSourceProxy(g_observedVisualSurfaceProxies, proxy,
+                                         create);
+}
+
 static long __cdecl CreateBitmapSourceProxyHook(void* pThis,
                                                  void** bitmapProxy)
 {
@@ -2642,6 +2664,22 @@ static long __cdecl CreateBitmapSourceProxyHook(void* pThis,
         FindObservedBitmapSourceProxy(*bitmapProxy, true);
         g_observedBitmapSourceCreateCount.fetch_add(1,
                                                      std::memory_order_relaxed);
+    }
+    return result;
+}
+
+static long __cdecl CreateVisualSurfaceProxyHook(void* pThis,
+                                                  void* sharedHandle,
+                                                  void** surfaceProxy)
+{
+    long result = g_createVisualSurfaceProxyOriginal(
+        pThis, sharedHandle, surfaceProxy);
+    if (result >= 0 && surfaceProxy && *surfaceProxy &&
+        !g_unloading.load(std::memory_order_acquire))
+    {
+        FindObservedVisualSurfaceProxy(*surfaceProxy, true);
+        g_observedVisualSurfaceCreateCount.fetch_add(
+            1, std::memory_order_relaxed);
     }
     return result;
 }
@@ -3246,6 +3284,15 @@ static bool InitializeDwmHooks()
          &g_createBitmapSourceProxyOriginal,
          CreateBitmapSourceProxyHook,
          true},
+        {{L"public: long __cdecl "
+           L"CCompositor::CreateVisualSurfaceProxyFromSharedHandle("
+           L"void *,class CVisualSurfaceProxy * *)",
+          L"protected: long __cdecl CCompositor::CreateProxyFromSharedHandle<"
+           L"class CVisualSurfaceProxy>(void *,"
+           L"class CVisualSurfaceProxy * *)"},
+         &g_createVisualSurfaceProxyOriginal,
+         CreateVisualSurfaceProxyHook,
+         true},
         {{L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CCachedVisualImageProxy>("
            L"class CCachedVisualImageProxy * *)"},
@@ -3494,6 +3541,7 @@ static bool InitializeDwmHooks()
     keepValid(g_createMeshGeometry2dProxy);
     keepValid(g_createGeometry2dGroupProxy);
     keepValid(g_createBitmapSourceProxyOriginal);
+    keepValid(g_createVisualSurfaceProxyOriginal);
     keepValid(g_geometry2dGroupProxyUpdate);
     keepValid(g_drawMesh2DInstructionCreate);
     keepValid(g_drawBitmapInstructionCreateOriginal);
@@ -3584,10 +3632,12 @@ static bool InitializeDwmHooks()
     bool hasExactClientAreaVtable =
         cacheVtableSymbol(g_clientAreaVtableSymbol, g_clientAreaVtable);
     Wh_Log(L"True 4x4 source probe: bitmap=%s visualSurface=%s "
-           L"bitmapCreationObserver=%s vtableAlias=%d",
+           L"bitmapCreationObserver=%s surfaceCreationObserver=%s "
+           L"vtableAlias=%d",
            hasExactBitmapSourceProxyVtable ? L"available" : L"unavailable",
            hasExactVisualSurfaceProxyVtable ? L"available" : L"unavailable",
            g_createBitmapSourceProxyOriginal ? L"available" : L"unavailable",
+           g_createVisualSurfaceProxyOriginal ? L"available" : L"unavailable",
            g_bitmapSourceProxyVtable.load(std::memory_order_acquire) ==
                g_visualSurfaceProxyVtable.load(std::memory_order_acquire));
     Wh_Log(L"True 4x4 GPU source probe: cachedVisual=%s clientArea=%s "
@@ -3844,6 +3894,10 @@ static MeshSourceKind GetMeshSourceKind(void* object)
     if (FindObservedBitmapSourceProxy(object, false))
     {
         return MeshSourceKind::Bitmap;
+    }
+    if (FindObservedVisualSurfaceProxy(object, false))
+    {
+        return MeshSourceKind::VisualSurface;
     }
     void* vtable = *reinterpret_cast<void**>(object);
     void* bitmapVtable =
@@ -4508,10 +4562,13 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         }
     }
     Wh_Log(L"True 4x4 native render source probe: HWND=%p candidates=%u "
-           L"exact=%u createdBitmapProxies=%u visualNodes=%u "
+           L"exact=%u createdBitmapProxies=%u createdVisualSurfaces=%u "
+           L"visualNodes=%u "
            L"(read-only, no mesh attached)",
            hwnd, nativeSourceCandidates, exactNativeSources,
            g_observedBitmapSourceCreateCount.load(std::memory_order_relaxed),
+           g_observedVisualSurfaceCreateCount.load(
+               std::memory_order_relaxed),
            nodeSampleCount);
     unsigned int observedDrawBitmapSources = 0;
     unsigned int observedImageEntries = 0;
@@ -9105,7 +9162,12 @@ BOOL Wh_ModInit()
     {
         proxy.store(nullptr, std::memory_order_relaxed);
     }
+    for (std::atomic<void*>& proxy : g_observedVisualSurfaceProxies)
+    {
+        proxy.store(nullptr, std::memory_order_relaxed);
+    }
     g_observedBitmapSourceCreateCount.store(0, std::memory_order_relaxed);
+    g_observedVisualSurfaceCreateCount.store(0, std::memory_order_relaxed);
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
