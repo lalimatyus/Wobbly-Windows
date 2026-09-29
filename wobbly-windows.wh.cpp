@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.154
+// @version         0.155
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -909,7 +909,9 @@ static void RestorePendingAnimationIdentities();
 static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
 static void RunNativeMeshCanary();
-static void RunLiveBaseImageMeshPublishCanary(void* imageProxy, HWND hwnd);
+static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
+                                               void* imageProxy, HWND hwnd,
+                                               long* addResult);
 static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwnd);
 static void RunCachedVisualImageCanary(void* sourceVisualProxy,
                                        void* hostVisual,
@@ -2815,49 +2817,54 @@ static long __cdecl DrawTileImageInstructionCreateHook(
 static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                                         void* instruction)
 {
-    long result = g_renderDataVisualAddInstruction(pThis, instruction);
-    if (result >= 0 && pThis && instruction &&
+    ObservedBitmapInstruction* source =
+        pThis && instruction
+            ? FindObservedImageEntry(g_observedBitmapInstructions,
+                                     instruction, false)
+            : nullptr;
+    void* imageProxy = source
+                           ? source->imageProxy.load(std::memory_order_acquire)
+                           : nullptr;
+    HWND ownerHwnd = nullptr;
+    void* ownerWindowData = nullptr;
+    long result = E_NOINTERFACE;
+    bool replaced = false;
+    if (imageProxy && !g_unloading.load(std::memory_order_acquire))
+    {
+        ownerWindowData = RegisterAnimationTopLevelWindow3D(pThis, &ownerHwnd);
+        replaced = TryInstallLiveBaseImageMeshCanary(
+            pThis, imageProxy, ownerHwnd, &result);
+    }
+    if (!replaced)
+    {
+        result = g_renderDataVisualAddInstruction(pThis, instruction);
+    }
+    if (result >= 0 && imageProxy &&
         !g_unloading.load(std::memory_order_acquire))
     {
-        ObservedBitmapInstruction* source = FindObservedImageEntry(
-            g_observedBitmapInstructions, instruction, false);
-        void* imageProxy = source ? source->imageProxy.load(
-                                        std::memory_order_acquire)
-                                  : nullptr;
-        if (imageProxy)
+        g_observedImageInstructionMatchedAddCount.fetch_add(
+            1, std::memory_order_relaxed);
+        if (ObservedRenderImage* entry = FindObservedImageEntry(
+                g_observedRenderImages, pThis, true))
         {
-            g_observedImageInstructionMatchedAddCount.fetch_add(
-                1, std::memory_order_relaxed);
-            if (ObservedRenderImage* entry = FindObservedImageEntry(
-                    g_observedRenderImages, pThis, true))
+            void* imageVtable = nullptr;
+            if (IsReadableMemory(imageProxy, sizeof(void*)))
             {
-                void* imageVtable = nullptr;
-                if (IsReadableMemory(imageProxy, sizeof(void*)))
+                void* candidate = *reinterpret_cast<void**>(imageProxy);
+                if (IsDwmImageAddress(candidate, sizeof(void*)))
                 {
-                    void* candidate = *reinterpret_cast<void**>(imageProxy);
-                    if (IsDwmImageAddress(candidate, sizeof(void*)))
-                    {
-                        imageVtable = candidate;
-                    }
+                    imageVtable = candidate;
                 }
-                HWND ownerHwnd = nullptr;
-                void* ownerWindowData =
-                    RegisterAnimationTopLevelWindow3D(pThis, &ownerHwnd);
-                entry->instruction.store(instruction,
-                                         std::memory_order_relaxed);
-                entry->imageVtable.store(imageVtable,
-                                         std::memory_order_relaxed);
-                entry->ownerWindowData.store(ownerWindowData,
-                                             std::memory_order_relaxed);
-                entry->ownerHwnd.store(ownerHwnd,
-                                       std::memory_order_relaxed);
-                entry->sourceKind.store(
-                    static_cast<int>(GetMeshSourceKind(imageProxy)),
-                    std::memory_order_relaxed);
-                entry->imageProxy.store(imageProxy,
-                                        std::memory_order_release);
-                RunLiveBaseImageMeshPublishCanary(imageProxy, ownerHwnd);
             }
+            entry->instruction.store(instruction, std::memory_order_relaxed);
+            entry->imageVtable.store(imageVtable, std::memory_order_relaxed);
+            entry->ownerWindowData.store(ownerWindowData,
+                                         std::memory_order_relaxed);
+            entry->ownerHwnd.store(ownerHwnd, std::memory_order_relaxed);
+            entry->sourceKind.store(
+                static_cast<int>(GetMeshSourceKind(imageProxy)),
+                std::memory_order_relaxed);
+            entry->imageProxy.store(imageProxy, std::memory_order_release);
         }
     }
     return result;
@@ -4221,8 +4228,8 @@ static void MaintainVisibleMeshCanary()
                   g_visibleMeshCanaryCleanupRequested.load(
                       std::memory_order_acquire);
     bool detach = forced ||
-                  (!g_realDragging.load(std::memory_order_acquire) &&
-                   GetTickCount64() >= g_visibleMeshCanary.detachAt);
+                  !g_realDragging.load(std::memory_order_acquire) ||
+                  GetTickCount64() >= g_visibleMeshCanary.detachAt;
     if (!detach)
     {
         return;
@@ -4230,6 +4237,44 @@ static void MaintainVisibleMeshCanary()
     VisibleMeshCanaryState state = g_visibleMeshCanary;
     g_visibleMeshCanary = {};
     long detachResult = E_NOINTERFACE;
+    if (!state.renderVisual && state.meshProxy &&
+        g_meshGeometry2dProxyUpdate)
+    {
+        D2DPoint3F positions[GRID_POINT_COUNT] = {};
+        MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
+        unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
+        for (int y = 0; y < GRID_HEIGHT; y++)
+        {
+            for (int x = 0; x < GRID_WIDTH; x++)
+            {
+                int index = GetPointIndex(x, y);
+                float px = static_cast<float>(x) / (GRID_WIDTH - 1);
+                float py = static_cast<float>(y) / (GRID_HEIGHT - 1);
+                positions[index] = {px, py, 0.0f};
+                textureCoordinates[index] = {px, py};
+            }
+        }
+        unsigned int indexCount = 0;
+        for (int y = 0; y < GRID_HEIGHT - 1; y++)
+        {
+            for (int x = 0; x < GRID_WIDTH - 1; x++)
+            {
+                unsigned int topLeft = GetPointIndex(x, y);
+                unsigned int topRight = GetPointIndex(x + 1, y);
+                unsigned int bottomLeft = GetPointIndex(x, y + 1);
+                unsigned int bottomRight = GetPointIndex(x + 1, y + 1);
+                indices[indexCount++] = topLeft;
+                indices[indexCount++] = bottomLeft;
+                indices[indexCount++] = topRight;
+                indices[indexCount++] = topRight;
+                indices[indexCount++] = bottomLeft;
+                indices[indexCount++] = bottomRight;
+            }
+        }
+        detachResult = g_meshGeometry2dProxyUpdate(
+            state.meshProxy, 0, positions, textureCoordinates,
+            GRID_POINT_COUNT, indices, indexCount);
+    }
     if (state.renderVisual && g_visualRemoveSelfFromParentOriginal)
     {
         detachResult = g_visualRemoveSelfFromParentOriginal(state.renderVisual);
@@ -4257,8 +4302,17 @@ static void MaintainVisibleMeshCanary()
     g_visibleMeshCanaryCleanupRequested.store(false,
                                                std::memory_order_release);
     g_visibleMeshCanaryActive.store(false, std::memory_order_release);
-    Wh_Log(L"True 4x4 visible warped canary: detached result=0x%08X HWND=%p",
-           static_cast<unsigned int>(detachResult), state.hwnd);
+    RequestDwmScenePass();
+    if (state.renderVisual)
+    {
+        Wh_Log(L"True 4x4 visible warped canary: detached result=0x%08X HWND=%p",
+               static_cast<unsigned int>(detachResult), state.hwnd);
+    }
+    else
+    {
+        Wh_Log(L"True 4x4 native in-place canary: restored identity result=0x%08X HWND=%p",
+               static_cast<unsigned int>(detachResult), state.hwnd);
+    }
 }
 
 static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwnd)
@@ -5096,19 +5150,24 @@ static void RunNativeMeshCanary()
            (GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6);
 }
 
-static void RunLiveBaseImageMeshPublishCanary(void* imageProxy, HWND hwnd)
+static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
+                                               void* imageProxy, HWND hwnd,
+                                               long* addResult)
 {
-    if (!IsOnDwmSceneThread() || !hwnd || !IsWindow(hwnd) || !imageProxy ||
+    if (!IsOnDwmSceneThread() || !renderVisual || !hwnd || !IsWindow(hwnd) ||
+        !imageProxy || !addResult ||
+        !g_realDragging.load(std::memory_order_acquire) ||
+        g_realDraggedWindow.load(std::memory_order_acquire) != hwnd ||
+        g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
         !g_nativeMeshCanarySucceeded.load(std::memory_order_acquire) ||
         GetMeshSourceKind(imageProxy) != MeshSourceKind::None ||
         !IsReadableMemory(imageProxy, 0x18) ||
         !g_createMeshGeometry2dProxy || !g_meshGeometry2dProxyUpdate ||
         !g_createGeometry2dGroupProxy || !g_geometry2dGroupProxyUpdate ||
-        !g_drawMesh2DInstructionCreate || !g_renderDataVisualCreate ||
-        !g_renderDataVisualAddInstruction ||
-        !g_renderDataVisualUpdateRenderData || !g_cBaseObjectRelease)
+        !g_drawMesh2DInstructionCreate || !g_renderDataVisualAddInstruction ||
+        !g_cBaseObjectRelease)
     {
-        return;
+        return false;
     }
 
     void* imageVtable = *reinterpret_cast<void**>(imageProxy);
@@ -5116,13 +5175,13 @@ static void RunLiveBaseImageMeshPublishCanary(void* imageProxy, HWND hwnd)
     if (!IsDwmImageAddress(imageVtable, sizeof(void*)) ||
         !IsReadableMemory(imageResource, 0x1C))
     {
-        return;
+        return false;
     }
     unsigned int imageResourceId = *reinterpret_cast<unsigned int*>(
         reinterpret_cast<unsigned char*>(imageResource) + 0x18);
     if (!imageResourceId)
     {
-        return;
+        return false;
     }
 
     bool expected = false;
@@ -5130,18 +5189,17 @@ static void RunLiveBaseImageMeshPublishCanary(void* imageProxy, HWND hwnd)
             expected, true, std::memory_order_acq_rel,
             std::memory_order_acquire))
     {
-        return;
+        return false;
     }
 
-    // Run while the original CDrawBitmapInstruction still owns imageProxy.
-    // The render visual stays detached: this tests only whether DWM accepts
-    // the live BaseImage resource in a mesh command without touching output.
+    // Replace one live bitmap draw in its existing CRenderDataVisual. Creating
+    // the mesh instruction here makes it retain imageProxy before the original
+    // bitmap instruction can release it. No duplicate visual layer is added.
     long result = E_NOINTERFACE;
     const wchar_t* stage = L"CreateMesh";
     void* meshProxy = nullptr;
     void* groupProxy = nullptr;
     void* meshInstruction = nullptr;
-    void* renderVisual = nullptr;
     D2DPoint3F positions[GRID_POINT_COUNT] = {};
     MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
     unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
@@ -5154,6 +5212,12 @@ static void RunLiveBaseImageMeshPublishCanary(void* imageProxy, HWND hwnd)
             float px = static_cast<float>(x) / (GRID_WIDTH - 1);
             float py = static_cast<float>(y) / (GRID_HEIGHT - 1);
             positions[index] = {px, py, 0.0f};
+            if (x > 0 && x < GRID_WIDTH - 1 && y > 0 &&
+                y < GRID_HEIGHT - 1)
+            {
+                positions[index].x += y == 1 ? 0.18f : -0.18f;
+                positions[index].y += x == 1 ? -0.12f : 0.12f;
+            }
             textureCoordinates[index] = {px, py};
         }
     }
@@ -5205,28 +5269,26 @@ static void RunLiveBaseImageMeshPublishCanary(void* imageProxy, HWND hwnd)
     }
     if (result >= 0)
     {
-        stage = L"CreateRenderVisual";
-        result = g_renderDataVisualCreate(&renderVisual);
-    }
-    if (result >= 0 && renderVisual && meshInstruction)
-    {
-        stage = L"AddInstruction";
+        stage = L"ReplaceInstruction";
         result = g_renderDataVisualAddInstruction(renderVisual,
                                                    meshInstruction);
     }
-    if (result >= 0 && renderVisual)
-    {
-        stage = L"PublishDetached";
-        result = g_renderDataVisualUpdateRenderData(renderVisual);
-    }
 
-    bool succeeded = result >= 0 && meshProxy && groupProxy &&
-                     meshInstruction && renderVisual;
+    bool succeeded = result >= 0 && meshProxy && groupProxy && meshInstruction;
     g_liveBaseImageMeshCanarySucceeded.store(succeeded,
                                                std::memory_order_release);
-    if (renderVisual)
+    if (succeeded)
     {
-        g_cBaseObjectRelease(renderVisual);
+        *addResult = result;
+        g_visibleMeshCanary = {nullptr, meshProxy, groupProxy, meshInstruction,
+                               nullptr, hwnd, GetTickCount64() + 5000};
+        meshProxy = nullptr;
+        groupProxy = nullptr;
+        meshInstruction = nullptr;
+        g_visibleMeshCanaryCleanupRequested.store(false,
+                                                   std::memory_order_release);
+        g_visibleMeshCanaryActive.store(true, std::memory_order_release);
+        RequestDwmScenePass();
     }
     if (meshInstruction)
     {
@@ -5241,12 +5303,13 @@ static void RunLiveBaseImageMeshPublishCanary(void* imageProxy, HWND hwnd)
         g_cBaseObjectRelease(meshProxy);
     }
 
-    Wh_Log(L"True 4x4 live BaseImage publish canary: %s stage=%s "
+    Wh_Log(L"True 4x4 native in-place canary: %s stage=%s "
            L"result=0x%08X HWND=%p image=%p imageVtable=%p "
            L"resource=%p resourceId=%u vertices=%u indices=%u",
-           succeeded ? L"passed" : L"failed", stage,
+           succeeded ? L"installed" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, imageProxy, imageVtable,
            imageResource, imageResourceId, GRID_POINT_COUNT, indexCount);
+    return succeeded;
 }
 
 static void SubmitPendingWobblySceneWork()
