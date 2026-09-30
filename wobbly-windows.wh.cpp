@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.157
+// @version         0.158
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -834,6 +834,13 @@ struct VisibleMeshCanaryState
     void* renderVisual;
     HWND hwnd;
     ULONGLONG detachAt;
+    struct
+    {
+        void* meshProxy;
+        void* groupProxy;
+        void* instruction;
+    } additionalNativeBindings[3];
+    unsigned int nativeBindingCount;
 };
 VisibleMeshCanaryState g_visibleMeshCanary = {};
 std::atomic_bool g_visibleMeshCanaryActive = false;
@@ -4284,6 +4291,34 @@ static long UpdateNativeMeshGeometry(void* meshProxy, const WobbleMesh* mesh)
         indices, indexCount);
 }
 
+static void* GetNativeMeshProxy(unsigned int index)
+{
+    if (index == 0)
+    {
+        return g_visibleMeshCanary.meshProxy;
+    }
+    return index <= ARRAYSIZE(g_visibleMeshCanary.additionalNativeBindings)
+               ? g_visibleMeshCanary.additionalNativeBindings[index - 1]
+                     .meshProxy
+               : nullptr;
+}
+
+static long UpdateAllNativeMeshGeometry(const WobbleMesh* mesh = nullptr)
+{
+    long result = S_OK;
+    for (unsigned int index = 0;
+         index < g_visibleMeshCanary.nativeBindingCount; index++)
+    {
+        void* meshProxy = GetNativeMeshProxy(index);
+        long updateResult = UpdateNativeMeshGeometry(meshProxy, mesh);
+        if (updateResult < 0 && result >= 0)
+        {
+            result = updateResult;
+        }
+    }
+    return result;
+}
+
 static void MaintainVisibleMeshCanary()
 {
     if (!IsOnDwmSceneThread() ||
@@ -4300,12 +4335,11 @@ static void MaintainVisibleMeshCanary()
         return;
     }
     VisibleMeshCanaryState state = g_visibleMeshCanary;
-    g_visibleMeshCanary = {};
     long detachResult = E_NOINTERFACE;
     if (!state.renderVisual && state.meshProxy &&
         g_meshGeometry2dProxyUpdate)
     {
-        detachResult = UpdateNativeMeshGeometry(state.meshProxy);
+        detachResult = UpdateAllNativeMeshGeometry();
     }
     if (state.renderVisual && g_visualRemoveSelfFromParentOriginal)
     {
@@ -4331,6 +4365,23 @@ static void MaintainVisibleMeshCanary()
     {
         g_cBaseObjectRelease(state.cachedVisual);
     }
+    for (unsigned int index = 1; index < state.nativeBindingCount; index++)
+    {
+        auto& binding = state.additionalNativeBindings[index - 1];
+        if (binding.instruction && g_cBaseObjectRelease)
+        {
+            g_cBaseObjectRelease(binding.instruction);
+        }
+        if (binding.groupProxy && g_cBaseObjectRelease)
+        {
+            g_cBaseObjectRelease(binding.groupProxy);
+        }
+        if (binding.meshProxy && g_cBaseObjectRelease)
+        {
+            g_cBaseObjectRelease(binding.meshProxy);
+        }
+    }
+    g_visibleMeshCanary = {};
     g_visibleMeshCanaryCleanupRequested.store(false,
                                                std::memory_order_release);
     g_visibleMeshCanaryActive.store(false, std::memory_order_release);
@@ -5186,9 +5237,16 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
                                                void* imageProxy, HWND hwnd,
                                                long* addResult)
 {
+    bool canAppend =
+        g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
+        !g_visibleMeshCanary.renderVisual &&
+        g_visibleMeshCanary.hwnd == hwnd &&
+        g_visibleMeshCanary.nativeBindingCount <
+            1 + ARRAYSIZE(g_visibleMeshCanary.additionalNativeBindings);
     if (!IsOnDwmSceneThread() || !renderVisual || !hwnd || !IsWindow(hwnd) ||
         GetForegroundWindow() != hwnd || !imageProxy || !addResult ||
-        g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
+        (g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
+         !canAppend) ||
         !g_nativeMeshCanarySucceeded.load(std::memory_order_acquire) ||
         GetMeshSourceKind(imageProxy) != MeshSourceKind::None ||
         !IsReadableMemory(imageProxy, 0x18) ||
@@ -5215,7 +5273,8 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     }
 
     bool expected = false;
-    if (!g_liveBaseImageMeshCanaryStarted.compare_exchange_strong(
+    if (!canAppend &&
+        !g_liveBaseImageMeshCanaryStarted.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel,
             std::memory_order_acquire))
     {
@@ -5304,8 +5363,22 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     if (succeeded)
     {
         *addResult = result;
-        g_visibleMeshCanary = {nullptr, meshProxy, groupProxy, meshInstruction,
-                               nullptr, hwnd, GetTickCount64() + 30000};
+        unsigned int bindingIndex = 0;
+        if (canAppend)
+        {
+            bindingIndex = g_visibleMeshCanary.nativeBindingCount++;
+            auto& binding =
+                g_visibleMeshCanary.additionalNativeBindings[bindingIndex - 1];
+            binding = {meshProxy, groupProxy, meshInstruction};
+            g_visibleMeshCanary.detachAt = GetTickCount64() + 30000;
+        }
+        else
+        {
+            g_visibleMeshCanary = {
+                nullptr, meshProxy, groupProxy, meshInstruction, nullptr,
+                hwnd, GetTickCount64() + 30000};
+            g_visibleMeshCanary.nativeBindingCount = 1;
+        }
         meshProxy = nullptr;
         groupProxy = nullptr;
         meshInstruction = nullptr;
@@ -5329,10 +5402,12 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
 
     Wh_Log(L"True 4x4 native in-place canary: %s stage=%s "
            L"result=0x%08X HWND=%p image=%p imageVtable=%p "
-           L"resource=%p resourceId=%u vertices=%u indices=%u",
+           L"resource=%p resourceId=%u bindings=%u vertices=%u indices=%u",
            succeeded ? L"installed" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, imageProxy, imageVtable,
-           imageResource, imageResourceId, GRID_POINT_COUNT, indexCount);
+           imageResource, imageResourceId,
+           g_visibleMeshCanary.nativeBindingCount, GRID_POINT_COUNT,
+           indexCount);
     return succeeded;
 }
 
@@ -7326,11 +7401,10 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
         !g_visibleMeshCanary.renderVisual &&
         g_visibleMeshCanary.hwnd == snapshot.hwnd &&
-        g_visibleMeshCanary.meshProxy;
+        g_visibleMeshCanary.nativeBindingCount > 0;
     if (nativeMeshTarget)
     {
-        long nativeResult = UpdateNativeMeshGeometry(
-            g_visibleMeshCanary.meshProxy,
+        long nativeResult = UpdateAllNativeMeshGeometry(
             identityUpdate ? nullptr : &snapshot.mesh);
         if (nativeResult >= 0)
         {
@@ -7345,8 +7419,22 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
                     !g_liveBaseImageMeshAnimationLogged.exchange(
                         true, std::memory_order_acq_rel))
                 {
-                    Wh_Log(L"True 4x4 native animation active: HWND=%p MeshProxy=%p",
-                           snapshot.hwnd, g_visibleMeshCanary.meshProxy);
+                    double maximumDisplacement = 0.0;
+                    for (int i = 0; i < GRID_POINT_COUNT; i++)
+                    {
+                        double dx = snapshot.mesh.points[i].position.x -
+                                    snapshot.mesh.points[i].basePosition.x;
+                        double dy = snapshot.mesh.points[i].position.y -
+                                    snapshot.mesh.points[i].basePosition.y;
+                        maximumDisplacement = std::max(
+                            maximumDisplacement, std::sqrt(dx * dx + dy * dy));
+                    }
+                    Wh_Log(L"True 4x4 native animation active: HWND=%p "
+                           L"bindings=%u MaxDisplacement=%.2f size=%.0fx%.0f",
+                           snapshot.hwnd,
+                           g_visibleMeshCanary.nativeBindingCount,
+                           maximumDisplacement, snapshot.mesh.width,
+                           snapshot.mesh.height);
                 }
                 if (identityUpdate && snapshot.retiring)
                 {
@@ -7359,7 +7447,7 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
             }
             // Never combine a live native deformation with a stale affine
             // matrix. Restore the mesh before using the established fallback.
-            UpdateNativeMeshGeometry(g_visibleMeshCanary.meshProxy);
+            UpdateAllNativeMeshGeometry();
             nativeResult = matrixResult;
         }
         g_visibleMeshCanaryCleanupRequested.store(true,
