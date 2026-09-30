@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.160
+// @version         0.161
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -453,6 +453,10 @@ CCompositorCreateVisualSurfaceProxy_t
     g_createVisualSurfaceProxyOriginal = nullptr;
 CGeometry2dGroupProxyUpdate_t g_geometry2dGroupProxyUpdate = nullptr;
 CDrawMesh2DInstructionCreate_t g_drawMesh2DInstructionCreate = nullptr;
+void* g_createTouchDragVisualFunction = nullptr;
+void* g_touchDragVisualNotifyFunction = nullptr;
+void* g_touchDragVisualStopFunction = nullptr;
+void* g_touchDragVisualCreateMeshInstructionFunction = nullptr;
 CDrawBitmapInstructionCreate_t g_drawBitmapInstructionCreateOriginal = nullptr;
 CDrawTileImageInstructionCreate_t g_drawTileImageInstructionCreateOriginal =
     nullptr;
@@ -3387,6 +3391,27 @@ static bool InitializeDwmHooks()
          &g_drawMesh2DInstructionCreate,
          nullptr,
          true},
+        {{L"long __cdecl CreateTouchVisual<class CTouchDragVisual>("
+           L"unsigned __int64,class CTouchDragVisual * *)"},
+         &g_createTouchDragVisualFunction,
+         nullptr,
+         true},
+        {{L"public: long __cdecl CTouchDragVisual::NotifyTouchDrag("
+           L"struct tagPOINT const *)"},
+         &g_touchDragVisualNotifyFunction,
+         nullptr,
+         true},
+        {{L"public: virtual void __cdecl CTouchDragVisual::Stop(void)"},
+         &g_touchDragVisualStopFunction,
+         nullptr,
+         true},
+        {{L"private: long __cdecl "
+           L"CTouchDragVisual::CreateDrawMesh2DInstruction("
+           L"struct Mesh2D const *,class CGeometry2dGroupProxy * *,"
+           L"class CMeshGeometry2dProxy * *)"},
+         &g_touchDragVisualCreateMeshInstructionFunction,
+         nullptr,
+         true},
         {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
            L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
          &g_drawBitmapInstructionCreateOriginal,
@@ -3604,6 +3629,10 @@ static bool InitializeDwmHooks()
     keepValid(g_createVisualSurfaceProxyOriginal);
     keepValid(g_geometry2dGroupProxyUpdate);
     keepValid(g_drawMesh2DInstructionCreate);
+    keepValid(g_createTouchDragVisualFunction);
+    keepValid(g_touchDragVisualNotifyFunction);
+    keepValid(g_touchDragVisualStopFunction);
+    keepValid(g_touchDragVisualCreateMeshInstructionFunction);
     keepValid(g_drawBitmapInstructionCreateOriginal);
     keepValid(g_drawTileImageInstructionCreateOriginal);
     keepValid(g_renderDataVisualAddInstruction);
@@ -3646,6 +3675,13 @@ static bool InitializeDwmHooks()
                                                   : L"unavailable",
            g_drawTileImageInstructionCreateOriginal ? L"available"
                                                      : L"unavailable");
+    Wh_Log(L"True 4x4 native touch path: create=%s notify=%s stop=%s "
+           L"meshBuilder=%s (probe only)",
+           g_createTouchDragVisualFunction ? L"available" : L"unavailable",
+           g_touchDragVisualNotifyFunction ? L"available" : L"unavailable",
+           g_touchDragVisualStopFunction ? L"available" : L"unavailable",
+           g_touchDragVisualCreateMeshInstructionFunction ? L"available"
+                                                          : L"unavailable");
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
