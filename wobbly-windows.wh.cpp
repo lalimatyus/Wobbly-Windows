@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.162
+// @version         0.163
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4209,7 +4209,8 @@ static void RunCachedVisualImageCanary(void* sourceVisualProxy,
         }
         if (result >= 0)
         {
-            stage = L"InsertTopmost";
+            stage = insertionReferenceProxy ? L"InsertAboveContentBranch"
+                                             : L"InsertTopmost";
             result = g_visualProxyInsertChildOriginal(
                 parentVisualProxy, renderVisualProxy,
                 insertionReferenceProxy, true);
@@ -4904,9 +4905,22 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                visualStats.firstVtable, proxyStats.nodes, proxyStats.contents,
                proxyStats.firstContent, proxyStats.firstVtable);
     }
+    void* contentBranchProxy = nullptr;
+    for (unsigned int index = 0; index < nodeSampleCount; index++)
+    {
+        if (nodeSamples[index].depth == 1 && nodeSamples[index].visualProxy)
+        {
+            // The content-bearing branch is normally the last direct child of
+            // CompleteWindowRoot. Use it as an explicit layer-order reference;
+            // a null reference can place the diagnostic mesh below opaque
+            // window content.
+            contentBranchProxy = nodeSamples[index].visualProxy;
+        }
+    }
     if (rootVisual)
     {
-        RunCachedVisualImageCanary(visualProxy, rootVisual, nullptr, hwnd, true);
+        RunCachedVisualImageCanary(visualProxy, rootVisual, contentBranchProxy,
+                                   hwnd, true);
     }
 }
 
