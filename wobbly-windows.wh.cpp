@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.159
+// @version         0.160
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -2838,17 +2838,14 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
     HWND ownerHwnd = nullptr;
     void* ownerWindowData = nullptr;
     long result = E_NOINTERFACE;
-    bool replaced = false;
     if (imageProxy && !g_unloading.load(std::memory_order_acquire))
     {
         ownerWindowData = RegisterAnimationTopLevelWindow3D(pThis, &ownerHwnd);
-        replaced = TryInstallLiveBaseImageMeshCanary(
-            pThis, imageProxy, ownerHwnd, &result);
     }
-    if (!replaced)
-    {
-        result = g_renderDataVisualAddInstruction(pThis, instruction);
-    }
+    // Keep the original draw instruction. Replacing it in-place cannot be
+    // considered reversible until the owning render visual can be rebuilt
+    // safely on every window-destruction path.
+    result = g_renderDataVisualAddInstruction(pThis, instruction);
     if (result >= 0 && imageProxy &&
         !g_unloading.load(std::memory_order_acquire))
     {
