@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.158
+// @version         0.159
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -7404,6 +7404,19 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         g_visibleMeshCanary.nativeBindingCount > 0;
     if (nativeMeshTarget)
     {
+        double maximumDisplacement = 0.0;
+        if (!identityUpdate)
+        {
+            for (int i = 0; i < GRID_POINT_COUNT; i++)
+            {
+                double dx = snapshot.mesh.points[i].position.x -
+                            snapshot.mesh.points[i].basePosition.x;
+                double dy = snapshot.mesh.points[i].position.y -
+                            snapshot.mesh.points[i].basePosition.y;
+                maximumDisplacement = std::max(
+                    maximumDisplacement, std::sqrt(dx * dx + dy * dy));
+            }
+        }
         long nativeResult = UpdateAllNativeMeshGeometry(
             identityUpdate ? nullptr : &snapshot.mesh);
         if (nativeResult >= 0)
@@ -7415,26 +7428,26 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
             if (matrixResult >= 0)
             {
                 g_visibleMeshCanary.detachAt = GetTickCount64() + 30000;
-                if (!identityUpdate &&
+                // The first scene pass can still contain the undeformed mesh.
+                // Log the first real deformation instead of consuming the
+                // one-shot diagnostic on that initial identity frame.
+                if (!identityUpdate && maximumDisplacement > 1.0 &&
                     !g_liveBaseImageMeshAnimationLogged.exchange(
                         true, std::memory_order_acq_rel))
                 {
-                    double maximumDisplacement = 0.0;
-                    for (int i = 0; i < GRID_POINT_COUNT; i++)
-                    {
-                        double dx = snapshot.mesh.points[i].position.x -
-                                    snapshot.mesh.points[i].basePosition.x;
-                        double dy = snapshot.mesh.points[i].position.y -
-                                    snapshot.mesh.points[i].basePosition.y;
-                        maximumDisplacement = std::max(
-                            maximumDisplacement, std::sqrt(dx * dx + dy * dy));
-                    }
+                    const WobblePoint& corner = snapshot.mesh.points[0];
+                    const WobblePoint& inner = snapshot.mesh.points[5];
                     Wh_Log(L"True 4x4 native animation active: HWND=%p "
-                           L"bindings=%u MaxDisplacement=%.2f size=%.0fx%.0f",
+                           L"bindings=%u MaxDisplacement=%.2f size=%.0fx%.0f "
+                           L"cornerDelta=(%.2f,%.2f) innerDelta=(%.2f,%.2f)",
                            snapshot.hwnd,
                            g_visibleMeshCanary.nativeBindingCount,
                            maximumDisplacement, snapshot.mesh.width,
-                           snapshot.mesh.height);
+                           snapshot.mesh.height,
+                           corner.position.x - corner.basePosition.x,
+                           corner.position.y - corner.basePosition.y,
+                           inner.position.x - inner.basePosition.x,
+                           inner.position.y - inner.basePosition.y);
                 }
                 if (identityUpdate && snapshot.retiring)
                 {
