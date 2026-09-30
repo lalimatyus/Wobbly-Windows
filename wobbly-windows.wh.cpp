@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.161
+// @version         0.162
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4100,7 +4100,10 @@ static void RunCachedVisualImageCanary(void* sourceVisualProxy,
                 int index = GetPointIndex(x, y);
                 float tx = static_cast<float>(x) / (GRID_WIDTH - 1);
                 float ty = static_cast<float>(y) / (GRID_HEIGHT - 1);
-                positions[index] = {tx, ty, 0.0f};
+                // DWM's mesh positions and bitmap coordinates are expressed in
+                // local pixels, not normalized 0..1 coordinates.
+                positions[index] = {tx * static_cast<float>(width),
+                                    ty * static_cast<float>(height), 0.0f};
                 if (x > 0 && x < GRID_WIDTH - 1 && y > 0 &&
                     y < GRID_HEIGHT - 1)
                 {
@@ -4109,10 +4112,14 @@ static void RunCachedVisualImageCanary(void* sourceVisualProxy,
                     // window positioning and clipping behavior.
                     float horizontalDirection = y == 1 ? 1.0f : -1.0f;
                     float verticalDirection = x == 1 ? -1.0f : 1.0f;
-                    positions[index].x += horizontalDirection * 0.16f;
-                    positions[index].y += verticalDirection * 0.11f;
+                    positions[index].x += horizontalDirection *
+                                          static_cast<float>(width) * 0.16f;
+                    positions[index].y += verticalDirection *
+                                          static_cast<float>(height) * 0.11f;
                 }
-                textureCoordinates[index] = {tx, ty};
+                textureCoordinates[index] = {
+                    tx * static_cast<float>(width),
+                    ty * static_cast<float>(height)};
             }
         }
         unsigned int indexCount = 0;
@@ -4251,7 +4258,7 @@ static void RunCachedVisualImageCanary(void* sourceVisualProxy,
     }
     Wh_Log(L"True 4x4 visible warped canary: %s stage=%s result=0x%08X "
            L"HWND=%p sourceProxy=%p hostProxy=%p referenceProxy=%p "
-           L"meshVisualProxy=%p source=%s coordinates=normalized "
+           L"meshVisualProxy=%p source=%s coordinates=pixels "
            L"size=%.0fx%.0f",
            succeeded ? L"attached" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, sourceVisualProxy,
@@ -4896,6 +4903,10 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
                visualStats.contents, visualStats.firstContent,
                visualStats.firstVtable, proxyStats.nodes, proxyStats.contents,
                proxyStats.firstContent, proxyStats.firstVtable);
+    }
+    if (rootVisual)
+    {
+        RunCachedVisualImageCanary(visualProxy, rootVisual, nullptr, hwnd, true);
     }
 }
 
