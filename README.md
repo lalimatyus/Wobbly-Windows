@@ -1,6 +1,6 @@
 # Wobbly Windows
 
-> This repo has test/experimental releases. If you want to download the stable release download it directly from Windhawk.
+## This repo has test/experimental releases. If you want to download the stable release download it directly from Windhawk.
 
 The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
 
