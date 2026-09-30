@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.163
+// @version         0.164
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -422,6 +422,7 @@ using CDrawTileImageInstructionCreate_t = long(__cdecl*)(
     float opacity, void** instruction);
 using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void* pThis,
                                                           void* instruction);
+using CRenderDataVisualClearInstructions_t = long(__cdecl*)(void* pThis);
 using CRenderDataVisualUpdateRenderData_t = long(__cdecl*)(void* pThis);
 using CVisualProxySetContent_t = long(__cdecl*)(void* pThis,
                                                 const void* content);
@@ -461,7 +462,11 @@ CDrawBitmapInstructionCreate_t g_drawBitmapInstructionCreateOriginal = nullptr;
 CDrawTileImageInstructionCreate_t g_drawTileImageInstructionCreateOriginal =
     nullptr;
 CRenderDataVisualAddInstruction_t g_renderDataVisualAddInstruction = nullptr;
+CRenderDataVisualClearInstructions_t g_renderDataVisualClearInstructions =
+    nullptr;
 CRenderDataVisualUpdateRenderData_t g_renderDataVisualUpdateRenderData = nullptr;
+size_t g_renderDataInstructionsOffset = SIZE_MAX;
+size_t g_renderDataInstructionCountOffset = SIZE_MAX;
 CVisualProxySetContent_t g_visualProxySetContentOriginal = nullptr;
 CVisualProxyInsertChild_t g_visualProxyInsertChildOriginal = nullptr;
 CVisualProxyRemoveChild_t g_visualProxyRemoveChildOriginal = nullptr;
@@ -1590,6 +1595,67 @@ static size_t FindOffsetFromFunction(void* function, size_t defaultValue)
         bytesRead += result.length;
     }
     return defaultValue;
+}
+
+static bool FindRenderDataInstructionLayout(void* function,
+                                            size_t* instructionsOffset,
+                                            size_t* countOffset)
+{
+    if (!instructionsOffset || !countOffset ||
+        !IsDwmFunctionPointerValid(function))
+    {
+        return false;
+    }
+    const std::regex countPattern(
+        R"(movsxd\s+\w+,\s*(?:dword ptr )?\[rcx\s*\+\s*0x([0-9a-f]{1,8})\])",
+        std::regex_constants::icase);
+    const std::regex arrayPattern(
+        R"(lea\s+\w+,\s*\[rcx\s*\+\s*0x([0-9a-f]{1,8})\])",
+        std::regex_constants::icase);
+    size_t candidateCount = SIZE_MAX;
+    size_t candidateArray = SIZE_MAX;
+    BYTE* instruction = static_cast<BYTE*>(function);
+    size_t bytesRead = 0;
+    for (int i = 0; i < 48 && bytesRead < 256; i++)
+    {
+        WH_DISASM_RESULT result = {};
+        if (!IsDwmExecutableAddress(instruction) ||
+            !Wh_Disasm(instruction, &result) || result.length == 0)
+        {
+            break;
+        }
+        std::string_view text = result.text;
+        std::match_results<std::string_view::const_iterator> match;
+        if (candidateCount == SIZE_MAX &&
+            std::regex_match(text.begin(), text.end(), match, countPattern))
+        {
+            candidateCount = std::stoull(match[1].str(), nullptr, 16);
+        }
+        else if (candidateArray == SIZE_MAX &&
+                 std::regex_match(text.begin(), text.end(), match,
+                                  arrayPattern))
+        {
+            candidateArray = std::stoull(match[1].str(), nullptr, 16);
+        }
+        if (candidateArray != SIZE_MAX && candidateCount != SIZE_MAX)
+        {
+            break;
+        }
+        if (text == "ret")
+        {
+            break;
+        }
+        instruction += result.length;
+        bytesRead += result.length;
+    }
+    if (candidateArray > 0x1000 || candidateCount > 0x1000 ||
+        candidateCount != candidateArray + 0x18)
+    {
+        return false;
+    }
+    *instructionsOffset = candidateArray;
+    *countOffset = candidateCount;
+    return true;
 }
 
 static size_t FindDesktopManagerThreadIdOffset(void* function)
@@ -3429,6 +3495,10 @@ static bool InitializeDwmHooks()
          &g_renderDataVisualAddInstruction,
          RenderDataVisualAddInstructionHook,
          true},
+        {{L"public: long __cdecl CRenderDataVisual::ClearInstructions(void)"},
+         &g_renderDataVisualClearInstructions,
+         nullptr,
+         true},
         {{L"public: virtual long __cdecl "
            L"CRenderDataVisual::UpdateRenderData(void)"},
          &g_renderDataVisualUpdateRenderData,
@@ -3636,6 +3706,7 @@ static bool InitializeDwmHooks()
     keepValid(g_drawBitmapInstructionCreateOriginal);
     keepValid(g_drawTileImageInstructionCreateOriginal);
     keepValid(g_renderDataVisualAddInstruction);
+    keepValid(g_renderDataVisualClearInstructions);
     keepValid(g_renderDataVisualUpdateRenderData);
     keepValid(g_renderDataVisualCreate);
     keepValid(g_createCachedVisualImageProxy);
@@ -3651,6 +3722,17 @@ static bool InitializeDwmHooks()
     keepValid(g_visualRemoveSelfFromParentOriginal);
     keepValid(g_visualGetTransformParent);
     keepValid(g_visualGetVisualProxyForStructure);
+    g_renderDataInstructionsOffset = SIZE_MAX;
+    g_renderDataInstructionCountOffset = SIZE_MAX;
+    bool hasRenderListLayout = FindRenderDataInstructionLayout(
+        reinterpret_cast<void*>(g_renderDataVisualClearInstructions),
+        &g_renderDataInstructionsOffset,
+        &g_renderDataInstructionCountOffset);
+    Wh_Log(L"True 4x4 render-list probe: clear=%s layout=%s "
+           L"instructions=0x%zx count=0x%zx (read-only)",
+           g_renderDataVisualClearInstructions ? L"available" : L"unavailable",
+           hasRenderListLayout ? L"available" : L"unavailable",
+           g_renderDataInstructionsOffset, g_renderDataInstructionCountOffset);
     Wh_Log(L"True 4x4 observation hooks: proxyContent=%p proxyInsert=%p "
            L"visualContent=%p visualParent=%p visualRemove=%p getParent=%p "
            L"getProxy=%p redirect=%p",
@@ -4867,13 +4949,49 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         {
             observedDrawBitmapSources++;
         }
+        void* instruction =
+            observed.instruction.load(std::memory_order_acquire);
+        unsigned int instructionCount = 0;
+        int instructionIndex = -1;
+        if (renderVisual && instruction &&
+            g_renderDataInstructionsOffset != SIZE_MAX &&
+            g_renderDataInstructionCountOffset != SIZE_MAX)
+        {
+            const BYTE* visualBytes = static_cast<const BYTE*>(renderVisual);
+            const void* countAddress =
+                visualBytes + g_renderDataInstructionCountOffset;
+            if (IsReadableMemory(countAddress, sizeof(int)))
+            {
+                int count = *reinterpret_cast<const int*>(countAddress);
+                if (count > 0 && count <= 64)
+                {
+                    void* array = ReadPointerMember(
+                        renderVisual, g_renderDataInstructionsOffset);
+                    size_t arrayBytes = static_cast<size_t>(count) * sizeof(void*);
+                    if (IsReadableMemory(array, arrayBytes))
+                    {
+                        instructionCount = static_cast<unsigned int>(count);
+                        void* const* instructions =
+                            static_cast<void* const*>(array);
+                        for (int index = 0; index < count; index++)
+                        {
+                            if (instructions[index] == instruction)
+                            {
+                                instructionIndex = index;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Wh_Log(L"True 4x4 observed image source[%u]: targetNode=%d "
                L"ownerHWND=%p ownerMatch=%d visual=%p instruction=%p "
-               L"image=%p imageVtable=%p kind=%s",
+                L"instructionCount=%u instructionIndex=%d "
+                L"image=%p imageVtable=%p kind=%s",
                observedImageEntries - 1, matchedVisualNode, sourceHwnd,
-               sourceOwnerMatches, renderVisual,
-               observed.instruction.load(std::memory_order_acquire), imageProxy,
-               imageVtable,
+                sourceOwnerMatches, renderVisual, instruction,
+                instructionCount, instructionIndex, imageProxy, imageVtable,
                kind == MeshSourceKind::None ? L"BaseImage"
                                              : GetMeshSourceKindName(kind));
     }
@@ -9530,6 +9648,8 @@ BOOL Wh_ModInit()
     }
     g_desktopManagerThreadIdOffset = SIZE_MAX;
     g_topLevelWindow3DWindowDataOffset = SIZE_MAX;
+    g_renderDataInstructionsOffset = SIZE_MAX;
+    g_renderDataInstructionCountOffset = SIZE_MAX;
     g_dwmSceneThreadId.store(0, std::memory_order_release);
     g_dwmCompositor.store(nullptr, std::memory_order_release);
     g_desktopManager.store(nullptr, std::memory_order_release);
