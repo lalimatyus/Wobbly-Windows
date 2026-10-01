@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.169
+// @version         0.171
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1072,7 +1072,8 @@ static void EnsurePendingMatrixTransformProxies();
 static void RunNativeMeshCanary();
 static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
                                                void* originalInstruction,
-                                               void* imageProxy, HWND hwnd);
+                                               void* imageProxy,
+                                               void* windowData, HWND hwnd);
 static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwnd);
 static void RunCachedVisualImageCanary(void* sourceVisualProxy,
                                        void* hostVisual,
@@ -3102,7 +3103,7 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
             entry->imageProxy.store(imageProxy, std::memory_order_release);
         }
         TryInstallLiveBaseImageMeshCanary(pThis, instruction, imageProxy,
-                                          ownerHwnd);
+                                          ownerWindowData, ownerHwnd);
     }
     return result;
 }
@@ -4247,6 +4248,206 @@ static MeshSourceKind GetMeshSourceKind(void* object)
     return MeshSourceKind::None;
 }
 
+static bool ReadBaseImageResourceId(void* imageProxy,
+                                    unsigned int* resourceId)
+{
+    const BYTE* field = static_cast<const BYTE*>(imageProxy) + 0x18;
+    if (!resourceId || !IsReadableMemory(field, sizeof(*resourceId)))
+    {
+        return false;
+    }
+    *resourceId = *reinterpret_cast<const unsigned int*>(field);
+    return *resourceId != 0;
+}
+
+static bool ReadBitmapSourceResourceId(void* sourceProxy,
+                                       unsigned int* resourceId)
+{
+    void* backing = ReadPointerMember(sourceProxy, 0x10);
+    if (!resourceId || !backing)
+    {
+        return false;
+    }
+    const BYTE* field = static_cast<const BYTE*>(backing) + 0x18;
+    if (!IsReadableMemory(field, sizeof(*resourceId)))
+    {
+        return false;
+    }
+    *resourceId = *reinterpret_cast<const unsigned int*>(field);
+    return *resourceId != 0;
+}
+
+static void* FindMatchingWindowBitmapSource(void* windowData,
+                                             void* imageProxy,
+                                             unsigned int* candidateCount,
+                                             unsigned int* matchCount,
+                                             unsigned int* imageResourceId)
+{
+    if (candidateCount)
+    {
+        *candidateCount = 0;
+    }
+    if (matchCount)
+    {
+        *matchCount = 0;
+    }
+    unsigned int targetId = 0;
+    if (!windowData || !ReadBaseImageResourceId(imageProxy, &targetId))
+    {
+        return nullptr;
+    }
+    if (imageResourceId)
+    {
+        *imageResourceId = targetId;
+    }
+
+    void* topLevelWindow = nullptr;
+    void* topLevelWindow3D = nullptr;
+    if (!ResolveDwmWindowObjects(windowData, &topLevelWindow,
+                                 &topLevelWindow3D) ||
+        !topLevelWindow || !g_topLevelWindowGetRootVisual)
+    {
+        return nullptr;
+    }
+    void* rootVisual = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
+    if (!rootVisual)
+    {
+        return nullptr;
+    }
+
+    struct VisualNode
+    {
+        void* visual;
+    } visualQueue[128] = {{rootVisual}};
+    unsigned int visualRead = 0;
+    unsigned int visualCount = 1;
+    void* seenResources[256] = {};
+    unsigned int seenResourceCount = 0;
+    void* matches[8] = {};
+    unsigned int candidates = 0;
+    unsigned int matching = 0;
+
+    auto scanContent = [&](void* content)
+    {
+        if (!content)
+        {
+            return;
+        }
+        struct ResourceNode
+        {
+            void* object;
+            unsigned int depth;
+        } queue[128] = {{content, 0}};
+        unsigned int read = 0;
+        unsigned int count = 1;
+        while (read < count)
+        {
+            ResourceNode current = queue[read++];
+            bool alreadySeen = false;
+            for (unsigned int i = 0; i < seenResourceCount; i++)
+            {
+                alreadySeen |= seenResources[i] == current.object;
+            }
+            if (alreadySeen)
+            {
+                continue;
+            }
+            if (seenResourceCount < ARRAYSIZE(seenResources))
+            {
+                seenResources[seenResourceCount++] = current.object;
+            }
+
+            MeshSourceKind kind = GetMeshSourceKind(current.object);
+            if (kind != MeshSourceKind::None)
+            {
+                candidates++;
+                unsigned int sourceId = 0;
+                if (ReadBitmapSourceResourceId(current.object, &sourceId) &&
+                    sourceId == targetId)
+                {
+                    bool duplicate = false;
+                    for (unsigned int i = 0; i < matching; i++)
+                    {
+                        duplicate |= matches[i] == current.object;
+                    }
+                    if (!duplicate && matching < ARRAYSIZE(matches))
+                    {
+                        matches[matching++] = current.object;
+                    }
+                }
+                continue;
+            }
+            if (current.depth >= 2)
+            {
+                continue;
+            }
+            for (size_t offset = sizeof(void*); offset < 0x200;
+                 offset += sizeof(void*))
+            {
+                void* child = ReadPointerMember(current.object, offset);
+                if (!child || child == current.object ||
+                    IsDwmImageAddress(child, sizeof(void*)) ||
+                    !IsReadableMemory(child, sizeof(void*)))
+                {
+                    continue;
+                }
+                void* childVtable = *reinterpret_cast<void**>(child);
+                if (!IsDwmImageAddress(childVtable, sizeof(void*)))
+                {
+                    continue;
+                }
+                bool queued = false;
+                for (unsigned int i = 0; i < count; i++)
+                {
+                    queued |= queue[i].object == child;
+                }
+                if (!queued && count < ARRAYSIZE(queue))
+                {
+                    queue[count++] = {child, current.depth + 1};
+                }
+            }
+        }
+    };
+
+    while (visualRead < visualCount)
+    {
+        void* visual = visualQueue[visualRead++].visual;
+        if (ObservedVisualProxy* entry =
+                FindObservedNode(g_observedVisuals, visual, false))
+        {
+            scanContent(entry->content.load(std::memory_order_acquire));
+        }
+        for (unsigned int i = 0; i < OBSERVED_VISUAL_PROXY_COUNT; i++)
+        {
+            ObservedVisualProxy& entry = g_observedVisuals[i];
+            if (entry.parent.load(std::memory_order_acquire) != visual)
+            {
+                continue;
+            }
+            void* child = entry.proxy.load(std::memory_order_acquire);
+            bool duplicate = false;
+            for (unsigned int j = 0; j < visualCount; j++)
+            {
+                duplicate |= visualQueue[j].visual == child;
+            }
+            if (!duplicate && child && visualCount < ARRAYSIZE(visualQueue))
+            {
+                visualQueue[visualCount++] = {child};
+            }
+        }
+    }
+
+    if (candidateCount)
+    {
+        *candidateCount = candidates;
+    }
+    if (matchCount)
+    {
+        *matchCount = matching;
+    }
+    return matching == 1 ? matches[0] : nullptr;
+}
+
 static void RunCachedVisualImageCanary(void* sourceVisualProxy,
                                        void* hostVisual,
                                        void* insertionReferenceProxy,
@@ -4462,8 +4663,14 @@ static void RunCachedVisualImageCanary(void* sourceVisualProxy,
                      instruction && renderVisual;
     if (succeeded)
     {
-        g_visibleMeshCanary = {cachedVisual, meshProxy, groupProxy, instruction,
-                               renderVisual, hwnd, GetTickCount64() + 5000};
+        g_visibleMeshCanary = {};
+        g_visibleMeshCanary.cachedVisual = cachedVisual;
+        g_visibleMeshCanary.meshProxy = meshProxy;
+        g_visibleMeshCanary.groupProxy = groupProxy;
+        g_visibleMeshCanary.instruction = instruction;
+        g_visibleMeshCanary.renderVisual = renderVisual;
+        g_visibleMeshCanary.hwnd = hwnd;
+        g_visibleMeshCanary.detachAt = GetTickCount64() + 5000;
         cachedVisual = nullptr;
         meshProxy = nullptr;
         groupProxy = nullptr;
@@ -5231,7 +5438,7 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         }
     }
     if (rootVisual &&
-        !g_liveBaseImageMeshCanarySucceeded.load(std::memory_order_acquire))
+        !g_liveBaseImageMeshCanaryStarted.load(std::memory_order_acquire))
     {
         RunCachedVisualImageCanary(visualProxy, rootVisual, contentBranchProxy,
                                    hwnd, true);
@@ -5607,7 +5814,8 @@ static void RunNativeMeshCanary()
 
 static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
                                                void* originalInstruction,
-                                               void* imageProxy, HWND hwnd)
+                                               void* imageProxy,
+                                               void* windowData, HWND hwnd)
 {
     if (!IsOnDwmSceneThread() || !renderVisual || !originalInstruction ||
         !hwnd || !IsWindow(hwnd) || GetForegroundWindow() != hwnd ||
@@ -5644,25 +5852,26 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     {
         return false;
     }
-    // CDrawBitmapInstruction owns a CBaseImageProxy, while
-    // CDrawMesh2DInstruction expects the contained CBitmapSourceProxy. This is
-    // the same unwrapping used by CTouchDragVisual's native mesh path.
-    void* bitmapSourceProxy = ReadPointerMember(imageProxy, 0x10);
-    MeshSourceKind bitmapSourceKind = GetMeshSourceKind(bitmapSourceProxy);
-    if (!bitmapSourceProxy ||
-        (bitmapSourceKind != MeshSourceKind::Bitmap &&
-         bitmapSourceKind != MeshSourceKind::AmbiguousProxy) ||
-        !IsReadableMemory(bitmapSourceProxy, sizeof(void*)) ||
-        !IsDwmImageAddress(*reinterpret_cast<void**>(bitmapSourceProxy),
-                           sizeof(void*)))
-    {
-        return false;
-    }
     bool expected = false;
     if (!g_liveBaseImageMeshCanaryStarted.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel,
             std::memory_order_acquire))
     {
+        return false;
+    }
+
+    unsigned int sourceCandidateCount = 0;
+    unsigned int sourceMatchCount = 0;
+    unsigned int imageResourceId = 0;
+    void* bitmapSourceProxy = FindMatchingWindowBitmapSource(
+        windowData, imageProxy, &sourceCandidateCount, &sourceMatchCount,
+        &imageResourceId);
+    if (!bitmapSourceProxy)
+    {
+        Wh_Log(L"True 4x4 native slot source unresolved: HWND=%p "
+               L"image=%p resourceId=%u candidates=%u matches=%u",
+               hwnd, imageProxy, imageResourceId, sourceCandidateCount,
+               sourceMatchCount);
         return false;
     }
 
@@ -5821,13 +6030,15 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
 
     Wh_Log(L"True 4x4 native slot-replacement canary: %s stage=%s "
            L"result=0x%08X HWND=%p visual=%p original=%p index=%d/%u "
-           L"image=%p imageVtable=%p bitmapSource=%p sourceKind=%s "
+           L"image=%p imageVtable=%p bitmapSource=%p resourceId=%u "
+           L"candidates=%u matches=%u "
            L"size=%.0fx%.0f",
            succeeded ? L"installed" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, renderVisual,
            originalInstruction, originalIndex, originalCount, imageProxy,
-           imageVtable, bitmapSourceProxy,
-           GetMeshSourceKindName(bitmapSourceKind), width, height);
+           imageVtable, bitmapSourceProxy, imageResourceId,
+           sourceCandidateCount, sourceMatchCount,
+           width, height);
     return succeeded;
 }
 
