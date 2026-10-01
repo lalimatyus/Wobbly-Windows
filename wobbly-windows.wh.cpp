@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.166
+// @version         0.167
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4523,6 +4523,33 @@ static long UpdateNativeMeshGeometry(void* meshProxy, const WobbleMesh* mesh,
     D2DPoint3F positions[GRID_POINT_COUNT] = {};
     MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
     unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
+    Vec2 anchorDisplacement = {};
+    if (mesh)
+    {
+        if (mesh->dragPointIndex >= 0 &&
+            mesh->dragPointIndex < GRID_POINT_COUNT)
+        {
+            const WobblePoint& anchor = mesh->points[mesh->dragPointIndex];
+            anchorDisplacement = {
+                anchor.position.x - anchor.basePosition.x,
+                anchor.position.y - anchor.basePosition.y};
+        }
+        else
+        {
+            for (const WobblePoint& point : mesh->points)
+            {
+                anchorDisplacement.x +=
+                    point.position.x - point.basePosition.x;
+                anchorDisplacement.y +=
+                    point.position.y - point.basePosition.y;
+            }
+            anchorDisplacement.x /= GRID_POINT_COUNT;
+            anchorDisplacement.y /= GRID_POINT_COUNT;
+        }
+    }
+    // This diagnostic gain makes non-affine deformation unmistakable. The
+    // production value will be tuned after the native path is visually proven.
+    constexpr double nativeResidualGain = 4.0;
     for (int y = 0; y < GRID_HEIGHT; y++)
     {
         for (int x = 0; x < GRID_WIDTH; x++)
@@ -4541,8 +4568,12 @@ static long UpdateNativeMeshGeometry(void* meshProxy, const WobbleMesh* mesh,
                 const WobblePoint& point = mesh->points[index];
                 baseX = point.basePosition.x;
                 baseY = point.basePosition.y;
-                renderedX = point.position.x;
-                renderedY = point.position.y;
+                renderedX = baseX +
+                            ((point.position.x - baseX) -
+                             anchorDisplacement.x) * nativeResidualGain;
+                renderedY = baseY +
+                            ((point.position.y - baseY) -
+                             anchorDisplacement.y) * nativeResidualGain;
             }
             if (!std::isfinite(baseX) || !std::isfinite(baseY) ||
                 !std::isfinite(renderedX) || !std::isfinite(renderedY))
@@ -5618,14 +5649,6 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
             float ty = static_cast<float>(y) / (GRID_HEIGHT - 1);
             positions[index] = {tx * static_cast<float>(width),
                                 ty * static_cast<float>(height), 0.0f};
-            if (x > 0 && x < GRID_WIDTH - 1 && y > 0 &&
-                y < GRID_HEIGHT - 1)
-            {
-                positions[index].x += (y == 1 ? 1.0f : -1.0f) *
-                                      static_cast<float>(width) * 0.16f;
-                positions[index].y += (x == 1 ? -1.0f : 1.0f) *
-                                      static_cast<float>(height) * 0.11f;
-            }
             textureCoordinates[index] = {tx * static_cast<float>(width),
                                          ty * static_cast<float>(height)};
         }
@@ -7763,11 +7786,35 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         !g_visibleMeshCanary.renderVisual &&
         g_visibleMeshCanary.hwnd == snapshot.hwnd &&
         g_visibleMeshCanary.nativeBindingCount > 0;
+    bool nativeMeshApplied = false;
     if (nativeMeshTarget)
     {
         double maximumDisplacement = 0.0;
+        double maximumResidual = 0.0;
         if (!identityUpdate)
         {
+            Vec2 anchorDisplacement = {};
+            if (snapshot.mesh.dragPointIndex >= 0 &&
+                snapshot.mesh.dragPointIndex < GRID_POINT_COUNT)
+            {
+                const WobblePoint& anchor =
+                    snapshot.mesh.points[snapshot.mesh.dragPointIndex];
+                anchorDisplacement = {
+                    anchor.position.x - anchor.basePosition.x,
+                    anchor.position.y - anchor.basePosition.y};
+            }
+            else
+            {
+                for (const WobblePoint& point : snapshot.mesh.points)
+                {
+                    anchorDisplacement.x +=
+                        point.position.x - point.basePosition.x;
+                    anchorDisplacement.y +=
+                        point.position.y - point.basePosition.y;
+                }
+                anchorDisplacement.x /= GRID_POINT_COUNT;
+                anchorDisplacement.y /= GRID_POINT_COUNT;
+            }
             for (int i = 0; i < GRID_POINT_COUNT; i++)
             {
                 double dx = snapshot.mesh.points[i].position.x -
@@ -7776,60 +7823,64 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
                             snapshot.mesh.points[i].basePosition.y;
                 maximumDisplacement = std::max(
                     maximumDisplacement, std::sqrt(dx * dx + dy * dy));
+                dx -= anchorDisplacement.x;
+                dy -= anchorDisplacement.y;
+                maximumResidual = std::max(
+                    maximumResidual, std::sqrt(dx * dx + dy * dy));
             }
         }
         long nativeResult = UpdateAllNativeMeshGeometry(
             identityUpdate ? nullptr : &snapshot.mesh);
         if (nativeResult >= 0)
         {
-            MilMatrix3x2D identityMatrix = {1.0, 0.0, 0.0, 1.0, 0.0,
-                                            0.0};
-            long matrixResult = UpdateMatrixTransformProxy(
-                snapshot.matrixTransformProxy, identityMatrix);
-            if (matrixResult >= 0)
+            g_visibleMeshCanary.detachAt = GetTickCount64() + 30000;
+            if (!identityUpdate && maximumDisplacement > 1.0 &&
+                !g_liveBaseImageMeshAnimationLogged.exchange(
+                    true, std::memory_order_acq_rel))
             {
-                g_visibleMeshCanary.detachAt = GetTickCount64() + 30000;
-                // The first scene pass can still contain the undeformed mesh.
-                // Log the first real deformation instead of consuming the
-                // one-shot diagnostic on that initial identity frame.
-                if (!identityUpdate && maximumDisplacement > 1.0 &&
-                    !g_liveBaseImageMeshAnimationLogged.exchange(
-                        true, std::memory_order_acq_rel))
-                {
-                    const WobblePoint& corner = snapshot.mesh.points[0];
-                    const WobblePoint& inner = snapshot.mesh.points[5];
-                    Wh_Log(L"True 4x4 native animation active: HWND=%p "
-                           L"bindings=%u MaxDisplacement=%.2f size=%.0fx%.0f "
-                           L"cornerDelta=(%.2f,%.2f) innerDelta=(%.2f,%.2f)",
-                           snapshot.hwnd,
-                           g_visibleMeshCanary.nativeBindingCount,
-                           maximumDisplacement, snapshot.mesh.width,
-                           snapshot.mesh.height,
-                           corner.position.x - corner.basePosition.x,
-                           corner.position.y - corner.basePosition.y,
-                           inner.position.x - inner.basePosition.x,
-                           inner.position.y - inner.basePosition.y);
-                }
-                if (identityUpdate && snapshot.retiring)
+                const WobblePoint& corner = snapshot.mesh.points[0];
+                const WobblePoint& inner = snapshot.mesh.points[5];
+                Wh_Log(L"True 4x4 native animation active: HWND=%p "
+                       L"bindings=%u MaxDisplacement=%.2f MaxResidual=%.2f "
+                       L"residualGain=4 size=%.0fx%.0f "
+                       L"cornerDelta=(%.2f,%.2f) innerDelta=(%.2f,%.2f)",
+                       snapshot.hwnd,
+                       g_visibleMeshCanary.nativeBindingCount,
+                       maximumDisplacement, maximumResidual,
+                       snapshot.mesh.width, snapshot.mesh.height,
+                       corner.position.x - corner.basePosition.x,
+                       corner.position.y - corner.basePosition.y,
+                       inner.position.x - inner.basePosition.x,
+                       inner.position.y - inner.basePosition.y);
+            }
+            if (identityUpdate)
+            {
+                MilMatrix3x2D identityMatrix = {1.0, 0.0, 0.0, 1.0,
+                                                0.0, 0.0};
+                long matrixResult = UpdateMatrixTransformProxy(
+                    snapshot.matrixTransformProxy, identityMatrix);
+                if (matrixResult >= 0 && snapshot.retiring)
                 {
                     g_visibleMeshCanaryCleanupRequested.store(
                         true, std::memory_order_release);
                     RequestDwmScenePass();
                 }
-                finishUpdate(S_OK, identityUpdate);
+                finishUpdate(matrixResult, matrixResult >= 0);
                 return;
             }
-            // Never combine a live native deformation with a stale affine
-            // matrix. Restore the mesh before using the established fallback.
-            UpdateAllNativeMeshGeometry();
-            nativeResult = matrixResult;
+            // Keep the established whole-window affine motion and add only the
+            // non-rigid residual through the native mesh.
+            nativeMeshApplied = true;
         }
-        g_visibleMeshCanaryCleanupRequested.store(true,
-                                                   std::memory_order_release);
-        RequestDwmScenePass();
-        Wh_Log(L"True 4x4 native animation update failed for HWND=%p: 0x%08X; "
-               L"using affine fallback",
-               snapshot.hwnd, static_cast<unsigned int>(nativeResult));
+        else
+        {
+            g_visibleMeshCanaryCleanupRequested.store(
+                true, std::memory_order_release);
+            RequestDwmScenePass();
+            Wh_Log(L"True 4x4 native animation update failed for HWND=%p: "
+                   L"0x%08X; using affine fallback",
+                   snapshot.hwnd, static_cast<unsigned int>(nativeResult));
+        }
     }
     if (identityUpdate)
     {
@@ -7955,6 +8006,13 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
     translationY = std::clamp(translationY, -emergencyTranslationLimit, emergencyTranslationLimit);
     MilMatrix3x2D matrix = {m11, m12, m21, m22, translationX, translationY};
     long updateResult = UpdateMatrixTransformProxy(snapshot.matrixTransformProxy, matrix);
+    if (updateResult < 0 && nativeMeshApplied)
+    {
+        UpdateAllNativeMeshGeometry();
+        g_visibleMeshCanaryCleanupRequested.store(true,
+                                                   std::memory_order_release);
+        RequestDwmScenePass();
+    }
     finishUpdate(updateResult, false);
 }
 
