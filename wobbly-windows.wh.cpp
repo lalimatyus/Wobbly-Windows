@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.167
+// @version         0.168
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4621,6 +4621,18 @@ static void* GetNativeMeshProxy(unsigned int index)
                : nullptr;
 }
 
+static void* GetNativeGeometryGroupProxy(unsigned int index)
+{
+    if (index == 0)
+    {
+        return g_visibleMeshCanary.groupProxy;
+    }
+    return index <= ARRAYSIZE(g_visibleMeshCanary.additionalNativeBindings)
+               ? g_visibleMeshCanary.additionalNativeBindings[index - 1]
+                     .groupProxy
+               : nullptr;
+}
+
 static long UpdateAllNativeMeshGeometry(const WobbleMesh* mesh = nullptr)
 {
     long result = S_OK;
@@ -4631,6 +4643,14 @@ static long UpdateAllNativeMeshGeometry(const WobbleMesh* mesh = nullptr)
         long updateResult = UpdateNativeMeshGeometry(
             meshProxy, mesh, g_visibleMeshCanary.width,
             g_visibleMeshCanary.height);
+        void* groupProxy = GetNativeGeometryGroupProxy(index);
+        if (updateResult >= 0)
+        {
+            updateResult = groupProxy && g_geometry2dGroupProxyUpdate
+                               ? g_geometry2dGroupProxyUpdate(groupProxy,
+                                                              meshProxy)
+                               : E_NOINTERFACE;
+        }
         if (updateResult < 0 && result >= 0)
         {
             result = updateResult;
