@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.175
+// @version         0.176
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1098,6 +1098,7 @@ static long __cdecl DrawTileImageInstructionCreateHook(
     float opacity, void** instruction);
 static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                                         void* instruction);
+static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis);
 static long __cdecl CreateBitmapSourceProxyHook(void* pThis,
                                                  void** bitmapProxy);
 static long __cdecl CreateVisualSurfaceProxyHook(void* pThis,
@@ -3104,8 +3105,51 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                 capturedInstructionIndex, std::memory_order_relaxed);
             entry->imageProxy.store(imageProxy, std::memory_order_release);
         }
-        TryInstallLiveBaseImageMeshCanary(pThis, instruction, imageProxy,
-                                          ownerWindowData, ownerHwnd);
+    }
+    return result;
+}
+
+static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
+{
+    bool installed = false;
+    unsigned int instructionCount = 0;
+    if (pThis && !g_unloading.load(std::memory_order_acquire) &&
+        !g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
+        g_nativeMeshCanarySucceeded.load(std::memory_order_acquire))
+    {
+        ObservedRenderImage* entry =
+            FindObservedImageEntry(g_observedRenderImages, pThis, false);
+        void* instruction = entry
+                                ? entry->instruction.load(
+                                      std::memory_order_acquire)
+                                : nullptr;
+        void* imageProxy = entry
+                               ? entry->imageProxy.load(
+                                     std::memory_order_acquire)
+                               : nullptr;
+        void* windowData = entry
+                               ? entry->ownerWindowData.load(
+                                     std::memory_order_acquire)
+                               : nullptr;
+        HWND hwnd = entry
+                        ? entry->ownerHwnd.load(std::memory_order_acquire)
+                        : nullptr;
+        int instructionIndex = -1;
+        if (instruction && imageProxy && windowData && hwnd &&
+            FindRenderDataInstructionIndex(pThis, instruction,
+                                           &instructionCount,
+                                           &instructionIndex))
+        {
+            installed = TryInstallLiveBaseImageMeshCanary(
+                pThis, instruction, imageProxy, windowData, hwnd);
+        }
+    }
+    long result = g_renderDataVisualUpdateRenderData(pThis);
+    if (installed)
+    {
+        Wh_Log(L"True 4x4 native publish boundary: meshPresent=1 "
+               L"prePublishInstructions=%u result=0x%08X",
+               instructionCount, static_cast<unsigned int>(result));
     }
     return result;
 }
@@ -3665,7 +3709,7 @@ static bool InitializeDwmHooks()
         {{L"public: virtual long __cdecl "
            L"CRenderDataVisual::UpdateRenderData(void)"},
          &g_renderDataVisualUpdateRenderData,
-         nullptr,
+         RenderDataVisualUpdateRenderDataHook,
          true},
         {{L"public: static long __cdecl CRenderDataVisual::Create("
            L"class CRenderDataVisual * *)"},
