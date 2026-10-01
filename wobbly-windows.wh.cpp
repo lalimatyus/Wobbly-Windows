@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.164
+// @version         0.165
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -687,6 +687,61 @@ static void* ReadPointerMember(void* object, size_t offset)
                : nullptr;
 }
 
+static bool FindRenderDataInstructionIndex(void* renderVisual,
+                                           void* instruction,
+                                           unsigned int* instructionCount,
+                                           int* instructionIndex)
+{
+    if (instructionCount)
+    {
+        *instructionCount = 0;
+    }
+    if (instructionIndex)
+    {
+        *instructionIndex = -1;
+    }
+    if (!renderVisual || !instruction ||
+        g_renderDataInstructionsOffset == SIZE_MAX ||
+        g_renderDataInstructionCountOffset == SIZE_MAX)
+    {
+        return false;
+    }
+    const BYTE* visualBytes = static_cast<const BYTE*>(renderVisual);
+    const void* countAddress = visualBytes + g_renderDataInstructionCountOffset;
+    if (!IsReadableMemory(countAddress, sizeof(int)))
+    {
+        return false;
+    }
+    int count = *reinterpret_cast<const int*>(countAddress);
+    if (count <= 0 || count > 64)
+    {
+        return false;
+    }
+    void* array = ReadPointerMember(renderVisual, g_renderDataInstructionsOffset);
+    size_t arrayBytes = static_cast<size_t>(count) * sizeof(void*);
+    if (!IsReadableMemory(array, arrayBytes))
+    {
+        return false;
+    }
+    if (instructionCount)
+    {
+        *instructionCount = static_cast<unsigned int>(count);
+    }
+    void* const* instructions = static_cast<void* const*>(array);
+    for (int index = 0; index < count; index++)
+    {
+        if (instructions[index] == instruction)
+        {
+            if (instructionIndex)
+            {
+                *instructionIndex = index;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 static void* GetTopLevelVisualProxy(void* topLevelWindow,
                                     const wchar_t** source = nullptr)
 {
@@ -887,6 +942,8 @@ struct ObservedRenderImage
     std::atomic<void*> ownerWindowData;
     std::atomic<HWND> ownerHwnd;
     std::atomic<int> sourceKind;
+    std::atomic<unsigned int> capturedInstructionCount;
+    std::atomic<int> capturedInstructionIndex;
 };
 ObservedBitmapInstruction
     g_observedBitmapInstructions[OBSERVED_VISUAL_PROXY_COUNT] = {};
@@ -2843,6 +2900,10 @@ static Entry* FindObservedImageEntry(Entry* table, void* key, bool create)
                     entry.sourceKind.store(
                         static_cast<int>(MeshSourceKind::None),
                         std::memory_order_relaxed);
+                    entry.capturedInstructionCount.store(
+                        0, std::memory_order_relaxed);
+                    entry.capturedInstructionIndex.store(
+                        -1, std::memory_order_relaxed);
                 }
                 return &entry;
             }
@@ -2924,6 +2985,11 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
         if (ObservedRenderImage* entry = FindObservedImageEntry(
                 g_observedRenderImages, pThis, true))
         {
+            unsigned int capturedInstructionCount = 0;
+            int capturedInstructionIndex = -1;
+            FindRenderDataInstructionIndex(
+                pThis, instruction, &capturedInstructionCount,
+                &capturedInstructionIndex);
             void* imageVtable = nullptr;
             if (IsReadableMemory(imageProxy, sizeof(void*)))
             {
@@ -2941,6 +3007,10 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
             entry->sourceKind.store(
                 static_cast<int>(GetMeshSourceKind(imageProxy)),
                 std::memory_order_relaxed);
+            entry->capturedInstructionCount.store(
+                capturedInstructionCount, std::memory_order_relaxed);
+            entry->capturedInstructionIndex.store(
+                capturedInstructionIndex, std::memory_order_relaxed);
             entry->imageProxy.store(imageProxy, std::memory_order_release);
         }
     }
@@ -4951,47 +5021,25 @@ static void RunMeshSourceProbe(void* topLevelWindow, void* visualProxy, HWND hwn
         }
         void* instruction =
             observed.instruction.load(std::memory_order_acquire);
-        unsigned int instructionCount = 0;
-        int instructionIndex = -1;
-        if (renderVisual && instruction &&
-            g_renderDataInstructionsOffset != SIZE_MAX &&
-            g_renderDataInstructionCountOffset != SIZE_MAX)
-        {
-            const BYTE* visualBytes = static_cast<const BYTE*>(renderVisual);
-            const void* countAddress =
-                visualBytes + g_renderDataInstructionCountOffset;
-            if (IsReadableMemory(countAddress, sizeof(int)))
-            {
-                int count = *reinterpret_cast<const int*>(countAddress);
-                if (count > 0 && count <= 64)
-                {
-                    void* array = ReadPointerMember(
-                        renderVisual, g_renderDataInstructionsOffset);
-                    size_t arrayBytes = static_cast<size_t>(count) * sizeof(void*);
-                    if (IsReadableMemory(array, arrayBytes))
-                    {
-                        instructionCount = static_cast<unsigned int>(count);
-                        void* const* instructions =
-                            static_cast<void* const*>(array);
-                        for (int index = 0; index < count; index++)
-                        {
-                            if (instructions[index] == instruction)
-                            {
-                                instructionIndex = index;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        unsigned int liveInstructionCount = 0;
+        int liveInstructionIndex = -1;
+        FindRenderDataInstructionIndex(
+            renderVisual, instruction, &liveInstructionCount,
+            &liveInstructionIndex);
+        unsigned int capturedInstructionCount =
+            observed.capturedInstructionCount.load(std::memory_order_acquire);
+        int capturedInstructionIndex =
+            observed.capturedInstructionIndex.load(std::memory_order_acquire);
         Wh_Log(L"True 4x4 observed image source[%u]: targetNode=%d "
                L"ownerHWND=%p ownerMatch=%d visual=%p instruction=%p "
-                L"instructionCount=%u instructionIndex=%d "
+                L"capturedCount=%u capturedIndex=%d "
+                L"liveCount=%u liveIndex=%d "
                 L"image=%p imageVtable=%p kind=%s",
                observedImageEntries - 1, matchedVisualNode, sourceHwnd,
                 sourceOwnerMatches, renderVisual, instruction,
-                instructionCount, instructionIndex, imageProxy, imageVtable,
+                capturedInstructionCount, capturedInstructionIndex,
+                liveInstructionCount, liveInstructionIndex, imageProxy,
+                imageVtable,
                kind == MeshSourceKind::None ? L"BaseImage"
                                              : GetMeshSourceKindName(kind));
     }
