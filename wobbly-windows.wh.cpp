@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.168
+// @version         0.169
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -5644,6 +5644,20 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     {
         return false;
     }
+    // CDrawBitmapInstruction owns a CBaseImageProxy, while
+    // CDrawMesh2DInstruction expects the contained CBitmapSourceProxy. This is
+    // the same unwrapping used by CTouchDragVisual's native mesh path.
+    void* bitmapSourceProxy = ReadPointerMember(imageProxy, 0x10);
+    MeshSourceKind bitmapSourceKind = GetMeshSourceKind(bitmapSourceProxy);
+    if (!bitmapSourceProxy ||
+        (bitmapSourceKind != MeshSourceKind::Bitmap &&
+         bitmapSourceKind != MeshSourceKind::AmbiguousProxy) ||
+        !IsReadableMemory(bitmapSourceProxy, sizeof(void*)) ||
+        !IsDwmImageAddress(*reinterpret_cast<void**>(bitmapSourceProxy),
+                           sizeof(void*)))
+    {
+        return false;
+    }
     bool expected = false;
     if (!g_liveBaseImageMeshCanaryStarted.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel,
@@ -5716,7 +5730,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     if (result >= 0)
     {
         stage = L"CreateInstruction";
-        result = g_drawMesh2DInstructionCreate(groupProxy, imageProxy,
+        result = g_drawMesh2DInstructionCreate(groupProxy, bitmapSourceProxy,
                                                 &meshInstruction);
     }
     if (result >= 0 && meshInstruction)
@@ -5807,11 +5821,13 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
 
     Wh_Log(L"True 4x4 native slot-replacement canary: %s stage=%s "
            L"result=0x%08X HWND=%p visual=%p original=%p index=%d/%u "
-           L"image=%p imageVtable=%p size=%.0fx%.0f",
+           L"image=%p imageVtable=%p bitmapSource=%p sourceKind=%s "
+           L"size=%.0fx%.0f",
            succeeded ? L"installed" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, renderVisual,
            originalInstruction, originalIndex, originalCount, imageProxy,
-           imageVtable, width, height);
+           imageVtable, bitmapSourceProxy,
+           GetMeshSourceKindName(bitmapSourceKind), width, height);
     return succeeded;
 }
 
