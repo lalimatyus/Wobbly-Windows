@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.174
+// @version         0.175
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4963,8 +4963,15 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
             int index = GetPointIndex(x, y);
             float tx = static_cast<float>(x) / (GRID_WIDTH - 1);
             float ty = static_cast<float>(y) / (GRID_HEIGHT - 1);
+            // Publish one unmistakable bend with the original render-data
+            // transaction. Later updates are held briefly so this proves
+            // whether the replaced slot itself reaches the displayed window.
+            float diagnosticBend =
+                std::sin(tx * static_cast<float>(3.14159265358979323846)) *
+                static_cast<float>(std::min(height * 0.12, 96.0));
             positions[index] = {tx * static_cast<float>(width),
-                                ty * static_cast<float>(height), 0.0f};
+                                ty * static_cast<float>(height) + diagnosticBend,
+                                0.0f};
             textureCoordinates[index] = {tx * static_cast<float>(width),
                                          ty * static_cast<float>(height)};
         }
@@ -5105,10 +5112,10 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
         g_visibleMeshCanary.imageAdapterBacking = bitmapSourceBacking;
         g_visibleMeshCanary.pinnedImageProxy = imageProxy;
         g_visibleMeshCanary.hwnd = hwnd;
-        // The native replacement belongs to the window, not to a timed probe.
-        // It stays installed at identity between animations and is released
-        // only when the window disappears, the update fails or the mod unloads.
-        g_visibleMeshCanary.detachAt = 0;
+        // MaintainVisibleMeshCanary ignores this deadline for native bindings.
+        // ApplyAnimationSlotTransform uses it only to keep the initial proof
+        // bend visible for five seconds before live updates take over.
+        g_visibleMeshCanary.detachAt = GetTickCount64() + 5000;
         g_visibleMeshCanary.nativeBindingCount = 1;
         g_visibleMeshCanary.width = width;
         g_visibleMeshCanary.height = height;
@@ -5155,7 +5162,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     Wh_Log(L"True 4x4 native slot-replacement canary: %s stage=%s "
            L"result=0x%08X HWND=%p visual=%p original=%p index=%d/%u "
            L"image=%p imageVtable=%p imageBacking=%p bitmapAdapter=%p "
-           L"adapterBacking=%p resourceId=%u "
+           L"adapterBacking=%p resourceId=%u diagnosticHoldMs=5000 "
            L"size=%.0fx%.0f",
            succeeded ? L"installed" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, renderVisual,
@@ -5811,18 +5818,6 @@ static void SimulateMeshSubstep(WobbleMesh& mesh, const WobblySettings& settings
             point.velocity = {};
             point.force = {};
         }
-    }
-    // The HWND already follows the pointer. Keep the grabbed control point in
-    // window-local space while the other points retain their inertia; letting
-    // this point drift makes the whole grid translate almost rigidly and leaves
-    // no visible non-affine deformation for the native 4x4 renderer.
-    if (mesh.dragging && mesh.dragPointIndex >= 0 &&
-        mesh.dragPointIndex < GRID_POINT_COUNT)
-    {
-        WobblePoint& anchor = mesh.points[mesh.dragPointIndex];
-        anchor.position = anchor.basePosition;
-        anchor.velocity = {};
-        anchor.force = {};
     }
     ApplyResizeConstraints(mesh);
     mesh.active = !(accelerationSum < 0.5 && velocitySum < 0.5);
@@ -7173,7 +7168,8 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
         !g_visibleMeshCanary.renderVisual &&
         g_visibleMeshCanary.hwnd == snapshot.hwnd &&
-        g_visibleMeshCanary.nativeBindingCount > 0;
+        g_visibleMeshCanary.nativeBindingCount > 0 &&
+        GetTickCount64() >= g_visibleMeshCanary.detachAt;
     bool nativeMeshApplied = false;
     if (nativeMeshTarget)
     {
