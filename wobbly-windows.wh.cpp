@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.172
+// @version         0.173
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -999,6 +999,7 @@ struct VisibleMeshCanaryState
 VisibleMeshCanaryState g_visibleMeshCanary = {};
 std::atomic_bool g_visibleMeshCanaryActive = false;
 std::atomic_bool g_visibleMeshCanaryCleanupRequested = false;
+std::atomic<HWND> g_visibleMeshCanaryHwnd = nullptr;
 static constexpr unsigned int OBSERVED_VISUAL_PROXY_COUNT = 4096;
 static constexpr unsigned int OBSERVED_VISUAL_PROXY_PROBES = 32;
 struct ObservedVisualProxy
@@ -1087,6 +1088,7 @@ static long UpdateNativeMeshGeometry(void* meshProxy,
                                       double identityWidth = 0.0,
                                       double identityHeight = 0.0);
 static void MaintainVisibleMeshCanary();
+static void RequestVisibleMeshCleanupForHwnd(HWND hwnd);
 static long __cdecl VisualProxySetContentHook(void* pThis, const void* content);
 static long __cdecl VisualProxyInsertChildHook(void* pThis, void* child,
                                                void* reference, bool insertAbove);
@@ -2763,6 +2765,7 @@ static void __cdecl TopLevelWindow3DSetWindowDataHook(void* pThis, void* windowD
 
 static void __cdecl WindowDataDestructorHook(void* pThis)
 {
+    RequestVisibleMeshCleanupForHwnd(GetHwndFromTrustedWindowData(pThis));
     ClearDwmWindowMappingByWindowData(pThis);
     g_windowDataDestructorOriginal(pThis);
 }
@@ -2787,6 +2790,7 @@ static long __cdecl EnsureTopLevelWindowHook(void* pThis, void* windowData)
 static void __cdecl TopLevelWindowDestructorHook(void* pThis)
 {
     void* windowData = ClearDwmWindowMappingByTopLevelWindow(pThis);
+    RequestVisibleMeshCleanupForHwnd(GetHwndFromTrustedWindowData(windowData));
     if (windowData && !g_unloading.load(std::memory_order_acquire))
     {
         MarkAnimationSlotForDwmObjectRefresh(windowData);
@@ -4874,6 +4878,19 @@ static long UpdateAllNativeMeshGeometry(const WobbleMesh* mesh = nullptr)
     return result;
 }
 
+static void RequestVisibleMeshCleanupForHwnd(HWND hwnd)
+{
+    if (!hwnd ||
+        g_visibleMeshCanaryHwnd.load(std::memory_order_acquire) != hwnd ||
+        !g_visibleMeshCanaryActive.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    g_visibleMeshCanaryCleanupRequested.store(true,
+                                               std::memory_order_release);
+    RequestDwmScenePass();
+}
+
 static void MaintainVisibleMeshCanary()
 {
     if (!IsOnDwmSceneThread() ||
@@ -4884,7 +4901,11 @@ static void MaintainVisibleMeshCanary()
     bool forced = g_unloading.load(std::memory_order_acquire) ||
                   g_visibleMeshCanaryCleanupRequested.load(
                       std::memory_order_acquire);
-    bool detach = forced || GetTickCount64() >= g_visibleMeshCanary.detachAt;
+    bool nativeBinding = !g_visibleMeshCanary.renderVisual &&
+                         g_visibleMeshCanary.nativeBindingCount > 0;
+    bool detach = forced ||
+                  (!nativeBinding && g_visibleMeshCanary.detachAt &&
+                   GetTickCount64() >= g_visibleMeshCanary.detachAt);
     if (!detach)
     {
         return;
@@ -4954,9 +4975,19 @@ static void MaintainVisibleMeshCanary()
         }
     }
     g_visibleMeshCanary = {};
+    g_visibleMeshCanaryHwnd.store(nullptr, std::memory_order_release);
     g_visibleMeshCanaryCleanupRequested.store(false,
                                                std::memory_order_release);
     g_visibleMeshCanaryActive.store(false, std::memory_order_release);
+    if (!g_unloading.load(std::memory_order_acquire))
+    {
+        g_liveBaseImageMeshCanaryStarted.store(false,
+                                                std::memory_order_release);
+        g_liveBaseImageMeshCanarySucceeded.store(false,
+                                                  std::memory_order_release);
+        g_liveBaseImageMeshAnimationLogged.store(false,
+                                                  std::memory_order_release);
+    }
     RequestDwmScenePass();
     if (state.renderVisual)
     {
@@ -6061,7 +6092,10 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
         g_visibleMeshCanary.imageAdapterBacking = bitmapSourceBacking;
         g_visibleMeshCanary.pinnedImageProxy = imageProxy;
         g_visibleMeshCanary.hwnd = hwnd;
-        g_visibleMeshCanary.detachAt = GetTickCount64() + 5000;
+        // The native replacement belongs to the window, not to a timed probe.
+        // It stays installed at identity between animations and is released
+        // only when the window disappears, the update fails or the mod unloads.
+        g_visibleMeshCanary.detachAt = 0;
         g_visibleMeshCanary.nativeBindingCount = 1;
         g_visibleMeshCanary.width = width;
         g_visibleMeshCanary.height = height;
@@ -6073,6 +6107,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
         meshInstruction = nullptr;
         g_visibleMeshCanaryCleanupRequested.store(false,
                                                    std::memory_order_release);
+        g_visibleMeshCanaryHwnd.store(hwnd, std::memory_order_release);
         g_visibleMeshCanaryActive.store(true, std::memory_order_release);
         RequestDwmScenePass();
     }
@@ -6164,7 +6199,8 @@ static void SubmitPendingWobblySceneWork()
 static bool HasPendingWobblySceneWork()
 {
     return g_nativeMeshCanaryPending.load(std::memory_order_acquire) ||
-           g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
+           g_visibleMeshCanaryCleanupRequested.load(
+               std::memory_order_acquire) ||
            g_sceneRequestedSerial.load(std::memory_order_acquire) >
                g_sceneSubmittedSerial.load(std::memory_order_acquire) ||
            g_existingWindowBackfillIndex.load(std::memory_order_acquire) <
@@ -8160,7 +8196,6 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
             identityUpdate ? nullptr : &snapshot.mesh);
         if (nativeResult >= 0)
         {
-            g_visibleMeshCanary.detachAt = GetTickCount64() + 30000;
             if (!identityUpdate && maximumDisplacement > 1.0 &&
                 !g_liveBaseImageMeshAnimationLogged.exchange(
                     true, std::memory_order_acq_rel))
@@ -8186,12 +8221,6 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
                                                 0.0, 0.0};
                 long matrixResult = UpdateMatrixTransformProxy(
                     snapshot.matrixTransformProxy, identityMatrix);
-                if (matrixResult >= 0 && snapshot.retiring)
-                {
-                    g_visibleMeshCanaryCleanupRequested.store(
-                        true, std::memory_order_release);
-                    RequestDwmScenePass();
-                }
                 finishUpdate(matrixResult, matrixResult >= 0);
                 return;
             }
@@ -9820,6 +9849,7 @@ static void CALLBACK WinEventCallback(HWINEVENTHOOK, DWORD event, HWND hwnd, LON
     {
         if (idObject == OBJID_WINDOW)
         {
+            RequestVisibleMeshCleanupForHwnd(hwnd);
             ForgetObservedWindowState(hwnd);
         }
         break;
@@ -10261,6 +10291,7 @@ BOOL Wh_ModInit()
     g_visibleMeshCanaryActive.store(false, std::memory_order_release);
     g_visibleMeshCanaryCleanupRequested.store(false,
                                                std::memory_order_release);
+    g_visibleMeshCanaryHwnd.store(nullptr, std::memory_order_release);
     auto resetObservedNodes = [](ObservedVisualProxy* table)
     {
         for (unsigned int index = 0; index < OBSERVED_VISUAL_PROXY_COUNT; index++)
