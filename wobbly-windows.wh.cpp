@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.171
+// @version         0.172
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -980,6 +980,9 @@ struct VisibleMeshCanaryState
     void* meshProxy;
     void* groupProxy;
     void* instruction;
+    void* imageAdapterProxy;
+    void* imageAdapterBacking;
+    void* pinnedImageProxy;
     void* renderVisual;
     HWND hwnd;
     ULONGLONG detachAt;
@@ -4251,8 +4254,13 @@ static MeshSourceKind GetMeshSourceKind(void* object)
 static bool ReadBaseImageResourceId(void* imageProxy,
                                     unsigned int* resourceId)
 {
-    const BYTE* field = static_cast<const BYTE*>(imageProxy) + 0x18;
-    if (!resourceId || !IsReadableMemory(field, sizeof(*resourceId)))
+    void* backing = ReadPointerMember(imageProxy, 0x10);
+    if (!resourceId || !backing)
+    {
+        return false;
+    }
+    const BYTE* field = static_cast<const BYTE*>(backing) + 0x18;
+    if (!IsReadableMemory(field, sizeof(*resourceId)))
     {
         return false;
     }
@@ -4896,9 +4904,26 @@ static void MaintainVisibleMeshCanary()
     {
         g_cBaseObjectRelease(state.renderVisual);
     }
+    if (state.imageAdapterProxy && state.imageAdapterBacking)
+    {
+        void** backingAddress = reinterpret_cast<void**>(
+            static_cast<BYTE*>(state.imageAdapterProxy) + 0x10);
+        if (IsWritableMemory(backingAddress, sizeof(*backingAddress)))
+        {
+            *backingAddress = state.imageAdapterBacking;
+        }
+    }
     if (state.instruction && g_cBaseObjectRelease)
     {
         g_cBaseObjectRelease(state.instruction);
+    }
+    if (state.imageAdapterProxy && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(state.imageAdapterProxy);
+    }
+    if (state.pinnedImageProxy && g_cBaseObjectRelease)
+    {
+        g_cBaseObjectRelease(state.pinnedImageProxy);
     }
     if (state.groupProxy && g_cBaseObjectRelease)
     {
@@ -5826,6 +5851,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
         !IsReadableMemory(imageProxy, sizeof(void*)) ||
         !g_createMeshGeometry2dProxy || !g_meshGeometry2dProxyUpdate ||
         !g_createGeometry2dGroupProxy || !g_geometry2dGroupProxyUpdate ||
+        !g_createBitmapSourceProxyOriginal ||
         !g_drawMesh2DInstructionCreate || !g_renderDataVisualAddInstruction ||
         !g_cBaseObjectRelease)
     {
@@ -5860,18 +5886,18 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
         return false;
     }
 
-    unsigned int sourceCandidateCount = 0;
-    unsigned int sourceMatchCount = 0;
     unsigned int imageResourceId = 0;
-    void* bitmapSourceProxy = FindMatchingWindowBitmapSource(
-        windowData, imageProxy, &sourceCandidateCount, &sourceMatchCount,
-        &imageResourceId);
-    if (!bitmapSourceProxy)
+    void* imageBacking = ReadPointerMember(imageProxy, 0x10);
+    auto* imageReferenceCount = reinterpret_cast<volatile LONG*>(
+        static_cast<BYTE*>(imageProxy) + sizeof(void*));
+    if (!ReadBaseImageResourceId(imageProxy, &imageResourceId) ||
+        !imageBacking ||
+        !IsWritableMemory(const_cast<LONG*>(imageReferenceCount),
+                          sizeof(*imageReferenceCount)))
     {
         Wh_Log(L"True 4x4 native slot source unresolved: HWND=%p "
-               L"image=%p resourceId=%u candidates=%u matches=%u",
-               hwnd, imageProxy, imageResourceId, sourceCandidateCount,
-               sourceMatchCount);
+               L"image=%p backing=%p resourceId=%u",
+               hwnd, imageProxy, imageBacking, imageResourceId);
         return false;
     }
 
@@ -5879,6 +5905,9 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     const wchar_t* stage = L"CreateMesh";
     void* meshProxy = nullptr;
     void* groupProxy = nullptr;
+    void* bitmapSourceProxy = nullptr;
+    void* bitmapSourceBacking = nullptr;
+    bool imagePinned = false;
     void* meshInstruction = nullptr;
     D2DPoint3F positions[GRID_POINT_COUNT] = {};
     MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
@@ -5935,6 +5964,32 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     {
         stage = L"UpdateGroup";
         result = g_geometry2dGroupProxyUpdate(groupProxy, meshProxy);
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateImageAdapter";
+        result = g_createBitmapSourceProxyOriginal(compositor,
+                                                    &bitmapSourceProxy);
+    }
+    if (result >= 0 && bitmapSourceProxy)
+    {
+        stage = L"BindImageAdapter";
+        void** backingAddress = reinterpret_cast<void**>(
+            static_cast<BYTE*>(bitmapSourceProxy) + 0x10);
+        bitmapSourceBacking = ReadPointerMember(bitmapSourceProxy, 0x10);
+        if (!bitmapSourceBacking ||
+            !IsDwmObjectPointerValid(bitmapSourceProxy,
+                                     g_bitmapSourceProxyVtable) ||
+            !IsWritableMemory(backingAddress, sizeof(*backingAddress)))
+        {
+            result = E_NOINTERFACE;
+        }
+        else
+        {
+            InterlockedIncrement(imageReferenceCount);
+            imagePinned = true;
+            *backingAddress = imageBacking;
+        }
     }
     if (result >= 0)
     {
@@ -6002,6 +6057,9 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
         g_visibleMeshCanary.meshProxy = meshProxy;
         g_visibleMeshCanary.groupProxy = groupProxy;
         g_visibleMeshCanary.instruction = meshInstruction;
+        g_visibleMeshCanary.imageAdapterProxy = bitmapSourceProxy;
+        g_visibleMeshCanary.imageAdapterBacking = bitmapSourceBacking;
+        g_visibleMeshCanary.pinnedImageProxy = imageProxy;
         g_visibleMeshCanary.hwnd = hwnd;
         g_visibleMeshCanary.detachAt = GetTickCount64() + 5000;
         g_visibleMeshCanary.nativeBindingCount = 1;
@@ -6009,6 +6067,9 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
         g_visibleMeshCanary.height = height;
         meshProxy = nullptr;
         groupProxy = nullptr;
+        bitmapSourceProxy = nullptr;
+        bitmapSourceBacking = nullptr;
+        imagePinned = false;
         meshInstruction = nullptr;
         g_visibleMeshCanaryCleanupRequested.store(false,
                                                    std::memory_order_release);
@@ -6018,6 +6079,21 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     if (meshInstruction)
     {
         g_cBaseObjectRelease(meshInstruction);
+    }
+    if (bitmapSourceProxy)
+    {
+        void** backingAddress = reinterpret_cast<void**>(
+            static_cast<BYTE*>(bitmapSourceProxy) + 0x10);
+        if (bitmapSourceBacking &&
+            IsWritableMemory(backingAddress, sizeof(*backingAddress)))
+        {
+            *backingAddress = bitmapSourceBacking;
+        }
+        g_cBaseObjectRelease(bitmapSourceProxy);
+    }
+    if (imagePinned)
+    {
+        g_cBaseObjectRelease(imageProxy);
     }
     if (groupProxy)
     {
@@ -6030,14 +6106,18 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
 
     Wh_Log(L"True 4x4 native slot-replacement canary: %s stage=%s "
            L"result=0x%08X HWND=%p visual=%p original=%p index=%d/%u "
-           L"image=%p imageVtable=%p bitmapSource=%p resourceId=%u "
-           L"candidates=%u matches=%u "
+           L"image=%p imageVtable=%p imageBacking=%p bitmapAdapter=%p "
+           L"adapterBacking=%p resourceId=%u "
            L"size=%.0fx%.0f",
            succeeded ? L"installed" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, renderVisual,
            originalInstruction, originalIndex, originalCount, imageProxy,
-           imageVtable, bitmapSourceProxy, imageResourceId,
-           sourceCandidateCount, sourceMatchCount,
+           imageVtable, imageBacking,
+           succeeded ? g_visibleMeshCanary.imageAdapterProxy
+                     : bitmapSourceProxy,
+           succeeded ? g_visibleMeshCanary.imageAdapterBacking
+                     : bitmapSourceBacking,
+           imageResourceId,
            width, height);
     return succeeded;
 }
