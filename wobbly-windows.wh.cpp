@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.180
+// @version         0.181
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -5223,6 +5223,62 @@ static void InstallRequestedLiveBaseImageMeshCanary()
                target, static_cast<unsigned int>(result));
         return;
     }
+
+    // Existing windows can keep a render list that was built before our
+    // observation hooks were installed. CTopLevelWindow3D is also the
+    // CRenderDataVisual base on this verified ABI, so inspect its current list
+    // directly. CDrawBitmapInstruction stores its CBaseImageProxy at +0x10;
+    // accept the field only when the image vtable, backing and resource ID all
+    // validate as live uDWM objects.
+    void* topLevelWindow = nullptr;
+    void* renderVisual = nullptr;
+    void** instructions = nullptr;
+    int instructionCount = 0;
+    unsigned int directCandidates = 0;
+    void* directInstruction = nullptr;
+    void* directImageProxy = nullptr;
+    int directInstructionIndex = -1;
+    if (ResolveDwmWindowObjects(currentWindowData, &topLevelWindow,
+                                &renderVisual) &&
+        IsDwmObjectPointerValid(renderVisual, g_topLevelWindow3DVtable) &&
+        GetRenderDataInstructionList(renderVisual, &instructions, nullptr,
+                                     &instructionCount))
+    {
+        for (int index = 0; index < instructionCount; index++)
+        {
+            void* instruction = instructions[index];
+            void* imageProxy = ReadPointerMember(instruction, 0x10);
+            if (!instruction || !imageProxy ||
+                !IsReadableMemory(imageProxy, sizeof(void*)) ||
+                !IsDwmImageAddress(*reinterpret_cast<void**>(imageProxy),
+                                   sizeof(void*)) ||
+                GetMeshSourceKind(imageProxy) != MeshSourceKind::None)
+            {
+                continue;
+            }
+            unsigned int resourceId = 0;
+            if (!ReadBaseImageResourceId(imageProxy, &resourceId))
+            {
+                continue;
+            }
+            directCandidates++;
+            directInstruction = instruction;
+            directImageProxy = imageProxy;
+            directInstructionIndex = index;
+        }
+    }
+    if (directCandidates == 1 &&
+        TryInstallLiveBaseImageMeshCanary(
+            renderVisual, directInstruction, directImageProxy,
+            currentWindowData, target))
+    {
+        long result = g_renderDataVisualUpdateRenderData(renderVisual);
+        Wh_Log(L"True 4x4 direct targeted publish: HWND=%p index=%d/%d "
+               L"result=0x%08X",
+               target, directInstructionIndex, instructionCount,
+               static_cast<unsigned int>(result));
+        return;
+    }
     static HWND lastMissTarget = nullptr;
     static ULONGLONG lastMissTime = 0;
     ULONGLONG now = GetTickCount64();
@@ -5231,9 +5287,11 @@ static void InstallRequestedLiveBaseImageMeshCanary()
         lastMissTarget = target;
         lastMissTime = now;
         Wh_Log(L"True 4x4 target pending: HWND=%p WindowData=%p "
-               L"ownerMatches=%u liveInstructions=%u",
+               L"ownerMatches=%u liveInstructions=%u renderVisual=%p "
+               L"directInstructions=%d directCandidates=%u",
                target, currentWindowData, ownerMatches,
-               liveInstructionMatches);
+               liveInstructionMatches, renderVisual, instructionCount,
+               directCandidates);
     }
 }
 
