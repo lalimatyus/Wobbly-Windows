@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.178
+// @version         0.179
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -971,6 +971,7 @@ std::atomic_bool g_nativeMeshCanarySucceeded = false;
 std::atomic_bool g_liveBaseImageMeshCanaryStarted = false;
 std::atomic_bool g_liveBaseImageMeshCanarySucceeded = false;
 std::atomic_bool g_liveBaseImageMeshAnimationLogged = false;
+std::atomic<HWND> g_liveBaseImageMeshTargetHwnd = nullptr;
 std::atomic_bool g_meshSourceProbePending = false;
 std::atomic_bool g_meshSourceProbeCompleted = false;
 std::atomic_bool g_cachedVisualImageCanaryCompleted = false;
@@ -1076,6 +1077,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
                                                void* originalInstruction,
                                                void* imageProxy,
                                                void* windowData, HWND hwnd);
+static void InstallRequestedLiveBaseImageMeshCanary();
 static long UpdateNativeMeshGeometry(void* meshProxy,
                                       const WobbleMesh* mesh = nullptr,
                                       double identityWidth = 0.0,
@@ -4917,6 +4919,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
 {
     if (!IsOnDwmSceneThread() || !renderVisual || !originalInstruction ||
         !windowData || !hwnd || GetHwndFromWindowData(windowData) != hwnd ||
+        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire) != hwnd ||
         !imageProxy ||
         g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
         !g_nativeMeshCanarySucceeded.load(std::memory_order_acquire) ||
@@ -4992,14 +4995,8 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
             int index = GetPointIndex(x, y);
             float tx = static_cast<float>(x) / (GRID_WIDTH - 1);
             float ty = static_cast<float>(y) / (GRID_HEIGHT - 1);
-            // Publish one unmistakable bend with the original render-data
-            // transaction. Later updates are held briefly so this proves
-            // whether the replaced slot itself reaches the displayed window.
-            float diagnosticBend =
-                std::sin(tx * static_cast<float>(3.14159265358979323846)) *
-                static_cast<float>(std::min(height * 0.12, 96.0));
             positions[index] = {tx * static_cast<float>(width),
-                                ty * static_cast<float>(height) + diagnosticBend,
+                                ty * static_cast<float>(height),
                                 0.0f};
             textureCoordinates[index] = {tx * static_cast<float>(width),
                                          ty * static_cast<float>(height)};
@@ -5126,10 +5123,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
         g_visibleMeshCanary.instruction = meshInstruction;
         g_visibleMeshCanary.pinnedImageProxy = imageProxy;
         g_visibleMeshCanary.hwnd = hwnd;
-        // MaintainVisibleMeshCanary ignores this deadline for native bindings.
-        // ApplyAnimationSlotTransform uses it only to keep the initial proof
-        // bend visible for five seconds before live updates take over.
-        g_visibleMeshCanary.detachAt = GetTickCount64() + 5000;
+        g_visibleMeshCanary.detachAt = 0;
         g_visibleMeshCanary.nativeBindingCount = 1;
         g_visibleMeshCanary.width = width;
         g_visibleMeshCanary.height = height;
@@ -5163,7 +5157,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     Wh_Log(L"True 4x4 native slot-replacement canary: %s stage=%s "
            L"result=0x%08X HWND=%p visual=%p original=%p index=%d/%u "
            L"image=%p imageVtable=%p imageBacking=%p directSource=1 "
-           L"resourceId=%u diagnosticHoldMs=5000 "
+           L"resourceId=%u target=active-drag "
            L"size=%.0fx%.0f",
            succeeded ? L"installed" : L"failed", stage,
            static_cast<unsigned int>(result), hwnd, renderVisual,
@@ -5171,6 +5165,50 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
            imageVtable, imageBacking, imageResourceId,
            width, height);
     return succeeded;
+}
+
+static void InstallRequestedLiveBaseImageMeshCanary()
+{
+    if (!IsOnDwmSceneThread() ||
+        g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
+        !g_nativeMeshCanarySucceeded.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    HWND target =
+        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire);
+    if (!target || !IsWindow(target))
+    {
+        return;
+    }
+    for (ObservedRenderImage& entry : g_observedRenderImages)
+    {
+        if (entry.ownerHwnd.load(std::memory_order_acquire) != target)
+        {
+            continue;
+        }
+        void* renderVisual = entry.visual.load(std::memory_order_acquire);
+        void* instruction = entry.instruction.load(std::memory_order_acquire);
+        void* imageProxy = entry.imageProxy.load(std::memory_order_acquire);
+        void* windowData =
+            entry.ownerWindowData.load(std::memory_order_acquire);
+        if (!renderVisual || !instruction || !imageProxy || !windowData ||
+            GetHwndFromWindowData(windowData) != target ||
+            !FindRenderDataInstructionIndex(renderVisual, instruction,
+                                            nullptr, nullptr))
+        {
+            continue;
+        }
+        if (!TryInstallLiveBaseImageMeshCanary(
+                renderVisual, instruction, imageProxy, windowData, target))
+        {
+            continue;
+        }
+        long result = g_renderDataVisualUpdateRenderData(renderVisual);
+        Wh_Log(L"True 4x4 targeted publish: HWND=%p result=0x%08X",
+               target, static_cast<unsigned int>(result));
+        return;
+    }
 }
 
 static void SubmitPendingWobblySceneWork()
@@ -5185,6 +5223,7 @@ static void SubmitPendingWobblySceneWork()
     g_sceneWakePostTimestamp.store(0, std::memory_order_release);
     g_scenePassCounter.fetch_add(1, std::memory_order_release);
     MaintainVisibleMeshCanary();
+    InstallRequestedLiveBaseImageMeshCanary();
     // Restore retiring/quiet windows before discovery, creation or normal rendering.
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
@@ -7049,6 +7088,24 @@ static void HandleMoveSizeStart(HWND hwnd)
     }
     ReleaseSRWLockExclusive(&g_animationSlotsLock);
     g_dragAnimationSlot = slotIndex;
+    HWND previousMeshTarget =
+        g_liveBaseImageMeshTargetHwnd.exchange(hwnd,
+                                                std::memory_order_acq_rel);
+    if (previousMeshTarget != hwnd)
+    {
+        g_liveBaseImageMeshCanaryStarted.store(false,
+                                                std::memory_order_release);
+        g_liveBaseImageMeshCanarySucceeded.store(false,
+                                                  std::memory_order_release);
+        g_liveBaseImageMeshAnimationLogged.store(false,
+                                                  std::memory_order_release);
+    }
+    HWND activeMeshWindow =
+        g_visibleMeshCanaryHwnd.load(std::memory_order_acquire);
+    if (activeMeshWindow && activeMeshWindow != hwnd)
+    {
+        RequestVisibleMeshCleanupForHwnd(activeMeshWindow);
+    }
     g_realDraggedWindow = hwnd;
     g_realDraggedWindowRect = rect;
     g_lastDraggedWindowRect = rect;
@@ -8867,6 +8924,10 @@ static void CALLBACK WinEventCallback(HWINEVENTHOOK, DWORD event, HWND hwnd, LON
         if (idObject == OBJID_WINDOW)
         {
             RequestVisibleMeshCleanupForHwnd(hwnd);
+            HWND expected = hwnd;
+            g_liveBaseImageMeshTargetHwnd.compare_exchange_strong(
+                expected, nullptr, std::memory_order_acq_rel,
+                std::memory_order_acquire);
             ForgetObservedWindowState(hwnd);
         }
         break;
@@ -9301,6 +9362,8 @@ BOOL Wh_ModInit()
                                               std::memory_order_release);
     g_liveBaseImageMeshAnimationLogged.store(false,
                                               std::memory_order_release);
+    g_liveBaseImageMeshTargetHwnd.store(nullptr,
+                                         std::memory_order_release);
     g_meshSourceProbePending.store(false, std::memory_order_release);
     g_meshSourceProbeCompleted.store(false, std::memory_order_release);
     g_cachedVisualImageCanaryCompleted.store(false, std::memory_order_release);
