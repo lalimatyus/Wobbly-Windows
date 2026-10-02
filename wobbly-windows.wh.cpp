@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.177
+// @version         0.178
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -980,8 +980,6 @@ struct VisibleMeshCanaryState
     void* meshProxy;
     void* groupProxy;
     void* instruction;
-    void* imageAdapterProxy;
-    void* imageAdapterBacking;
     void* pinnedImageProxy;
     void* renderVisual;
     HWND hwnd;
@@ -4492,22 +4490,9 @@ static void MaintainVisibleMeshCanary()
     {
         g_cBaseObjectRelease(state.renderVisual);
     }
-    if (state.imageAdapterProxy && state.imageAdapterBacking)
-    {
-        void** backingAddress = reinterpret_cast<void**>(
-            static_cast<BYTE*>(state.imageAdapterProxy) + 0x10);
-        if (IsWritableMemory(backingAddress, sizeof(*backingAddress)))
-        {
-            *backingAddress = state.imageAdapterBacking;
-        }
-    }
     if (state.instruction && g_cBaseObjectRelease)
     {
         g_cBaseObjectRelease(state.instruction);
-    }
-    if (state.imageAdapterProxy && g_cBaseObjectRelease)
-    {
-        g_cBaseObjectRelease(state.imageAdapterProxy);
     }
     if (state.pinnedImageProxy && g_cBaseObjectRelease)
     {
@@ -4931,7 +4916,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
                                                void* windowData, HWND hwnd)
 {
     if (!IsOnDwmSceneThread() || !renderVisual || !originalInstruction ||
-        !hwnd || !IsWindow(hwnd) || GetForegroundWindow() != hwnd ||
+        !windowData || !hwnd || GetHwndFromWindowData(windowData) != hwnd ||
         !imageProxy ||
         g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
         !g_nativeMeshCanarySucceeded.load(std::memory_order_acquire) ||
@@ -4965,14 +4950,6 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     {
         return false;
     }
-    bool expected = false;
-    if (!g_liveBaseImageMeshCanaryStarted.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel,
-            std::memory_order_acquire))
-    {
-        return false;
-    }
-
     unsigned int imageResourceId = 0;
     void* imageBacking = ReadPointerMember(imageProxy, 0x10);
     auto* imageReferenceCount = reinterpret_cast<volatile LONG*>(
@@ -4985,6 +4962,17 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
         Wh_Log(L"True 4x4 native slot source unresolved: HWND=%p "
                L"image=%p backing=%p resourceId=%u",
                hwnd, imageProxy, imageBacking, imageResourceId);
+        return false;
+    }
+
+    // UpdateRenderData can run before a taskbar-restored window becomes the
+    // foreground window. The live CWindowData/HWND match above is the stable
+    // ownership proof; foreground state is only transient UI state.
+    bool expected = false;
+    if (!g_liveBaseImageMeshCanaryStarted.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire))
+    {
         return false;
     }
 
@@ -5123,6 +5111,13 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
                      meshInstruction;
     g_liveBaseImageMeshCanarySucceeded.store(succeeded,
                                                std::memory_order_release);
+    if (!succeeded)
+    {
+        // A transient render-list rebuild must not permanently consume the
+        // one-shot installation gate. A later valid publish can retry.
+        g_liveBaseImageMeshCanaryStarted.store(false,
+                                                std::memory_order_release);
+    }
     if (succeeded)
     {
         g_visibleMeshCanary = {};
