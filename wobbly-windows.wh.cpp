@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.179
+// @version         0.180
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -5181,26 +5181,40 @@ static void InstallRequestedLiveBaseImageMeshCanary()
     {
         return;
     }
+    void* windowList =
+        g_windowListForSceneWake.load(std::memory_order_acquire);
+    void* currentWindowData =
+        IsDwmObjectPointerValid(windowList, g_windowListVtable) &&
+                g_findWindowDataByHwnd
+            ? FindWindowDataByHwnd(windowList, target)
+            : nullptr;
+    if (!currentWindowData ||
+        GetHwndFromWindowData(currentWindowData) != target)
+    {
+        return;
+    }
+    unsigned int ownerMatches = 0;
+    unsigned int liveInstructionMatches = 0;
     for (ObservedRenderImage& entry : g_observedRenderImages)
     {
         if (entry.ownerHwnd.load(std::memory_order_acquire) != target)
         {
             continue;
         }
+        ownerMatches++;
         void* renderVisual = entry.visual.load(std::memory_order_acquire);
         void* instruction = entry.instruction.load(std::memory_order_acquire);
         void* imageProxy = entry.imageProxy.load(std::memory_order_acquire);
-        void* windowData =
-            entry.ownerWindowData.load(std::memory_order_acquire);
-        if (!renderVisual || !instruction || !imageProxy || !windowData ||
-            GetHwndFromWindowData(windowData) != target ||
+        if (!renderVisual || !instruction || !imageProxy ||
             !FindRenderDataInstructionIndex(renderVisual, instruction,
                                             nullptr, nullptr))
         {
             continue;
         }
+        liveInstructionMatches++;
         if (!TryInstallLiveBaseImageMeshCanary(
-                renderVisual, instruction, imageProxy, windowData, target))
+                renderVisual, instruction, imageProxy, currentWindowData,
+                target))
         {
             continue;
         }
@@ -5208,6 +5222,18 @@ static void InstallRequestedLiveBaseImageMeshCanary()
         Wh_Log(L"True 4x4 targeted publish: HWND=%p result=0x%08X",
                target, static_cast<unsigned int>(result));
         return;
+    }
+    static HWND lastMissTarget = nullptr;
+    static ULONGLONG lastMissTime = 0;
+    ULONGLONG now = GetTickCount64();
+    if (lastMissTarget != target || now - lastMissTime >= 1000)
+    {
+        lastMissTarget = target;
+        lastMissTime = now;
+        Wh_Log(L"True 4x4 target pending: HWND=%p WindowData=%p "
+               L"ownerMatches=%u liveInstructions=%u",
+               target, currentWindowData, ownerMatches,
+               liveInstructionMatches);
     }
 }
 
