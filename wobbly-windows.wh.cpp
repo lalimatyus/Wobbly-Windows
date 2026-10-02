@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.181
+// @version         0.182
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -5279,6 +5279,122 @@ static void InstallRequestedLiveBaseImageMeshCanary()
                static_cast<unsigned int>(result));
         return;
     }
+
+    static HWND lastDeepScanTarget = nullptr;
+    static ULONGLONG nextDeepScanAt = 0;
+    ULONGLONG scanNow = GetTickCount64();
+    if (lastDeepScanTarget == target && scanNow < nextDeepScanAt)
+    {
+        return;
+    }
+    lastDeepScanTarget = target;
+    nextDeepScanAt = scanNow + 100;
+
+    struct VisualScanNode
+    {
+        void* object;
+        unsigned int depth;
+    };
+    VisualScanNode scanNodes[192] = {};
+    unsigned int scanCount = 0;
+    unsigned int scanIndex = 0;
+    auto queueScanNode = [&](void* object, unsigned int depth)
+    {
+        if (!object || scanCount >= ARRAYSIZE(scanNodes) ||
+            !IsReadableMemory(object, sizeof(void*)))
+        {
+            return;
+        }
+        void* vtable = *reinterpret_cast<void**>(object);
+        if (!IsDwmImageAddress(vtable, sizeof(void*)))
+        {
+            return;
+        }
+        for (unsigned int index = 0; index < scanCount; index++)
+        {
+            if (scanNodes[index].object == object)
+            {
+                return;
+            }
+        }
+        scanNodes[scanCount++] = {object, depth};
+    };
+    void* rootVisual =
+        topLevelWindow && g_topLevelWindowGetRootVisual
+            ? g_topLevelWindowGetRootVisual(topLevelWindow, 0)
+            : nullptr;
+    queueScanNode(topLevelWindow, 0);
+    queueScanNode(renderVisual, 0);
+    queueScanNode(rootVisual, 0);
+    unsigned int treeRenderLists = 0;
+    unsigned int treeCandidates = 0;
+    void* treeRenderVisual = nullptr;
+    void* treeInstruction = nullptr;
+    void* treeImageProxy = nullptr;
+    int treeInstructionIndex = -1;
+    int treeInstructionCount = 0;
+    while (scanIndex < scanCount)
+    {
+        VisualScanNode node = scanNodes[scanIndex++];
+        if (HasExactDwmVtableTrusted(node.object,
+                                     g_topLevelWindow3DVtable))
+        {
+            void** nodeInstructions = nullptr;
+            int nodeInstructionCount = 0;
+            if (GetRenderDataInstructionList(
+                    node.object, &nodeInstructions, nullptr,
+                    &nodeInstructionCount))
+            {
+                treeRenderLists++;
+                for (int index = 0; index < nodeInstructionCount; index++)
+                {
+                    void* instruction = nodeInstructions[index];
+                    void* imageProxy = ReadPointerMember(instruction, 0x10);
+                    unsigned int resourceId = 0;
+                    if (!instruction || !imageProxy ||
+                        !IsReadableMemory(imageProxy, sizeof(void*)) ||
+                        !IsDwmImageAddress(
+                            *reinterpret_cast<void**>(imageProxy),
+                            sizeof(void*)) ||
+                        GetMeshSourceKind(imageProxy) != MeshSourceKind::None ||
+                        !ReadBaseImageResourceId(imageProxy, &resourceId))
+                    {
+                        continue;
+                    }
+                    treeCandidates++;
+                    treeRenderVisual = node.object;
+                    treeInstruction = instruction;
+                    treeImageProxy = imageProxy;
+                    treeInstructionIndex = index;
+                    treeInstructionCount = nodeInstructionCount;
+                }
+            }
+        }
+        if (node.depth >= 6)
+        {
+            continue;
+        }
+        for (size_t offset = 0; offset < 0x300; offset += sizeof(void*))
+        {
+            void* child = ReadPointerMember(node.object, offset);
+            if (child != node.object)
+            {
+                queueScanNode(child, node.depth + 1);
+            }
+        }
+    }
+    if (treeCandidates == 1 &&
+        TryInstallLiveBaseImageMeshCanary(
+            treeRenderVisual, treeInstruction, treeImageProxy,
+            currentWindowData, target))
+    {
+        long result = g_renderDataVisualUpdateRenderData(treeRenderVisual);
+        Wh_Log(L"True 4x4 visual-tree targeted publish: HWND=%p "
+               L"index=%d/%d nodes=%u result=0x%08X",
+               target, treeInstructionIndex, treeInstructionCount,
+               scanCount, static_cast<unsigned int>(result));
+        return;
+    }
     static HWND lastMissTarget = nullptr;
     static ULONGLONG lastMissTime = 0;
     ULONGLONG now = GetTickCount64();
@@ -5288,10 +5404,12 @@ static void InstallRequestedLiveBaseImageMeshCanary()
         lastMissTime = now;
         Wh_Log(L"True 4x4 target pending: HWND=%p WindowData=%p "
                L"ownerMatches=%u liveInstructions=%u renderVisual=%p "
-               L"directInstructions=%d directCandidates=%u",
+               L"directInstructions=%d directCandidates=%u root=%p "
+               L"treeNodes=%u treeLists=%u treeCandidates=%u",
                target, currentWindowData, ownerMatches,
                liveInstructionMatches, renderVisual, instructionCount,
-               directCandidates);
+               directCandidates, rootVisual, scanCount, treeRenderLists,
+               treeCandidates);
     }
 }
 
