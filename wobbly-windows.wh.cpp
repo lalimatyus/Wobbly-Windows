@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.192
+// @version         0.193
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -480,6 +480,7 @@ CVisualSetParent_t g_visualSetParentOriginal = nullptr;
 CVisualRemoveSelfFromParent_t g_visualRemoveSelfFromParentOriginal = nullptr;
 CVisualGetTransformParent_t g_visualGetTransformParent = nullptr;
 CVisualGetVisualProxyForStructure_t g_visualGetVisualProxyForStructure = nullptr;
+void* g_visualCollectionInsertRelativeFunction = nullptr;
 CRedirectVisualProxySetRedirectedVisual_t
     g_redirectVisualProxySetRedirectedVisualOriginal = nullptr;
 CCompositorCreateCachedVisualImageProxy_t
@@ -530,6 +531,7 @@ std::atomic<void*> g_bitmapSourceProxyVtable = nullptr;
 std::atomic<void*> g_visualSurfaceProxyVtable = nullptr;
 std::atomic<void*> g_cachedVisualImageProxyVtable = nullptr;
 std::atomic<void*> g_clientAreaVtable = nullptr;
+std::atomic<void*> g_visualCollectionVtable = nullptr;
 std::atomic<void*> g_dwmCompositor = nullptr;
 std::atomic<void*> g_desktopManager = nullptr;
 void* g_desktopManagerVtableSymbol = nullptr;
@@ -545,12 +547,15 @@ void* g_bitmapSourceProxyVtableSymbol = nullptr;
 void* g_visualSurfaceProxyVtableSymbol = nullptr;
 void* g_cachedVisualImageProxyVtableSymbol = nullptr;
 void* g_clientAreaVtableSymbol = nullptr;
+void* g_visualCollectionVtableSymbol = nullptr;
 size_t g_desktopManagerCompositorOffset = SIZE_MAX;
 size_t g_desktopManagerThreadIdOffset = SIZE_MAX;
 size_t g_canvasVisualOwnerOffset = SIZE_MAX;
 size_t g_visualProxyOffset = SIZE_MAX;
 size_t g_visualParentOffset = SIZE_MAX;
 size_t g_visualContentOffset = SIZE_MAX;
+size_t g_visualCollectionArrayOffset = SIZE_MAX;
+size_t g_visualCollectionCountOffset = SIZE_MAX;
 size_t g_transitionVisualProxyOffset = SIZE_MAX;
 size_t g_topLevelWindowWindowDataOffset = SIZE_MAX;
 static bool IsDwmObjectPointerValid(void* object, std::atomic<void*>& expectedVtable);
@@ -1820,6 +1825,149 @@ static bool FindRenderDataInstructionLayout(void* function,
     }
     *instructionsOffset = candidateArray;
     *countOffset = candidateCount;
+    return true;
+}
+
+static bool FindVisualCollectionLayout(void* function, size_t* arrayOffset,
+                                       size_t* countOffset)
+{
+    if (!arrayOffset || !countOffset ||
+        !IsDwmFunctionPointerValid(function))
+    {
+        return false;
+    }
+
+    std::string thisAliases[12] = {"rcx"};
+    unsigned int aliasCount = 1;
+    auto findAlias = [&](const std::string& name) -> int
+    {
+        for (unsigned int i = 0; i < aliasCount; i++)
+        {
+            if (thisAliases[i] == name)
+            {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    };
+    auto removeAlias = [&](const std::string& name)
+    {
+        int index = findAlias(name);
+        if (index >= 0)
+        {
+            thisAliases[index] = thisAliases[--aliasCount];
+        }
+    };
+    auto addAlias = [&](const std::string& name)
+    {
+        if (findAlias(name) < 0 && aliasCount < ARRAYSIZE(thisAliases))
+        {
+            thisAliases[aliasCount++] = name;
+        }
+    };
+
+    const std::regex movePattern(
+        R"(^mov\s+(r[a-z0-9]+),\s*(r[a-z0-9]+)$)",
+        std::regex_constants::icase);
+    const std::regex countPattern(
+        R"(^mov\s+(?:e[a-z0-9]+|r[0-9]+d),\s*(?:dword ptr\s*)?\[(r[a-z0-9]+)\s*\+\s*0x([0-9a-f]{1,8})\]$)",
+        std::regex_constants::icase);
+    const std::regex arrayPattern(
+        R"(^lea\s+(r[a-z0-9]+),\s*\[(r[a-z0-9]+)\s*\+\s*0x([0-9a-f]{1,8})\]$)",
+        std::regex_constants::icase);
+    size_t countCandidates[8] = {};
+    size_t arrayCandidates[8] = {};
+    unsigned int countCandidateCount = 0;
+    unsigned int arrayCandidateCount = 0;
+    auto addCandidate = [](size_t* candidates, unsigned int* count,
+                           size_t value)
+    {
+        if (value > 0x100 || value % sizeof(void*) != 0)
+        {
+            return;
+        }
+        for (unsigned int i = 0; i < *count; i++)
+        {
+            if (candidates[i] == value)
+            {
+                return;
+            }
+        }
+        if (*count < 8)
+        {
+            candidates[(*count)++] = value;
+        }
+    };
+
+    BYTE* instruction = static_cast<BYTE*>(function);
+    size_t bytesRead = 0;
+    for (int i = 0; i < 96 && bytesRead < 512; i++)
+    {
+        WH_DISASM_RESULT result = {};
+        if (!IsDwmExecutableAddress(instruction) ||
+            !Wh_Disasm(instruction, &result) || result.length == 0)
+        {
+            break;
+        }
+        std::string text = result.text;
+        std::smatch match;
+        if (std::regex_match(text, match, movePattern))
+        {
+            const std::string destination = match[1].str();
+            if (findAlias(match[2].str()) >= 0)
+            {
+                addAlias(destination);
+            }
+            else
+            {
+                removeAlias(destination);
+            }
+        }
+        else if (std::regex_match(text, match, countPattern) &&
+                 findAlias(match[1].str()) >= 0)
+        {
+            addCandidate(countCandidates, &countCandidateCount,
+                         std::stoull(match[2].str(), nullptr, 16));
+        }
+        else if (std::regex_match(text, match, arrayPattern))
+        {
+            const std::string destination = match[1].str();
+            if (findAlias(match[2].str()) >= 0)
+            {
+                addCandidate(arrayCandidates, &arrayCandidateCount,
+                             std::stoull(match[3].str(), nullptr, 16));
+            }
+            removeAlias(destination);
+        }
+        if (text == "ret")
+        {
+            break;
+        }
+        instruction += result.length;
+        bytesRead += result.length;
+    }
+
+    size_t matchedArray = SIZE_MAX;
+    size_t matchedCount = SIZE_MAX;
+    unsigned int matches = 0;
+    for (unsigned int i = 0; i < arrayCandidateCount; i++)
+    {
+        for (unsigned int j = 0; j < countCandidateCount; j++)
+        {
+            if (countCandidates[j] == arrayCandidates[i] + 0x18)
+            {
+                matchedArray = arrayCandidates[i];
+                matchedCount = countCandidates[j];
+                matches++;
+            }
+        }
+    }
+    if (matches != 1)
+    {
+        return false;
+    }
+    *arrayOffset = matchedArray;
+    *countOffset = matchedCount;
     return true;
 }
 
@@ -4003,6 +4151,11 @@ static bool InitializeDwmHooks()
          &g_visualGetVisualProxyForStructure,
          nullptr,
          true},
+        {{L"public: long __cdecl VisualCollection::InsertRelative("
+           L"class CVisual *,class CVisual *,bool,bool)"},
+         &g_visualCollectionInsertRelativeFunction,
+         nullptr,
+         true},
         {{L"public: unsigned long __cdecl CBaseObject::Release(void)"},
          &g_cBaseObjectRelease,
          nullptr,
@@ -4116,6 +4269,10 @@ static bool InitializeDwmHooks()
         {{L"const CClientArea::`vftable'"},
          &g_clientAreaVtableSymbol,
          nullptr,
+         true},
+        {{L"const VisualCollection::`vftable'"},
+         &g_visualCollectionVtableSymbol,
+         nullptr,
          true}};
     if (!WindhawkUtils::HookSymbols(udwm, udwmDllHooks, ARRAYSIZE(udwmDllHooks)))
     {
@@ -4170,10 +4327,16 @@ static bool InitializeDwmHooks()
     keepValid(g_visualRemoveSelfFromParentOriginal);
     keepValid(g_visualGetTransformParent);
     keepValid(g_visualGetVisualProxyForStructure);
+    keepValid(g_visualCollectionInsertRelativeFunction);
     g_visualParentOffset = FindOffsetFromFunction(
         reinterpret_cast<void*>(g_visualGetTransformParent), SIZE_MAX);
     g_visualContentOffset = FindOffsetFromFunction(
         reinterpret_cast<void*>(g_visualSetContentOriginal), SIZE_MAX);
+    g_visualCollectionArrayOffset = SIZE_MAX;
+    g_visualCollectionCountOffset = SIZE_MAX;
+    bool hasVisualCollectionLayout = FindVisualCollectionLayout(
+        g_visualCollectionInsertRelativeFunction,
+        &g_visualCollectionArrayOffset, &g_visualCollectionCountOffset);
     g_renderDataInstructionsOffset = SIZE_MAX;
     g_renderDataInstructionCountOffset = SIZE_MAX;
     bool hasRenderListLayout = FindRenderDataInstructionLayout(
@@ -4196,14 +4359,18 @@ static bool InitializeDwmHooks()
            g_ensureRenderDataPointerOffsetCount);
     Wh_Log(L"True 4x4 observation hooks: proxyContent=%p proxyInsert=%p "
            L"visualContent=%p visualParent=%p visualRemove=%p getParent=%p "
-           L"getProxy=%p redirect=%p parentOffset=0x%zx contentOffset=0x%zx",
+           L"getProxy=%p redirect=%p parentOffset=0x%zx contentOffset=0x%zx "
+           L"childLayout=%s childArray=0x%zx childCount=0x%zx",
            g_visualProxySetContentOriginal, g_visualProxyInsertChildOriginal,
            g_visualSetContentOriginal, g_visualSetParentOriginal,
            g_visualRemoveSelfFromParentOriginal,
            g_visualGetTransformParent,
            g_visualGetVisualProxyForStructure,
            g_redirectVisualProxySetRedirectedVisualOriginal,
-           g_visualParentOffset, g_visualContentOffset);
+           g_visualParentOffset, g_visualContentOffset,
+           hasVisualCollectionLayout ? L"available" : L"unavailable",
+           g_visualCollectionArrayOffset,
+           g_visualCollectionCountOffset);
     bool hasNativeMeshGeometry =
         g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate;
@@ -4271,6 +4438,14 @@ static bool InitializeDwmHooks()
         g_cachedVisualImageProxyVtableSymbol, g_cachedVisualImageProxyVtable);
     bool hasExactClientAreaVtable =
         cacheVtableSymbol(g_clientAreaVtableSymbol, g_clientAreaVtable);
+    bool hasExactVisualCollectionVtable = cacheVtableSymbol(
+        g_visualCollectionVtableSymbol, g_visualCollectionVtable);
+    Wh_Log(L"True 4x4 child-tree probe: collection=%s layout=%s "
+           L"array=0x%zx count=0x%zx (read-only)",
+           hasExactVisualCollectionVtable ? L"available" : L"unavailable",
+           hasVisualCollectionLayout ? L"available" : L"unavailable",
+           g_visualCollectionArrayOffset,
+           g_visualCollectionCountOffset);
     Wh_Log(L"True 4x4 source probe: bitmap=%s visualSurface=%s "
            L"bitmapCreationObserver=%s surfaceCreationObserver=%s "
            L"vtableAlias=%d",
@@ -5507,7 +5682,120 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     return succeeded;
 }
 
-static void ProbeCompleteWindowRootRoute(HWND hwnd, void* topLevelWindow)
+static void* FindVisualChildCollection(void* visual, size_t* memberOffset,
+                                       bool* indirect)
+{
+    if (memberOffset)
+    {
+        *memberOffset = SIZE_MAX;
+    }
+    if (indirect)
+    {
+        *indirect = false;
+    }
+    void* expectedVtable =
+        g_visualCollectionVtable.load(std::memory_order_acquire);
+    if (!visual || !expectedVtable ||
+        !IsReadableMemory(visual, 0x108))
+    {
+        return nullptr;
+    }
+
+    void* match = nullptr;
+    size_t matchOffset = SIZE_MAX;
+    bool matchIndirect = false;
+    unsigned int matchCount = 0;
+    auto accept = [&](void* candidate, size_t offset, bool isIndirect)
+    {
+        if (!candidate || !IsReadableMemory(candidate, sizeof(void*)) ||
+            *reinterpret_cast<void**>(candidate) != expectedVtable)
+        {
+            return;
+        }
+        if (candidate == match)
+        {
+            return;
+        }
+        match = candidate;
+        matchOffset = offset;
+        matchIndirect = isIndirect;
+        matchCount++;
+    };
+    for (size_t offset = 0; offset <= 0x100; offset += sizeof(void*))
+    {
+        BYTE* embedded = static_cast<BYTE*>(visual) + offset;
+        accept(embedded, offset, false);
+        accept(ReadPointerMember(visual, offset), offset, true);
+    }
+    if (matchCount != 1)
+    {
+        return nullptr;
+    }
+    if (memberOffset)
+    {
+        *memberOffset = matchOffset;
+    }
+    if (indirect)
+    {
+        *indirect = matchIndirect;
+    }
+    return match;
+}
+
+static bool GetVisualChildren(void* visual, void*** children, int* count,
+                              size_t* collectionOffset, bool* indirect)
+{
+    if (children)
+    {
+        *children = nullptr;
+    }
+    if (count)
+    {
+        *count = 0;
+    }
+    if (g_visualCollectionArrayOffset == SIZE_MAX ||
+        g_visualCollectionCountOffset == SIZE_MAX)
+    {
+        return false;
+    }
+    void* collection =
+        FindVisualChildCollection(visual, collectionOffset, indirect);
+    if (!collection)
+    {
+        return false;
+    }
+    BYTE* countField = static_cast<BYTE*>(collection) +
+                       g_visualCollectionCountOffset;
+    if (!IsReadableMemory(countField, sizeof(int)))
+    {
+        return false;
+    }
+    int childCount = *reinterpret_cast<int*>(countField);
+    if (childCount < 0 || childCount > 64)
+    {
+        return false;
+    }
+    void** childArray = static_cast<void**>(
+        ReadPointerMember(collection, g_visualCollectionArrayOffset));
+    if (childCount > 0 &&
+        (!childArray ||
+         !IsReadableMemory(childArray,
+                           static_cast<size_t>(childCount) * sizeof(void*))))
+    {
+        return false;
+    }
+    if (children)
+    {
+        *children = childArray;
+    }
+    if (count)
+    {
+        *count = childCount;
+    }
+    return true;
+}
+
+static void ProbeCompleteWindowRootTree(HWND hwnd, void* topLevelWindow)
 {
     static HWND lastHwnd = nullptr;
     static void* lastRoot = nullptr;
@@ -5529,38 +5817,52 @@ static void ProbeCompleteWindowRootRoute(HWND hwnd, void* topLevelWindow)
     lastHwnd = hwnd;
     lastRoot = root;
 
-    void* visited[8] = {};
-    void* visual = root;
-    for (unsigned int depth = 0;
-         depth < ARRAYSIZE(visited) && visual; depth++)
+    struct PendingVisual
     {
-        if (!IsReadableMemory(visual, sizeof(void*)))
+        void* visual;
+        void* expectedParent;
+        unsigned int depth;
+    };
+    PendingVisual pending[64] = {{root, nullptr, 0}};
+    void* visited[64] = {};
+    unsigned int pendingBegin = 0;
+    unsigned int pendingEnd = 1;
+    unsigned int visitedCount = 0;
+    unsigned int contentCount = 0;
+    while (pendingBegin < pendingEnd && visitedCount < ARRAYSIZE(visited))
+    {
+        PendingVisual item = pending[pendingBegin++];
+        if (!item.visual || !IsReadableMemory(item.visual, sizeof(void*)))
         {
-            Wh_Log(L"True 4x4 root route[%u]: HWND=%p visual=%p unreadable",
-                   depth, hwnd, visual);
-            break;
+            continue;
         }
-        bool cycle = false;
-        for (unsigned int index = 0; index < depth; index++)
+        bool seen = false;
+        for (unsigned int i = 0; i < visitedCount; i++)
         {
-            if (visited[index] == visual)
+            if (visited[i] == item.visual)
             {
-                cycle = true;
+                seen = true;
                 break;
             }
         }
-        if (cycle)
+        if (seen)
         {
-            Wh_Log(L"True 4x4 root route[%u]: HWND=%p visual=%p cycle=1",
-                   depth, hwnd, visual);
-            break;
+            continue;
         }
-        visited[depth] = visual;
+        visited[visitedCount] = item.visual;
+        unsigned int nodeIndex = visitedCount++;
 
-        void* visualVtable = *reinterpret_cast<void**>(visual);
-        void* parent = ReadPointerMember(visual, g_visualParentOffset);
-        void* proxy = ReadPointerMember(visual, g_visualProxyOffset);
-        void* content = ReadPointerMember(visual, g_visualContentOffset);
+        void* visualVtable = *reinterpret_cast<void**>(item.visual);
+        if (!IsDwmImageAddress(visualVtable, sizeof(void*)))
+        {
+            Wh_Log(L"True 4x4 root tree[%u]: HWND=%p depth=%u visual=%p "
+                   L"invalidVtable=%p",
+                   nodeIndex, hwnd, item.depth, item.visual, visualVtable);
+            continue;
+        }
+        void* parent = ReadPointerMember(item.visual, g_visualParentOffset);
+        void* proxy = ReadPointerMember(item.visual, g_visualProxyOffset);
+        void* content = ReadPointerMember(item.visual, g_visualContentOffset);
         void* proxyVtable =
             proxy && IsReadableMemory(proxy, sizeof(void*))
                 ? *reinterpret_cast<void**>(proxy)
@@ -5569,47 +5871,67 @@ static void ProbeCompleteWindowRootRoute(HWND hwnd, void* topLevelWindow)
             content && IsReadableMemory(content, sizeof(void*))
                 ? *reinterpret_cast<void**>(content)
                 : nullptr;
-        void* observedVisualParent = nullptr;
-        void* observedVisualContent = nullptr;
-        if (ObservedVisualProxy* entry = FindObservedVisual(visual, false))
+        void* redirect = nullptr;
+        if (ObservedVisualProxy* entry = FindObservedVisualProxy(proxy, false))
         {
-            observedVisualParent =
-                entry->parent.load(std::memory_order_acquire);
-            observedVisualContent =
-                entry->content.load(std::memory_order_acquire);
-        }
-        void* observedProxyParent = nullptr;
-        void* observedProxyContent = nullptr;
-        void* observedRedirect = nullptr;
-        if (ObservedVisualProxy* entry =
-                FindObservedVisualProxy(proxy, false))
-        {
-            observedProxyParent =
-                entry->parent.load(std::memory_order_acquire);
-            observedProxyContent =
-                entry->content.load(std::memory_order_acquire);
-            observedRedirect =
-                entry->redirectTarget.load(std::memory_order_acquire);
+            redirect = entry->redirectTarget.load(std::memory_order_acquire);
         }
         unsigned int resourceId = 0;
         if (content)
         {
+            contentCount++;
             ReadBaseImageResourceId(content, &resourceId);
         }
-        Wh_Log(L"True 4x4 root route[%u]: HWND=%p visual=%p "
-               L"visualVtable=%p parent=%p proxy=%p proxyVtable=%p "
-               L"content=%p contentVtable=%p contentKind=%d "
-               L"resourceId=%u observedVisualParent=%p "
-               L"observedVisualContent=%p observedProxyParent=%p "
-               L"observedProxyContent=%p redirect=%p",
-               depth, hwnd, visual, visualVtable, parent, proxy,
-               proxyVtable, content, contentVtable,
+
+        void** children = nullptr;
+        int childCount = 0;
+        size_t collectionOffset = SIZE_MAX;
+        bool indirectCollection = false;
+        bool hasChildren = GetVisualChildren(
+            item.visual, &children, &childCount, &collectionOffset,
+            &indirectCollection);
+        Wh_Log(L"True 4x4 root tree[%u]: HWND=%p depth=%u visual=%p "
+               L"visualVtable=%p parent=%p parentMatch=%d proxy=%p "
+               L"proxyVtable=%p content=%p contentVtable=%p contentKind=%d "
+               L"resourceId=%u redirect=%p collection=%s offset=0x%zx "
+               L"indirect=%d children=%d",
+               nodeIndex, hwnd, item.depth, item.visual, visualVtable,
+               parent, !item.expectedParent || parent == item.expectedParent,
+               proxy, proxyVtable, content, contentVtable,
                static_cast<int>(GetMeshSourceKind(content)), resourceId,
-               observedVisualParent, observedVisualContent,
-               observedProxyParent, observedProxyContent,
-               observedRedirect);
-        visual = parent;
+               redirect, hasChildren ? L"valid" : L"unavailable",
+               collectionOffset, indirectCollection, childCount);
+
+        if (!hasChildren || item.depth >= 8)
+        {
+            continue;
+        }
+        for (int i = 0; i < childCount && pendingEnd < ARRAYSIZE(pending);
+             i++)
+        {
+            void* child = children[i];
+            if (!child || !IsReadableMemory(child, sizeof(void*)))
+            {
+                Wh_Log(L"True 4x4 root tree[%u] child[%d]: invalid=%p",
+                       nodeIndex, i, child);
+                continue;
+            }
+            void* childVtable = *reinterpret_cast<void**>(child);
+            if (!IsDwmImageAddress(childVtable, sizeof(void*)))
+            {
+                Wh_Log(L"True 4x4 root tree[%u] child[%d]: visual=%p "
+                       L"invalidVtable=%p",
+                       nodeIndex, i, child, childVtable);
+                continue;
+            }
+            pending[pendingEnd++] =
+                {child, item.visual, item.depth + 1};
+        }
     }
+    Wh_Log(L"True 4x4 root tree summary: HWND=%p root=%p nodes=%u "
+           L"contents=%u queued=%u truncated=%d (read-only)",
+           hwnd, root, visitedCount, contentCount, pendingEnd,
+           pendingBegin < pendingEnd || pendingEnd == ARRAYSIZE(pending));
 }
 
 static void InstallRequestedLiveBaseImageMeshCanary()
@@ -5733,7 +6055,7 @@ static void InstallRequestedLiveBaseImageMeshCanary()
                                 &renderVisual) &&
         IsDwmObjectPointerValid(renderVisual, g_topLevelWindow3DVtable))
     {
-        ProbeCompleteWindowRootRoute(target, topLevelWindow);
+        ProbeCompleteWindowRootTree(target, topLevelWindow);
         for (unsigned int index = 0;
              index < g_ensureRenderDataPointerOffsetCount; index++)
         {
@@ -9968,6 +10290,9 @@ BOOL Wh_ModInit()
     g_renderDataInstructionCountOffset = SIZE_MAX;
     g_visualParentOffset = SIZE_MAX;
     g_visualContentOffset = SIZE_MAX;
+    g_visualCollectionArrayOffset = SIZE_MAX;
+    g_visualCollectionCountOffset = SIZE_MAX;
+    g_visualCollectionVtable.store(nullptr, std::memory_order_release);
     std::fill_n(g_ensureRenderDataPointerOffsets,
                 ARRAYSIZE(g_ensureRenderDataPointerOffsets), SIZE_MAX);
     g_ensureRenderDataPointerOffsetCount = 0;
