@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.183
+// @version         0.184
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1023,6 +1023,12 @@ enum class MeshSourceKind
     AmbiguousProxy,
 };
 static MeshSourceKind GetMeshSourceKind(void* object);
+static bool ReadBaseImageResourceId(void* imageProxy,
+                                    unsigned int* resourceId);
+static bool FindUniqueBaseImageInstruction(
+    void* renderVisual, unsigned int requiredResourceId,
+    void** instruction, void** imageProxy, int* instructionIndex,
+    int* instructionCount, unsigned int* candidateCount);
 struct ObservedRenderImage
 {
     std::atomic<void*> visual;
@@ -3117,8 +3123,17 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
         !g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
         g_nativeMeshCanarySucceeded.load(std::memory_order_acquire))
     {
-        ObservedRenderImage* entry =
-            FindObservedImageEntry(g_observedRenderImages, pThis, false);
+        HWND mappedHwnd = nullptr;
+        void* mappedWindowData =
+            RegisterAnimationTopLevelWindow3D(pThis, &mappedHwnd);
+        ObservedRenderImage* entry = FindObservedImageEntry(
+            g_observedRenderImages, pThis, mappedWindowData != nullptr);
+        if (entry && mappedWindowData && mappedHwnd)
+        {
+            entry->ownerWindowData.store(mappedWindowData,
+                                         std::memory_order_relaxed);
+            entry->ownerHwnd.store(mappedHwnd, std::memory_order_release);
+        }
         void* instruction = entry
                                 ? entry->instruction.load(
                                       std::memory_order_acquire)
@@ -3142,6 +3157,34 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
         {
             installed = TryInstallLiveBaseImageMeshCanary(
                 pThis, instruction, imageProxy, windowData, hwnd);
+        }
+        if (!installed && mappedWindowData && mappedHwnd &&
+            g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire) ==
+                mappedHwnd)
+        {
+            void* liveInstruction = nullptr;
+            void* liveImageProxy = nullptr;
+            int liveInstructionIndex = -1;
+            int liveInstructionCount = 0;
+            unsigned int liveCandidateCount = 0;
+            if (FindUniqueBaseImageInstruction(
+                    pThis, 0, &liveInstruction, &liveImageProxy,
+                    &liveInstructionIndex, &liveInstructionCount,
+                    &liveCandidateCount))
+            {
+                installed = TryInstallLiveBaseImageMeshCanary(
+                    pThis, liveInstruction, liveImageProxy,
+                    mappedWindowData, mappedHwnd);
+                instructionCount =
+                    static_cast<unsigned int>(liveInstructionCount);
+                if (installed)
+                {
+                    Wh_Log(L"True 4x4 publish-boundary target match: "
+                           L"HWND=%p index=%d/%d candidates=%u",
+                           mappedHwnd, liveInstructionIndex,
+                           liveInstructionCount, liveCandidateCount);
+                }
+            }
         }
     }
     long result = g_renderDataVisualUpdateRenderData(pThis);
@@ -4296,6 +4339,91 @@ static bool ReadBaseImageResourceId(void* imageProxy,
     return *resourceId != 0;
 }
 
+static bool FindUniqueBaseImageInstruction(
+    void* renderVisual, unsigned int requiredResourceId,
+    void** instruction, void** imageProxy, int* instructionIndex,
+    int* instructionCount, unsigned int* candidateCount)
+{
+    if (instruction)
+    {
+        *instruction = nullptr;
+    }
+    if (imageProxy)
+    {
+        *imageProxy = nullptr;
+    }
+    if (instructionIndex)
+    {
+        *instructionIndex = -1;
+    }
+    if (instructionCount)
+    {
+        *instructionCount = 0;
+    }
+    if (candidateCount)
+    {
+        *candidateCount = 0;
+    }
+
+    void** instructions = nullptr;
+    int count = 0;
+    if (!GetRenderDataInstructionList(renderVisual, &instructions, nullptr,
+                                      &count))
+    {
+        return false;
+    }
+    if (instructionCount)
+    {
+        *instructionCount = count;
+    }
+
+    unsigned int matches = 0;
+    void* matchedInstruction = nullptr;
+    void* matchedImage = nullptr;
+    int matchedIndex = -1;
+    for (int index = 0; index < count; index++)
+    {
+        void* candidateInstruction = instructions[index];
+        void* candidateImage = ReadPointerMember(candidateInstruction, 0x10);
+        unsigned int resourceId = 0;
+        if (!candidateInstruction || !candidateImage ||
+            !IsReadableMemory(candidateImage, sizeof(void*)) ||
+            !IsDwmImageAddress(*reinterpret_cast<void**>(candidateImage),
+                               sizeof(void*)) ||
+            GetMeshSourceKind(candidateImage) != MeshSourceKind::None ||
+            !ReadBaseImageResourceId(candidateImage, &resourceId) ||
+            (requiredResourceId && resourceId != requiredResourceId))
+        {
+            continue;
+        }
+        matches++;
+        matchedInstruction = candidateInstruction;
+        matchedImage = candidateImage;
+        matchedIndex = index;
+    }
+    if (candidateCount)
+    {
+        *candidateCount = matches;
+    }
+    if (matches != 1)
+    {
+        return false;
+    }
+    if (instruction)
+    {
+        *instruction = matchedInstruction;
+    }
+    if (imageProxy)
+    {
+        *imageProxy = matchedImage;
+    }
+    if (instructionIndex)
+    {
+        *instructionIndex = matchedIndex;
+    }
+    return true;
+}
+
 static long UpdateNativeMeshGeometry(void* meshProxy, const WobbleMesh* mesh,
                                      double identityWidth,
                                      double identityHeight)
@@ -5207,12 +5335,12 @@ static void InstallRequestedLiveBaseImageMeshCanary()
         void* renderVisual = entry.visual.load(std::memory_order_acquire);
         void* instruction = entry.instruction.load(std::memory_order_acquire);
         void* imageProxy = entry.imageProxy.load(std::memory_order_acquire);
-        if (!renderVisual || !imageProxy)
+        if (!renderVisual)
         {
             continue;
         }
 
-        if (instruction &&
+        if (instruction && imageProxy &&
             FindRenderDataInstructionIndex(renderVisual, instruction,
                                            nullptr, nullptr))
         {
@@ -5233,46 +5361,22 @@ static void InstallRequestedLiveBaseImageMeshCanary()
         // only that proven visual for the same live image resource instead of
         // walking arbitrary DWM objects from the animation loop.
         unsigned int observedResourceId = 0;
-        if (!ReadBaseImageResourceId(imageProxy, &observedResourceId))
+        if (imageProxy)
         {
-            continue;
+            ReadBaseImageResourceId(imageProxy, &observedResourceId);
         }
-        void** ownerInstructions = nullptr;
-        int ownerInstructionCount = 0;
-        if (!GetRenderDataInstructionList(renderVisual, &ownerInstructions,
-                                          nullptr, &ownerInstructionCount))
-        {
-            continue;
-        }
-        ownerRenderLists++;
         void* replacementInstruction = nullptr;
         void* replacementImageProxy = nullptr;
         int replacementIndex = -1;
+        int ownerInstructionCount = 0;
         unsigned int replacementCount = 0;
-        for (int index = 0; index < ownerInstructionCount; index++)
-        {
-            void* candidateInstruction = ownerInstructions[index];
-            void* candidateImage =
-                ReadPointerMember(candidateInstruction, 0x10);
-            unsigned int candidateResourceId = 0;
-            if (!candidateInstruction || !candidateImage ||
-                !IsReadableMemory(candidateImage, sizeof(void*)) ||
-                !IsDwmImageAddress(*reinterpret_cast<void**>(candidateImage),
-                                   sizeof(void*)) ||
-                GetMeshSourceKind(candidateImage) != MeshSourceKind::None ||
-                !ReadBaseImageResourceId(candidateImage,
-                                         &candidateResourceId) ||
-                candidateResourceId != observedResourceId)
-            {
-                continue;
-            }
-            replacementCount++;
-            replacementInstruction = candidateInstruction;
-            replacementImageProxy = candidateImage;
-            replacementIndex = index;
-        }
+        bool uniqueOwnerCandidate = FindUniqueBaseImageInstruction(
+            renderVisual, observedResourceId, &replacementInstruction,
+            &replacementImageProxy, &replacementIndex,
+            &ownerInstructionCount, &replacementCount);
+        ownerRenderLists += ownerInstructionCount > 0;
         ownerListCandidates += replacementCount;
-        if (replacementCount == 1 &&
+        if (uniqueOwnerCandidate &&
             TryInstallLiveBaseImageMeshCanary(
                 renderVisual, replacementInstruction, replacementImageProxy,
                 currentWindowData, target))
