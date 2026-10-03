@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.189
+// @version         0.190
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -5612,6 +5612,11 @@ static void InstallRequestedLiveBaseImageMeshCanary()
     unsigned int directSourceCandidates = 0;
     void* directSourceImage = nullptr;
     size_t directSourceOffset = SIZE_MAX;
+    void* probedSourceImage = nullptr;
+    void* probedSourceVtable = nullptr;
+    void* probedSourceBacking = nullptr;
+    unsigned int probedSourceResourceId = 0;
+    MeshSourceKind probedSourceKind = MeshSourceKind::None;
     if (ResolveDwmWindowObjects(currentWindowData, &topLevelWindow,
                                 &renderVisual) &&
         IsDwmObjectPointerValid(renderVisual, g_topLevelWindow3DVtable))
@@ -5621,6 +5626,22 @@ static void InstallRequestedLiveBaseImageMeshCanary()
         {
             size_t offset = g_ensureRenderDataPointerOffsets[index];
             void* imageProxy = ReadPointerMember(renderVisual, offset);
+            if (index == 0)
+            {
+                directSourceOffset = offset;
+                probedSourceImage = imageProxy;
+                if (imageProxy &&
+                    IsReadableMemory(imageProxy, sizeof(void*)))
+                {
+                    probedSourceVtable =
+                        *reinterpret_cast<void**>(imageProxy);
+                    probedSourceBacking =
+                        ReadPointerMember(imageProxy, 0x10);
+                    probedSourceKind = GetMeshSourceKind(imageProxy);
+                    ReadBaseImageResourceId(
+                        imageProxy, &probedSourceResourceId);
+                }
+            }
             if (!imageProxy || !IsReadableMemory(imageProxy, sizeof(void*)) ||
                 !IsDwmImageAddress(*reinterpret_cast<void**>(imageProxy),
                                    sizeof(void*)) ||
@@ -5690,7 +5711,9 @@ static void InstallRequestedLiveBaseImageMeshCanary()
                L"ownerLists=%u ownerCandidates=%u "
                L"directInstructions=%d directCandidates=%u "
                L"sourceOffsets=%u sourceCandidates=%u "
-               L"sourceOffset=0x%zx sourceImage=%p "
+               L"sourceOffset=0x%zx sourceImage=%p sourceVtable=%p "
+               L"sourceBacking=%p sourceResourceId=%u sourceKind=%d "
+               L"topLevelWindow=%p "
                L"ensureCalls=%u ensureMapped=%u ensurePopulated=%u "
                L"drawBitmap=%u matchedAdds=%u",
                target, currentWindowData, ownerMatches,
@@ -5698,7 +5721,10 @@ static void InstallRequestedLiveBaseImageMeshCanary()
                ownerListCandidates, instructionCount, directCandidates,
                g_ensureRenderDataPointerOffsetCount,
                directSourceCandidates, directSourceOffset,
-               directSourceImage,
+               probedSourceImage ? probedSourceImage : directSourceImage,
+               probedSourceVtable, probedSourceBacking,
+               probedSourceResourceId,
+               static_cast<int>(probedSourceKind), topLevelWindow,
                g_ensureRenderDataCallCount.load(std::memory_order_relaxed),
                g_ensureRenderDataMappedCount.load(std::memory_order_relaxed),
                g_ensureRenderDataPopulatedCount.load(
