@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.191
+// @version         0.192
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4172,8 +4172,8 @@ static bool InitializeDwmHooks()
     keepValid(g_visualGetVisualProxyForStructure);
     g_visualParentOffset = FindOffsetFromFunction(
         reinterpret_cast<void*>(g_visualGetTransformParent), SIZE_MAX);
-    g_visualContentOffset = FindStoredWindowDataOffset(
-        reinterpret_cast<void*>(g_visualSetContentOriginal));
+    g_visualContentOffset = FindOffsetFromFunction(
+        reinterpret_cast<void*>(g_visualSetContentOriginal), SIZE_MAX);
     g_renderDataInstructionsOffset = SIZE_MAX;
     g_renderDataInstructionCountOffset = SIZE_MAX;
     bool hasRenderListLayout = FindRenderDataInstructionLayout(
