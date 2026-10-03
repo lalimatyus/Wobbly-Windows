@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.184
+// @version         0.185
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -424,6 +424,7 @@ using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void* pThis,
                                                           void* instruction);
 using CRenderDataVisualClearInstructions_t = long(__cdecl*)(void* pThis);
 using CRenderDataVisualUpdateRenderData_t = long(__cdecl*)(void* pThis);
+using CTopLevelWindow3DEnsureRenderData_t = long(__cdecl*)(void* pThis);
 using CVisualProxySetContent_t = long(__cdecl*)(void* pThis,
                                                 const void* content);
 using CVisualProxyInsertChild_t = long(__cdecl*)(void* pThis, void* child,
@@ -465,6 +466,8 @@ CRenderDataVisualAddInstruction_t g_renderDataVisualAddInstruction = nullptr;
 CRenderDataVisualClearInstructions_t g_renderDataVisualClearInstructions =
     nullptr;
 CRenderDataVisualUpdateRenderData_t g_renderDataVisualUpdateRenderData = nullptr;
+CTopLevelWindow3DEnsureRenderData_t g_topLevelWindow3DEnsureRenderData =
+    nullptr;
 size_t g_renderDataInstructionsOffset = SIZE_MAX;
 size_t g_renderDataInstructionCountOffset = SIZE_MAX;
 CVisualProxySetContent_t g_visualProxySetContentOriginal = nullptr;
@@ -3754,6 +3757,12 @@ static bool InitializeDwmHooks()
          &g_renderDataVisualUpdateRenderData,
          RenderDataVisualUpdateRenderDataHook,
          true},
+        {{L"private: long __cdecl CTopLevelWindow3D::EnsureRenderData(void)",
+          L"protected: long __cdecl CTopLevelWindow3D::EnsureRenderData(void)",
+          L"public: long __cdecl CTopLevelWindow3D::EnsureRenderData(void)"},
+         &g_topLevelWindow3DEnsureRenderData,
+         nullptr,
+         true},
         {{L"public: static long __cdecl CRenderDataVisual::Create("
            L"class CRenderDataVisual * *)"},
          &g_renderDataVisualCreate,
@@ -3958,6 +3967,7 @@ static bool InitializeDwmHooks()
     keepValid(g_renderDataVisualAddInstruction);
     keepValid(g_renderDataVisualClearInstructions);
     keepValid(g_renderDataVisualUpdateRenderData);
+    keepValid(g_topLevelWindow3DEnsureRenderData);
     keepValid(g_renderDataVisualCreate);
     keepValid(g_createCachedVisualImageProxy);
     keepValid(g_cachedVisualImageProxyUpdate);
@@ -3978,9 +3988,10 @@ static bool InitializeDwmHooks()
         reinterpret_cast<void*>(g_renderDataVisualClearInstructions),
         &g_renderDataInstructionsOffset,
         &g_renderDataInstructionCountOffset);
-    Wh_Log(L"True 4x4 render-list probe: clear=%s layout=%s "
+    Wh_Log(L"True 4x4 render-list probe: clear=%s ensure=%s layout=%s "
            L"instructions=0x%zx count=0x%zx (read-only)",
            g_renderDataVisualClearInstructions ? L"available" : L"unavailable",
+           g_topLevelWindow3DEnsureRenderData ? L"available" : L"unavailable",
            hasRenderListLayout ? L"available" : L"unavailable",
            g_renderDataInstructionsOffset, g_renderDataInstructionCountOffset);
     Wh_Log(L"True 4x4 observation hooks: proxyContent=%p proxyInsert=%p "
@@ -5404,33 +5415,58 @@ static void InstallRequestedLiveBaseImageMeshCanary()
     void* directInstruction = nullptr;
     void* directImageProxy = nullptr;
     int directInstructionIndex = -1;
+    bool ensureCalled = false;
+    long ensureResult = E_NOINTERFACE;
     if (ResolveDwmWindowObjects(currentWindowData, &topLevelWindow,
                                 &renderVisual) &&
-        IsDwmObjectPointerValid(renderVisual, g_topLevelWindow3DVtable) &&
-        GetRenderDataInstructionList(renderVisual, &instructions, nullptr,
-                                     &instructionCount))
+        IsDwmObjectPointerValid(renderVisual, g_topLevelWindow3DVtable))
     {
-        for (int index = 0; index < instructionCount; index++)
+        GetRenderDataInstructionList(renderVisual, &instructions, nullptr,
+                                     &instructionCount);
+        static HWND lastEnsureTarget = nullptr;
+        static ULONGLONG lastEnsureTime = 0;
+        ULONGLONG ensureNow = GetTickCount64();
+        if (instructionCount == 0 && g_topLevelWindow3DEnsureRenderData &&
+            (lastEnsureTarget != target ||
+             ensureNow - lastEnsureTime >= 1000))
         {
-            void* instruction = instructions[index];
-            void* imageProxy = ReadPointerMember(instruction, 0x10);
-            if (!instruction || !imageProxy ||
-                !IsReadableMemory(imageProxy, sizeof(void*)) ||
-                !IsDwmImageAddress(*reinterpret_cast<void**>(imageProxy),
-                                   sizeof(void*)) ||
-                GetMeshSourceKind(imageProxy) != MeshSourceKind::None)
+            lastEnsureTarget = target;
+            lastEnsureTime = ensureNow;
+            ensureCalled = true;
+            ensureResult = g_topLevelWindow3DEnsureRenderData(renderVisual);
+            instructions = nullptr;
+            instructionCount = 0;
+            GetRenderDataInstructionList(renderVisual, &instructions, nullptr,
+                                         &instructionCount);
+            Wh_Log(L"True 4x4 native EnsureRenderData: HWND=%p visual=%p "
+                   L"result=0x%08X instructions=%d",
+                   target, renderVisual,
+                   static_cast<unsigned int>(ensureResult), instructionCount);
+        }
+        if (instructions)
+        {
+            for (int index = 0; index < instructionCount; index++)
             {
-                continue;
+                void* instruction = instructions[index];
+                void* imageProxy = ReadPointerMember(instruction, 0x10);
+                if (!instruction || !imageProxy ||
+                    !IsReadableMemory(imageProxy, sizeof(void*)) ||
+                    !IsDwmImageAddress(*reinterpret_cast<void**>(imageProxy),
+                                       sizeof(void*)) ||
+                    GetMeshSourceKind(imageProxy) != MeshSourceKind::None)
+                {
+                    continue;
+                }
+                unsigned int resourceId = 0;
+                if (!ReadBaseImageResourceId(imageProxy, &resourceId))
+                {
+                    continue;
+                }
+                directCandidates++;
+                directInstruction = instruction;
+                directImageProxy = imageProxy;
+                directInstructionIndex = index;
             }
-            unsigned int resourceId = 0;
-            if (!ReadBaseImageResourceId(imageProxy, &resourceId))
-            {
-                continue;
-            }
-            directCandidates++;
-            directInstruction = instruction;
-            directImageProxy = imageProxy;
-            directInstructionIndex = index;
         }
     }
     if (directCandidates == 1 &&
@@ -5456,10 +5492,12 @@ static void InstallRequestedLiveBaseImageMeshCanary()
         Wh_Log(L"True 4x4 target pending: HWND=%p WindowData=%p "
                L"ownerMatches=%u liveInstructions=%u renderVisual=%p "
                L"ownerLists=%u ownerCandidates=%u "
-               L"directInstructions=%d directCandidates=%u",
+               L"directInstructions=%d directCandidates=%u "
+               L"ensureCalled=%d ensureResult=0x%08X",
                target, currentWindowData, ownerMatches,
                liveInstructionMatches, renderVisual, ownerRenderLists,
-               ownerListCandidates, instructionCount, directCandidates);
+               ownerListCandidates, instructionCount, directCandidates,
+               ensureCalled, static_cast<unsigned int>(ensureResult));
     }
 }
 
