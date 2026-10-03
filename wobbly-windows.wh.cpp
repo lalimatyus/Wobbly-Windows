@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.187
+// @version         0.188
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1056,6 +1056,9 @@ std::atomic<unsigned int> g_observedVisualSurfaceCreateCount = 0;
 std::atomic<unsigned int> g_observedDrawBitmapCreateCount = 0;
 std::atomic<unsigned int> g_observedDrawTileCreateCount = 0;
 std::atomic<unsigned int> g_observedImageInstructionMatchedAddCount = 0;
+std::atomic<unsigned int> g_ensureRenderDataCallCount = 0;
+std::atomic<unsigned int> g_ensureRenderDataMappedCount = 0;
+std::atomic<unsigned int> g_ensureRenderDataPopulatedCount = 0;
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -3204,6 +3207,8 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
 static long __cdecl TopLevelWindow3DEnsureRenderDataHook(void* pThis)
 {
     long result = g_topLevelWindow3DEnsureRenderDataOriginal(pThis);
+    unsigned int callNumber =
+        g_ensureRenderDataCallCount.fetch_add(1, std::memory_order_relaxed) + 1;
     if (result < 0 || !pThis ||
         g_unloading.load(std::memory_order_acquire))
     {
@@ -3212,6 +3217,27 @@ static long __cdecl TopLevelWindow3DEnsureRenderDataHook(void* pThis)
 
     HWND hwnd = nullptr;
     void* windowData = RegisterAnimationTopLevelWindow3D(pThis, &hwnd);
+    void** observedInstructions = nullptr;
+    int observedInstructionCount = 0;
+    GetRenderDataInstructionList(pThis, &observedInstructions, nullptr,
+                                 &observedInstructionCount);
+    if (observedInstructionCount > 0)
+    {
+        g_ensureRenderDataPopulatedCount.fetch_add(1,
+                                                   std::memory_order_relaxed);
+    }
+    if (windowData && hwnd)
+    {
+        g_ensureRenderDataMappedCount.fetch_add(1,
+                                                std::memory_order_relaxed);
+    }
+    if (callNumber <= 12)
+    {
+        Wh_Log(L"True 4x4 EnsureRenderData observed: call=%u result=0x%08X "
+               L"object=%p WindowData=%p HWND=%p instructions=%d",
+               callNumber, static_cast<unsigned int>(result), pThis,
+               windowData, hwnd, observedInstructionCount);
+    }
     if (!windowData || !hwnd)
     {
         return result;
@@ -5519,10 +5545,20 @@ static void InstallRequestedLiveBaseImageMeshCanary()
         Wh_Log(L"True 4x4 target pending: HWND=%p WindowData=%p "
                L"ownerMatches=%u liveInstructions=%u renderVisual=%p "
                L"ownerLists=%u ownerCandidates=%u "
-               L"directInstructions=%d directCandidates=%u",
+               L"directInstructions=%d directCandidates=%u "
+               L"ensureCalls=%u ensureMapped=%u ensurePopulated=%u "
+               L"drawBitmap=%u matchedAdds=%u",
                target, currentWindowData, ownerMatches,
                liveInstructionMatches, renderVisual, ownerRenderLists,
-               ownerListCandidates, instructionCount, directCandidates);
+               ownerListCandidates, instructionCount, directCandidates,
+               g_ensureRenderDataCallCount.load(std::memory_order_relaxed),
+               g_ensureRenderDataMappedCount.load(std::memory_order_relaxed),
+               g_ensureRenderDataPopulatedCount.load(
+                   std::memory_order_relaxed),
+               g_observedDrawBitmapCreateCount.load(
+                   std::memory_order_relaxed),
+               g_observedImageInstructionMatchedAddCount.load(
+                   std::memory_order_relaxed));
     }
 }
 
@@ -9709,6 +9745,13 @@ BOOL Wh_ModInit()
     }
     g_observedBitmapSourceCreateCount.store(0, std::memory_order_relaxed);
     g_observedVisualSurfaceCreateCount.store(0, std::memory_order_relaxed);
+    g_observedDrawBitmapCreateCount.store(0, std::memory_order_relaxed);
+    g_observedDrawTileCreateCount.store(0, std::memory_order_relaxed);
+    g_observedImageInstructionMatchedAddCount.store(
+        0, std::memory_order_relaxed);
+    g_ensureRenderDataCallCount.store(0, std::memory_order_relaxed);
+    g_ensureRenderDataMappedCount.store(0, std::memory_order_relaxed);
+    g_ensureRenderDataPopulatedCount.store(0, std::memory_order_relaxed);
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
