@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.190
+// @version         0.191
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -549,6 +549,8 @@ size_t g_desktopManagerCompositorOffset = SIZE_MAX;
 size_t g_desktopManagerThreadIdOffset = SIZE_MAX;
 size_t g_canvasVisualOwnerOffset = SIZE_MAX;
 size_t g_visualProxyOffset = SIZE_MAX;
+size_t g_visualParentOffset = SIZE_MAX;
+size_t g_visualContentOffset = SIZE_MAX;
 size_t g_transitionVisualProxyOffset = SIZE_MAX;
 size_t g_topLevelWindowWindowDataOffset = SIZE_MAX;
 static bool IsDwmObjectPointerValid(void* object, std::atomic<void*>& expectedVtable);
@@ -4168,6 +4170,10 @@ static bool InitializeDwmHooks()
     keepValid(g_visualRemoveSelfFromParentOriginal);
     keepValid(g_visualGetTransformParent);
     keepValid(g_visualGetVisualProxyForStructure);
+    g_visualParentOffset = FindOffsetFromFunction(
+        reinterpret_cast<void*>(g_visualGetTransformParent), SIZE_MAX);
+    g_visualContentOffset = FindStoredWindowDataOffset(
+        reinterpret_cast<void*>(g_visualSetContentOriginal));
     g_renderDataInstructionsOffset = SIZE_MAX;
     g_renderDataInstructionCountOffset = SIZE_MAX;
     bool hasRenderListLayout = FindRenderDataInstructionLayout(
@@ -4190,13 +4196,14 @@ static bool InitializeDwmHooks()
            g_ensureRenderDataPointerOffsetCount);
     Wh_Log(L"True 4x4 observation hooks: proxyContent=%p proxyInsert=%p "
            L"visualContent=%p visualParent=%p visualRemove=%p getParent=%p "
-           L"getProxy=%p redirect=%p",
+           L"getProxy=%p redirect=%p parentOffset=0x%zx contentOffset=0x%zx",
            g_visualProxySetContentOriginal, g_visualProxyInsertChildOriginal,
            g_visualSetContentOriginal, g_visualSetParentOriginal,
            g_visualRemoveSelfFromParentOriginal,
            g_visualGetTransformParent,
            g_visualGetVisualProxyForStructure,
-           g_redirectVisualProxySetRedirectedVisualOriginal);
+           g_redirectVisualProxySetRedirectedVisualOriginal,
+           g_visualParentOffset, g_visualContentOffset);
     bool hasNativeMeshGeometry =
         g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate;
@@ -5500,6 +5507,111 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     return succeeded;
 }
 
+static void ProbeCompleteWindowRootRoute(HWND hwnd, void* topLevelWindow)
+{
+    static HWND lastHwnd = nullptr;
+    static void* lastRoot = nullptr;
+    if (!hwnd || !topLevelWindow || !g_topLevelWindowGetRootVisual ||
+        g_visualProxyOffset == SIZE_MAX ||
+        g_visualParentOffset == SIZE_MAX ||
+        g_visualContentOffset == SIZE_MAX)
+    {
+        return;
+    }
+
+    constexpr int completeWindowRoot = 0;
+    void* root =
+        g_topLevelWindowGetRootVisual(topLevelWindow, completeWindowRoot);
+    if (!root || (lastHwnd == hwnd && lastRoot == root))
+    {
+        return;
+    }
+    lastHwnd = hwnd;
+    lastRoot = root;
+
+    void* visited[8] = {};
+    void* visual = root;
+    for (unsigned int depth = 0;
+         depth < ARRAYSIZE(visited) && visual; depth++)
+    {
+        if (!IsReadableMemory(visual, sizeof(void*)))
+        {
+            Wh_Log(L"True 4x4 root route[%u]: HWND=%p visual=%p unreadable",
+                   depth, hwnd, visual);
+            break;
+        }
+        bool cycle = false;
+        for (unsigned int index = 0; index < depth; index++)
+        {
+            if (visited[index] == visual)
+            {
+                cycle = true;
+                break;
+            }
+        }
+        if (cycle)
+        {
+            Wh_Log(L"True 4x4 root route[%u]: HWND=%p visual=%p cycle=1",
+                   depth, hwnd, visual);
+            break;
+        }
+        visited[depth] = visual;
+
+        void* visualVtable = *reinterpret_cast<void**>(visual);
+        void* parent = ReadPointerMember(visual, g_visualParentOffset);
+        void* proxy = ReadPointerMember(visual, g_visualProxyOffset);
+        void* content = ReadPointerMember(visual, g_visualContentOffset);
+        void* proxyVtable =
+            proxy && IsReadableMemory(proxy, sizeof(void*))
+                ? *reinterpret_cast<void**>(proxy)
+                : nullptr;
+        void* contentVtable =
+            content && IsReadableMemory(content, sizeof(void*))
+                ? *reinterpret_cast<void**>(content)
+                : nullptr;
+        void* observedVisualParent = nullptr;
+        void* observedVisualContent = nullptr;
+        if (ObservedVisualProxy* entry = FindObservedVisual(visual, false))
+        {
+            observedVisualParent =
+                entry->parent.load(std::memory_order_acquire);
+            observedVisualContent =
+                entry->content.load(std::memory_order_acquire);
+        }
+        void* observedProxyParent = nullptr;
+        void* observedProxyContent = nullptr;
+        void* observedRedirect = nullptr;
+        if (ObservedVisualProxy* entry =
+                FindObservedVisualProxy(proxy, false))
+        {
+            observedProxyParent =
+                entry->parent.load(std::memory_order_acquire);
+            observedProxyContent =
+                entry->content.load(std::memory_order_acquire);
+            observedRedirect =
+                entry->redirectTarget.load(std::memory_order_acquire);
+        }
+        unsigned int resourceId = 0;
+        if (content)
+        {
+            ReadBaseImageResourceId(content, &resourceId);
+        }
+        Wh_Log(L"True 4x4 root route[%u]: HWND=%p visual=%p "
+               L"visualVtable=%p parent=%p proxy=%p proxyVtable=%p "
+               L"content=%p contentVtable=%p contentKind=%d "
+               L"resourceId=%u observedVisualParent=%p "
+               L"observedVisualContent=%p observedProxyParent=%p "
+               L"observedProxyContent=%p redirect=%p",
+               depth, hwnd, visual, visualVtable, parent, proxy,
+               proxyVtable, content, contentVtable,
+               static_cast<int>(GetMeshSourceKind(content)), resourceId,
+               observedVisualParent, observedVisualContent,
+               observedProxyParent, observedProxyContent,
+               observedRedirect);
+        visual = parent;
+    }
+}
+
 static void InstallRequestedLiveBaseImageMeshCanary()
 {
     if (!IsOnDwmSceneThread() ||
@@ -5621,6 +5733,7 @@ static void InstallRequestedLiveBaseImageMeshCanary()
                                 &renderVisual) &&
         IsDwmObjectPointerValid(renderVisual, g_topLevelWindow3DVtable))
     {
+        ProbeCompleteWindowRootRoute(target, topLevelWindow);
         for (unsigned int index = 0;
              index < g_ensureRenderDataPointerOffsetCount; index++)
         {
@@ -9853,6 +9966,8 @@ BOOL Wh_ModInit()
     g_topLevelWindow3DWindowDataOffset = SIZE_MAX;
     g_renderDataInstructionsOffset = SIZE_MAX;
     g_renderDataInstructionCountOffset = SIZE_MAX;
+    g_visualParentOffset = SIZE_MAX;
+    g_visualContentOffset = SIZE_MAX;
     std::fill_n(g_ensureRenderDataPointerOffsets,
                 ARRAYSIZE(g_ensureRenderDataPointerOffsets), SIZE_MAX);
     g_ensureRenderDataPointerOffsetCount = 0;
