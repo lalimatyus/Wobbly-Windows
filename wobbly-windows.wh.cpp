@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.188
+// @version         0.189
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -470,6 +470,8 @@ CTopLevelWindow3DEnsureRenderData_t
     g_topLevelWindow3DEnsureRenderDataOriginal = nullptr;
 size_t g_renderDataInstructionsOffset = SIZE_MAX;
 size_t g_renderDataInstructionCountOffset = SIZE_MAX;
+size_t g_ensureRenderDataPointerOffsets[16] = {};
+unsigned int g_ensureRenderDataPointerOffsetCount = 0;
 CVisualProxySetContent_t g_visualProxySetContentOriginal = nullptr;
 CVisualProxyInsertChild_t g_visualProxyInsertChildOriginal = nullptr;
 CVisualProxyRemoveChild_t g_visualProxyRemoveChildOriginal = nullptr;
@@ -1817,6 +1819,116 @@ static bool FindRenderDataInstructionLayout(void* function,
     *instructionsOffset = candidateArray;
     *countOffset = candidateCount;
     return true;
+}
+
+static unsigned int FindEnsureRenderDataPointerOffsets(
+    void* function, size_t* offsets, unsigned int capacity)
+{
+    if (!offsets || capacity == 0 || !IsDwmFunctionPointerValid(function))
+    {
+        return 0;
+    }
+
+    std::string thisAliases[16] = {"rcx"};
+    unsigned int aliasCount = 1;
+    auto findAlias = [&](const std::string& name) -> int
+    {
+        for (unsigned int i = 0; i < aliasCount; i++)
+        {
+            if (thisAliases[i] == name)
+            {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    };
+    auto removeAlias = [&](const std::string& name)
+    {
+        int index = findAlias(name);
+        if (index >= 0)
+        {
+            thisAliases[index] = thisAliases[--aliasCount];
+        }
+    };
+    auto addAlias = [&](const std::string& name)
+    {
+        if (findAlias(name) < 0 && aliasCount < ARRAYSIZE(thisAliases))
+        {
+            thisAliases[aliasCount++] = name;
+        }
+    };
+    auto addOffset = [&](size_t offset, unsigned int count)
+    {
+        if (offset < 0x20 || offset > 0x800 ||
+            offset % sizeof(void*) != 0)
+        {
+            return count;
+        }
+        for (unsigned int i = 0; i < count; i++)
+        {
+            if (offsets[i] == offset)
+            {
+                return count;
+            }
+        }
+        if (count < capacity)
+        {
+            offsets[count++] = offset;
+        }
+        return count;
+    };
+
+    const std::regex movePattern(
+        R"(^mov\s+(r[a-z0-9]+),\s*(r[a-z0-9]+)$)",
+        std::regex_constants::icase);
+    const std::regex loadPattern(
+        R"(^mov\s+(r[a-z0-9]+),\s*(?:qword ptr\s*)?\[(r[a-z0-9]+)\s*\+\s*0x([0-9a-f]{1,8})\]$)",
+        std::regex_constants::icase);
+    BYTE* instruction = static_cast<BYTE*>(function);
+    size_t bytesRead = 0;
+    unsigned int count = 0;
+    for (int i = 0; i < 256 && bytesRead < 1024; i++)
+    {
+        WH_DISASM_RESULT result = {};
+        if (!IsDwmExecutableAddress(instruction) ||
+            !Wh_Disasm(instruction, &result) || result.length == 0)
+        {
+            break;
+        }
+        std::string text = result.text;
+        std::smatch match;
+        if (std::regex_match(text, match, loadPattern))
+        {
+            const std::string destination = match[1].str();
+            const std::string base = match[2].str();
+            if (findAlias(base) >= 0)
+            {
+                count = addOffset(
+                    std::stoull(match[3].str(), nullptr, 16), count);
+            }
+            removeAlias(destination);
+        }
+        else if (std::regex_match(text, match, movePattern))
+        {
+            const std::string destination = match[1].str();
+            const std::string source = match[2].str();
+            if (findAlias(source) >= 0)
+            {
+                addAlias(destination);
+            }
+            else
+            {
+                removeAlias(destination);
+            }
+        }
+        if (text == "ret")
+        {
+            break;
+        }
+        instruction += result.length;
+        bytesRead += result.length;
+    }
+    return count;
 }
 
 static size_t FindDesktopManagerThreadIdOffset(void* function)
@@ -4062,13 +4174,20 @@ static bool InitializeDwmHooks()
         reinterpret_cast<void*>(g_renderDataVisualClearInstructions),
         &g_renderDataInstructionsOffset,
         &g_renderDataInstructionCountOffset);
+    g_ensureRenderDataPointerOffsetCount =
+        FindEnsureRenderDataPointerOffsets(
+            reinterpret_cast<void*>(
+                g_topLevelWindow3DEnsureRenderDataOriginal),
+            g_ensureRenderDataPointerOffsets,
+            ARRAYSIZE(g_ensureRenderDataPointerOffsets));
     Wh_Log(L"True 4x4 render-list probe: clear=%s ensureHook=%s layout=%s "
-           L"instructions=0x%zx count=0x%zx (read-only)",
+           L"instructions=0x%zx count=0x%zx sourceOffsets=%u (read-only)",
            g_renderDataVisualClearInstructions ? L"available" : L"unavailable",
            g_topLevelWindow3DEnsureRenderDataOriginal ? L"available"
                                                       : L"unavailable",
            hasRenderListLayout ? L"available" : L"unavailable",
-           g_renderDataInstructionsOffset, g_renderDataInstructionCountOffset);
+           g_renderDataInstructionsOffset, g_renderDataInstructionCountOffset,
+           g_ensureRenderDataPointerOffsetCount);
     Wh_Log(L"True 4x4 observation hooks: proxyContent=%p proxyInsert=%p "
            L"visualContent=%p visualParent=%p visualRemove=%p getParent=%p "
            L"getProxy=%p redirect=%p",
@@ -5490,10 +5609,34 @@ static void InstallRequestedLiveBaseImageMeshCanary()
     void* directInstruction = nullptr;
     void* directImageProxy = nullptr;
     int directInstructionIndex = -1;
+    unsigned int directSourceCandidates = 0;
+    void* directSourceImage = nullptr;
+    size_t directSourceOffset = SIZE_MAX;
     if (ResolveDwmWindowObjects(currentWindowData, &topLevelWindow,
                                 &renderVisual) &&
         IsDwmObjectPointerValid(renderVisual, g_topLevelWindow3DVtable))
     {
+        for (unsigned int index = 0;
+             index < g_ensureRenderDataPointerOffsetCount; index++)
+        {
+            size_t offset = g_ensureRenderDataPointerOffsets[index];
+            void* imageProxy = ReadPointerMember(renderVisual, offset);
+            if (!imageProxy || !IsReadableMemory(imageProxy, sizeof(void*)) ||
+                !IsDwmImageAddress(*reinterpret_cast<void**>(imageProxy),
+                                   sizeof(void*)) ||
+                GetMeshSourceKind(imageProxy) != MeshSourceKind::None)
+            {
+                continue;
+            }
+            unsigned int resourceId = 0;
+            if (!ReadBaseImageResourceId(imageProxy, &resourceId))
+            {
+                continue;
+            }
+            directSourceCandidates++;
+            directSourceImage = imageProxy;
+            directSourceOffset = offset;
+        }
         GetRenderDataInstructionList(renderVisual, &instructions, nullptr,
                                      &instructionCount);
         if (instructions)
@@ -5546,11 +5689,16 @@ static void InstallRequestedLiveBaseImageMeshCanary()
                L"ownerMatches=%u liveInstructions=%u renderVisual=%p "
                L"ownerLists=%u ownerCandidates=%u "
                L"directInstructions=%d directCandidates=%u "
+               L"sourceOffsets=%u sourceCandidates=%u "
+               L"sourceOffset=0x%zx sourceImage=%p "
                L"ensureCalls=%u ensureMapped=%u ensurePopulated=%u "
                L"drawBitmap=%u matchedAdds=%u",
                target, currentWindowData, ownerMatches,
                liveInstructionMatches, renderVisual, ownerRenderLists,
                ownerListCandidates, instructionCount, directCandidates,
+               g_ensureRenderDataPointerOffsetCount,
+               directSourceCandidates, directSourceOffset,
+               directSourceImage,
                g_ensureRenderDataCallCount.load(std::memory_order_relaxed),
                g_ensureRenderDataMappedCount.load(std::memory_order_relaxed),
                g_ensureRenderDataPopulatedCount.load(
@@ -9679,6 +9827,9 @@ BOOL Wh_ModInit()
     g_topLevelWindow3DWindowDataOffset = SIZE_MAX;
     g_renderDataInstructionsOffset = SIZE_MAX;
     g_renderDataInstructionCountOffset = SIZE_MAX;
+    std::fill_n(g_ensureRenderDataPointerOffsets,
+                ARRAYSIZE(g_ensureRenderDataPointerOffsets), SIZE_MAX);
+    g_ensureRenderDataPointerOffsetCount = 0;
     g_dwmSceneThreadId.store(0, std::memory_order_release);
     g_dwmCompositor.store(nullptr, std::memory_order_release);
     g_desktopManager.store(nullptr, std::memory_order_release);
