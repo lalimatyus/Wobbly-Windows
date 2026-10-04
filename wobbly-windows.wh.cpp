@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.205
+// @version         0.206
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1039,6 +1039,18 @@ VisibleMeshCanaryState g_visibleMeshCanary = {};
 std::atomic_bool g_visibleMeshCanaryActive = false;
 std::atomic_bool g_visibleMeshCanaryCleanupRequested = false;
 std::atomic<HWND> g_visibleMeshCanaryHwnd = nullptr;
+struct NativeMeshPublishLease
+{
+    void* renderVisual;
+    void** instructionArray;
+    int* countAddress;
+    void* originalInstruction;
+    void* meshInstruction;
+    HWND hwnd;
+    int instructionIndex;
+    int instructionCount;
+};
+NativeMeshPublishLease g_nativeMeshPublishLease = {};
 struct NativeRenderSlotProbeState
 {
     HWND hwnd;
@@ -1157,6 +1169,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
                                                void* imageProxy,
                                                void* windowData, HWND hwnd);
 static bool RebindLiveBaseImageMeshCanary(void* imageProxy, HWND hwnd);
+static bool RestoreNativeMeshPublishLease(const wchar_t* stage);
 static void InstallRequestedLiveBaseImageMeshCanary();
 static long UpdateNativeMeshGeometry(void* meshProxy,
                                       const WobbleMesh* mesh = nullptr,
@@ -1179,6 +1192,7 @@ static long __cdecl DrawTileImageInstructionCreateHook(
 static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                                         void* instruction);
 static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis);
+static long __cdecl RenderDataVisualClearInstructionsHook(void* pThis);
 static long __cdecl TopLevelWindow3DEnsureRenderDataHook(void* pThis);
 static long __cdecl CreateBitmapSourceProxyHook(void* pThis,
                                                  void** bitmapProxy);
@@ -3588,8 +3602,60 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
     return result;
 }
 
+static bool RestoreNativeMeshPublishLease(const wchar_t* stage)
+{
+    if (!g_nativeMeshPublishLease.renderVisual)
+    {
+        return true;
+    }
+    NativeMeshPublishLease lease = g_nativeMeshPublishLease;
+    void** currentInstructions = nullptr;
+    int* currentCountAddress = nullptr;
+    int currentCount = 0;
+    bool exact = GetRenderDataInstructionList(
+                     lease.renderVisual, &currentInstructions,
+                     &currentCountAddress, &currentCount) &&
+                 currentInstructions == lease.instructionArray &&
+                 currentCountAddress == lease.countAddress &&
+                 currentCount == lease.instructionCount &&
+                 lease.instructionIndex >= 0 &&
+                 lease.instructionIndex < currentCount &&
+                 IsWritableMemory(currentInstructions + lease.instructionIndex,
+                                  sizeof(void*)) &&
+                 currentInstructions[lease.instructionIndex] ==
+                     lease.meshInstruction;
+    if (!exact)
+    {
+        Wh_Log(L"True 4x4 scene lease restore deferred: stage=%s HWND=%p "
+               L"visual=%p expectedList=%p currentList=%p index=%d/%d",
+               stage, lease.hwnd, lease.renderVisual, lease.instructionArray,
+               currentInstructions, lease.instructionIndex, currentCount);
+        return false;
+    }
+    currentInstructions[lease.instructionIndex] = lease.originalInstruction;
+    g_nativeMeshPublishLease = {};
+    Wh_Log(L"True 4x4 scene lease restored: stage=%s HWND=%p visual=%p "
+           L"index=%d/%d",
+           stage, lease.hwnd, lease.renderVisual, lease.instructionIndex,
+           lease.instructionCount);
+    return true;
+}
+
+static long __cdecl RenderDataVisualClearInstructionsHook(void* pThis)
+{
+    if (pThis && g_nativeMeshPublishLease.renderVisual == pThis)
+    {
+        RestoreNativeMeshPublishLease(L"ClearInstructions");
+    }
+    return g_renderDataVisualClearInstructions(pThis);
+}
+
 static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
 {
+    if (g_nativeMeshPublishLease.renderVisual)
+    {
+        RestoreNativeMeshPublishLease(L"UpdateRenderDataReentry");
+    }
     HWND probeHwnd = nullptr;
     void* probeWindowData = nullptr;
     bool probeTarget = false;
@@ -3610,7 +3676,7 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
     bool prepared = false;
     bool rebound = false;
     bool substituted = false;
-    bool restored = false;
+    bool leased = false;
     void* meshInstruction = nullptr;
     if (NATIVE_MESH_TRANSACTION_PROBE_ENABLED && probeTarget &&
         before.listValid && before.unique && before.instruction &&
@@ -3671,20 +3737,28 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
             IsWritableMemory(currentInstructions + before.instructionIndex,
                              sizeof(void*)))
         {
-            currentInstructions[before.instructionIndex] = before.instruction;
-            restored = true;
+            g_nativeMeshPublishLease = {
+                pThis,
+                currentInstructions,
+                currentCountAddress,
+                before.instruction,
+                meshInstruction,
+                probeHwnd,
+                before.instructionIndex,
+                before.instructionCount};
+            leased = true;
         }
-        if (!restored)
+        if (!leased)
         {
             g_visibleMeshCanaryCleanupRequested.store(
                 true, std::memory_order_release);
             RequestDwmScenePass();
         }
         Wh_Log(L"True 4x4 transactional publish: HWND=%p index=%d/%d "
-               L"prepared=%d rebound=%d substituted=1 restored=%d "
+               L"prepared=%d rebound=%d substituted=1 sceneLease=%d "
                L"result=0x%08X",
                probeHwnd, before.instructionIndex, before.instructionCount,
-               prepared, rebound, restored,
+               prepared, rebound, leased,
                static_cast<unsigned int>(result));
     }
     if (probeTarget)
@@ -4730,7 +4804,7 @@ static bool InitializeDwmHooks()
          true},
         {{L"public: long __cdecl CRenderDataVisual::ClearInstructions(void)"},
          &g_renderDataVisualClearInstructions,
-         nullptr,
+         RenderDataVisualClearInstructionsHook,
          true},
         {{L"public: virtual long __cdecl "
            L"CRenderDataVisual::UpdateRenderData(void)"},
@@ -5698,6 +5772,14 @@ static void MaintainVisibleMeshCanary()
     if (!IsOnDwmSceneThread() ||
         !g_visibleMeshCanaryActive.load(std::memory_order_acquire))
     {
+        return;
+    }
+    if (g_nativeMeshPublishLease.renderVisual &&
+        !RestoreNativeMeshPublishLease(L"MeshCleanup"))
+    {
+        // Never release a mesh instruction while a DWM render list might
+        // still reference it. ClearInstructions or the enclosing scene call
+        // will provide another exact restoration point.
         return;
     }
     bool forced = g_unloading.load(std::memory_order_acquire) ||
@@ -7184,6 +7266,7 @@ static long __cdecl ForceUpdateSceneHook(void* pThis)
     long result = g_windowListForceUpdateSceneOriginal(pThis);
     if (outermostPass)
     {
+        RestoreNativeMeshPublishLease(L"ForceUpdateSceneReturn");
         BindAnimationTransformsAfterNativeScene();
         g_insideWobblyScenePass = false;
     }
@@ -7211,6 +7294,7 @@ static long __cdecl UpdateSceneHook(void* pThis)
     long result = g_windowListUpdateSceneOriginal(pThis);
     if (outermostPass)
     {
+        RestoreNativeMeshPublishLease(L"UpdateSceneReturn");
         BindAnimationTransformsAfterNativeScene();
         g_insideWobblyScenePass = false;
     }
@@ -7258,6 +7342,7 @@ static void __cdecl AdvanceTimelinesHook(void* pThis, double currentTime)
     if (canSubmit && !g_insideWobblyScenePass)
     {
         g_insideWobblyScenePass = true;
+        RestoreNativeMeshPublishLease(L"AdvanceTimelinesReturn");
         BindAnimationTransformsAfterNativeScene();
         g_insideWobblyScenePass = false;
     }
@@ -7351,6 +7436,7 @@ static void __cdecl DesktopManagerHandleThreadMessageHook(UINT message,
     }
     if (nativeSceneUpdated)
     {
+        RestoreNativeMeshPublishLease(L"ThreadWakeSceneReturn");
         // uDWM can replace the root transform while maximizing or restoring.
         BindPendingAnimationSlotTransforms(true);
     }
@@ -11269,6 +11355,7 @@ BOOL Wh_ModInit()
     g_meshSourceProbeCompleted.store(false, std::memory_order_release);
     g_cachedVisualImageCanaryCompleted.store(false, std::memory_order_release);
     g_visibleMeshCanary = {};
+    g_nativeMeshPublishLease = {};
     g_visibleMeshCanaryActive.store(false, std::memory_order_release);
     g_visibleMeshCanaryCleanupRequested.store(false,
                                                std::memory_order_release);
