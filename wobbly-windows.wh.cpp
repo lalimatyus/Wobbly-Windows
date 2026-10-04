@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.193
+// @version         0.194
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -5890,17 +5890,57 @@ static void ProbeCompleteWindowRootTree(HWND hwnd, void* topLevelWindow)
         bool hasChildren = GetVisualChildren(
             item.visual, &children, &childCount, &collectionOffset,
             &indirectCollection);
+        void** renderInstructions = nullptr;
+        int renderInstructionCount = 0;
+        bool hasRenderList = content && GetRenderDataInstructionList(
+            item.visual, &renderInstructions, nullptr,
+            &renderInstructionCount);
         Wh_Log(L"True 4x4 root tree[%u]: HWND=%p depth=%u visual=%p "
                L"visualVtable=%p parent=%p parentMatch=%d proxy=%p "
                L"proxyVtable=%p content=%p contentVtable=%p contentKind=%d "
                L"resourceId=%u redirect=%p collection=%s offset=0x%zx "
-               L"indirect=%d children=%d",
+               L"indirect=%d children=%d renderList=%s instructions=%d",
                nodeIndex, hwnd, item.depth, item.visual, visualVtable,
                parent, !item.expectedParent || parent == item.expectedParent,
                proxy, proxyVtable, content, contentVtable,
                static_cast<int>(GetMeshSourceKind(content)), resourceId,
                redirect, hasChildren ? L"valid" : L"unavailable",
-               collectionOffset, indirectCollection, childCount);
+               collectionOffset, indirectCollection, childCount,
+               hasRenderList ? L"valid" : L"unavailable",
+               renderInstructionCount);
+
+        if (hasRenderList)
+        {
+            for (int i = 0; i < renderInstructionCount; i++)
+            {
+                void* instruction = renderInstructions[i];
+                void* instructionVtable =
+                    instruction && IsReadableMemory(instruction, sizeof(void*))
+                        ? *reinterpret_cast<void**>(instruction)
+                        : nullptr;
+                void* source = ReadPointerMember(instruction, 0x10);
+                void* sourceVtable =
+                    source && IsReadableMemory(source, sizeof(void*))
+                        ? *reinterpret_cast<void**>(source)
+                        : nullptr;
+                void* backing = ReadPointerMember(source, 0x10);
+                unsigned int sourceResourceId = 0;
+                bool hasResourceId =
+                    ReadBaseImageResourceId(source, &sourceResourceId);
+                Wh_Log(L"True 4x4 root tree[%u] instruction[%d]: "
+                       L"instruction=%p instructionVtable=%p "
+                       L"instructionVtableInDwm=%d source=%p "
+                       L"sourceVtable=%p sourceVtableInDwm=%d "
+                       L"sourceKind=%d backing=%p resourceId=%u "
+                       L"resourceValid=%d",
+                       nodeIndex, i, instruction, instructionVtable,
+                       IsDwmImageAddress(instructionVtable, sizeof(void*)),
+                       source, sourceVtable,
+                       IsDwmImageAddress(sourceVtable, sizeof(void*)),
+                       static_cast<int>(GetMeshSourceKind(source)), backing,
+                       sourceResourceId, hasResourceId);
+            }
+        }
 
         if (!hasChildren || item.depth >= 8)
         {
