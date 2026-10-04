@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.204
+// @version         0.205
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1156,6 +1156,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
                                                void* originalInstruction,
                                                void* imageProxy,
                                                void* windowData, HWND hwnd);
+static bool RebindLiveBaseImageMeshCanary(void* imageProxy, HWND hwnd);
 static void InstallRequestedLiveBaseImageMeshCanary();
 static long UpdateNativeMeshGeometry(void* meshProxy,
                                       const WobbleMesh* mesh = nullptr,
@@ -3607,6 +3608,7 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
         }
     }
     bool prepared = false;
+    bool rebound = false;
     bool substituted = false;
     bool restored = false;
     void* meshInstruction = nullptr;
@@ -3620,6 +3622,19 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
             prepared = TryInstallLiveBaseImageMeshCanary(
                 pThis, before.instruction, before.imageProxy,
                 probeWindowData, probeHwnd);
+        }
+        if (g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
+            g_visibleMeshCanary.hwnd == probeHwnd &&
+            g_visibleMeshCanary.pinnedImageProxy != before.imageProxy)
+        {
+            rebound = RebindLiveBaseImageMeshCanary(before.imageProxy,
+                                                     probeHwnd);
+            if (!rebound)
+            {
+                g_visibleMeshCanaryCleanupRequested.store(
+                    true, std::memory_order_release);
+                RequestDwmScenePass();
+            }
         }
         if (g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
             g_visibleMeshCanary.hwnd == probeHwnd &&
@@ -3637,13 +3652,6 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
                     meshInstruction;
                 substituted = true;
             }
-        }
-        else if (g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
-                 g_visibleMeshCanary.hwnd == probeHwnd)
-        {
-            g_visibleMeshCanaryCleanupRequested.store(
-                true, std::memory_order_release);
-            RequestDwmScenePass();
         }
     }
     long result = g_renderDataVisualUpdateRenderData(pThis);
@@ -3673,9 +3681,11 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
             RequestDwmScenePass();
         }
         Wh_Log(L"True 4x4 transactional publish: HWND=%p index=%d/%d "
-               L"prepared=%d substituted=1 restored=%d result=0x%08X",
+               L"prepared=%d rebound=%d substituted=1 restored=%d "
+               L"result=0x%08X",
                probeHwnd, before.instructionIndex, before.instructionCount,
-               prepared, restored, static_cast<unsigned int>(result));
+               prepared, rebound, restored,
+               static_cast<unsigned int>(result));
     }
     if (probeTarget)
     {
@@ -6139,6 +6149,73 @@ static void RunNativeMeshCanary()
            succeeded ? L"passed" : L"failed", stage,
            static_cast<unsigned int>(result), GRID_POINT_COUNT,
            (GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6);
+}
+
+static bool RebindLiveBaseImageMeshCanary(void* imageProxy, HWND hwnd)
+{
+    if (!IsOnDwmSceneThread() || !imageProxy || !hwnd ||
+        !g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
+        g_visibleMeshCanary.hwnd != hwnd ||
+        !g_visibleMeshCanary.groupProxy ||
+        !g_visibleMeshCanary.instruction ||
+        !g_visibleMeshCanary.pinnedImageProxy ||
+        !g_drawMesh2DInstructionCreate || !g_cBaseObjectRelease)
+    {
+        return false;
+    }
+    if (g_visibleMeshCanary.pinnedImageProxy == imageProxy)
+    {
+        return true;
+    }
+    if (GetMeshSourceKind(imageProxy) != MeshSourceKind::None ||
+        !IsReadableMemory(imageProxy, sizeof(void*)))
+    {
+        return false;
+    }
+
+    void* imageVtable = *reinterpret_cast<void**>(imageProxy);
+    void* imageBacking = ReadPointerMember(imageProxy, 0x10);
+    unsigned int imageResourceId = 0;
+    auto* imageReferenceCount = reinterpret_cast<volatile LONG*>(
+        static_cast<BYTE*>(imageProxy) + sizeof(void*));
+    if (!IsDwmImageAddress(imageVtable, sizeof(void*)) || !imageBacking ||
+        !ReadBaseImageResourceId(imageProxy, &imageResourceId) ||
+        !IsWritableMemory(const_cast<LONG*>(imageReferenceCount),
+                          sizeof(*imageReferenceCount)))
+    {
+        return false;
+    }
+
+    InterlockedIncrement(imageReferenceCount);
+    void* replacementInstruction = nullptr;
+    long result = g_drawMesh2DInstructionCreate(
+        g_visibleMeshCanary.groupProxy, imageProxy, &replacementInstruction);
+    if (result < 0 || !replacementInstruction)
+    {
+        g_cBaseObjectRelease(imageProxy);
+        Wh_Log(L"True 4x4 native transaction source rebind failed: "
+               L"result=0x%08X HWND=%p image=%p resourceId=%u",
+               static_cast<unsigned int>(result), hwnd, imageProxy,
+               imageResourceId);
+        return false;
+    }
+
+    void* previousInstruction = g_visibleMeshCanary.instruction;
+    void* previousImage = g_visibleMeshCanary.pinnedImageProxy;
+    unsigned int previousResourceId = 0;
+    ReadBaseImageResourceId(previousImage, &previousResourceId);
+    g_visibleMeshCanary.instruction = replacementInstruction;
+    g_visibleMeshCanary.pinnedImageProxy = imageProxy;
+
+    // Every transaction restores the DWM slot before returning, so the old
+    // instruction and its explicit image pin are no longer reachable here.
+    g_cBaseObjectRelease(previousInstruction);
+    g_cBaseObjectRelease(previousImage);
+    Wh_Log(L"True 4x4 native transaction source rebound: HWND=%p "
+           L"oldImage=%p oldResourceId=%u newImage=%p newResourceId=%u",
+           hwnd, previousImage, previousResourceId, imageProxy,
+           imageResourceId);
+    return true;
 }
 
 static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
