@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.202
+// @version         0.203
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1007,6 +1007,7 @@ std::atomic_bool g_nativeMeshCanarySucceeded = false;
 // replacement transaction are proven. Older slot-replacement experiments
 // could leave an identity mesh instruction alive after the mod was unloaded.
 static constexpr bool NATIVE_MESH_WRITE_PROBE_ENABLED = false;
+static constexpr bool NATIVE_MESH_TRANSACTION_PROBE_ENABLED = true;
 std::atomic_bool g_liveBaseImageMeshCanaryStarted = false;
 std::atomic_bool g_liveBaseImageMeshCanarySucceeded = false;
 std::atomic_bool g_liveBaseImageMeshAnimationLogged = false;
@@ -3605,78 +3606,77 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
             before = CaptureNativeRenderCallSnapshot(pThis);
         }
     }
-    bool installed = false;
-    unsigned int instructionCount = 0;
-    if (NATIVE_MESH_WRITE_PROBE_ENABLED && pThis &&
-        !g_unloading.load(std::memory_order_acquire) &&
-        !g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
+    bool prepared = false;
+    bool substituted = false;
+    bool restored = false;
+    void* meshInstruction = nullptr;
+    if (NATIVE_MESH_TRANSACTION_PROBE_ENABLED && probeTarget &&
+        before.listValid && before.unique && before.instruction &&
+        before.imageProxy && before.instructionIndex >= 0 &&
         g_nativeMeshCanarySucceeded.load(std::memory_order_acquire))
     {
-        HWND mappedHwnd = nullptr;
-        void* mappedWindowData =
-            RegisterAnimationTopLevelWindow3D(pThis, &mappedHwnd);
-        ObservedRenderImage* entry = FindObservedImageEntry(
-            g_observedRenderImages, pThis, mappedWindowData != nullptr);
-        if (entry && mappedWindowData && mappedHwnd)
+        if (!g_visibleMeshCanaryActive.load(std::memory_order_acquire))
         {
-            entry->ownerWindowData.store(mappedWindowData,
-                                         std::memory_order_relaxed);
-            entry->ownerHwnd.store(mappedHwnd, std::memory_order_release);
+            prepared = TryInstallLiveBaseImageMeshCanary(
+                pThis, before.instruction, before.imageProxy,
+                probeWindowData, probeHwnd);
         }
-        void* instruction = entry
-                                ? entry->instruction.load(
-                                      std::memory_order_acquire)
-                                : nullptr;
-        void* imageProxy = entry
-                               ? entry->imageProxy.load(
-                                     std::memory_order_acquire)
-                               : nullptr;
-        void* windowData = entry
-                               ? entry->ownerWindowData.load(
-                                     std::memory_order_acquire)
-                               : nullptr;
-        HWND hwnd = entry
-                        ? entry->ownerHwnd.load(std::memory_order_acquire)
-                        : nullptr;
-        int instructionIndex = -1;
-        if (instruction && imageProxy && windowData && hwnd &&
-            FindRenderDataInstructionIndex(pThis, instruction,
-                                           &instructionCount,
-                                           &instructionIndex))
+        if (g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
+            g_visibleMeshCanary.hwnd == probeHwnd &&
+            g_visibleMeshCanary.pinnedImageProxy == before.imageProxy)
         {
-            installed = TryInstallLiveBaseImageMeshCanary(
-                pThis, instruction, imageProxy, windowData, hwnd);
-        }
-        if (!installed && mappedWindowData && mappedHwnd &&
-            g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire) ==
-                mappedHwnd)
-        {
-            void* liveInstruction = nullptr;
-            void* liveImageProxy = nullptr;
-            int liveInstructionIndex = -1;
-            int liveInstructionCount = 0;
-            unsigned int liveCandidateCount = 0;
-            if (FindUniqueBaseImageInstruction(
-                    pThis, 0, &liveInstruction, &liveImageProxy,
-                    &liveInstructionIndex, &liveInstructionCount,
-                    &liveCandidateCount))
+            meshInstruction = g_visibleMeshCanary.instruction;
+            if (meshInstruction &&
+                IsWritableMemory(before.instructionArray +
+                                     before.instructionIndex,
+                                 sizeof(void*)) &&
+                before.instructionArray[before.instructionIndex] ==
+                    before.instruction)
             {
-                installed = TryInstallLiveBaseImageMeshCanary(
-                    pThis, liveInstruction, liveImageProxy,
-                    mappedWindowData, mappedHwnd);
-                instructionCount =
-                    static_cast<unsigned int>(liveInstructionCount);
-                if (installed)
-                {
-                    Wh_Log(L"True 4x4 publish-boundary target match: "
-                           L"HWND=%p index=%d/%d candidates=%u",
-                           mappedHwnd, liveInstructionIndex,
-                           liveInstructionCount, liveCandidateCount);
-                }
+                before.instructionArray[before.instructionIndex] =
+                    meshInstruction;
+                substituted = true;
             }
+        }
+        else if (g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
+                 g_visibleMeshCanary.hwnd == probeHwnd)
+        {
+            g_visibleMeshCanaryCleanupRequested.store(
+                true, std::memory_order_release);
+            RequestDwmScenePass();
         }
     }
     long result = g_renderDataVisualUpdateRenderData(pThis);
+    if (substituted)
+    {
+        void** currentInstructions = nullptr;
+        int* currentCountAddress = nullptr;
+        int currentCount = 0;
+        if (GetRenderDataInstructionList(
+                pThis, &currentInstructions, &currentCountAddress,
+                &currentCount) &&
+            currentInstructions == before.instructionArray &&
+            currentCountAddress == before.countAddress &&
+            currentCount == before.instructionCount &&
+            before.instructionIndex < currentCount &&
+            currentInstructions[before.instructionIndex] == meshInstruction &&
+            IsWritableMemory(currentInstructions + before.instructionIndex,
+                             sizeof(void*)))
+        {
+            currentInstructions[before.instructionIndex] = before.instruction;
+            restored = true;
+        }
+        if (!restored)
+        {
+            g_visibleMeshCanaryCleanupRequested.store(
+                true, std::memory_order_release);
+            RequestDwmScenePass();
+        }
+        Wh_Log(L"True 4x4 transactional publish: HWND=%p index=%d/%d "
+               L"prepared=%d substituted=1 restored=%d result=0x%08X",
+               probeHwnd, before.instructionIndex, before.instructionCount,
+               prepared, restored, static_cast<unsigned int>(result));
+    }
     if (probeTarget)
     {
         NativeRenderCallSnapshot after =
@@ -3730,12 +3730,6 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
                    static_cast<unsigned long long>(after.fingerprint),
                    after.listValid, after.unique, after.candidateCount);
         }
-    }
-    if (installed)
-    {
-        Wh_Log(L"True 4x4 native publish boundary: meshPresent=1 "
-               L"prePublishInstructions=%u result=0x%08X",
-               instructionCount, static_cast<unsigned int>(result));
     }
     return result;
 }
@@ -5655,6 +5649,27 @@ static long UpdateAllNativeMeshGeometry(const WobbleMesh* mesh = nullptr)
     return result;
 }
 
+static long RepublishOriginalRenderData(HWND hwnd)
+{
+    void* windowList = g_windowListForSceneWake.load(std::memory_order_acquire);
+    if (!hwnd || !g_renderDataVisualUpdateRenderData ||
+        !IsDwmObjectPointerValid(windowList, g_windowListVtable) ||
+        !g_findWindowDataByHwnd)
+    {
+        return E_NOINTERFACE;
+    }
+    void* windowData = FindWindowDataByHwnd(windowList, hwnd);
+    void* topLevelWindow = nullptr;
+    void* renderVisual = nullptr;
+    if (!windowData || GetHwndFromWindowData(windowData) != hwnd ||
+        !ResolveDwmWindowObjects(windowData, &topLevelWindow, &renderVisual) ||
+        !IsDwmObjectPointerValid(renderVisual, g_topLevelWindow3DVtable))
+    {
+        return E_NOINTERFACE;
+    }
+    return g_renderDataVisualUpdateRenderData(renderVisual);
+}
+
 static void RequestVisibleMeshCleanupForHwnd(HWND hwnd)
 {
     if (!hwnd ||
@@ -5692,7 +5707,11 @@ static void MaintainVisibleMeshCanary()
     if (!state.renderVisual && state.meshProxy &&
         g_meshGeometry2dProxyUpdate)
     {
-        detachResult = UpdateAllNativeMeshGeometry();
+        detachResult = RepublishOriginalRenderData(state.hwnd);
+        if (detachResult < 0)
+        {
+            detachResult = UpdateAllNativeMeshGeometry();
+        }
     }
     if (state.renderVisual && g_visualRemoveSelfFromParentOriginal)
     {
@@ -5760,7 +5779,7 @@ static void MaintainVisibleMeshCanary()
     }
     else
     {
-        Wh_Log(L"True 4x4 native in-place canary: restored identity result=0x%08X HWND=%p",
+        Wh_Log(L"True 4x4 native transaction canary: restored original result=0x%08X HWND=%p",
                static_cast<unsigned int>(detachResult), state.hwnd);
     }
 }
@@ -6137,8 +6156,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
         !IsReadableMemory(imageProxy, sizeof(void*)) ||
         !g_createMeshGeometry2dProxy || !g_meshGeometry2dProxyUpdate ||
         !g_createGeometry2dGroupProxy || !g_geometry2dGroupProxyUpdate ||
-        !g_drawMesh2DInstructionCreate || !g_renderDataVisualAddInstruction ||
-        !g_cBaseObjectRelease)
+        !g_drawMesh2DInstructionCreate || !g_cBaseObjectRelease)
     {
         return false;
     }
@@ -6266,56 +6284,10 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
     }
     if (result >= 0 && meshInstruction)
     {
-        stage = L"AppendMeshInstruction";
-        result = g_renderDataVisualAddInstruction(renderVisual,
-                                                   meshInstruction);
+        stage = L"Prepared";
     }
 
-    bool replaced = false;
-    if (result >= 0 && meshInstruction)
-    {
-        stage = L"ReplaceOriginalSlot";
-        void** instructions = nullptr;
-        int* countAddress = nullptr;
-        int count = 0;
-        unsigned int ignoredCount = 0;
-        int currentOriginalIndex = -1;
-        int meshIndex = -1;
-        bool foundOriginal = FindRenderDataInstructionIndex(
-            renderVisual, originalInstruction, &ignoredCount,
-            &currentOriginalIndex);
-        bool foundMesh = FindRenderDataInstructionIndex(
-            renderVisual, meshInstruction, nullptr, &meshIndex);
-        if (foundOriginal && foundMesh &&
-            GetRenderDataInstructionList(renderVisual, &instructions,
-                                         &countAddress, &count) &&
-            count == static_cast<int>(originalCount + 1) &&
-            currentOriginalIndex == originalIndex && meshIndex == count - 1 &&
-            IsWritableMemory(instructions,
-                             static_cast<size_t>(count) * sizeof(void*)) &&
-            IsWritableMemory(countAddress, sizeof(*countAddress)))
-        {
-            instructions[currentOriginalIndex] = meshInstruction;
-            instructions[meshIndex] = nullptr;
-            *countAddress = count - 1;
-            g_cBaseObjectRelease(originalInstruction);
-            replaced = true;
-        }
-        else if (foundMesh && meshIndex == count - 1 && instructions &&
-                 countAddress &&
-                 IsWritableMemory(instructions + meshIndex, sizeof(void*)) &&
-                 IsWritableMemory(countAddress, sizeof(*countAddress)))
-        {
-            // Remove the appended diagnostic instruction if the exact original
-            // slot can no longer be proven. The production draw stays intact.
-            instructions[meshIndex] = nullptr;
-            *countAddress = count - 1;
-            g_cBaseObjectRelease(meshInstruction);
-        }
-    }
-
-    bool succeeded = result >= 0 && replaced && meshProxy && groupProxy &&
-                     meshInstruction;
+    bool succeeded = result >= 0 && meshProxy && groupProxy && meshInstruction;
     g_liveBaseImageMeshCanarySucceeded.store(succeeded,
                                                std::memory_order_release);
     if (!succeeded)
@@ -6364,7 +6336,7 @@ static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
         g_cBaseObjectRelease(meshProxy);
     }
 
-    Wh_Log(L"True 4x4 native slot-replacement canary: %s stage=%s "
+    Wh_Log(L"True 4x4 native transaction canary: %s stage=%s "
            L"result=0x%08X HWND=%p visual=%p original=%p index=%d/%u "
            L"image=%p imageVtable=%p imageBacking=%p directSource=1 "
            L"resourceId=%u target=active-drag "
