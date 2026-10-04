@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.196
+// @version         0.197
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -334,6 +334,11 @@ CTopLevelWindowGetRootVisual_t g_topLevelWindowGetRootVisual = nullptr;
 using CWindowBorderCloneVisualTree_t =
     long(__cdecl*)(void* pThis, void** clonedVisual, int cloneOptions);
 CWindowBorderCloneVisualTree_t g_windowBorderCloneVisualTreeOriginal = nullptr;
+using CTopLevelWindowCloneVisualTreeForLivePreview_t =
+    long(__cdecl*)(void* pThis, bool includeRenderData,
+                   void** clonedTopLevelWindow);
+CTopLevelWindowCloneVisualTreeForLivePreview_t
+    g_topLevelWindowCloneVisualTreeForLivePreviewOriginal = nullptr;
 void* g_transitionWrapperGetVisualWeakFunction = nullptr;
 void* g_transitionWrapperGetVisualProxyWeakFunction = nullptr;
 using CTopLevelWindowGetWindowData_t = void*(__cdecl*)(void* pThis);
@@ -1076,6 +1081,7 @@ std::atomic<unsigned int> g_ensureRenderDataCallCount = 0;
 std::atomic<unsigned int> g_ensureRenderDataMappedCount = 0;
 std::atomic<unsigned int> g_ensureRenderDataPopulatedCount = 0;
 std::atomic<unsigned int> g_windowBorderCloneCallCount = 0;
+std::atomic<unsigned int> g_livePreviewCloneCallCount = 0;
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -3591,6 +3597,70 @@ static long __cdecl CWindowBorderCloneVisualTreeHook(void* pThis,
     return result;
 }
 
+static long __cdecl CTopLevelWindowCloneVisualTreeForLivePreviewHook(
+    void* pThis, bool includeRenderData, void** clonedTopLevelWindow)
+{
+    long result = g_topLevelWindowCloneVisualTreeForLivePreviewOriginal(
+        pThis, includeRenderData, clonedTopLevelWindow);
+    if (g_unloading.load(std::memory_order_acquire) || !pThis)
+    {
+        return result;
+    }
+
+    void* clone = result >= 0 && clonedTopLevelWindow
+                      ? *clonedTopLevelWindow
+                      : nullptr;
+    bool sourceValid =
+        IsDwmObjectPointerValid(pThis, g_topLevelWindowVtable);
+    bool cloneValid =
+        IsDwmObjectPointerValid(clone, g_topLevelWindowVtable);
+    void* sourceWindowData =
+        sourceValid && g_topLevelWindowGetWindowData
+            ? g_topLevelWindowGetWindowData(pThis)
+            : nullptr;
+    void* cloneWindowData =
+        cloneValid && g_topLevelWindowGetWindowData
+            ? g_topLevelWindowGetWindowData(clone)
+            : nullptr;
+    HWND sourceHwnd = GetHwndFromWindowData(sourceWindowData);
+    HWND cloneHwnd = GetHwndFromWindowData(cloneWindowData);
+
+    constexpr int completeWindowRoot = 0;
+    void* sourceRoot =
+        sourceValid && g_topLevelWindowGetRootVisual
+            ? g_topLevelWindowGetRootVisual(pThis, completeWindowRoot)
+            : nullptr;
+    void* cloneRoot =
+        cloneValid && g_topLevelWindowGetRootVisual
+            ? g_topLevelWindowGetRootVisual(clone, completeWindowRoot)
+            : nullptr;
+    void* sourceProxy = ReadPointerMember(sourceRoot, g_visualProxyOffset);
+    void* cloneProxy = ReadPointerMember(cloneRoot, g_visualProxyOffset);
+    unsigned int callNumber =
+        g_livePreviewCloneCallCount.fetch_add(1,
+                                               std::memory_order_relaxed) +
+        1;
+    HWND dragHwnd = g_realDraggedWindow.load(std::memory_order_acquire);
+    HWND meshTarget =
+        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire);
+    DWORD sceneThreadId = g_dwmSceneThreadId.load(std::memory_order_acquire);
+    Wh_Log(L"True 4x4 live-preview clone observed: call=%u result=0x%08X "
+           L"includeRenderData=%d source=%p sourceValid=%d "
+           L"sourceWindowData=%p sourceHWND=%p sourceRoot=%p "
+           L"sourceProxy=%p clone=%p cloneValid=%d cloneWindowData=%p "
+           L"cloneHWND=%p cloneRoot=%p cloneProxy=%p sameWindowData=%d "
+           L"sceneThread=%d activeDrag=%d meshTarget=%d (read-only)",
+           callNumber, static_cast<unsigned int>(result), includeRenderData,
+           pThis, sourceValid, sourceWindowData, sourceHwnd, sourceRoot,
+           sourceProxy, clone, cloneValid, cloneWindowData, cloneHwnd,
+           cloneRoot, cloneProxy,
+           sourceWindowData && sourceWindowData == cloneWindowData,
+           sceneThreadId != 0 && sceneThreadId == GetCurrentThreadId(),
+           sourceHwnd && dragHwnd == sourceHwnd,
+           sourceHwnd && meshTarget == sourceHwnd);
+    return result;
+}
+
 static long __cdecl TopLevelWindow3DEnsureRenderDataHook(void* pThis)
 {
     long result = g_topLevelWindow3DEnsureRenderDataOriginal(pThis);
@@ -4071,6 +4141,12 @@ static bool InitializeDwmHooks()
          &g_windowBorderCloneVisualTreeOriginal,
          CWindowBorderCloneVisualTreeHook,
          true},
+        {{L"public: long __cdecl "
+           L"CTopLevelWindow::CloneVisualTreeForLivePreview("
+           L"bool,class CTopLevelWindow * *)"},
+         &g_topLevelWindowCloneVisualTreeForLivePreviewOriginal,
+         CTopLevelWindowCloneVisualTreeForLivePreviewHook,
+         true},
         {{L"public: virtual class CTopLevelWindow3D * __cdecl "
             L"winrt::Udwm::Transitions::implementation::TopLevelWindow3DWrapper::GetVisualWeak(void)"},
          &g_transitionWrapperGetVisualWeakFunction, nullptr, true},
@@ -4426,6 +4502,7 @@ static bool InitializeDwmHooks()
     keepValid(g_getCanvasRootVisualProxy);
     keepValid(g_topLevelWindowGetRootVisual);
     keepValid(g_windowBorderCloneVisualTreeOriginal);
+    keepValid(g_topLevelWindowCloneVisualTreeForLivePreviewOriginal);
     keepValid(g_topLevelWindowGetWindowData);
     keepValid(g_desktopManagerPostStartAnimations);
     keepValid(g_meshGeometry2dProxyUpdate);
@@ -4578,9 +4655,13 @@ static bool InitializeDwmHooks()
            hasVisualCollectionLayout ? L"available" : L"unavailable",
            g_visualCollectionArrayOffset,
            g_visualCollectionCountOffset);
-    Wh_Log(L"True 4x4 complete-root clone observer: %s (read-only)",
+    Wh_Log(L"True 4x4 clone observers: border=%s livePreview=%s "
+           L"(read-only)",
            g_windowBorderCloneVisualTreeOriginal ? L"available"
-                                                  : L"unavailable");
+                                                  : L"unavailable",
+           g_topLevelWindowCloneVisualTreeForLivePreviewOriginal
+               ? L"available"
+               : L"unavailable");
     Wh_Log(L"True 4x4 source probe: bitmap=%s visualSurface=%s "
            L"bitmapCreationObserver=%s surfaceCreationObserver=%s "
            L"vtableAlias=%d",
@@ -10558,6 +10639,7 @@ BOOL Wh_ModInit()
     g_ensureRenderDataMappedCount.store(0, std::memory_order_relaxed);
     g_ensureRenderDataPopulatedCount.store(0, std::memory_order_relaxed);
     g_windowBorderCloneCallCount.store(0, std::memory_order_relaxed);
+    g_livePreviewCloneCallCount.store(0, std::memory_order_relaxed);
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
