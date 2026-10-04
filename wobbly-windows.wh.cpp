@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.198
+// @version         0.199
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -6135,6 +6135,107 @@ static bool GetVisualChildren(void* visual, void*** children, int* count,
     return true;
 }
 
+static void ProbeNativeRepresentationAncestry(HWND hwnd, void* completeRoot,
+                                               void* secondaryVisual)
+{
+    static HWND lastHwnd = nullptr;
+    static void* lastCompleteRoot = nullptr;
+    static void* lastSecondaryVisual = nullptr;
+    if (!hwnd || !completeRoot || !secondaryVisual ||
+        g_visualParentOffset == SIZE_MAX ||
+        (lastHwnd == hwnd && lastCompleteRoot == completeRoot &&
+         lastSecondaryVisual == secondaryVisual))
+    {
+        return;
+    }
+    lastHwnd = hwnd;
+    lastCompleteRoot = completeRoot;
+    lastSecondaryVisual = secondaryVisual;
+
+    struct VisualAncestry
+    {
+        void* nodes[16];
+        unsigned int count;
+    };
+    auto collect = [](void* start)
+    {
+        VisualAncestry ancestry = {};
+        void* current = start;
+        while (current && ancestry.count < ARRAYSIZE(ancestry.nodes) &&
+               IsReadableMemory(current, sizeof(void*)))
+        {
+            bool duplicate = false;
+            for (unsigned int index = 0; index < ancestry.count; index++)
+            {
+                duplicate |= ancestry.nodes[index] == current;
+            }
+            if (duplicate)
+            {
+                break;
+            }
+            void* vtable = *reinterpret_cast<void**>(current);
+            if (!IsDwmImageAddress(vtable, sizeof(void*)))
+            {
+                break;
+            }
+            ancestry.nodes[ancestry.count++] = current;
+            current = ReadPointerMember(current, g_visualParentOffset);
+        }
+        return ancestry;
+    };
+
+    VisualAncestry live = collect(completeRoot);
+    VisualAncestry secondary = collect(secondaryVisual);
+    void* common = nullptr;
+    int liveCommonDepth = -1;
+    int secondaryCommonDepth = -1;
+    for (unsigned int liveIndex = 0; liveIndex < live.count && !common;
+         liveIndex++)
+    {
+        for (unsigned int secondaryIndex = 0;
+             secondaryIndex < secondary.count; secondaryIndex++)
+        {
+            if (live.nodes[liveIndex] == secondary.nodes[secondaryIndex])
+            {
+                common = live.nodes[liveIndex];
+                liveCommonDepth = static_cast<int>(liveIndex);
+                secondaryCommonDepth = static_cast<int>(secondaryIndex);
+                break;
+            }
+        }
+    }
+
+    auto logChain = [hwnd](const wchar_t* name,
+                           const VisualAncestry& ancestry)
+    {
+        for (unsigned int index = 0; index < ancestry.count; index++)
+        {
+            void* visual = ancestry.nodes[index];
+            void* vtable = *reinterpret_cast<void**>(visual);
+            void* parent = ReadPointerMember(visual, g_visualParentOffset);
+            void* proxy = ReadPointerMember(visual, g_visualProxyOffset);
+            int childCount = 0;
+            size_t collectionOffset = SIZE_MAX;
+            bool indirect = false;
+            bool hasChildren = GetVisualChildren(
+                visual, nullptr, &childCount, &collectionOffset, &indirect);
+            Wh_Log(L"True 4x4 ancestry %s[%u]: HWND=%p visual=%p "
+                   L"vtable=%p parent=%p proxy=%p childLayout=%d "
+                   L"children=%d collectionOffset=0x%zx indirect=%d "
+                   L"(read-only)",
+                   name, index, hwnd, visual, vtable, parent, proxy,
+                   hasChildren, childCount, collectionOffset, indirect);
+        }
+    };
+    logChain(L"live", live);
+    logChain(L"secondary", secondary);
+    Wh_Log(L"True 4x4 ancestry summary: HWND=%p liveRoot=%p "
+           L"secondary=%p liveDepth=%u secondaryDepth=%u common=%p "
+           L"liveCommonDepth=%d secondaryCommonDepth=%d (read-only)",
+           hwnd, completeRoot, secondaryVisual, live.count,
+           secondary.count, common, liveCommonDepth, secondaryCommonDepth);
+}
+
 static void ProbeCompleteWindowRootTree(HWND hwnd, void* topLevelWindow)
 {
     static HWND lastHwnd = nullptr;
@@ -6342,11 +6443,18 @@ static void InstallRequestedLiveBaseImageMeshCanary()
     if (!NATIVE_MESH_WRITE_PROBE_ENABLED)
     {
         void* topLevelWindow = nullptr;
-        void* ignoredTopLevelWindow3D = nullptr;
+        void* topLevelWindow3D = nullptr;
         if (ResolveDwmWindowObjects(currentWindowData, &topLevelWindow,
-                                    &ignoredTopLevelWindow3D))
+                                    &topLevelWindow3D))
         {
             ProbeCompleteWindowRootTree(target, topLevelWindow);
+            constexpr int completeWindowRoot = 0;
+            void* completeRoot = g_topLevelWindowGetRootVisual
+                                     ? g_topLevelWindowGetRootVisual(
+                                           topLevelWindow, completeWindowRoot)
+                                     : nullptr;
+            ProbeNativeRepresentationAncestry(target, completeRoot,
+                                               topLevelWindow3D);
         }
         return;
     }
