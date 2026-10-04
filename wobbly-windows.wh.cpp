@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.194
+// @version         0.195
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -980,6 +980,10 @@ std::atomic_bool g_sceneOwnershipResetPending = false;
 std::atomic<ULONGLONG> g_lastBindPrerequisiteLog = 0;
 std::atomic_bool g_nativeMeshCanaryPending = false;
 std::atomic_bool g_nativeMeshCanarySucceeded = false;
+// Discovery stays read-only until both the exact owner and a reversible
+// replacement transaction are proven. Older slot-replacement experiments
+// could leave an identity mesh instruction alive after the mod was unloaded.
+static constexpr bool NATIVE_MESH_WRITE_PROBE_ENABLED = false;
 std::atomic_bool g_liveBaseImageMeshCanaryStarted = false;
 std::atomic_bool g_liveBaseImageMeshCanarySucceeded = false;
 std::atomic_bool g_liveBaseImageMeshAnimationLogged = false;
@@ -3388,7 +3392,8 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
 {
     bool installed = false;
     unsigned int instructionCount = 0;
-    if (pThis && !g_unloading.load(std::memory_order_acquire) &&
+    if (NATIVE_MESH_WRITE_PROBE_ENABLED && pThis &&
+        !g_unloading.load(std::memory_order_acquire) &&
         !g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
         g_nativeMeshCanarySucceeded.load(std::memory_order_acquire))
     {
@@ -3511,7 +3516,8 @@ static long __cdecl TopLevelWindow3DEnsureRenderDataHook(void* pThis)
         entry->ownerHwnd.store(hwnd, std::memory_order_release);
     }
 
-    if (g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire) != hwnd ||
+    if (!NATIVE_MESH_WRITE_PROBE_ENABLED ||
+        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire) != hwnd ||
         g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
         !g_nativeMeshCanarySucceeded.load(std::memory_order_acquire))
     {
@@ -5977,8 +5983,7 @@ static void ProbeCompleteWindowRootTree(HWND hwnd, void* topLevelWindow)
 static void InstallRequestedLiveBaseImageMeshCanary()
 {
     if (!IsOnDwmSceneThread() ||
-        g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
-        !g_nativeMeshCanarySucceeded.load(std::memory_order_acquire))
+        g_visibleMeshCanaryActive.load(std::memory_order_acquire))
     {
         return;
     }
@@ -5998,6 +6003,17 @@ static void InstallRequestedLiveBaseImageMeshCanary()
     if (!currentWindowData ||
         GetHwndFromWindowData(currentWindowData) != target)
     {
+        return;
+    }
+    if (!NATIVE_MESH_WRITE_PROBE_ENABLED)
+    {
+        void* topLevelWindow = nullptr;
+        void* ignoredTopLevelWindow3D = nullptr;
+        if (ResolveDwmWindowObjects(currentWindowData, &topLevelWindow,
+                                    &ignoredTopLevelWindow3D))
+        {
+            ProbeCompleteWindowRootTree(target, topLevelWindow);
+        }
         return;
     }
     unsigned int ownerMatches = 0;
@@ -6228,7 +6244,10 @@ static void SubmitPendingWobblySceneWork()
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
     {
-        RunNativeMeshCanary();
+        if (NATIVE_MESH_WRITE_PROBE_ENABLED)
+        {
+            RunNativeMeshCanary();
+        }
         BackfillExistingDwmWindowMappings();
         EnsurePendingMatrixTransformProxies();
         for (int i = 0; i < MAX_ANIMATION_SLOTS; i++)
