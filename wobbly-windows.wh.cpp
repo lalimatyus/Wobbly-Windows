@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.203
+// @version         0.204
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -5043,17 +5043,17 @@ static bool InitializeDwmHooks()
         g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate;
     bool hasMeshBitmapRenderer =
-        hasNativeMeshGeometry && g_drawMesh2DInstructionCreate &&
-        g_renderDataVisualAddInstruction;
+        hasNativeMeshGeometry && g_drawMesh2DInstructionCreate;
     Wh_Log(L"True 4x4 mesh probe: geometry=%s bitmapRenderer=%s "
            L"bitmapObserver=%s tileObserver=%s "
-           L"(rendering remains on stable affine fallback)",
+           L"transactionalProbe=%s",
            hasNativeMeshGeometry ? L"available" : L"unavailable",
            hasMeshBitmapRenderer ? L"available" : L"unavailable",
            g_drawBitmapInstructionCreateOriginal ? L"available"
                                                   : L"unavailable",
-           g_drawTileImageInstructionCreateOriginal ? L"available"
-                                                     : L"unavailable");
+            g_drawTileImageInstructionCreateOriginal ? L"available"
+                                                     : L"unavailable",
+            NATIVE_MESH_TRANSACTION_PROBE_ENABLED ? L"enabled" : L"disabled");
     Wh_Log(L"True 4x4 native touch path: create=%s notify=%s stop=%s "
            L"meshBuilder=%s (probe only)",
            g_createTouchDragVisualFunction ? L"available" : L"unavailable",
@@ -7040,7 +7040,8 @@ static void SubmitPendingWobblySceneWork()
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
     {
-        if (NATIVE_MESH_WRITE_PROBE_ENABLED)
+        if (NATIVE_MESH_WRITE_PROBE_ENABLED ||
+            NATIVE_MESH_TRANSACTION_PROBE_ENABLED)
         {
             RunNativeMeshCanary();
         }
