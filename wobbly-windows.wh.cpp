@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.200
+// @version         0.201
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1038,6 +1038,24 @@ VisibleMeshCanaryState g_visibleMeshCanary = {};
 std::atomic_bool g_visibleMeshCanaryActive = false;
 std::atomic_bool g_visibleMeshCanaryCleanupRequested = false;
 std::atomic<HWND> g_visibleMeshCanaryHwnd = nullptr;
+struct NativeRenderSlotProbeState
+{
+    HWND hwnd;
+    void* renderVisual;
+    void** instructionArray;
+    int* countAddress;
+    void* instruction;
+    void* imageProxy;
+    uintptr_t fingerprint;
+    int instructionIndex;
+    int instructionCount;
+    unsigned int samples;
+    unsigned int arrayChanges;
+    unsigned int slotChanges;
+    unsigned int missingSamples;
+};
+NativeRenderSlotProbeState g_nativeRenderSlotProbe = {};
+SRWLOCK g_nativeRenderSlotProbeLock = SRWLOCK_INIT;
 static constexpr unsigned int OBSERVED_VISUAL_PROXY_COUNT = 4096;
 static constexpr unsigned int OBSERVED_VISUAL_PROXY_PROBES = 32;
 struct ObservedVisualProxy
@@ -1068,6 +1086,9 @@ static bool FindUniqueBaseImageInstruction(
     void* renderVisual, unsigned int requiredResourceId,
     void** instruction, void** imageProxy, int* instructionIndex,
     int* instructionCount, unsigned int* candidateCount);
+static void ObserveNativeRenderSlotStability(void* renderVisual,
+                                             void* windowData, HWND hwnd,
+                                             const wchar_t* eventName);
 struct ObservedRenderImage
 {
     std::atomic<void*> visual;
@@ -1216,6 +1237,109 @@ static bool GetMonitorWorkArea(const RECT& rect, RECT& workArea)
     }
     workArea = monitorInfo.rcWork;
     return true;
+}
+
+static void ObserveNativeRenderSlotStability(void* renderVisual,
+                                             void* windowData, HWND hwnd,
+                                             const wchar_t* eventName)
+{
+    if (!renderVisual || !windowData || !hwnd ||
+        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire) != hwnd ||
+        GetHwndFromWindowData(windowData) != hwnd)
+    {
+        return;
+    }
+
+    void** instructions = nullptr;
+    int* countAddress = nullptr;
+    int instructionCount = 0;
+    bool listValid = GetRenderDataInstructionList(
+        renderVisual, &instructions, &countAddress, &instructionCount);
+    uintptr_t fingerprint = 0;
+    if (listValid)
+    {
+        for (int index = 0; index < instructionCount; index++)
+        {
+            uintptr_t value = reinterpret_cast<uintptr_t>(instructions[index]);
+            fingerprint ^= value + static_cast<uintptr_t>(0x9E3779B9u) +
+                           (fingerprint << 6) + (fingerprint >> 2);
+        }
+    }
+
+    void* instruction = nullptr;
+    void* imageProxy = nullptr;
+    int instructionIndex = -1;
+    int uniqueInstructionCount = 0;
+    unsigned int candidateCount = 0;
+    bool unique = listValid && FindUniqueBaseImageInstruction(
+                                   renderVisual, 0, &instruction, &imageProxy,
+                                   &instructionIndex, &uniqueInstructionCount,
+                                   &candidateCount);
+
+    bool logSample = false;
+    bool changed = false;
+    NativeRenderSlotProbeState snapshot = {};
+    AcquireSRWLockExclusive(&g_nativeRenderSlotProbeLock);
+    bool newTarget = g_nativeRenderSlotProbe.hwnd != hwnd ||
+                     g_nativeRenderSlotProbe.renderVisual != renderVisual;
+    if (newTarget)
+    {
+        g_nativeRenderSlotProbe = {};
+        g_nativeRenderSlotProbe.hwnd = hwnd;
+        g_nativeRenderSlotProbe.renderVisual = renderVisual;
+    }
+    else if (g_nativeRenderSlotProbe.samples)
+    {
+        bool arrayChanged =
+            g_nativeRenderSlotProbe.instructionArray != instructions ||
+            g_nativeRenderSlotProbe.countAddress != countAddress ||
+            g_nativeRenderSlotProbe.instructionCount != instructionCount;
+        bool slotChanged =
+            g_nativeRenderSlotProbe.instruction != instruction ||
+            g_nativeRenderSlotProbe.imageProxy != imageProxy ||
+            g_nativeRenderSlotProbe.instructionIndex != instructionIndex ||
+            g_nativeRenderSlotProbe.fingerprint != fingerprint;
+        if (arrayChanged)
+        {
+            g_nativeRenderSlotProbe.arrayChanges++;
+        }
+        if (slotChanged)
+        {
+            g_nativeRenderSlotProbe.slotChanges++;
+        }
+        changed = arrayChanged || slotChanged;
+    }
+    g_nativeRenderSlotProbe.samples++;
+    if (!listValid || !unique)
+    {
+        g_nativeRenderSlotProbe.missingSamples++;
+    }
+    g_nativeRenderSlotProbe.instructionArray = instructions;
+    g_nativeRenderSlotProbe.countAddress = countAddress;
+    g_nativeRenderSlotProbe.instruction = instruction;
+    g_nativeRenderSlotProbe.imageProxy = imageProxy;
+    g_nativeRenderSlotProbe.fingerprint = fingerprint;
+    g_nativeRenderSlotProbe.instructionIndex = instructionIndex;
+    g_nativeRenderSlotProbe.instructionCount = instructionCount;
+    snapshot = g_nativeRenderSlotProbe;
+    logSample = newTarget || changed || snapshot.samples == 4 ||
+                snapshot.samples == 12 || snapshot.samples == 32 ||
+                ((!listValid || !unique) && snapshot.missingSamples <= 2);
+    ReleaseSRWLockExclusive(&g_nativeRenderSlotProbeLock);
+
+    if (logSample)
+    {
+        Wh_Log(L"True 4x4 native slot stability: event=%s sample=%u "
+               L"HWND=%p visual=%p list=%p countField=%p index=%d/%d "
+               L"instruction=%p image=%p fingerprint=0x%llX "
+               L"candidates=%u listValid=%d unique=%d arrayChanges=%u "
+               L"slotChanges=%u missing=%u (read-only)",
+               eventName, snapshot.samples, hwnd, renderVisual, instructions,
+               countAddress, instructionIndex, instructionCount, instruction,
+               imageProxy, static_cast<unsigned long long>(fingerprint),
+               candidateCount, listValid, unique, snapshot.arrayChanges,
+               snapshot.slotChanges, snapshot.missingSamples);
+    }
 }
 
 static bool WindowStateEdgesClose(LONG first, LONG second)
@@ -3701,6 +3825,7 @@ static void LogTopLevelWindow3DRepresentationState(
             ? ReadPointerMember(pThis, g_ensureRenderDataPointerOffsets[0])
             : nullptr;
     HWND dragHwnd = g_realDraggedWindow.load(std::memory_order_acquire);
+    ObserveNativeRenderSlotStability(pThis, windowData, hwnd, eventName);
     Wh_Log(L"True 4x4 secondary representation: event=%s call=%u "
            L"result=0x%08X object=%p WindowData=%p HWND=%p arg1=%d "
            L"arg2=%d requestedParent=%p parentBefore=%p parentAfter=%p "
@@ -3895,6 +4020,8 @@ static long __cdecl TopLevelWindow3DEnsureRenderDataHook(void* pThis)
         entry->ownerWindowData.store(windowData, std::memory_order_relaxed);
         entry->ownerHwnd.store(hwnd, std::memory_order_release);
     }
+    ObserveNativeRenderSlotStability(pThis, windowData, hwnd,
+                                     L"EnsureRenderData");
 
     if (!NATIVE_MESH_WRITE_PROBE_ENABLED ||
         g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire) != hwnd ||
@@ -10980,6 +11107,7 @@ BOOL Wh_ModInit()
     g_visibleMeshCanaryCleanupRequested.store(false,
                                                std::memory_order_release);
     g_visibleMeshCanaryHwnd.store(nullptr, std::memory_order_release);
+    g_nativeRenderSlotProbe = {};
     auto resetObservedNodes = [](ObservedVisualProxy* table)
     {
         for (unsigned int index = 0; index < OBSERVED_VISUAL_PROXY_COUNT; index++)
