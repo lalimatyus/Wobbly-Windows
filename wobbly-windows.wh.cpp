@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.197
+// @version         0.198
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -476,6 +476,16 @@ CRenderDataVisualClearInstructions_t g_renderDataVisualClearInstructions =
 CRenderDataVisualUpdateRenderData_t g_renderDataVisualUpdateRenderData = nullptr;
 CTopLevelWindow3DEnsureRenderData_t
     g_topLevelWindow3DEnsureRenderDataOriginal = nullptr;
+using CTopLevelWindow3DEnsureSecondaryWindowRepresentation_t =
+    long(__cdecl*)(void* pThis, bool forceRecreate);
+CTopLevelWindow3DEnsureSecondaryWindowRepresentation_t
+    g_topLevelWindow3DEnsureSecondaryWindowRepresentationOriginal = nullptr;
+using CTopLevelWindow3DSetParent_t =
+    long(__cdecl*)(void* pThis, void* parent);
+CTopLevelWindow3DSetParent_t g_topLevelWindow3DSetParentOriginal = nullptr;
+using CTopLevelWindow3DShowWindow_t =
+    long(__cdecl*)(void* pThis, bool show, bool activate);
+CTopLevelWindow3DShowWindow_t g_topLevelWindow3DShowWindowOriginal = nullptr;
 size_t g_renderDataInstructionsOffset = SIZE_MAX;
 size_t g_renderDataInstructionCountOffset = SIZE_MAX;
 size_t g_ensureRenderDataPointerOffsets[16] = {};
@@ -1082,6 +1092,9 @@ std::atomic<unsigned int> g_ensureRenderDataMappedCount = 0;
 std::atomic<unsigned int> g_ensureRenderDataPopulatedCount = 0;
 std::atomic<unsigned int> g_windowBorderCloneCallCount = 0;
 std::atomic<unsigned int> g_livePreviewCloneCallCount = 0;
+std::atomic<unsigned int> g_secondaryRepresentationCallCount = 0;
+std::atomic<unsigned int> g_topLevelWindow3DSetParentCallCount = 0;
+std::atomic<unsigned int> g_topLevelWindow3DShowWindowCallCount = 0;
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -3661,6 +3674,91 @@ static long __cdecl CTopLevelWindowCloneVisualTreeForLivePreviewHook(
     return result;
 }
 
+static void LogTopLevelWindow3DRepresentationState(
+    const wchar_t* eventName, unsigned int callNumber, void* pThis,
+    long result, int argument1, int argument2, void* requestedParent,
+    void* parentBefore)
+{
+    HWND hwnd = nullptr;
+    void* windowData = RegisterAnimationTopLevelWindow3D(pThis, &hwnd);
+    if (!windowData || !hwnd)
+    {
+        return;
+    }
+    int instructionCount = 0;
+    GetRenderDataInstructionList(pThis, nullptr, nullptr,
+                                 &instructionCount);
+    void* parentAfter = ReadPointerMember(pThis, g_visualParentOffset);
+    void* transitionProxy = GetTransitionVisualProxy(pThis);
+    void* sourceImage =
+        g_ensureRenderDataPointerOffsetCount > 0
+            ? ReadPointerMember(pThis, g_ensureRenderDataPointerOffsets[0])
+            : nullptr;
+    HWND dragHwnd = g_realDraggedWindow.load(std::memory_order_acquire);
+    Wh_Log(L"True 4x4 secondary representation: event=%s call=%u "
+           L"result=0x%08X object=%p WindowData=%p HWND=%p arg1=%d "
+           L"arg2=%d requestedParent=%p parentBefore=%p parentAfter=%p "
+           L"transitionProxy=%p sourceImage=%p instructions=%d "
+           L"activeDrag=%d (read-only)",
+           eventName, callNumber, static_cast<unsigned int>(result), pThis,
+           windowData, hwnd, argument1, argument2, requestedParent,
+           parentBefore, parentAfter, transitionProxy, sourceImage,
+           instructionCount, dragHwnd == hwnd);
+}
+
+static long __cdecl TopLevelWindow3DEnsureSecondaryWindowRepresentationHook(
+    void* pThis, bool forceRecreate)
+{
+    long result = g_topLevelWindow3DEnsureSecondaryWindowRepresentationOriginal(
+        pThis, forceRecreate);
+    if (!g_unloading.load(std::memory_order_acquire))
+    {
+        unsigned int callNumber = g_secondaryRepresentationCallCount.fetch_add(
+                                      1, std::memory_order_relaxed) +
+                                  1;
+        LogTopLevelWindow3DRepresentationState(
+            L"EnsureSecondary", callNumber, pThis, result, forceRecreate, 0,
+            nullptr, nullptr);
+    }
+    return result;
+}
+
+static long __cdecl TopLevelWindow3DSetParentHook(void* pThis, void* parent)
+{
+    void* parentBefore = ReadPointerMember(pThis, g_visualParentOffset);
+    long result = g_topLevelWindow3DSetParentOriginal(pThis, parent);
+    if (!g_unloading.load(std::memory_order_acquire))
+    {
+        unsigned int callNumber =
+            g_topLevelWindow3DSetParentCallCount.fetch_add(
+                1, std::memory_order_relaxed) +
+            1;
+        LogTopLevelWindow3DRepresentationState(
+            L"SetParent", callNumber, pThis, result, 0, 0, parent,
+            parentBefore);
+    }
+    return result;
+}
+
+static long __cdecl TopLevelWindow3DShowWindowHook(void* pThis, bool show,
+                                                   bool activate)
+{
+    void* parentBefore = ReadPointerMember(pThis, g_visualParentOffset);
+    long result =
+        g_topLevelWindow3DShowWindowOriginal(pThis, show, activate);
+    if (!g_unloading.load(std::memory_order_acquire))
+    {
+        unsigned int callNumber =
+            g_topLevelWindow3DShowWindowCallCount.fetch_add(
+                1, std::memory_order_relaxed) +
+            1;
+        LogTopLevelWindow3DRepresentationState(
+            L"ShowWindow", callNumber, pThis, result, show, activate, nullptr,
+            parentBefore);
+    }
+    return result;
+}
+
 static long __cdecl TopLevelWindow3DEnsureRenderDataHook(void* pThis)
 {
     long result = g_topLevelWindow3DEnsureRenderDataOriginal(pThis);
@@ -4306,6 +4404,20 @@ static bool InitializeDwmHooks()
          &g_topLevelWindow3DEnsureRenderDataOriginal,
          TopLevelWindow3DEnsureRenderDataHook,
          true},
+        {{L"public: long __cdecl "
+           L"CTopLevelWindow3D::EnsureSecondaryWindowRepresentation(bool)"},
+         &g_topLevelWindow3DEnsureSecondaryWindowRepresentationOriginal,
+         TopLevelWindow3DEnsureSecondaryWindowRepresentationHook,
+         true},
+        {{L"public: virtual long __cdecl "
+           L"CTopLevelWindow3D::SetParent(class CVisual *)"},
+         &g_topLevelWindow3DSetParentOriginal,
+         TopLevelWindow3DSetParentHook,
+         true},
+        {{L"public: long __cdecl CTopLevelWindow3D::ShowWindow(bool,bool)"},
+         &g_topLevelWindow3DShowWindowOriginal,
+         TopLevelWindow3DShowWindowHook,
+         true},
         {{L"public: static long __cdecl CRenderDataVisual::Create("
            L"class CRenderDataVisual * *)"},
          &g_renderDataVisualCreate,
@@ -4522,6 +4634,9 @@ static bool InitializeDwmHooks()
     keepValid(g_renderDataVisualClearInstructions);
     keepValid(g_renderDataVisualUpdateRenderData);
     keepValid(g_topLevelWindow3DEnsureRenderDataOriginal);
+    keepValid(g_topLevelWindow3DEnsureSecondaryWindowRepresentationOriginal);
+    keepValid(g_topLevelWindow3DSetParentOriginal);
+    keepValid(g_topLevelWindow3DShowWindowOriginal);
     keepValid(g_renderDataVisualCreate);
     keepValid(g_createCachedVisualImageProxy);
     keepValid(g_cachedVisualImageProxyUpdate);
@@ -4662,6 +4777,15 @@ static bool InitializeDwmHooks()
            g_topLevelWindowCloneVisualTreeForLivePreviewOriginal
                ? L"available"
                : L"unavailable");
+    Wh_Log(L"True 4x4 secondary representation observers: ensure=%s "
+           L"parent=%s show=%s (read-only)",
+           g_topLevelWindow3DEnsureSecondaryWindowRepresentationOriginal
+               ? L"available"
+               : L"unavailable",
+           g_topLevelWindow3DSetParentOriginal ? L"available"
+                                                : L"unavailable",
+           g_topLevelWindow3DShowWindowOriginal ? L"available"
+                                                 : L"unavailable");
     Wh_Log(L"True 4x4 source probe: bitmap=%s visualSurface=%s "
            L"bitmapCreationObserver=%s surfaceCreationObserver=%s "
            L"vtableAlias=%d",
@@ -10640,6 +10764,11 @@ BOOL Wh_ModInit()
     g_ensureRenderDataPopulatedCount.store(0, std::memory_order_relaxed);
     g_windowBorderCloneCallCount.store(0, std::memory_order_relaxed);
     g_livePreviewCloneCallCount.store(0, std::memory_order_relaxed);
+    g_secondaryRepresentationCallCount.store(0, std::memory_order_relaxed);
+    g_topLevelWindow3DSetParentCallCount.store(0,
+                                               std::memory_order_relaxed);
+    g_topLevelWindow3DShowWindowCallCount.store(0,
+                                                std::memory_order_relaxed);
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
