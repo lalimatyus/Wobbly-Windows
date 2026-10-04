@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.199
+// @version         0.200
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -496,6 +496,11 @@ CVisualProxyRemoveChild_t g_visualProxyRemoveChildOriginal = nullptr;
 CVisualSetContent_t g_visualSetContentOriginal = nullptr;
 CVisualSetParent_t g_visualSetParentOriginal = nullptr;
 CVisualRemoveSelfFromParent_t g_visualRemoveSelfFromParentOriginal = nullptr;
+using CVisualVisibility_t = void(__cdecl*)(void* pThis);
+CVisualVisibility_t g_visualHideOriginal = nullptr;
+CVisualVisibility_t g_visualUnhideOriginal = nullptr;
+using CVisualSetOpacity_t = void(__cdecl*)(void* pThis, double opacity);
+CVisualSetOpacity_t g_visualSetOpacityOriginal = nullptr;
 CVisualGetTransformParent_t g_visualGetTransformParent = nullptr;
 CVisualGetVisualProxyForStructure_t g_visualGetVisualProxyForStructure = nullptr;
 void* g_visualCollectionInsertRelativeFunction = nullptr;
@@ -1095,6 +1100,7 @@ std::atomic<unsigned int> g_livePreviewCloneCallCount = 0;
 std::atomic<unsigned int> g_secondaryRepresentationCallCount = 0;
 std::atomic<unsigned int> g_topLevelWindow3DSetParentCallCount = 0;
 std::atomic<unsigned int> g_topLevelWindow3DShowWindowCallCount = 0;
+std::atomic<unsigned int> g_trackedVisualVisibilityCallCount = 0;
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -3759,6 +3765,92 @@ static long __cdecl TopLevelWindow3DShowWindowHook(void* pThis, bool show,
     return result;
 }
 
+static bool FindTrackedTopLevelVisual(void* visual, void** windowData,
+                                      HWND* hwnd, const wchar_t** kind)
+{
+    *windowData = nullptr;
+    *hwnd = nullptr;
+    *kind = L"None";
+    if (!visual)
+    {
+        return false;
+    }
+    AcquireSRWLockShared(&g_dwmWindowMappingsLock);
+    for (const DwmWindowObjectMapping& mapping : g_dwmWindowMappings)
+    {
+        if (mapping.topLevelWindow == visual)
+        {
+            *windowData = mapping.windowData;
+            *kind = L"CTopLevelWindow";
+            break;
+        }
+        if (mapping.topLevelWindow3D == visual)
+        {
+            *windowData = mapping.windowData;
+            *kind = L"CTopLevelWindow3D";
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_dwmWindowMappingsLock);
+    *hwnd = GetHwndFromWindowData(*windowData);
+    return *hwnd != nullptr;
+}
+
+static unsigned int ReadVisualFlags(void* visual)
+{
+    BYTE* flags = visual ? static_cast<BYTE*>(visual) + 0x5c : nullptr;
+    return IsReadableMemory(flags, sizeof(*flags)) ? *flags : UINT_MAX;
+}
+
+static void LogTrackedVisualState(const wchar_t* eventName, void* visual,
+                                  double opacity, unsigned int flagsBefore,
+                                  unsigned int flagsAfter)
+{
+    void* windowData = nullptr;
+    HWND hwnd = nullptr;
+    const wchar_t* kind = nullptr;
+    if (!FindTrackedTopLevelVisual(visual, &windowData, &hwnd, &kind))
+    {
+        return;
+    }
+    unsigned int callNumber =
+        g_trackedVisualVisibilityCallCount.fetch_add(
+            1, std::memory_order_relaxed) +
+        1;
+    void* parent = ReadPointerMember(visual, g_visualParentOffset);
+    void* proxy = ReadPointerMember(visual, g_visualProxyOffset);
+    Wh_Log(L"True 4x4 tracked visual state: event=%s call=%u kind=%s "
+           L"visual=%p WindowData=%p HWND=%p opacity=%.3f "
+           L"flagsBefore=0x%02X flagsAfter=0x%02X parent=%p proxy=%p "
+           L"(read-only observation)",
+           eventName, callNumber, kind, visual, windowData, hwnd, opacity,
+           flagsBefore, flagsAfter, parent, proxy);
+}
+
+static void __cdecl VisualHideHook(void* pThis)
+{
+    unsigned int flagsBefore = ReadVisualFlags(pThis);
+    g_visualHideOriginal(pThis);
+    LogTrackedVisualState(L"Hide", pThis, -1.0, flagsBefore,
+                          ReadVisualFlags(pThis));
+}
+
+static void __cdecl VisualUnhideHook(void* pThis)
+{
+    unsigned int flagsBefore = ReadVisualFlags(pThis);
+    g_visualUnhideOriginal(pThis);
+    LogTrackedVisualState(L"Unhide", pThis, -1.0, flagsBefore,
+                          ReadVisualFlags(pThis));
+}
+
+static void __cdecl VisualSetOpacityHook(void* pThis, double opacity)
+{
+    unsigned int flagsBefore = ReadVisualFlags(pThis);
+    g_visualSetOpacityOriginal(pThis, opacity);
+    LogTrackedVisualState(L"SetOpacity", pThis, opacity, flagsBefore,
+                          ReadVisualFlags(pThis));
+}
+
 static long __cdecl TopLevelWindow3DEnsureRenderDataHook(void* pThis)
 {
     long result = g_topLevelWindow3DEnsureRenderDataOriginal(pThis);
@@ -4458,6 +4550,18 @@ static bool InitializeDwmHooks()
          &g_visualRemoveSelfFromParentOriginal,
          VisualRemoveSelfFromParentHook,
          true},
+        {{L"public: void __cdecl CVisual::Hide(void)"},
+         &g_visualHideOriginal,
+         VisualHideHook,
+         true},
+        {{L"public: void __cdecl CVisual::Unhide(void)"},
+         &g_visualUnhideOriginal,
+         VisualUnhideHook,
+         true},
+        {{L"public: virtual void __cdecl CVisual::SetOpacity(double)"},
+         &g_visualSetOpacityOriginal,
+         VisualSetOpacityHook,
+         true},
         {{L"public: virtual class CVisual * __cdecl "
            L"CVisual::GetTransformParent(void)const",
           L"public: virtual class CVisual * __cdecl "
@@ -4649,6 +4753,9 @@ static bool InitializeDwmHooks()
     keepValid(g_visualSetContentOriginal);
     keepValid(g_visualSetParentOriginal);
     keepValid(g_visualRemoveSelfFromParentOriginal);
+    keepValid(g_visualHideOriginal);
+    keepValid(g_visualUnhideOriginal);
+    keepValid(g_visualSetOpacityOriginal);
     keepValid(g_visualGetTransformParent);
     keepValid(g_visualGetVisualProxyForStructure);
     keepValid(g_visualCollectionInsertRelativeFunction);
@@ -4786,6 +4893,11 @@ static bool InitializeDwmHooks()
                                                 : L"unavailable",
            g_topLevelWindow3DShowWindowOriginal ? L"available"
                                                  : L"unavailable");
+    Wh_Log(L"True 4x4 visibility observers: hide=%s unhide=%s opacity=%s "
+           L"(read-only)",
+           g_visualHideOriginal ? L"available" : L"unavailable",
+           g_visualUnhideOriginal ? L"available" : L"unavailable",
+           g_visualSetOpacityOriginal ? L"available" : L"unavailable");
     Wh_Log(L"True 4x4 source probe: bitmap=%s visualSurface=%s "
            L"bitmapCreationObserver=%s surfaceCreationObserver=%s "
            L"vtableAlias=%d",
@@ -6204,6 +6316,31 @@ static void ProbeNativeRepresentationAncestry(HWND hwnd, void* completeRoot,
             }
         }
     }
+    int liveChildIndex = -1;
+    int secondaryChildIndex = -1;
+    int commonChildCount = 0;
+    if (common && liveCommonDepth > 0 && secondaryCommonDepth > 0)
+    {
+        void** commonChildren = nullptr;
+        if (GetVisualChildren(common, &commonChildren, &commonChildCount,
+                              nullptr, nullptr))
+        {
+            void* liveChild = live.nodes[liveCommonDepth - 1];
+            void* secondaryChild =
+                secondary.nodes[secondaryCommonDepth - 1];
+            for (int index = 0; index < commonChildCount; index++)
+            {
+                if (commonChildren[index] == liveChild)
+                {
+                    liveChildIndex = index;
+                }
+                if (commonChildren[index] == secondaryChild)
+                {
+                    secondaryChildIndex = index;
+                }
+            }
+        }
+    }
 
     auto logChain = [hwnd](const wchar_t* name,
                            const VisualAncestry& ancestry)
@@ -6231,9 +6368,11 @@ static void ProbeNativeRepresentationAncestry(HWND hwnd, void* completeRoot,
     logChain(L"secondary", secondary);
     Wh_Log(L"True 4x4 ancestry summary: HWND=%p liveRoot=%p "
            L"secondary=%p liveDepth=%u secondaryDepth=%u common=%p "
-           L"liveCommonDepth=%d secondaryCommonDepth=%d (read-only)",
+           L"liveCommonDepth=%d secondaryCommonDepth=%d commonChildren=%d "
+           L"liveChildIndex=%d secondaryChildIndex=%d (read-only)",
            hwnd, completeRoot, secondaryVisual, live.count,
-           secondary.count, common, liveCommonDepth, secondaryCommonDepth);
+           secondary.count, common, liveCommonDepth, secondaryCommonDepth,
+           commonChildCount, liveChildIndex, secondaryChildIndex);
 }
 
 static void ProbeCompleteWindowRootTree(HWND hwnd, void* topLevelWindow)
@@ -10877,6 +11016,8 @@ BOOL Wh_ModInit()
                                                std::memory_order_relaxed);
     g_topLevelWindow3DShowWindowCallCount.store(0,
                                                 std::memory_order_relaxed);
+    g_trackedVisualVisibilityCallCount.store(0,
+                                              std::memory_order_relaxed);
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
