@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.201
+// @version         0.202
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1056,6 +1056,9 @@ struct NativeRenderSlotProbeState
 };
 NativeRenderSlotProbeState g_nativeRenderSlotProbe = {};
 SRWLOCK g_nativeRenderSlotProbeLock = SRWLOCK_INIT;
+std::atomic_uint g_nativePublishProbeSamples = 0;
+std::atomic_uint g_nativePublishProbeChanges = 0;
+std::atomic_uint g_nativePublishProbeMissing = 0;
 static constexpr unsigned int OBSERVED_VISUAL_PROXY_COUNT = 4096;
 static constexpr unsigned int OBSERVED_VISUAL_PROXY_PROBES = 32;
 struct ObservedVisualProxy
@@ -1214,6 +1217,48 @@ static void QueueMaximizedStateCheck(HWND hwnd)
     {
         g_maximizedStateCheckQueued.store(false, std::memory_order_release);
     }
+}
+
+struct NativeRenderCallSnapshot
+{
+    void** instructionArray;
+    int* countAddress;
+    void* instruction;
+    void* imageProxy;
+    uintptr_t fingerprint;
+    int instructionIndex;
+    int instructionCount;
+    unsigned int candidateCount;
+    bool listValid;
+    bool unique;
+};
+
+static NativeRenderCallSnapshot CaptureNativeRenderCallSnapshot(
+    void* renderVisual)
+{
+    NativeRenderCallSnapshot snapshot = {};
+    snapshot.instructionIndex = -1;
+    snapshot.listValid = GetRenderDataInstructionList(
+        renderVisual, &snapshot.instructionArray, &snapshot.countAddress,
+        &snapshot.instructionCount);
+    if (!snapshot.listValid)
+    {
+        return snapshot;
+    }
+    for (int index = 0; index < snapshot.instructionCount; index++)
+    {
+        uintptr_t value = reinterpret_cast<uintptr_t>(
+            snapshot.instructionArray[index]);
+        snapshot.fingerprint ^=
+            value + static_cast<uintptr_t>(0x9E3779B9u) +
+            (snapshot.fingerprint << 6) + (snapshot.fingerprint >> 2);
+    }
+    int uniqueInstructionCount = 0;
+    snapshot.unique = FindUniqueBaseImageInstruction(
+        renderVisual, 0, &snapshot.instruction, &snapshot.imageProxy,
+        &snapshot.instructionIndex, &uniqueInstructionCount,
+        &snapshot.candidateCount);
+    return snapshot;
 }
 
 static constexpr LONGLONG WINDOW_STATE_EDGE_TOLERANCE = 32;
@@ -3543,6 +3588,23 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
 
 static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
 {
+    HWND probeHwnd = nullptr;
+    void* probeWindowData = nullptr;
+    bool probeTarget = false;
+    NativeRenderCallSnapshot before = {};
+    if (pThis && !g_unloading.load(std::memory_order_acquire))
+    {
+        probeWindowData =
+            RegisterAnimationTopLevelWindow3D(pThis, &probeHwnd);
+        probeTarget = probeWindowData && probeHwnd &&
+                      GetHwndFromWindowData(probeWindowData) == probeHwnd &&
+                      g_liveBaseImageMeshTargetHwnd.load(
+                          std::memory_order_acquire) == probeHwnd;
+        if (probeTarget)
+        {
+            before = CaptureNativeRenderCallSnapshot(pThis);
+        }
+    }
     bool installed = false;
     unsigned int instructionCount = 0;
     if (NATIVE_MESH_WRITE_PROBE_ENABLED && pThis &&
@@ -3615,6 +3677,60 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
         }
     }
     long result = g_renderDataVisualUpdateRenderData(pThis);
+    if (probeTarget)
+    {
+        NativeRenderCallSnapshot after =
+            CaptureNativeRenderCallSnapshot(pThis);
+        bool changed =
+            before.instructionArray != after.instructionArray ||
+            before.countAddress != after.countAddress ||
+            before.instruction != after.instruction ||
+            before.imageProxy != after.imageProxy ||
+            before.fingerprint != after.fingerprint ||
+            before.instructionIndex != after.instructionIndex ||
+            before.instructionCount != after.instructionCount ||
+            before.listValid != after.listValid ||
+            before.unique != after.unique;
+        unsigned int sample = g_nativePublishProbeSamples.fetch_add(
+                                  1, std::memory_order_relaxed) +
+                              1;
+        unsigned int changes = changed
+                                   ? g_nativePublishProbeChanges.fetch_add(
+                                         1, std::memory_order_relaxed) +
+                                         1
+                                   : g_nativePublishProbeChanges.load(
+                                         std::memory_order_relaxed);
+        bool missing = !before.listValid || !before.unique ||
+                       !after.listValid || !after.unique;
+        unsigned int missingCount = missing
+                                        ? g_nativePublishProbeMissing.fetch_add(
+                                              1, std::memory_order_relaxed) +
+                                              1
+                                        : g_nativePublishProbeMissing.load(
+                                              std::memory_order_relaxed);
+        if (sample <= 8 || changed || sample % 64 == 0)
+        {
+            Wh_Log(L"True 4x4 native publish-call stability: sample=%u "
+                   L"HWND=%p result=0x%08X changed=%d changes=%u "
+                   L"missing=%u before={list=%p countField=%p index=%d/%d "
+                   L"instruction=%p image=%p fingerprint=0x%llX valid=%d "
+                   L"unique=%d candidates=%u} after={list=%p countField=%p "
+                   L"index=%d/%d instruction=%p image=%p fingerprint=0x%llX "
+                   L"valid=%d unique=%d candidates=%u} (read-only)",
+                   sample, probeHwnd, static_cast<unsigned int>(result),
+                   changed, changes, missingCount, before.instructionArray,
+                   before.countAddress, before.instructionIndex,
+                   before.instructionCount, before.instruction,
+                   before.imageProxy,
+                   static_cast<unsigned long long>(before.fingerprint),
+                   before.listValid, before.unique, before.candidateCount,
+                   after.instructionArray, after.countAddress,
+                   after.instructionIndex, after.instructionCount,
+                   after.instruction, after.imageProxy,
+                   static_cast<unsigned long long>(after.fingerprint),
+                   after.listValid, after.unique, after.candidateCount);
+        }
+    }
     if (installed)
     {
         Wh_Log(L"True 4x4 native publish boundary: meshPresent=1 "
@@ -11108,6 +11224,9 @@ BOOL Wh_ModInit()
                                                std::memory_order_release);
     g_visibleMeshCanaryHwnd.store(nullptr, std::memory_order_release);
     g_nativeRenderSlotProbe = {};
+    g_nativePublishProbeSamples.store(0, std::memory_order_release);
+    g_nativePublishProbeChanges.store(0, std::memory_order_release);
+    g_nativePublishProbeMissing.store(0, std::memory_order_release);
     auto resetObservedNodes = [](ObservedVisualProxy* table)
     {
         for (unsigned int index = 0; index < OBSERVED_VISUAL_PROXY_COUNT; index++)
