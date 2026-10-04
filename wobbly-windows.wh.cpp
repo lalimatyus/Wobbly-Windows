@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.195
+// @version         0.196
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -331,6 +331,9 @@ using CTopLevelWindowGetVisualProxy_t = void*(__cdecl*)(void* pThis);
 CTopLevelWindowGetVisualProxy_t g_getCanvasRootVisualProxy = nullptr;
 using CTopLevelWindowGetRootVisual_t = void*(__cdecl*)(void* pThis, int rootVisualType);
 CTopLevelWindowGetRootVisual_t g_topLevelWindowGetRootVisual = nullptr;
+using CWindowBorderCloneVisualTree_t =
+    long(__cdecl*)(void* pThis, void** clonedVisual, int cloneOptions);
+CWindowBorderCloneVisualTree_t g_windowBorderCloneVisualTreeOriginal = nullptr;
 void* g_transitionWrapperGetVisualWeakFunction = nullptr;
 void* g_transitionWrapperGetVisualProxyWeakFunction = nullptr;
 using CTopLevelWindowGetWindowData_t = void*(__cdecl*)(void* pThis);
@@ -1072,6 +1075,7 @@ std::atomic<unsigned int> g_observedImageInstructionMatchedAddCount = 0;
 std::atomic<unsigned int> g_ensureRenderDataCallCount = 0;
 std::atomic<unsigned int> g_ensureRenderDataMappedCount = 0;
 std::atomic<unsigned int> g_ensureRenderDataPopulatedCount = 0;
+std::atomic<unsigned int> g_windowBorderCloneCallCount = 0;
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -3471,6 +3475,122 @@ static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
     return result;
 }
 
+static void* FindTopLevelWindowForCompleteRoot(void* root, void** windowData,
+                                                HWND* hwnd)
+{
+    if (windowData)
+    {
+        *windowData = nullptr;
+    }
+    if (hwnd)
+    {
+        *hwnd = nullptr;
+    }
+    if (!root || !g_topLevelWindowGetRootVisual)
+    {
+        return nullptr;
+    }
+
+    struct Candidate
+    {
+        void* windowData;
+        void* topLevelWindow;
+    };
+    Candidate candidates[MAX_DWM_WINDOW_MAPPINGS] = {};
+    unsigned int candidateCount = 0;
+    AcquireSRWLockShared(&g_dwmWindowMappingsLock);
+    for (const DwmWindowObjectMapping& mapping : g_dwmWindowMappings)
+    {
+        if (mapping.windowData && mapping.topLevelWindow &&
+            candidateCount < ARRAYSIZE(candidates))
+        {
+            candidates[candidateCount++] =
+                {mapping.windowData, mapping.topLevelWindow};
+        }
+    }
+    ReleaseSRWLockShared(&g_dwmWindowMappingsLock);
+
+    constexpr int completeWindowRoot = 0;
+    for (unsigned int index = 0; index < candidateCount; index++)
+    {
+        const Candidate& candidate = candidates[index];
+        if (!IsTopLevelWindowForWindowData(candidate.topLevelWindow,
+                                            candidate.windowData) ||
+            g_topLevelWindowGetRootVisual(candidate.topLevelWindow,
+                                           completeWindowRoot) != root)
+        {
+            continue;
+        }
+        HWND candidateHwnd = GetHwndFromWindowData(candidate.windowData);
+        if (!candidateHwnd)
+        {
+            return nullptr;
+        }
+        if (windowData)
+        {
+            *windowData = candidate.windowData;
+        }
+        if (hwnd)
+        {
+            *hwnd = candidateHwnd;
+        }
+        return candidate.topLevelWindow;
+    }
+    return nullptr;
+}
+
+static long __cdecl CWindowBorderCloneVisualTreeHook(void* pThis,
+                                                      void** clonedVisual,
+                                                      int cloneOptions)
+{
+    long result = g_windowBorderCloneVisualTreeOriginal(
+        pThis, clonedVisual, cloneOptions);
+    if (g_unloading.load(std::memory_order_acquire) || !pThis)
+    {
+        return result;
+    }
+
+    void* windowData = nullptr;
+    HWND hwnd = nullptr;
+    void* topLevelWindow =
+        FindTopLevelWindowForCompleteRoot(pThis, &windowData, &hwnd);
+    if (!topLevelWindow)
+    {
+        return result;
+    }
+
+    void* clone = result >= 0 && clonedVisual ? *clonedVisual : nullptr;
+    void* sourceProxy = ReadPointerMember(pThis, g_visualProxyOffset);
+    void* cloneProxy = ReadPointerMember(clone, g_visualProxyOffset);
+    void* sourceParent = ReadPointerMember(pThis, g_visualParentOffset);
+    void* cloneParent = ReadPointerMember(clone, g_visualParentOffset);
+    void* sourceVtable =
+        IsReadableMemory(pThis, sizeof(void*))
+            ? *reinterpret_cast<void**>(pThis)
+            : nullptr;
+    void* cloneVtable =
+        IsReadableMemory(clone, sizeof(void*))
+            ? *reinterpret_cast<void**>(clone)
+            : nullptr;
+    unsigned int callNumber =
+        g_windowBorderCloneCallCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    DWORD sceneThreadId = g_dwmSceneThreadId.load(std::memory_order_acquire);
+    HWND dragHwnd = g_realDraggedWindow.load(std::memory_order_acquire);
+    HWND meshTarget =
+        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire);
+    Wh_Log(L"True 4x4 complete-root clone observed: call=%u result=0x%08X "
+           L"HWND=%p WindowData=%p CTopLevelWindow=%p options=%d "
+           L"source=%p sourceVtable=%p sourceParent=%p sourceProxy=%p "
+           L"clone=%p cloneVtable=%p cloneParent=%p cloneProxy=%p "
+           L"sceneThread=%d activeDrag=%d meshTarget=%d (read-only)",
+           callNumber, static_cast<unsigned int>(result), hwnd, windowData,
+           topLevelWindow, cloneOptions, pThis, sourceVtable, sourceParent,
+           sourceProxy, clone, cloneVtable, cloneParent, cloneProxy,
+           sceneThreadId != 0 && sceneThreadId == GetCurrentThreadId(),
+           dragHwnd == hwnd, meshTarget == hwnd);
+    return result;
+}
+
 static long __cdecl TopLevelWindow3DEnsureRenderDataHook(void* pThis)
 {
     long result = g_topLevelWindow3DEnsureRenderDataOriginal(pThis);
@@ -3946,6 +4066,11 @@ static bool InitializeDwmHooks()
          &g_topLevelWindowGetRootVisual,
          nullptr,
          true},
+        {{L"public: virtual long __cdecl CWindowBorder::CloneVisualTree("
+           L"class CVisual * *,enum CloneOptions)"},
+         &g_windowBorderCloneVisualTreeOriginal,
+         CWindowBorderCloneVisualTreeHook,
+         true},
         {{L"public: virtual class CTopLevelWindow3D * __cdecl "
             L"winrt::Udwm::Transitions::implementation::TopLevelWindow3DWrapper::GetVisualWeak(void)"},
          &g_transitionWrapperGetVisualWeakFunction, nullptr, true},
@@ -4300,6 +4425,7 @@ static bool InitializeDwmHooks()
     keepValid(g_topLevelWindow3DStartAnimationOriginal);
     keepValid(g_getCanvasRootVisualProxy);
     keepValid(g_topLevelWindowGetRootVisual);
+    keepValid(g_windowBorderCloneVisualTreeOriginal);
     keepValid(g_topLevelWindowGetWindowData);
     keepValid(g_desktopManagerPostStartAnimations);
     keepValid(g_meshGeometry2dProxyUpdate);
@@ -4452,6 +4578,9 @@ static bool InitializeDwmHooks()
            hasVisualCollectionLayout ? L"available" : L"unavailable",
            g_visualCollectionArrayOffset,
            g_visualCollectionCountOffset);
+    Wh_Log(L"True 4x4 complete-root clone observer: %s (read-only)",
+           g_windowBorderCloneVisualTreeOriginal ? L"available"
+                                                  : L"unavailable");
     Wh_Log(L"True 4x4 source probe: bitmap=%s visualSurface=%s "
            L"bitmapCreationObserver=%s surfaceCreationObserver=%s "
            L"vtableAlias=%d",
@@ -10428,6 +10557,7 @@ BOOL Wh_ModInit()
     g_ensureRenderDataCallCount.store(0, std::memory_order_relaxed);
     g_ensureRenderDataMappedCount.store(0, std::memory_order_relaxed);
     g_ensureRenderDataPopulatedCount.store(0, std::memory_order_relaxed);
+    g_windowBorderCloneCallCount.store(0, std::memory_order_relaxed);
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
