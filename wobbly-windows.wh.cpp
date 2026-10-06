@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.213
+// @version         0.214
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -92,7 +92,7 @@ the combined mod is not offered under GPLv2.
 
 - Renderer: "affine"
   $name: Renderer
-  $description: The 4x4 mesh-layer backend is under development and currently falls back to the stable affine renderer.
+  $description: The experimental mode adds an identity 4x4 GPU layer while retaining the stable affine renderer.
   $options:
   - "affine": "Affine (stable)"
   - "mesh-layer": "True 4x4 mesh layer (experimental)"
@@ -390,9 +390,55 @@ CVisualProxySetTransform_t g_cVisualProxySetTransform = nullptr;
 using CCompositorCreateMatrixTransformProxy_t = long(__cdecl*)(void* pThis, void** transformProxy);
 CCompositorCreateMatrixTransformProxy_t g_createMatrixTransformProxy = nullptr;
 
-// The mesh-layer renderer is intentionally isolated from the stable affine
-// renderer. Version 0.116 only resolves and validates its prerequisites; it
-// performs no mesh-layer writes yet.
+struct D2DPoint3F
+{
+    float x;
+    float y;
+    float z;
+};
+
+struct D2DPoint2F
+{
+    float x;
+    float y;
+};
+
+struct MilRectF
+{
+    float left;
+    float top;
+    float right;
+    float bottom;
+};
+
+struct MilSizeD
+{
+    double width;
+    double height;
+};
+
+using CMeshGeometry2dProxyUpdate_t = long(__cdecl*)(
+    void* pThis, int mode, const D2DPoint3F* positions,
+    const D2DPoint2F* textureCoordinates, unsigned int vertexCount,
+    const unsigned int* indices, unsigned int indexCount);
+using CCompositorCreateProxy_t = long(__cdecl*)(void* pThis, void** proxy);
+using CGeometry2dGroupProxyUpdate_t = long(__cdecl*)(void* pThis,
+                                                     void* meshProxy);
+using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(
+    void* geometryGroupProxy, void* bitmapSourceProxy, void** instruction);
+using CCachedVisualImageProxyUpdate_t = long(__cdecl*)(
+    void* pThis, const MilRectF& sourceRect, const MilSizeD& size,
+    const void* rectAnimation, const void* sizeAnimation, void* visualProxy,
+    int mappingMode);
+using CRenderDataVisualCreate_t = long(__cdecl*)(void** visual);
+using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void* pThis,
+                                                          void* instruction);
+using CVisualSetParent_t = long(__cdecl*)(void* pThis, void* parent);
+using CVisualRemoveSelfFromParent_t = long(__cdecl*)(void* pThis);
+using CVisualGetTransformParent_t = void*(__cdecl*)(void* pThis);
+
+// The experimental renderer owns a separate resource chain. The stable affine
+// renderer never depends on these optional symbols.
 struct MeshLayerSymbols
 {
     void* meshGeometryUpdate = nullptr;
@@ -409,6 +455,9 @@ struct MeshLayerSymbols
     void* updateRenderData = nullptr;
     void* insertVisualChild = nullptr;
     void* removeVisualChild = nullptr;
+    void* setVisualParent = nullptr;
+    void* removeVisualFromParent = nullptr;
+    void* getVisualParent = nullptr;
 
     bool HasGeometryPipeline() const
     {
@@ -418,14 +467,13 @@ struct MeshLayerSymbols
 
     bool HasImagePipeline() const
     {
-        return createCachedImage && cachedImageUpdate && cachedImageSnapshot &&
-               cachedImageFreeze;
+        return createCachedImage && cachedImageUpdate;
     }
 
     bool HasVisualPipeline() const
     {
-        return createRenderDataVisual && addRenderInstruction && updateRenderData &&
-               insertVisualChild && removeVisualChild;
+        return createRenderDataVisual && addRenderInstruction && setVisualParent &&
+               removeVisualFromParent && getVisualParent;
     }
 
     bool IsComplete() const
@@ -436,6 +484,24 @@ struct MeshLayerSymbols
 
 MeshLayerSymbols g_meshLayerSymbols;
 std::atomic_bool g_meshLayerBackendAvailable = false;
+
+struct MeshLayerState
+{
+    void* cachedImage;
+    void* meshProxy;
+    void* groupProxy;
+    void* instruction;
+    void* renderVisual;
+    void* sourceVisualProxy;
+    HWND hwnd;
+    int slotIndex;
+    ULONGLONG generation;
+};
+
+MeshLayerState g_meshLayerState = {};
+std::atomic_bool g_meshLayerActive = false;
+int g_meshLayerAttemptSlot = -1;
+ULONGLONG g_meshLayerAttemptGeneration = 0;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
@@ -796,6 +862,10 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly = false
 static void RestorePendingAnimationIdentities();
 static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
+static void MaintainMeshLayer();
+static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
+                               void* topLevelWindow,
+                               void* sourceVisualProxy);
 static bool HasAnyAnimationSlots();
 static int GetPointIndex(int x, int y);
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy);
@@ -2793,6 +2863,17 @@ static bool InitializeDwmHooks()
          &g_meshLayerSymbols.insertVisualChild, nullptr, true},
         {{L"public: long __cdecl CVisualProxy::RemoveChild(class CVisualProxy *)"},
          &g_meshLayerSymbols.removeVisualChild, nullptr, true},
+        {{L"public: virtual long __cdecl CVisual::SetParent(class CVisual *)",
+          L"public: virtual long __cdecl CVisual::SetParent("
+           L"class CContainerVisual *)"},
+         &g_meshLayerSymbols.setVisualParent, nullptr, true},
+        {{L"public: long __cdecl CVisual::RemoveSelfFromParent(void)"},
+         &g_meshLayerSymbols.removeVisualFromParent, nullptr, true},
+        {{L"public: virtual class CVisual * __cdecl "
+           L"CVisual::GetTransformParent(void)const",
+          L"public: virtual class CVisual * __cdecl "
+           L"CVisual::GetTransformParent(void)const "},
+         &g_meshLayerSymbols.getVisualParent, nullptr, true},
         {{L"public: unsigned long __cdecl CBaseObject::Release(void)"},
          &g_cBaseObjectRelease,
          nullptr,
@@ -2927,10 +3008,13 @@ static bool InitializeDwmHooks()
     keepValid(g_meshLayerSymbols.updateRenderData);
     keepValid(g_meshLayerSymbols.insertVisualChild);
     keepValid(g_meshLayerSymbols.removeVisualChild);
+    keepValid(g_meshLayerSymbols.setVisualParent);
+    keepValid(g_meshLayerSymbols.removeVisualFromParent);
+    keepValid(g_meshLayerSymbols.getVisualParent);
     g_meshLayerBackendAvailable.store(g_meshLayerSymbols.IsComplete(),
                                       std::memory_order_release);
     Wh_Log(L"4x4 mesh-layer prerequisites: geometry=%s image=%s visual=%s "
-           L"complete=%s (probe only; affine renderer remains active)",
+           L"complete=%s (identity-layer test; affine renderer remains active)",
            g_meshLayerSymbols.HasGeometryPipeline() ? L"available" : L"unavailable",
            g_meshLayerSymbols.HasImagePipeline() ? L"available" : L"unavailable",
            g_meshLayerSymbols.HasVisualPipeline() ? L"available" : L"unavailable",
@@ -3180,6 +3264,303 @@ static bool InitializeDwmHooks()
     return true;
 }
 
+static bool IsNativeVisualPointerValid(void* visual)
+{
+    if (!IsReadableMemory(visual, sizeof(void*)))
+    {
+        return false;
+    }
+    return IsDwmFunctionPointerValid(*static_cast<void**>(visual));
+}
+
+static void ReleaseMeshLayerResources(MeshLayerState& state)
+{
+    if (!g_cBaseObjectRelease)
+    {
+        return;
+    }
+    void* resources[] = {state.renderVisual, state.instruction, state.groupProxy,
+                         state.meshProxy, state.cachedImage};
+    for (void* resource : resources)
+    {
+        if (resource)
+        {
+            g_cBaseObjectRelease(resource);
+        }
+    }
+    state = {};
+}
+
+static bool DetachMeshLayer(const wchar_t* reason)
+{
+    if (!g_meshLayerState.renderVisual)
+    {
+        g_meshLayerActive.store(false, std::memory_order_release);
+        return true;
+    }
+
+    auto removeFromParent = reinterpret_cast<CVisualRemoveSelfFromParent_t>(
+        g_meshLayerSymbols.removeVisualFromParent);
+    long result = removeFromParent ? removeFromParent(g_meshLayerState.renderVisual)
+                                   : E_NOINTERFACE;
+    if (result < 0)
+    {
+        Wh_Log(L"4x4 identity layer detach deferred: HWND=%p reason=%s "
+               L"result=0x%08X",
+               g_meshLayerState.hwnd, reason,
+               static_cast<unsigned int>(result));
+        RequestDwmScenePass();
+        return false;
+    }
+
+    HWND hwnd = g_meshLayerState.hwnd;
+    ReleaseMeshLayerResources(g_meshLayerState);
+    g_meshLayerActive.store(false, std::memory_order_release);
+    Wh_Log(L"4x4 identity layer detached: HWND=%p reason=%s result=0x%08X",
+           hwnd, reason, static_cast<unsigned int>(result));
+    return true;
+}
+
+static void MaintainMeshLayer()
+{
+    if (!IsOnDwmSceneThread() ||
+        !g_meshLayerActive.load(std::memory_order_acquire))
+    {
+        return;
+    }
+
+    bool keepLayer = false;
+    AcquireSRWLockShared(&g_animationSlotsLock);
+    if (g_meshLayerState.slotIndex >= 0 &&
+        g_meshLayerState.slotIndex < MAX_ANIMATION_SLOTS)
+    {
+        const WindowAnimationSlot& slot =
+            g_animationSlots[g_meshLayerState.slotIndex];
+        keepLayer = !g_unloading.load(std::memory_order_acquire) &&
+                    (slot.active || slot.retiring) &&
+                    slot.generation == g_meshLayerState.generation &&
+                    slot.hwnd == g_meshLayerState.hwnd &&
+                    slot.settings.rendererMode == RendererMode::MeshLayer;
+    }
+    ReleaseSRWLockShared(&g_animationSlotsLock);
+
+    if (!keepLayer)
+    {
+        DetachMeshLayer(g_unloading.load(std::memory_order_acquire)
+                            ? L"unload"
+                            : L"slot-ended");
+    }
+}
+
+static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
+                               void* topLevelWindow,
+                               void* sourceVisualProxy)
+{
+    if (!IsOnDwmSceneThread() ||
+        !g_meshLayerBackendAvailable.load(std::memory_order_acquire) ||
+        !hwnd || !topLevelWindow ||
+        !IsVisualProxyPointerValid(sourceVisualProxy))
+    {
+        return;
+    }
+
+    if (g_meshLayerState.renderVisual)
+    {
+        if (g_meshLayerState.slotIndex == slotIndex &&
+            g_meshLayerState.generation == generation &&
+            g_meshLayerState.hwnd == hwnd &&
+            g_meshLayerState.sourceVisualProxy == sourceVisualProxy)
+        {
+            return;
+        }
+        if (!DetachMeshLayer(L"source-changed"))
+        {
+            return;
+        }
+    }
+    if (g_meshLayerAttemptSlot == slotIndex &&
+        g_meshLayerAttemptGeneration == generation)
+    {
+        return;
+    }
+    g_meshLayerAttemptSlot = slotIndex;
+    g_meshLayerAttemptGeneration = generation;
+
+    auto createProxy = reinterpret_cast<CCompositorCreateProxy_t>(
+        g_meshLayerSymbols.createCachedImage);
+    auto updateCachedImage = reinterpret_cast<CCachedVisualImageProxyUpdate_t>(
+        g_meshLayerSymbols.cachedImageUpdate);
+    auto createMesh = reinterpret_cast<CCompositorCreateProxy_t>(
+        g_meshLayerSymbols.createMeshGeometry);
+    auto updateMesh = reinterpret_cast<CMeshGeometry2dProxyUpdate_t>(
+        g_meshLayerSymbols.meshGeometryUpdate);
+    auto createGroup = reinterpret_cast<CCompositorCreateProxy_t>(
+        g_meshLayerSymbols.createGeometryGroup);
+    auto updateGroup = reinterpret_cast<CGeometry2dGroupProxyUpdate_t>(
+        g_meshLayerSymbols.geometryGroupUpdate);
+    auto createInstruction = reinterpret_cast<CDrawMesh2DInstructionCreate_t>(
+        g_meshLayerSymbols.createMeshInstruction);
+    auto createRenderVisual = reinterpret_cast<CRenderDataVisualCreate_t>(
+        g_meshLayerSymbols.createRenderDataVisual);
+    auto addInstruction = reinterpret_cast<CRenderDataVisualAddInstruction_t>(
+        g_meshLayerSymbols.addRenderInstruction);
+    auto setParent = reinterpret_cast<CVisualSetParent_t>(
+        g_meshLayerSymbols.setVisualParent);
+    auto getParent = reinterpret_cast<CVisualGetTransformParent_t>(
+        g_meshLayerSymbols.getVisualParent);
+
+    MeshLayerState pending = {};
+    pending.hwnd = hwnd;
+    pending.slotIndex = slotIndex;
+    pending.generation = generation;
+    pending.sourceVisualProxy = sourceVisualProxy;
+    const wchar_t* stage = L"Prerequisites";
+    long result = E_NOINTERFACE;
+    bool attachAttempted = false;
+
+    void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
+    constexpr int completeWindowRoot = 0;
+    void* rootVisual = g_topLevelWindowGetRootVisual
+                           ? g_topLevelWindowGetRootVisual(topLevelWindow,
+                                                          completeWindowRoot)
+                           : nullptr;
+    void* parentVisual = IsNativeVisualPointerValid(rootVisual) && getParent
+                             ? getParent(rootVisual)
+                             : nullptr;
+    RECT rect = {};
+    bool hasRect = GetWindowRect(hwnd, &rect) != FALSE;
+    double width = hasRect ? static_cast<double>(rect.right - rect.left) : 0.0;
+    double height = hasRect ? static_cast<double>(rect.bottom - rect.top) : 0.0;
+
+    if (IsDwmObjectPointerValid(compositor, g_compositorVtable) &&
+        IsNativeVisualPointerValid(parentVisual) && width > 0.0 && height > 0.0 &&
+        createProxy && updateCachedImage && createMesh && updateMesh &&
+        createGroup && updateGroup && createInstruction && createRenderVisual &&
+        addInstruction && setParent)
+    {
+        stage = L"CreateImage";
+        result = createProxy(compositor, &pending.cachedImage);
+        if (result >= 0 && pending.cachedImage)
+        {
+            MilRectF sourceRect = {0.0f, 0.0f, static_cast<float>(width),
+                                   static_cast<float>(height)};
+            MilSizeD size = {width, height};
+            constexpr int absoluteMappingMode = 0;
+            stage = L"UpdateImage";
+            result = updateCachedImage(pending.cachedImage, sourceRect, size,
+                                       nullptr, nullptr, sourceVisualProxy,
+                                       absoluteMappingMode);
+        }
+
+        D2DPoint3F positions[GRID_POINT_COUNT] = {};
+        D2DPoint2F textureCoordinates[GRID_POINT_COUNT] = {};
+        unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
+        for (int y = 0; y < GRID_HEIGHT; y++)
+        {
+            for (int x = 0; x < GRID_WIDTH; x++)
+            {
+                int index = GetPointIndex(x, y);
+                float tx = static_cast<float>(x) / (GRID_WIDTH - 1);
+                float ty = static_cast<float>(y) / (GRID_HEIGHT - 1);
+                positions[index] = {tx * static_cast<float>(width),
+                                    ty * static_cast<float>(height), 0.0f};
+                textureCoordinates[index] = {tx, ty};
+            }
+        }
+        unsigned int indexCount = 0;
+        for (int y = 0; y < GRID_HEIGHT - 1; y++)
+        {
+            for (int x = 0; x < GRID_WIDTH - 1; x++)
+            {
+                unsigned int topLeft = GetPointIndex(x, y);
+                unsigned int topRight = GetPointIndex(x + 1, y);
+                unsigned int bottomLeft = GetPointIndex(x, y + 1);
+                unsigned int bottomRight = GetPointIndex(x + 1, y + 1);
+                indices[indexCount++] = topLeft;
+                indices[indexCount++] = bottomLeft;
+                indices[indexCount++] = topRight;
+                indices[indexCount++] = topRight;
+                indices[indexCount++] = bottomLeft;
+                indices[indexCount++] = bottomRight;
+            }
+        }
+        if (result >= 0)
+        {
+            stage = L"CreateMesh";
+            result = createMesh(compositor, &pending.meshProxy);
+        }
+        if (result >= 0 && pending.meshProxy)
+        {
+            stage = L"UpdateMesh";
+            result = updateMesh(pending.meshProxy, 0, positions,
+                                textureCoordinates, GRID_POINT_COUNT, indices,
+                                indexCount);
+        }
+        if (result >= 0)
+        {
+            stage = L"CreateGroup";
+            result = createGroup(compositor, &pending.groupProxy);
+        }
+        if (result >= 0 && pending.groupProxy)
+        {
+            stage = L"UpdateGroup";
+            result = updateGroup(pending.groupProxy, pending.meshProxy);
+        }
+        if (result >= 0)
+        {
+            stage = L"CreateVisual";
+            result = createRenderVisual(&pending.renderVisual);
+        }
+        if (result >= 0 && pending.renderVisual)
+        {
+            stage = L"CreateInstruction";
+            result = createInstruction(pending.groupProxy, pending.cachedImage,
+                                       &pending.instruction);
+        }
+        if (result >= 0 && pending.instruction)
+        {
+            stage = L"AddInstruction";
+            result = addInstruction(pending.renderVisual, pending.instruction);
+        }
+        if (result >= 0 && pending.renderVisual)
+        {
+            stage = L"Attach";
+            attachAttempted = true;
+            result = setParent(pending.renderVisual, parentVisual);
+        }
+    }
+
+    bool succeeded = result >= 0 && pending.cachedImage && pending.meshProxy &&
+                     pending.groupProxy && pending.instruction &&
+                     pending.renderVisual;
+    if (succeeded)
+    {
+        g_meshLayerState = pending;
+        g_meshLayerActive.store(true, std::memory_order_release);
+        Wh_Log(L"4x4 identity layer attached: Slot=%d HWND=%p Source=%p "
+               L"Root=%p Parent=%p size=%.0fx%.0f",
+               slotIndex, hwnd, sourceVisualProxy, rootVisual, parentVisual,
+               width, height);
+        return;
+    }
+
+    if (attachAttempted && pending.renderVisual && getParent &&
+        getParent(pending.renderVisual))
+    {
+        g_meshLayerState = pending;
+        g_meshLayerActive.store(true, std::memory_order_release);
+        DetachMeshLayer(L"failed-attach");
+    }
+    else
+    {
+        ReleaseMeshLayerResources(pending);
+    }
+    Wh_Log(L"4x4 identity layer failed: Slot=%d HWND=%p Stage=%s "
+           L"result=0x%08X Root=%p Parent=%p size=%.0fx%.0f",
+           slotIndex, hwnd, stage, static_cast<unsigned int>(result),
+           rootVisual, parentVisual, width, height);
+}
+
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
 {
     if (!IsOnDwmSceneThread() || g_unloading.load(std::memory_order_acquire) ||
@@ -3215,6 +3596,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         bool previouslyTopLevelAttached = false;
         bool previouslyTransitionAttached = false;
         bool windowStateThrob = false;
+        RendererMode rendererMode = RendererMode::Affine;
         bool bindingPending = false;
         AcquireSRWLockExclusive(&g_animationSlotsLock);
         WindowAnimationSlot& slot = g_animationSlots[i];
@@ -3237,6 +3619,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             previouslyTopLevelAttached = slot.transformAttached;
             previouslyTransitionAttached = slot.transitionTransformAttached;
             windowStateThrob = slot.windowStateThrob;
+            rendererMode = slot.settings.rendererMode;
         }
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
         if (!matrixTransformProxy)
@@ -3311,6 +3694,11 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         {
             transitionBindResult =
                 g_cVisualProxySetTransform(transitionVisualProxy, matrixTransformProxy);
+        }
+        if (rendererMode == RendererMode::MeshLayer && topLevelVisualProxy)
+        {
+            TryAttachMeshLayer(i, generation, hwnd, topLevelWindow,
+                               topLevelVisualProxy);
         }
         bool logBinding = false;
         bool logBindingFailure = false;
@@ -3458,6 +3846,7 @@ static void SubmitPendingWobblySceneWork()
     g_sceneWakeScheduled.store(false, std::memory_order_release);
     g_sceneWakePostTimestamp.store(0, std::memory_order_release);
     g_scenePassCounter.fetch_add(1, std::memory_order_release);
+    MaintainMeshLayer();
     // Restore retiring/quiet windows before discovery, creation or normal rendering.
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
@@ -3486,7 +3875,8 @@ static void SubmitPendingWobblySceneWork()
 
 static bool HasPendingWobblySceneWork()
 {
-    return g_sceneRequestedSerial.load(std::memory_order_acquire) >
+    return g_meshLayerActive.load(std::memory_order_acquire) ||
+           g_sceneRequestedSerial.load(std::memory_order_acquire) >
                g_sceneSubmittedSerial.load(std::memory_order_acquire) ||
            g_existingWindowBackfillIndex.load(std::memory_order_acquire) <
                g_existingWindowBackfillCount.load(std::memory_order_acquire) ||
@@ -5570,6 +5960,8 @@ static void StopAllAnimations()
     int slotsToRetire[MAX_ANIMATION_SLOTS] = {};
     bool sceneCleanupNeeded = false;
     int retireCount = CollectActiveAnimationSlots(slotsToRetire, &sceneCleanupNeeded);
+    sceneCleanupNeeded = sceneCleanupNeeded ||
+                         g_meshLayerActive.load(std::memory_order_acquire);
     for (int i = 0; i < retireCount; i++)
     {
         RetireAnimationSlot(slotsToRetire[i]);
@@ -5603,7 +5995,9 @@ static void StopAllAnimations()
         // Wakes carry only an instance token, not pointers; keep their counter
         // intact for late acknowledgments, but don't mistake them for resources.
         bool wakePending = g_sceneWakeOutstanding.load(std::memory_order_acquire) != 0;
-        if (!hookUsers && !retainedProxies)
+        bool meshLayerRetained =
+            g_meshLayerActive.load(std::memory_order_acquire);
+        if (!hookUsers && !retainedProxies && !meshLayerRetained)
         {
             break;
         }
@@ -5617,7 +6011,7 @@ static void StopAllAnimations()
             break;
         }
         ULONGLONG lastWakePost = g_sceneWakePostTimestamp.load(std::memory_order_acquire);
-        if (retainedProxies &&
+        if ((retainedProxies || meshLayerRetained) &&
             (!wakePending || !lastWakePost || now - lastWakePost >= 50))
         {
             PostPendingDwmSceneWake(true);
