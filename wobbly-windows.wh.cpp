@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.207
+// @version         0.208
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -358,7 +358,7 @@ enum class InteractiveStateThrobKind : unsigned char
 InteractiveStateThrobKind g_interactiveStateThrob = InteractiveStateThrobKind::None;
 LPARAM g_interactiveStateThrobDirection = 0;
 bool g_interactiveStateThrobFromPointerEdge = false;
-double g_resizeCoordinateScale = 1.0;
+double g_visualCoordinateScale = 1.0;
 using GetDpiForMonitor_t = HRESULT(WINAPI*)(HMONITOR monitor, int dpiType, UINT* dpiX, UINT* dpiY);
 HMODULE g_shcoreModule = nullptr;
 GetDpiForMonitor_t g_getDpiForMonitor = nullptr;
@@ -8184,7 +8184,7 @@ static void ResetDragInputState()
     g_interactiveStateThrob = InteractiveStateThrobKind::None;
     g_interactiveStateThrobDirection = 0;
     g_interactiveStateThrobFromPointerEdge = false;
-    g_resizeCoordinateScale = 1.0;
+    g_visualCoordinateScale = 1.0;
     g_dragAnimationSlot = -1;
     g_hasLastMousePosition = false;
     g_lastMousePosition = {};
@@ -8863,8 +8863,18 @@ static void UninitializeDpiSupport()
     }
 }
 
-static double GetResizeVisualCoordinateScale(HWND hwnd, const RECT& windowRect)
+static double GetVisualCoordinateScale(HWND hwnd, const RECT& windowRect,
+                                       UINT* windowDpiOut = nullptr,
+                                       UINT* monitorDpiOut = nullptr)
 {
+    if (windowDpiOut)
+    {
+        *windowDpiOut = 0;
+    }
+    if (monitorDpiOut)
+    {
+        *monitorDpiOut = 0;
+    }
     if (!hwnd || !g_getDpiForMonitor)
     {
         return 1.0;
@@ -8885,7 +8895,16 @@ static double GetResizeVisualCoordinateScale(HWND hwnd, const RECT& windowRect)
     {
         return 1.0;
     }
-    // Correct system-DPI surfaces transformed by DWM on another monitor.
+    if (windowDpiOut)
+    {
+        *windowDpiOut = windowDpi;
+    }
+    if (monitorDpiOut)
+    {
+        *monitorDpiOut = monitorDpiX;
+    }
+    // DWM keeps system-DPI-aware window visuals in the app's coordinate space.
+    // Convert physical window/cursor coordinates to that space on every monitor.
     return std::clamp(static_cast<double>(windowDpi) / static_cast<double>(monitorDpiX), 0.50,
                       2.00);
 }
@@ -9068,15 +9087,22 @@ static void HandleMoveSizeStart(HWND hwnd)
     {
         return;
     }
-    g_resizeCoordinateScale =
-        operationTypeKnown && operationResizing ? GetResizeVisualCoordinateScale(hwnd, rect) : 1.0;
-    if (operationTypeKnown && operationResizing)
+    UINT windowDpi = 0;
+    UINT monitorDpi = 0;
+    g_visualCoordinateScale =
+        GetVisualCoordinateScale(hwnd, rect, &windowDpi, &monitorDpi);
+    localMousePosition.x *= g_visualCoordinateScale;
+    localMousePosition.y *= g_visualCoordinateScale;
+    if (std::abs(g_visualCoordinateScale - 1.0) > 0.001)
     {
-        localMousePosition.x *= g_resizeCoordinateScale;
-        localMousePosition.y *= g_resizeCoordinateScale;
+        Wh_Log(L"MIXED-DPI VISUAL SCALE: HWND=%p WindowDpi=%u MonitorDpi=%u "
+               L"Scale=%.4f Resize=%d Size=%dx%d Grab=(%.1f,%.1f)",
+               hwnd, windowDpi, monitorDpi, g_visualCoordinateScale,
+               operationTypeKnown && operationResizing, width, height,
+               localMousePosition.x, localMousePosition.y);
     }
-    double meshWidth = static_cast<double>(width) * g_resizeCoordinateScale;
-    double meshHeight = static_cast<double>(height) * g_resizeCoordinateScale;
+    double meshWidth = static_cast<double>(width) * g_visualCoordinateScale;
+    double meshHeight = static_cast<double>(height) * g_visualCoordinateScale;
     int slotIndex =
         AcquireAnimationSlot(hwnd, activeSettings, meshWidth, meshHeight, localMousePosition);
     if (slotIndex < 0)
@@ -9855,7 +9881,6 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
                          (currentWidth != originalWidth || currentHeight != originalHeight);
         if (g_realResizing)
         {
-            g_resizeCoordinateScale = GetResizeVisualCoordinateScale(hwnd, rect);
             resizeDetectedThisEvent = true;
         }
         g_moveTypeKnown = true;
@@ -9899,7 +9924,6 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         MonitorFromPoint(mousePosition, MONITOR_DEFAULTTONEAREST) == g_dragCursorMonitor)
     {
         g_realResizing = true;
-        g_resizeCoordinateScale = GetResizeVisualCoordinateScale(hwnd, rect);
         resizeDetectedThisEvent = true;
     }
     if (g_realResizing && !g_dragResizeWobbleEnabled)
@@ -9926,7 +9950,11 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     {
         snapIntentDirection = mouseEdgeState.direction;
     }
-    double coordinateScale = g_realResizing ? g_resizeCoordinateScale : 1.0;
+    double previousCoordinateScale = g_visualCoordinateScale;
+    double coordinateScale = GetVisualCoordinateScale(hwnd, rect);
+    bool coordinateScaleChanged =
+        std::abs(coordinateScale - previousCoordinateScale) > 0.001;
+    g_visualCoordinateScale = coordinateScale;
     double windowDeltaX =
         static_cast<double>(rect.left - g_lastDraggedWindowRect.left) * coordinateScale;
     double windowDeltaY =
@@ -9951,14 +9979,14 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     }
     bool dpiReflow = !g_realResizing && sizeChanged && !zoomStateChanged &&
                      g_interactiveStateThrob == InteractiveStateThrobKind::None;
-    if (dpiReflow)
+    if (dpiReflow || coordinateScaleChanged)
     {
         g_monitorTransitionRebaseUntil = now + 750;
     }
     bool largeNativeCatchUp = std::abs(windowDeltaX) > 64.0 || std::abs(windowDeltaY) > 64.0;
     bool rebaseMonitorTransition =
         !g_realResizing && now <= g_monitorTransitionRebaseUntil &&
-        (monitorChanged || dpiReflow || largeNativeCatchUp);
+        (monitorChanged || dpiReflow || coordinateScaleChanged || largeNativeCatchUp);
     Vec2 localMousePosition = {static_cast<double>(mousePosition.x - rect.left) * coordinateScale,
                                static_cast<double>(mousePosition.y - rect.top) * coordinateScale};
     double currentMeshWidth = static_cast<double>(currentWidth) * coordinateScale;
@@ -9995,8 +10023,7 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     auto startInteractiveStateThrob = [&](InteractiveStateThrobKind kind, bool maximizing,
                                           Vec2 direction)
     {
-        InitializeMesh(slot.mesh, static_cast<double>(currentWidth),
-                       static_cast<double>(currentHeight));
+        InitializeMesh(slot.mesh, currentMeshWidth, currentMeshHeight);
         ApplyWindowStateThrob(slot.mesh, maximizing, true, slot.settings, direction);
         ClearWindowStateThrobConstraints(slot.mesh);
         BeginDrag(slot.mesh, localMousePosition);
@@ -10072,16 +10099,14 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     {
         // Per-monitor DPI changes can make the native window catch up in one
         // large step. Treat that step as new geometry, not as wobble velocity.
-        InitializeMesh(slot.mesh, static_cast<double>(currentWidth),
-                       static_cast<double>(currentHeight));
+        InitializeMesh(slot.mesh, currentMeshWidth, currentMeshHeight);
         BeginDrag(slot.mesh, localMousePosition);
         slot.windowStateThrob = false;
     }
     else if (sizeChanged)
     {
         // Only IsZoomed transitions trigger state wobble during a move.
-        InitializeMesh(slot.mesh, static_cast<double>(currentWidth),
-                       static_cast<double>(currentHeight));
+        InitializeMesh(slot.mesh, currentMeshWidth, currentMeshHeight);
         if (zoomStateChanged && slot.settings.windowStateWobbleEnabled)
         {
             ApplyWindowStateThrob(slot.mesh, windowZoomed, false, slot.settings,
