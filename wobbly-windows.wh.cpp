@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.215
+// @version         0.216
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3274,7 +3274,9 @@ static bool IsNativeVisualPointerValid(void* visual)
     {
         return false;
     }
-    return IsDwmFunctionPointerValid(*static_cast<void**>(visual));
+    // CVisual subclasses can begin with a non-code vtable entry. The exact
+    // object type varies, but every supported visual vtable lives in udwm.dll.
+    return IsDwmImageAddress(*static_cast<void**>(visual), sizeof(void*));
 }
 
 static void ReleaseMeshLayerResources(MeshLayerState& state)
