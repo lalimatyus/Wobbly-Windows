@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.209
+// @version         0.210
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -8765,6 +8765,16 @@ static bool IsResizeHitTestResult(LRESULT hitTestResult)
     }
 }
 
+static bool GetPhysicalExtendedFrameBounds(HWND hwnd, RECT& bounds)
+{
+    constexpr DWORD dwmwaExtendedFrameBounds = 9;
+    bounds = {};
+    return hwnd && g_dwmGetWindowAttribute &&
+           SUCCEEDED(g_dwmGetWindowAttribute(hwnd, dwmwaExtendedFrameBounds,
+                                             &bounds, sizeof(bounds))) &&
+           bounds.right > bounds.left && bounds.bottom > bounds.top;
+}
+
 static bool IsCursorOnResizableFrame(HWND hwnd, const POINT& mousePosition,
                                      const RECT& rect, bool includeTopEdge)
 {
@@ -8781,13 +8791,32 @@ static bool IsCursorOnResizableFrame(HWND hwnd, const POINT& mousePosition,
                  GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
     int frameY = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
                  GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-    frameX = std::clamp(frameX, 4, 32);
-    frameY = std::clamp(frameY, 4, 32);
-    LONG localX = mousePosition.x - rect.left;
-    LONG localY = mousePosition.y - rect.top;
-    LONG width = rect.right - rect.left;
-    LONG height = rect.bottom - rect.top;
-    if (localX < -1 || localY < -1 || localX > width + 1 || localY > height + 1)
+    RECT hitRect = rect;
+    bool physicalBounds = GetPhysicalExtendedFrameBounds(hwnd, hitRect);
+    if (physicalBounds && g_getDpiForMonitor)
+    {
+        HMONITOR monitor = MonitorFromRect(&hitRect, MONITOR_DEFAULTTONEAREST);
+        UINT monitorDpiX = 0;
+        UINT monitorDpiY = 0;
+        if (monitor &&
+            SUCCEEDED(g_getDpiForMonitor(monitor, 0, &monitorDpiX, &monitorDpiY)) &&
+            monitorDpiX && dpi)
+        {
+            double scale = static_cast<double>(monitorDpiX) / static_cast<double>(dpi);
+            frameX = static_cast<int>(std::ceil(static_cast<double>(frameX) * scale));
+            frameY = static_cast<int>(std::ceil(static_cast<double>(frameY) * scale));
+        }
+    }
+    frameX = std::clamp(frameX, 4, 48);
+    frameY = std::clamp(frameY, 4, 48);
+    LONG localX = mousePosition.x - hitRect.left;
+    LONG localY = mousePosition.y - hitRect.top;
+    LONG width = hitRect.right - hitRect.left;
+    LONG height = hitRect.bottom - hitRect.top;
+    LONG outsideMarginX = physicalBounds ? frameX : 1;
+    LONG outsideMarginY = physicalBounds ? frameY : 1;
+    if (localX < -outsideMarginX || localY < -outsideMarginY ||
+        localX > width + outsideMarginX || localY > height + outsideMarginY)
     {
         return false;
     }
@@ -8885,11 +8914,8 @@ static WindowVisualCoordinates GetWindowVisualCoordinates(HWND hwnd,
     {
         return result;
     }
-    constexpr DWORD dwmwaExtendedFrameBounds = 9;
     RECT physicalRect = {};
-    if (FAILED(g_dwmGetWindowAttribute(hwnd, dwmwaExtendedFrameBounds,
-                                       &physicalRect, sizeof(physicalRect))) ||
-        physicalRect.right <= physicalRect.left || physicalRect.bottom <= physicalRect.top)
+    if (!GetPhysicalExtendedFrameBounds(hwnd, physicalRect))
     {
         return result;
     }
@@ -9093,9 +9119,12 @@ static void HandleMoveSizeStart(HWND hwnd)
         return;
     }
     WobblySettings activeSettings = GetSettingsSnapshot();
-    Vec2 localMousePosition = {
+    Vec2 rawLocalMousePosition = {
         visualCoordinates.cursor.x - static_cast<double>(visualCoordinates.rect.left),
         visualCoordinates.cursor.y - static_cast<double>(visualCoordinates.rect.top)};
+    Vec2 localMousePosition = {
+        std::clamp(rawLocalMousePosition.x, 0.0, static_cast<double>(visualWidth)),
+        std::clamp(rawLocalMousePosition.y, 0.0, static_cast<double>(visualHeight))};
     bool startedWindowZoomed = IsZoomed(hwnd) != FALSE || IsApproximatelyMonitorWorkArea(rect);
     bool operationResizing = false;
     bool operationTypeKnown = startedWindowZoomed ||
@@ -9110,11 +9139,13 @@ static void HandleMoveSizeStart(HWND hwnd)
          std::abs(visualCoordinates.scaleY - 1.0) > 0.001))
     {
         Wh_Log(L"MIXED-DPI VISUAL COORDINATES: HWND=%p Scale=(%.4f,%.4f) "
-               L"NativeSize=%dx%d VisualSize=%dx%d Resize=%d Grab=(%.1f,%.1f)",
+               L"NativeSize=%dx%d VisualSize=%dx%d Resize=%d Grab=(%.1f,%.1f) "
+               L"RawGrab=(%.1f,%.1f)",
                hwnd, visualCoordinates.scaleX, visualCoordinates.scaleY,
                width, height, visualWidth, visualHeight,
                operationTypeKnown && operationResizing,
-               localMousePosition.x, localMousePosition.y);
+               localMousePosition.x, localMousePosition.y,
+               rawLocalMousePosition.x, rawLocalMousePosition.y);
     }
     double meshWidth = static_cast<double>(visualWidth);
     double meshHeight = static_cast<double>(visualHeight);
@@ -10012,11 +10043,15 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     bool rebaseMonitorTransition =
         !g_realResizing && now <= g_monitorTransitionRebaseUntil &&
         (monitorChanged || dpiReflow || coordinateScaleChanged || largeNativeCatchUp);
-    Vec2 localMousePosition = {
-        visualCoordinates.cursor.x - static_cast<double>(visualCoordinates.rect.left),
-        visualCoordinates.cursor.y - static_cast<double>(visualCoordinates.rect.top)};
     double currentMeshWidth = static_cast<double>(currentVisualWidth);
     double currentMeshHeight = static_cast<double>(currentVisualHeight);
+    Vec2 localMousePosition = {
+        std::clamp(visualCoordinates.cursor.x -
+                       static_cast<double>(visualCoordinates.rect.left),
+                   0.0, currentMeshWidth),
+        std::clamp(visualCoordinates.cursor.y -
+                       static_cast<double>(visualCoordinates.rect.top),
+                   0.0, currentMeshHeight)};
     AcquireSRWLockExclusive(&g_animationSlotsLock);
     WindowAnimationSlot& slot = g_animationSlots[slotIndex];
     if (!slot.active || slot.hwnd != hwnd)
