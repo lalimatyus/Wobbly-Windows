@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.217
+// @version         0.218
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -436,9 +436,15 @@ using CCachedVisualImageProxyFreeze_t = long(__cdecl*)(void* pThis);
 using CRenderDataVisualCreate_t = long(__cdecl*)(void** visual);
 using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void* pThis,
                                                           void* instruction);
+using CRenderDataVisualUpdateRenderData_t = long(__cdecl*)(void* pThis);
 using CVisualSetParent_t = long(__cdecl*)(void* pThis, void* parent);
 using CVisualRemoveSelfFromParent_t = long(__cdecl*)(void* pThis);
 using CVisualGetTransformParent_t = void*(__cdecl*)(void* pThis);
+using CVisualGetVisualProxyForStructure_t = void*(__cdecl*)(void* pThis);
+using CVisualProxyInsertChild_t = long(__cdecl*)(void* pThis, void* child,
+                                                 void* reference,
+                                                 bool insertAbove);
+using CVisualProxyRemoveChild_t = long(__cdecl*)(void* pThis, void* child);
 
 // The experimental renderer owns a separate resource chain. The stable affine
 // renderer never depends on these optional symbols.
@@ -461,6 +467,7 @@ struct MeshLayerSymbols
     void* setVisualParent = nullptr;
     void* removeVisualFromParent = nullptr;
     void* getVisualParent = nullptr;
+    void* getVisualProxy = nullptr;
 
     bool HasGeometryPipeline() const
     {
@@ -476,8 +483,9 @@ struct MeshLayerSymbols
 
     bool HasVisualPipeline() const
     {
-        return createRenderDataVisual && addRenderInstruction && setVisualParent &&
-               removeVisualFromParent;
+        return createRenderDataVisual && addRenderInstruction && updateRenderData &&
+               insertVisualChild && removeVisualChild && setVisualParent &&
+               removeVisualFromParent && getVisualProxy;
     }
 
     bool IsComplete() const
@@ -2878,6 +2886,9 @@ static bool InitializeDwmHooks()
           L"public: virtual class CVisual * __cdecl "
            L"CVisual::GetTransformParent(void)const "},
          &g_meshLayerSymbols.getVisualParent, nullptr, true},
+        {{L"public: virtual class CVisualProxy * __cdecl "
+           L"CVisual::GetVisualProxyForStructure(void)"},
+         &g_meshLayerSymbols.getVisualProxy, nullptr, true},
         {{L"public: unsigned long __cdecl CBaseObject::Release(void)"},
          &g_cBaseObjectRelease,
          nullptr,
@@ -3015,6 +3026,7 @@ static bool InitializeDwmHooks()
     keepValid(g_meshLayerSymbols.setVisualParent);
     keepValid(g_meshLayerSymbols.removeVisualFromParent);
     keepValid(g_meshLayerSymbols.getVisualParent);
+    keepValid(g_meshLayerSymbols.getVisualProxy);
     g_meshLayerBackendAvailable.store(g_meshLayerSymbols.IsComplete(),
                                       std::memory_order_release);
     Wh_Log(L"4x4 mesh-layer prerequisites: geometry=%s image=%s visual=%s "
@@ -3415,8 +3427,18 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         g_meshLayerSymbols.createRenderDataVisual);
     auto addInstruction = reinterpret_cast<CRenderDataVisualAddInstruction_t>(
         g_meshLayerSymbols.addRenderInstruction);
+    auto updateRenderData =
+        reinterpret_cast<CRenderDataVisualUpdateRenderData_t>(
+            g_meshLayerSymbols.updateRenderData);
     auto setParent = reinterpret_cast<CVisualSetParent_t>(
         g_meshLayerSymbols.setVisualParent);
+    auto getVisualProxy =
+        reinterpret_cast<CVisualGetVisualProxyForStructure_t>(
+            g_meshLayerSymbols.getVisualProxy);
+    auto removeChild = reinterpret_cast<CVisualProxyRemoveChild_t>(
+        g_meshLayerSymbols.removeVisualChild);
+    auto insertChild = reinterpret_cast<CVisualProxyInsertChild_t>(
+        g_meshLayerSymbols.insertVisualChild);
 
     MeshLayerState pending = {};
     pending.hwnd = hwnd;
@@ -3426,6 +3448,8 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     const wchar_t* stage = L"Prerequisites";
     long result = E_NOINTERFACE;
     bool attachAttempted = false;
+    void* renderVisualProxy = nullptr;
+    void* hostVisualProxy = nullptr;
 
     void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
     constexpr int completeWindowRoot = 0;
@@ -3443,7 +3467,9 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         hostVisual && width > 0.0 && height > 0.0 && createProxy &&
         updateCachedImage && snapshotCachedImage && freezeCachedImage &&
         createMesh && updateMesh && createGroup && updateGroup &&
-        createInstruction && createRenderVisual && addInstruction && setParent)
+        createInstruction && createRenderVisual && addInstruction &&
+        updateRenderData && setParent && getVisualProxy && removeChild &&
+        insertChild)
     {
         stage = L"CreateImage";
         result = createProxy(compositor, &pending.cachedImage);
@@ -3566,9 +3592,36 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         }
         if (result >= 0 && pending.renderVisual)
         {
+            stage = L"PublishRenderData";
+            result = updateRenderData(pending.renderVisual);
+        }
+        if (result >= 0 && pending.renderVisual)
+        {
             stage = L"Attach";
             attachAttempted = true;
             result = setParent(pending.renderVisual, hostVisual);
+        }
+        if (result >= 0)
+        {
+            stage = L"ResolveLayerOrder";
+            renderVisualProxy = getVisualProxy(pending.renderVisual);
+            hostVisualProxy = getVisualProxy(hostVisual);
+            if (!IsVisualProxyPointerValid(renderVisualProxy) ||
+                !IsVisualProxyPointerValid(hostVisualProxy))
+            {
+                result = E_NOINTERFACE;
+            }
+        }
+        if (result >= 0)
+        {
+            stage = L"RemoveForReorder";
+            result = removeChild(hostVisualProxy, renderVisualProxy);
+        }
+        if (result >= 0)
+        {
+            stage = L"InsertTopmost";
+            result = insertChild(hostVisualProxy, renderVisualProxy, nullptr,
+                                 true);
         }
     }
 
@@ -3580,9 +3633,10 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         g_meshLayerState = pending;
         g_meshLayerActive.store(true, std::memory_order_release);
         Wh_Log(L"4x4 static-warp layer attached: Slot=%d HWND=%p Source=%p "
-               L"Root=%p Host=%p snapshot=frozen shape=hourglass size=%.0fx%.0f",
+               L"Root=%p Host=%p HostProxy=%p LayerProxy=%p "
+               L"snapshot=frozen order=topmost shape=hourglass size=%.0fx%.0f",
                slotIndex, hwnd, sourceVisualProxy, rootVisual, hostVisual,
-               width, height);
+               hostVisualProxy, renderVisualProxy, width, height);
         return;
     }
 
@@ -3600,9 +3654,11 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         ReleaseMeshLayerResources(pending);
     }
     Wh_Log(L"4x4 mesh layer failed: Slot=%d HWND=%p Stage=%s "
-           L"result=0x%08X Root=%p Host=%p size=%.0fx%.0f",
+           L"result=0x%08X Root=%p Host=%p HostProxy=%p LayerProxy=%p "
+           L"size=%.0fx%.0f",
            slotIndex, hwnd, stage, static_cast<unsigned int>(result),
-           rootVisual, hostVisual, width, height);
+           rootVisual, hostVisual, hostVisualProxy, renderVisualProxy, width,
+           height);
 }
 
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
