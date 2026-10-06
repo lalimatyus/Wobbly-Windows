@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.208
+// @version         0.209
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -296,6 +296,7 @@ std::atomic<HWND> g_pendingInteractiveTransitionWindow = nullptr;
 std::atomic<LPARAM> g_pendingInteractiveTransitionFlags = 0;
 RECT g_realDraggedWindowRect = {};
 RECT g_lastDraggedWindowRect = {};
+RECT g_lastDraggedVisualRect = {};
 bool g_lastDraggedWindowZoomed = false;
 bool g_finalizingMoveSize = false;
 std::atomic_bool g_realDragging = false;
@@ -8192,6 +8193,7 @@ static void ResetDragInputState()
     g_monitorTransitionRebaseUntil = 0;
     g_realDraggedWindowRect = {};
     g_lastDraggedWindowRect = {};
+    g_lastDraggedVisualRect = {};
     g_lastDraggedWindowZoomed = false;
     g_finalizingMoveSize = false;
 }
@@ -8863,50 +8865,56 @@ static void UninitializeDpiSupport()
     }
 }
 
-static double GetVisualCoordinateScale(HWND hwnd, const RECT& windowRect,
-                                       UINT* windowDpiOut = nullptr,
-                                       UINT* monitorDpiOut = nullptr)
+struct WindowVisualCoordinates
 {
-    if (windowDpiOut)
+    RECT rect = {};
+    Vec2 cursor = {};
+    double scaleX = 1.0;
+    double scaleY = 1.0;
+    bool converted = false;
+};
+
+static WindowVisualCoordinates GetWindowVisualCoordinates(HWND hwnd,
+                                                           const RECT& fallbackRect,
+                                                           const POINT& physicalCursor)
+{
+    WindowVisualCoordinates result = {
+        fallbackRect,
+        {static_cast<double>(physicalCursor.x), static_cast<double>(physicalCursor.y)}};
+    if (!hwnd || !g_dwmGetWindowAttribute)
     {
-        *windowDpiOut = 0;
+        return result;
     }
-    if (monitorDpiOut)
+    constexpr DWORD dwmwaExtendedFrameBounds = 9;
+    RECT physicalRect = {};
+    if (FAILED(g_dwmGetWindowAttribute(hwnd, dwmwaExtendedFrameBounds,
+                                       &physicalRect, sizeof(physicalRect))) ||
+        physicalRect.right <= physicalRect.left || physicalRect.bottom <= physicalRect.top)
     {
-        *monitorDpiOut = 0;
+        return result;
     }
-    if (!hwnd || !g_getDpiForMonitor)
+    POINT logicalTopLeft = {physicalRect.left, physicalRect.top};
+    POINT logicalBottomRight = {physicalRect.right, physicalRect.bottom};
+    if (!PhysicalToLogicalPointForPerMonitorDPI(hwnd, &logicalTopLeft) ||
+        !PhysicalToLogicalPointForPerMonitorDPI(hwnd, &logicalBottomRight) ||
+        logicalBottomRight.x <= logicalTopLeft.x ||
+        logicalBottomRight.y <= logicalTopLeft.y)
     {
-        return 1.0;
+        return result;
     }
-    HMONITOR monitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONEAREST);
-    UINT monitorDpiX = 0;
-    UINT monitorDpiY = 0;
-    if (!monitor ||
-        FAILED(g_getDpiForMonitor(monitor,
-                                  0, // MDT_EFFECTIVE_DPI
-                                  &monitorDpiX, &monitorDpiY)) ||
-        monitorDpiX == 0)
-    {
-        return 1.0;
-    }
-    UINT windowDpi = GetDpiForWindow(hwnd);
-    if (windowDpi == 0)
-    {
-        return 1.0;
-    }
-    if (windowDpiOut)
-    {
-        *windowDpiOut = windowDpi;
-    }
-    if (monitorDpiOut)
-    {
-        *monitorDpiOut = monitorDpiX;
-    }
-    // DWM keeps system-DPI-aware window visuals in the app's coordinate space.
-    // Convert physical window/cursor coordinates to that space on every monitor.
-    return std::clamp(static_cast<double>(windowDpi) / static_cast<double>(monitorDpiX), 0.50,
-                      2.00);
+    result.rect = {logicalTopLeft.x, logicalTopLeft.y,
+                   logicalBottomRight.x, logicalBottomRight.y};
+    result.scaleX = static_cast<double>(logicalBottomRight.x - logicalTopLeft.x) /
+                    static_cast<double>(physicalRect.right - physicalRect.left);
+    result.scaleY = static_cast<double>(logicalBottomRight.y - logicalTopLeft.y) /
+                    static_cast<double>(physicalRect.bottom - physicalRect.top);
+    result.cursor = {
+        static_cast<double>(logicalTopLeft.x) +
+            static_cast<double>(physicalCursor.x - physicalRect.left) * result.scaleX,
+        static_cast<double>(logicalTopLeft.y) +
+            static_cast<double>(physicalCursor.y - physicalRect.top) * result.scaleY};
+    result.converted = true;
+    return result;
 }
 
 static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, double width,
@@ -9066,7 +9074,7 @@ static void HandleMoveSizeStart(HWND hwnd)
         return;
     }
     POINT mousePosition = {};
-    if (!GetCursorPos(&mousePosition))
+    if (!GetPhysicalCursorPos(&mousePosition))
     {
         return;
     }
@@ -9076,9 +9084,18 @@ static void HandleMoveSizeStart(HWND hwnd)
     {
         return;
     }
+    WindowVisualCoordinates visualCoordinates =
+        GetWindowVisualCoordinates(hwnd, rect, mousePosition);
+    int visualWidth = visualCoordinates.rect.right - visualCoordinates.rect.left;
+    int visualHeight = visualCoordinates.rect.bottom - visualCoordinates.rect.top;
+    if (visualWidth <= 0 || visualHeight <= 0)
+    {
+        return;
+    }
     WobblySettings activeSettings = GetSettingsSnapshot();
-    Vec2 localMousePosition = {static_cast<double>(mousePosition.x - rect.left),
-                               static_cast<double>(mousePosition.y - rect.top)};
+    Vec2 localMousePosition = {
+        visualCoordinates.cursor.x - static_cast<double>(visualCoordinates.rect.left),
+        visualCoordinates.cursor.y - static_cast<double>(visualCoordinates.rect.top)};
     bool startedWindowZoomed = IsZoomed(hwnd) != FALSE || IsApproximatelyMonitorWorkArea(rect);
     bool operationResizing = false;
     bool operationTypeKnown = startedWindowZoomed ||
@@ -9087,22 +9104,20 @@ static void HandleMoveSizeStart(HWND hwnd)
     {
         return;
     }
-    UINT windowDpi = 0;
-    UINT monitorDpi = 0;
-    g_visualCoordinateScale =
-        GetVisualCoordinateScale(hwnd, rect, &windowDpi, &monitorDpi);
-    localMousePosition.x *= g_visualCoordinateScale;
-    localMousePosition.y *= g_visualCoordinateScale;
-    if (std::abs(g_visualCoordinateScale - 1.0) > 0.001)
+    g_visualCoordinateScale = visualCoordinates.scaleX;
+    if (visualCoordinates.converted &&
+        (std::abs(visualCoordinates.scaleX - 1.0) > 0.001 ||
+         std::abs(visualCoordinates.scaleY - 1.0) > 0.001))
     {
-        Wh_Log(L"MIXED-DPI VISUAL SCALE: HWND=%p WindowDpi=%u MonitorDpi=%u "
-               L"Scale=%.4f Resize=%d Size=%dx%d Grab=(%.1f,%.1f)",
-               hwnd, windowDpi, monitorDpi, g_visualCoordinateScale,
-               operationTypeKnown && operationResizing, width, height,
+        Wh_Log(L"MIXED-DPI VISUAL COORDINATES: HWND=%p Scale=(%.4f,%.4f) "
+               L"NativeSize=%dx%d VisualSize=%dx%d Resize=%d Grab=(%.1f,%.1f)",
+               hwnd, visualCoordinates.scaleX, visualCoordinates.scaleY,
+               width, height, visualWidth, visualHeight,
+               operationTypeKnown && operationResizing,
                localMousePosition.x, localMousePosition.y);
     }
-    double meshWidth = static_cast<double>(width) * g_visualCoordinateScale;
-    double meshHeight = static_cast<double>(height) * g_visualCoordinateScale;
+    double meshWidth = static_cast<double>(visualWidth);
+    double meshHeight = static_cast<double>(visualHeight);
     int slotIndex =
         AcquireAnimationSlot(hwnd, activeSettings, meshWidth, meshHeight, localMousePosition);
     if (slotIndex < 0)
@@ -9122,27 +9137,27 @@ static void HandleMoveSizeStart(HWND hwnd)
     }
     ReleaseSRWLockExclusive(&g_animationSlotsLock);
     g_dragAnimationSlot = slotIndex;
-    HWND previousMeshTarget =
-        g_liveBaseImageMeshTargetHwnd.exchange(hwnd,
-                                                std::memory_order_acq_rel);
-    if (previousMeshTarget != hwnd)
+    if constexpr (NATIVE_MESH_EXPERIMENT_ENABLED)
     {
-        g_liveBaseImageMeshCanaryStarted.store(false,
-                                                std::memory_order_release);
-        g_liveBaseImageMeshCanarySucceeded.store(false,
-                                                  std::memory_order_release);
-        g_liveBaseImageMeshAnimationLogged.store(false,
-                                                  std::memory_order_release);
-    }
-    HWND activeMeshWindow =
-        g_visibleMeshCanaryHwnd.load(std::memory_order_acquire);
-    if (activeMeshWindow && activeMeshWindow != hwnd)
-    {
-        RequestVisibleMeshCleanupForHwnd(activeMeshWindow);
+        HWND previousMeshTarget =
+            g_liveBaseImageMeshTargetHwnd.exchange(hwnd, std::memory_order_acq_rel);
+        if (previousMeshTarget != hwnd)
+        {
+            g_liveBaseImageMeshCanaryStarted.store(false, std::memory_order_release);
+            g_liveBaseImageMeshCanarySucceeded.store(false, std::memory_order_release);
+            g_liveBaseImageMeshAnimationLogged.store(false, std::memory_order_release);
+        }
+        HWND activeMeshWindow =
+            g_visibleMeshCanaryHwnd.load(std::memory_order_acquire);
+        if (activeMeshWindow && activeMeshWindow != hwnd)
+        {
+            RequestVisibleMeshCleanupForHwnd(activeMeshWindow);
+        }
     }
     g_realDraggedWindow = hwnd;
     g_realDraggedWindowRect = rect;
     g_lastDraggedWindowRect = rect;
+    g_lastDraggedVisualRect = visualCoordinates.rect;
     g_lastDraggedWindowZoomed = startedWindowZoomed;
     g_dragStartedWindowZoomed = startedWindowZoomed;
     g_waitingForInitialRestore = startedWindowZoomed;
@@ -9886,7 +9901,17 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         g_moveTypeKnown = true;
     }
     POINT mousePosition = {};
-    if (!GetCursorPos(&mousePosition))
+    if (!GetPhysicalCursorPos(&mousePosition))
+    {
+        return;
+    }
+    WindowVisualCoordinates visualCoordinates =
+        GetWindowVisualCoordinates(hwnd, rect, mousePosition);
+    int currentVisualWidth =
+        visualCoordinates.rect.right - visualCoordinates.rect.left;
+    int currentVisualHeight =
+        visualCoordinates.rect.bottom - visualCoordinates.rect.top;
+    if (currentVisualWidth <= 0 || currentVisualHeight <= 0)
     {
         return;
     }
@@ -9951,14 +9976,14 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         snapIntentDirection = mouseEdgeState.direction;
     }
     double previousCoordinateScale = g_visualCoordinateScale;
-    double coordinateScale = GetVisualCoordinateScale(hwnd, rect);
+    double coordinateScale = visualCoordinates.scaleX;
     bool coordinateScaleChanged =
         std::abs(coordinateScale - previousCoordinateScale) > 0.001;
     g_visualCoordinateScale = coordinateScale;
     double windowDeltaX =
-        static_cast<double>(rect.left - g_lastDraggedWindowRect.left) * coordinateScale;
+        static_cast<double>(visualCoordinates.rect.left - g_lastDraggedVisualRect.left);
     double windowDeltaY =
-        static_cast<double>(rect.top - g_lastDraggedWindowRect.top) * coordinateScale;
+        static_cast<double>(visualCoordinates.rect.top - g_lastDraggedVisualRect.top);
     int previousWidth = g_lastDraggedWindowRect.right - g_lastDraggedWindowRect.left;
     int previousHeight = g_lastDraggedWindowRect.bottom - g_lastDraggedWindowRect.top;
     bool sizeChanged = currentWidth != previousWidth || currentHeight != previousHeight;
@@ -9987,10 +10012,11 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     bool rebaseMonitorTransition =
         !g_realResizing && now <= g_monitorTransitionRebaseUntil &&
         (monitorChanged || dpiReflow || coordinateScaleChanged || largeNativeCatchUp);
-    Vec2 localMousePosition = {static_cast<double>(mousePosition.x - rect.left) * coordinateScale,
-                               static_cast<double>(mousePosition.y - rect.top) * coordinateScale};
-    double currentMeshWidth = static_cast<double>(currentWidth) * coordinateScale;
-    double currentMeshHeight = static_cast<double>(currentHeight) * coordinateScale;
+    Vec2 localMousePosition = {
+        visualCoordinates.cursor.x - static_cast<double>(visualCoordinates.rect.left),
+        visualCoordinates.cursor.y - static_cast<double>(visualCoordinates.rect.top)};
+    double currentMeshWidth = static_cast<double>(currentVisualWidth);
+    double currentMeshHeight = static_cast<double>(currentVisualHeight);
     AcquireSRWLockExclusive(&g_animationSlotsLock);
     WindowAnimationSlot& slot = g_animationSlots[slotIndex];
     if (!slot.active || slot.hwnd != hwnd)
@@ -10015,6 +10041,7 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         slot.meshRevision++;
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
         g_lastDraggedWindowRect = rect;
+        g_lastDraggedVisualRect = visualCoordinates.rect;
         g_lastDraggedWindowZoomed = IsZoomed(hwnd) != FALSE;
         g_lastMousePosition = mousePosition;
         RequestDwmScenePass();
@@ -10131,6 +10158,7 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     slot.meshRevision++;
     ReleaseSRWLockExclusive(&g_animationSlotsLock);
     g_lastDraggedWindowRect = rect;
+    g_lastDraggedVisualRect = visualCoordinates.rect;
     g_lastDraggedWindowZoomed = windowZoomed;
     g_lastMousePosition = mousePosition;
 }
@@ -10145,7 +10173,8 @@ static void HandleMoveSizeEnd(HWND hwnd)
     }
     int slotIndex = g_dragAnimationSlot;
     POINT releaseMousePosition = {};
-    bool hasReleaseMousePosition = !g_realResizing && GetCursorPos(&releaseMousePosition);
+    bool hasReleaseMousePosition =
+        !g_realResizing && GetPhysicalCursorPos(&releaseMousePosition);
     MonitorEdgeState releaseEdgeState = hasReleaseMousePosition
                                             ? GetPointMonitorEdgeState(releaseMousePosition)
                                             : MonitorEdgeState{};
