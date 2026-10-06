@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.218
+// @version         0.219
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -877,7 +877,7 @@ static void EnsurePendingMatrixTransformProxies();
 static void MaintainMeshLayer();
 static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                                void* topLevelWindow,
-                               void* sourceVisualProxy);
+                               void* sourceVisualProxy, bool clientSource);
 static bool HasAnyAnimationSlots();
 static int GetPointIndex(int x, int y);
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy);
@@ -3372,7 +3372,7 @@ static void MaintainMeshLayer()
 
 static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                                void* topLevelWindow,
-                               void* sourceVisualProxy)
+                               void* sourceVisualProxy, bool clientSource)
 {
     if (!IsOnDwmSceneThread() ||
         !g_meshLayerBackendAvailable.load(std::memory_order_acquire) ||
@@ -3458,10 +3458,31 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                                                           completeWindowRoot)
                            : nullptr;
     void* hostVisual = IsNativeVisualPointerValid(rootVisual) ? rootVisual : nullptr;
-    RECT rect = {};
-    bool hasRect = GetWindowRect(hwnd, &rect) != FALSE;
-    double width = hasRect ? static_cast<double>(rect.right - rect.left) : 0.0;
-    double height = hasRect ? static_cast<double>(rect.bottom - rect.top) : 0.0;
+    RECT windowRect = {};
+    RECT sourceBounds = {};
+    POINT clientOrigin = {};
+    bool hasWindowRect = GetWindowRect(hwnd, &windowRect) != FALSE;
+    bool hasSourceBounds = clientSource
+                               ? GetClientRect(hwnd, &sourceBounds) != FALSE
+                               : hasWindowRect;
+    if (!clientSource && hasWindowRect)
+    {
+        sourceBounds = {0, 0, windowRect.right - windowRect.left,
+                        windowRect.bottom - windowRect.top};
+    }
+    bool hasClientOrigin = !clientSource || ClientToScreen(hwnd, &clientOrigin);
+    double originX = clientSource && hasWindowRect && hasClientOrigin
+                         ? static_cast<double>(clientOrigin.x - windowRect.left)
+                         : 0.0;
+    double originY = clientSource && hasWindowRect && hasClientOrigin
+                         ? static_cast<double>(clientOrigin.y - windowRect.top)
+                         : 0.0;
+    double width = hasSourceBounds
+                       ? static_cast<double>(sourceBounds.right - sourceBounds.left)
+                       : 0.0;
+    double height = hasSourceBounds
+                        ? static_cast<double>(sourceBounds.bottom - sourceBounds.top)
+                        : 0.0;
 
     if (IsDwmObjectPointerValid(compositor, g_compositorVtable) &&
         hostVisual && width > 0.0 && height > 0.0 && createProxy &&
@@ -3507,8 +3528,10 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                 int index = GetPointIndex(x, y);
                 float tx = static_cast<float>(x) / (GRID_WIDTH - 1);
                 float ty = static_cast<float>(y) / (GRID_HEIGHT - 1);
-                float positionX = tx * static_cast<float>(width);
-                float positionY = ty * static_cast<float>(height);
+                float positionX = static_cast<float>(originX) +
+                                  tx * static_cast<float>(width);
+                float positionY = static_cast<float>(originY) +
+                                  ty * static_cast<float>(height);
                 // Deliberately obvious but non-folding test shape. Keeping this
                 // static separates geometry/order problems from live physics.
                 float horizontalInset =
@@ -3634,9 +3657,12 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         g_meshLayerActive.store(true, std::memory_order_release);
         Wh_Log(L"4x4 static-warp layer attached: Slot=%d HWND=%p Source=%p "
                L"Root=%p Host=%p HostProxy=%p LayerProxy=%p "
-               L"snapshot=frozen order=topmost shape=hourglass size=%.0fx%.0f",
+               L"sourceKind=%s snapshot=frozen order=topmost shape=hourglass "
+               L"origin=%.0f,%.0f size=%.0fx%.0f",
                slotIndex, hwnd, sourceVisualProxy, rootVisual, hostVisual,
-               hostVisualProxy, renderVisualProxy, width, height);
+               hostVisualProxy, renderVisualProxy,
+               clientSource ? L"CanvasRoot" : L"CompleteWindowRoot",
+               originX, originY, width, height);
         return;
     }
 
@@ -3655,10 +3681,11 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     }
     Wh_Log(L"4x4 mesh layer failed: Slot=%d HWND=%p Stage=%s "
            L"result=0x%08X Root=%p Host=%p HostProxy=%p LayerProxy=%p "
-           L"size=%.0fx%.0f",
+           L"sourceKind=%s origin=%.0f,%.0f size=%.0fx%.0f",
            slotIndex, hwnd, stage, static_cast<unsigned int>(result),
-           rootVisual, hostVisual, hostVisualProxy, renderVisualProxy, width,
-           height);
+           rootVisual, hostVisual, hostVisualProxy, renderVisualProxy,
+           clientSource ? L"CanvasRoot" : L"CompleteWindowRoot", originX,
+           originY, width, height);
 }
 
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
@@ -3797,8 +3824,22 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         }
         if (rendererMode == RendererMode::MeshLayer && topLevelVisualProxy)
         {
-            TryAttachMeshLayer(i, generation, hwnd, topLevelWindow,
-                               topLevelVisualProxy);
+            void* meshSourceVisualProxy = nullptr;
+            if (g_getCanvasRootVisualProxy && topLevelWindow)
+            {
+                void* canvasProxy = g_getCanvasRootVisualProxy(topLevelWindow);
+                if (IsVisualProxyPointerValid(canvasProxy))
+                {
+                    meshSourceVisualProxy = canvasProxy;
+                }
+            }
+            bool clientSource = meshSourceVisualProxy &&
+                                meshSourceVisualProxy != topLevelVisualProxy;
+            TryAttachMeshLayer(
+                i, generation, hwnd, topLevelWindow,
+                meshSourceVisualProxy ? meshSourceVisualProxy
+                                      : topLevelVisualProxy,
+                clientSource);
         }
         bool logBinding = false;
         bool logBindingFailure = false;
