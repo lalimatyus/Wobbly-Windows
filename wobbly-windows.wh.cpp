@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.216
+// @version         0.217
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -92,7 +92,7 @@ the combined mod is not offered under GPLv2.
 
 - Renderer: "affine"
   $name: Renderer
-  $description: The experimental mode adds an identity 4x4 GPU layer while retaining the stable affine renderer.
+  $description: The experimental mode adds a separate 4x4 GPU layer while retaining the stable affine renderer.
   $options:
   - "affine": "Affine (stable)"
   - "mesh-layer": "True 4x4 mesh layer (experimental)"
@@ -3311,7 +3311,7 @@ static bool DetachMeshLayer(const wchar_t* reason)
                                    : E_NOINTERFACE;
     if (result < 0)
     {
-        Wh_Log(L"4x4 identity layer detach deferred: HWND=%p reason=%s "
+        Wh_Log(L"4x4 mesh layer detach deferred: HWND=%p reason=%s "
                L"result=0x%08X",
                g_meshLayerState.hwnd, reason,
                static_cast<unsigned int>(result));
@@ -3322,7 +3322,7 @@ static bool DetachMeshLayer(const wchar_t* reason)
     HWND hwnd = g_meshLayerState.hwnd;
     ReleaseMeshLayerResources(g_meshLayerState);
     g_meshLayerActive.store(false, std::memory_order_release);
-    Wh_Log(L"4x4 identity layer detached: HWND=%p reason=%s result=0x%08X",
+    Wh_Log(L"4x4 mesh layer detached: HWND=%p reason=%s result=0x%08X",
            hwnd, reason, static_cast<unsigned int>(result));
     return true;
 }
@@ -3481,8 +3481,31 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                 int index = GetPointIndex(x, y);
                 float tx = static_cast<float>(x) / (GRID_WIDTH - 1);
                 float ty = static_cast<float>(y) / (GRID_HEIGHT - 1);
-                positions[index] = {tx * static_cast<float>(width),
-                                    ty * static_cast<float>(height), 0.0f};
+                float positionX = tx * static_cast<float>(width);
+                float positionY = ty * static_cast<float>(height);
+                // Deliberately obvious but non-folding test shape. Keeping this
+                // static separates geometry/order problems from live physics.
+                float horizontalInset =
+                    std::sin(ty * 3.14159265f) * static_cast<float>(width) * 0.10f;
+                float verticalInset =
+                    std::sin(tx * 3.14159265f) * static_cast<float>(height) * 0.07f;
+                if (x == 0)
+                {
+                    positionX += horizontalInset;
+                }
+                else if (x == GRID_WIDTH - 1)
+                {
+                    positionX -= horizontalInset;
+                }
+                if (y == 0)
+                {
+                    positionY += verticalInset;
+                }
+                else if (y == GRID_HEIGHT - 1)
+                {
+                    positionY -= verticalInset;
+                }
+                positions[index] = {positionX, positionY, 0.0f};
                 textureCoordinates[index] = {tx, ty};
             }
         }
@@ -3556,8 +3579,8 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     {
         g_meshLayerState = pending;
         g_meshLayerActive.store(true, std::memory_order_release);
-        Wh_Log(L"4x4 identity layer attached: Slot=%d HWND=%p Source=%p "
-               L"Root=%p Host=%p snapshot=frozen size=%.0fx%.0f",
+        Wh_Log(L"4x4 static-warp layer attached: Slot=%d HWND=%p Source=%p "
+               L"Root=%p Host=%p snapshot=frozen shape=hourglass size=%.0fx%.0f",
                slotIndex, hwnd, sourceVisualProxy, rootVisual, hostVisual,
                width, height);
         return;
@@ -3576,7 +3599,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     {
         ReleaseMeshLayerResources(pending);
     }
-    Wh_Log(L"4x4 identity layer failed: Slot=%d HWND=%p Stage=%s "
+    Wh_Log(L"4x4 mesh layer failed: Slot=%d HWND=%p Stage=%s "
            L"result=0x%08X Root=%p Host=%p size=%.0fx%.0f",
            slotIndex, hwnd, stage, static_cast<unsigned int>(result),
            rootVisual, hostVisual, width, height);
