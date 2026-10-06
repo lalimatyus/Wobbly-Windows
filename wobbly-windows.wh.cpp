@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.206
+// @version         0.207
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1006,8 +1006,11 @@ std::atomic_bool g_nativeMeshCanarySucceeded = false;
 // Discovery stays read-only until both the exact owner and a reversible
 // replacement transaction are proven. Older slot-replacement experiments
 // could leave an identity mesh instruction alive after the mod was unloaded.
+// Keep the experimental implementation compiled, but don't detour DWM's
+// render/visual pipeline in the affine safety baseline.
+static constexpr bool NATIVE_MESH_EXPERIMENT_ENABLED = false;
 static constexpr bool NATIVE_MESH_WRITE_PROBE_ENABLED = false;
-static constexpr bool NATIVE_MESH_TRANSACTION_PROBE_ENABLED = true;
+static constexpr bool NATIVE_MESH_TRANSACTION_PROBE_ENABLED = false;
 std::atomic_bool g_liveBaseImageMeshCanaryStarted = false;
 std::atomic_bool g_liveBaseImageMeshCanarySucceeded = false;
 std::atomic_bool g_liveBaseImageMeshAnimationLogged = false;
@@ -4650,13 +4653,16 @@ static bool InitializeDwmHooks()
         {{L"public: virtual long __cdecl CWindowBorder::CloneVisualTree("
            L"class CVisual * *,enum CloneOptions)"},
          &g_windowBorderCloneVisualTreeOriginal,
-         CWindowBorderCloneVisualTreeHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? CWindowBorderCloneVisualTreeHook
+                                        : nullptr,
          true},
         {{L"public: long __cdecl "
            L"CTopLevelWindow::CloneVisualTreeForLivePreview("
            L"bool,class CTopLevelWindow * *)"},
          &g_topLevelWindowCloneVisualTreeForLivePreviewOriginal,
-         CTopLevelWindowCloneVisualTreeForLivePreviewHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED
+             ? CTopLevelWindowCloneVisualTreeForLivePreviewHook
+             : nullptr,
          true},
         {{L"public: virtual class CTopLevelWindow3D * __cdecl "
             L"winrt::Udwm::Transitions::implementation::TopLevelWindow3DWrapper::GetVisualWeak(void)"},
@@ -4719,7 +4725,8 @@ static bool InitializeDwmHooks()
           L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CBitmapSourceProxy>(class CBitmapSourceProxy * *)"},
          &g_createBitmapSourceProxyOriginal,
-         CreateBitmapSourceProxyHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? CreateBitmapSourceProxyHook
+                                        : nullptr,
          true},
         {{L"public: long __cdecl "
            L"CCompositor::CreateVisualSurfaceProxyFromSharedHandle("
@@ -4728,7 +4735,8 @@ static bool InitializeDwmHooks()
            L"class CVisualSurfaceProxy>(void *,"
            L"class CVisualSurfaceProxy * *)"},
          &g_createVisualSurfaceProxyOriginal,
-         CreateVisualSurfaceProxyHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? CreateVisualSurfaceProxyHook
+                                        : nullptr,
          true},
         {{L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CCachedVisualImageProxy>("
@@ -4788,48 +4796,62 @@ static bool InitializeDwmHooks()
         {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
            L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
          &g_drawBitmapInstructionCreateOriginal,
-         DrawBitmapInstructionCreateHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? DrawBitmapInstructionCreateHook
+                                        : nullptr,
          true},
         {{L"public: static long __cdecl CDrawTileImageInstruction::Create("
            L"class CBaseImageProxy *,struct tagRECT const &,"
            L"struct tagPOINT const &,float,"
            L"class CDrawTileImageInstruction * *)"},
          &g_drawTileImageInstructionCreateOriginal,
-         DrawTileImageInstructionCreateHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? DrawTileImageInstructionCreateHook
+                                        : nullptr,
          true},
         {{L"public: long __cdecl CRenderDataVisual::AddInstruction("
            L"class CRenderDataInstruction *)"},
          &g_renderDataVisualAddInstruction,
-         RenderDataVisualAddInstructionHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED
+             ? RenderDataVisualAddInstructionHook
+             : nullptr,
          true},
         {{L"public: long __cdecl CRenderDataVisual::ClearInstructions(void)"},
          &g_renderDataVisualClearInstructions,
-         RenderDataVisualClearInstructionsHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED
+             ? RenderDataVisualClearInstructionsHook
+             : nullptr,
          true},
         {{L"public: virtual long __cdecl "
            L"CRenderDataVisual::UpdateRenderData(void)"},
          &g_renderDataVisualUpdateRenderData,
-         RenderDataVisualUpdateRenderDataHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED
+             ? RenderDataVisualUpdateRenderDataHook
+             : nullptr,
          true},
         {{L"private: long __cdecl CTopLevelWindow3D::EnsureRenderData(void)",
           L"protected: long __cdecl CTopLevelWindow3D::EnsureRenderData(void)",
           L"public: long __cdecl CTopLevelWindow3D::EnsureRenderData(void)"},
          &g_topLevelWindow3DEnsureRenderDataOriginal,
-         TopLevelWindow3DEnsureRenderDataHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED
+             ? TopLevelWindow3DEnsureRenderDataHook
+             : nullptr,
          true},
         {{L"public: long __cdecl "
            L"CTopLevelWindow3D::EnsureSecondaryWindowRepresentation(bool)"},
          &g_topLevelWindow3DEnsureSecondaryWindowRepresentationOriginal,
-         TopLevelWindow3DEnsureSecondaryWindowRepresentationHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED
+             ? TopLevelWindow3DEnsureSecondaryWindowRepresentationHook
+             : nullptr,
          true},
         {{L"public: virtual long __cdecl "
            L"CTopLevelWindow3D::SetParent(class CVisual *)"},
          &g_topLevelWindow3DSetParentOriginal,
-         TopLevelWindow3DSetParentHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? TopLevelWindow3DSetParentHook
+                                        : nullptr,
          true},
         {{L"public: long __cdecl CTopLevelWindow3D::ShowWindow(bool,bool)"},
          &g_topLevelWindow3DShowWindowOriginal,
-         TopLevelWindow3DShowWindowHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? TopLevelWindow3DShowWindowHook
+                                        : nullptr,
          true},
         {{L"public: static long __cdecl CRenderDataVisual::Create("
            L"class CRenderDataVisual * *)"},
@@ -4839,49 +4861,56 @@ static bool InitializeDwmHooks()
         {{L"public: long __cdecl CVisualProxy::SetContent("
            L"class CResourceProxy const *)"},
          &g_visualProxySetContentOriginal,
-         VisualProxySetContentHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualProxySetContentHook
+                                        : nullptr,
          true},
         {{L"public: long __cdecl CVisualProxy::InsertChild("
            L"class CVisualProxy *,class CVisualProxy *,bool)"},
          &g_visualProxyInsertChildOriginal,
-         VisualProxyInsertChildHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualProxyInsertChildHook
+                                        : nullptr,
          true},
         {{L"public: long __cdecl CVisualProxy::RemoveChild("
            L"class CVisualProxy *)"},
          &g_visualProxyRemoveChildOriginal,
-         VisualProxyRemoveChildHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualProxyRemoveChildHook
+                                        : nullptr,
          true},
         {{L"public: long __cdecl CRedirectVisualProxy::SetRedirectedVisual("
            L"class CVisualProxy *)"},
          &g_redirectVisualProxySetRedirectedVisualOriginal,
-         RedirectVisualProxySetRedirectedVisualHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED
+             ? RedirectVisualProxySetRedirectedVisualHook
+             : nullptr,
          true},
         {{L"public: virtual long __cdecl CVisual::SetContent("
            L"class CResourceProxy *)"},
          &g_visualSetContentOriginal,
-         VisualSetContentHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualSetContentHook : nullptr,
          true},
         {{L"public: virtual long __cdecl CVisual::SetParent(class CVisual *)",
           L"public: virtual long __cdecl CVisual::SetParent("
            L"class CContainerVisual *)"},
          &g_visualSetParentOriginal,
-         VisualSetParentHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualSetParentHook : nullptr,
          true},
         {{L"public: long __cdecl CVisual::RemoveSelfFromParent(void)"},
          &g_visualRemoveSelfFromParentOriginal,
-         VisualRemoveSelfFromParentHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED
+             ? VisualRemoveSelfFromParentHook
+             : nullptr,
          true},
         {{L"public: void __cdecl CVisual::Hide(void)"},
          &g_visualHideOriginal,
-         VisualHideHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualHideHook : nullptr,
          true},
         {{L"public: void __cdecl CVisual::Unhide(void)"},
          &g_visualUnhideOriginal,
-         VisualUnhideHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualUnhideHook : nullptr,
          true},
         {{L"public: virtual void __cdecl CVisual::SetOpacity(double)"},
          &g_visualSetOpacityOriginal,
-         VisualSetOpacityHook,
+         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualSetOpacityHook : nullptr,
          true},
         {{L"public: virtual class CVisual * __cdecl "
            L"CVisual::GetTransformParent(void)const",
@@ -11430,7 +11459,8 @@ void Wh_ModAfterInit()
     // Windhawk activates detours after Wh_ModInit returns. Queue the first
     // scene pass only now so already-open windows cannot miss the wake.
     QueueExistingWindowBackfill();
-    if (g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
+    if (NATIVE_MESH_EXPERIMENT_ENABLED &&
+        g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
         g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate)
     {
         g_nativeMeshCanaryPending.store(true, std::memory_order_release);
