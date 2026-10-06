@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.219
+// @version         0.220
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -426,6 +426,11 @@ using CGeometry2dGroupProxyUpdate_t = long(__cdecl*)(void* pThis,
                                                      void* meshProxy);
 using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(
     void* geometryGroupProxy, void* bitmapSourceProxy, void** instruction);
+using CDrawBitmapInstructionCreate_t = long(__cdecl*)(void* imageProxy,
+                                                       void** instruction);
+using CDrawTileImageInstructionCreate_t = long(__cdecl*)(
+    void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
+    float opacity, void** instruction);
 using CCachedVisualImageProxyUpdate_t = long(__cdecl*)(
     void* pThis, const MilRectF& sourceRect, const MilSizeD& size,
     const void* rectAnimation, const void* sizeAnimation, void* visualProxy,
@@ -490,12 +495,39 @@ struct MeshLayerSymbols
 
     bool IsComplete() const
     {
-        return HasGeometryPipeline() && HasImagePipeline() && HasVisualPipeline();
+        return HasGeometryPipeline() && HasVisualPipeline();
     }
 };
 
 MeshLayerSymbols g_meshLayerSymbols;
 std::atomic_bool g_meshLayerBackendAvailable = false;
+CDrawBitmapInstructionCreate_t g_drawBitmapInstructionCreateOriginal = nullptr;
+CDrawTileImageInstructionCreate_t g_drawTileImageInstructionCreateOriginal =
+    nullptr;
+CRenderDataVisualAddInstruction_t
+    g_renderDataVisualAddInstructionOriginal = nullptr;
+
+static constexpr unsigned int OBSERVED_IMAGE_COUNT = 2048;
+static constexpr unsigned int OBSERVED_IMAGE_PROBES = 24;
+
+struct ObservedBitmapInstruction
+{
+    std::atomic<void*> instruction;
+    std::atomic<void*> imageProxy;
+};
+
+struct ObservedRenderImage
+{
+    std::atomic<void*> visual;
+    std::atomic<void*> imageProxy;
+    std::atomic<ULONGLONG> sequence;
+};
+
+ObservedBitmapInstruction
+    g_observedBitmapInstructions[OBSERVED_IMAGE_COUNT] = {};
+ObservedRenderImage g_observedRenderImages[OBSERVED_IMAGE_COUNT] = {};
+std::atomic<ULONGLONG> g_observedImageSequence = 0;
+std::atomic_bool g_meshImageObservationAvailable = false;
 
 struct MeshLayerState
 {
@@ -514,6 +546,8 @@ MeshLayerState g_meshLayerState = {};
 std::atomic_bool g_meshLayerActive = false;
 int g_meshLayerAttemptSlot = -1;
 ULONGLONG g_meshLayerAttemptGeneration = 0;
+int g_meshImagePendingLogSlot = -1;
+ULONGLONG g_meshImagePendingLogGeneration = 0;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
@@ -875,9 +909,17 @@ static void RestorePendingAnimationIdentities();
 static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
 static void MaintainMeshLayer();
+static void* FindObservedImageForWindow(void* topLevelWindow3D, HWND hwnd);
 static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                                void* topLevelWindow,
-                               void* sourceVisualProxy, bool clientSource);
+                               void* imageProxy);
+static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
+                                                     void** instruction);
+static long __cdecl DrawTileImageInstructionCreateHook(
+    void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
+    float opacity, void** instruction);
+static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
+                                                        void* instruction);
 static bool HasAnyAnimationSlots();
 static int GetPointIndex(int x, int y);
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy);
@@ -2722,6 +2764,149 @@ static void* FindDwmCompositor()
     return g_dwmCompositor.load(std::memory_order_acquire);
 }
 
+static ObservedBitmapInstruction* FindObservedBitmapInstruction(
+    void* instruction, bool create)
+{
+    if (!instruction)
+    {
+        return nullptr;
+    }
+    size_t hash = (reinterpret_cast<uintptr_t>(instruction) >> 4) %
+                  OBSERVED_IMAGE_COUNT;
+    for (unsigned int probe = 0; probe < OBSERVED_IMAGE_PROBES; probe++)
+    {
+        ObservedBitmapInstruction& entry =
+            g_observedBitmapInstructions[(hash + probe) % OBSERVED_IMAGE_COUNT];
+        void* observed = entry.instruction.load(std::memory_order_acquire);
+        if (observed == instruction)
+        {
+            return &entry;
+        }
+        if (!observed && create)
+        {
+            void* expected = nullptr;
+            if (entry.instruction.compare_exchange_strong(
+                    expected, instruction, std::memory_order_acq_rel,
+                    std::memory_order_acquire))
+            {
+                entry.imageProxy.store(nullptr, std::memory_order_relaxed);
+                return &entry;
+            }
+            if (expected == instruction)
+            {
+                return &entry;
+            }
+        }
+    }
+    return nullptr;
+}
+
+static ObservedRenderImage* FindObservedRenderImage(void* visual, bool create)
+{
+    if (!visual)
+    {
+        return nullptr;
+    }
+    size_t hash = (reinterpret_cast<uintptr_t>(visual) >> 4) %
+                  OBSERVED_IMAGE_COUNT;
+    for (unsigned int probe = 0; probe < OBSERVED_IMAGE_PROBES; probe++)
+    {
+        ObservedRenderImage& entry =
+            g_observedRenderImages[(hash + probe) % OBSERVED_IMAGE_COUNT];
+        void* observed = entry.visual.load(std::memory_order_acquire);
+        if (observed == visual)
+        {
+            return &entry;
+        }
+        if (!observed && create)
+        {
+            void* expected = nullptr;
+            if (entry.visual.compare_exchange_strong(
+                    expected, visual, std::memory_order_acq_rel,
+                    std::memory_order_acquire))
+            {
+                entry.imageProxy.store(nullptr, std::memory_order_relaxed);
+                entry.sequence.store(0, std::memory_order_relaxed);
+                return &entry;
+            }
+            if (expected == visual)
+            {
+                return &entry;
+            }
+        }
+    }
+    return nullptr;
+}
+
+static void RememberObservedBitmapInstruction(void* instruction,
+                                               void* imageProxy)
+{
+    if (instruction && imageProxy)
+    {
+        if (ObservedBitmapInstruction* entry =
+                FindObservedBitmapInstruction(instruction, true))
+        {
+            entry->imageProxy.store(imageProxy, std::memory_order_release);
+        }
+    }
+}
+
+static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
+                                                     void** instruction)
+{
+    long result = g_drawBitmapInstructionCreateOriginal(imageProxy, instruction);
+    if (result >= 0 && instruction && *instruction &&
+        !g_unloading.load(std::memory_order_acquire))
+    {
+        RememberObservedBitmapInstruction(*instruction, imageProxy);
+    }
+    return result;
+}
+
+static long __cdecl DrawTileImageInstructionCreateHook(
+    void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
+    float opacity, void** instruction)
+{
+    long result = g_drawTileImageInstructionCreateOriginal(
+        imageProxy, sourceRect, destinationOffset, opacity, instruction);
+    if (result >= 0 && instruction && *instruction &&
+        !g_unloading.load(std::memory_order_acquire))
+    {
+        RememberObservedBitmapInstruction(*instruction, imageProxy);
+    }
+    return result;
+}
+
+static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
+                                                        void* instruction)
+{
+    long result =
+        g_renderDataVisualAddInstructionOriginal(pThis, instruction);
+    if (result >= 0 && pThis && instruction &&
+        !g_unloading.load(std::memory_order_acquire))
+    {
+        ObservedBitmapInstruction* source =
+            FindObservedBitmapInstruction(instruction, false);
+        void* imageProxy = source
+                               ? source->imageProxy.load(std::memory_order_acquire)
+                               : nullptr;
+        if (imageProxy)
+        {
+            if (ObservedRenderImage* entry =
+                    FindObservedRenderImage(pThis, true))
+            {
+                entry->imageProxy.store(imageProxy, std::memory_order_relaxed);
+                entry->sequence.store(
+                    g_observedImageSequence.fetch_add(
+                        1, std::memory_order_acq_rel) +
+                        1,
+                    std::memory_order_release);
+            }
+        }
+    }
+    return result;
+}
+
 static bool InitializeDwmHooks()
 {
     HMODULE udwm = GetModuleHandleW(L"udwm.dll");
@@ -2849,6 +3034,18 @@ static bool InitializeDwmHooks()
            L"class CGeometry2dGroupProxy *,class CBitmapSourceProxy *,"
            L"class CDrawMesh2DInstruction * *)"},
          &g_meshLayerSymbols.createMeshInstruction, nullptr, true},
+        {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
+           L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
+         &g_drawBitmapInstructionCreateOriginal,
+         DrawBitmapInstructionCreateHook,
+         true},
+        {{L"public: static long __cdecl CDrawTileImageInstruction::Create("
+           L"class CBaseImageProxy *,struct tagRECT const &,"
+           L"struct tagPOINT const &,float,"
+           L"class CDrawTileImageInstruction * *)"},
+         &g_drawTileImageInstructionCreateOriginal,
+         DrawTileImageInstructionCreateHook,
+         true},
         {{L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CCachedVisualImageProxy>(class CCachedVisualImageProxy * *)"},
          &g_meshLayerSymbols.createCachedImage, nullptr, true},
@@ -2867,7 +3064,9 @@ static bool InitializeDwmHooks()
          &g_meshLayerSymbols.createRenderDataVisual, nullptr, true},
         {{L"public: long __cdecl CRenderDataVisual::AddInstruction("
            L"class CRenderDataInstruction *)"},
-         &g_meshLayerSymbols.addRenderInstruction, nullptr, true},
+         &g_renderDataVisualAddInstructionOriginal,
+         RenderDataVisualAddInstructionHook,
+         true},
         {{L"public: virtual long __cdecl CRenderDataVisual::UpdateRenderData(void)"},
          &g_meshLayerSymbols.updateRenderData, nullptr, true},
         {{L"public: long __cdecl CVisualProxy::InsertChild("
@@ -3014,12 +3213,16 @@ static bool InitializeDwmHooks()
     keepValid(g_meshLayerSymbols.createGeometryGroup);
     keepValid(g_meshLayerSymbols.geometryGroupUpdate);
     keepValid(g_meshLayerSymbols.createMeshInstruction);
+    keepValid(g_drawBitmapInstructionCreateOriginal);
+    keepValid(g_drawTileImageInstructionCreateOriginal);
     keepValid(g_meshLayerSymbols.createCachedImage);
     keepValid(g_meshLayerSymbols.cachedImageUpdate);
     keepValid(g_meshLayerSymbols.cachedImageSnapshot);
     keepValid(g_meshLayerSymbols.cachedImageFreeze);
     keepValid(g_meshLayerSymbols.createRenderDataVisual);
-    keepValid(g_meshLayerSymbols.addRenderInstruction);
+    keepValid(g_renderDataVisualAddInstructionOriginal);
+    g_meshLayerSymbols.addRenderInstruction =
+        reinterpret_cast<void*>(g_renderDataVisualAddInstructionOriginal);
     keepValid(g_meshLayerSymbols.updateRenderData);
     keepValid(g_meshLayerSymbols.insertVisualChild);
     keepValid(g_meshLayerSymbols.removeVisualChild);
@@ -3027,14 +3230,25 @@ static bool InitializeDwmHooks()
     keepValid(g_meshLayerSymbols.removeVisualFromParent);
     keepValid(g_meshLayerSymbols.getVisualParent);
     keepValid(g_meshLayerSymbols.getVisualProxy);
-    g_meshLayerBackendAvailable.store(g_meshLayerSymbols.IsComplete(),
+    g_meshImageObservationAvailable.store(
+        g_drawBitmapInstructionCreateOriginal &&
+            g_renderDataVisualAddInstructionOriginal,
+        std::memory_order_release);
+    bool meshLayerComplete = g_meshLayerSymbols.IsComplete() &&
+                             g_meshImageObservationAvailable.load(
+                                 std::memory_order_acquire);
+    g_meshLayerBackendAvailable.store(meshLayerComplete,
                                       std::memory_order_release);
     Wh_Log(L"4x4 mesh-layer prerequisites: geometry=%s image=%s visual=%s "
-           L"complete=%s (identity-layer test; affine renderer remains active)",
+           L"complete=%s (direct live-image test; affine renderer remains active)",
            g_meshLayerSymbols.HasGeometryPipeline() ? L"available" : L"unavailable",
            g_meshLayerSymbols.HasImagePipeline() ? L"available" : L"unavailable",
            g_meshLayerSymbols.HasVisualPipeline() ? L"available" : L"unavailable",
-           g_meshLayerSymbols.IsComplete() ? L"yes" : L"no");
+           meshLayerComplete ? L"yes" : L"no");
+    Wh_Log(L"4x4 direct image observation: bitmap=%s tile=%s owner=%s",
+           g_drawBitmapInstructionCreateOriginal ? L"available" : L"unavailable",
+           g_drawTileImageInstructionCreateOriginal ? L"available" : L"unavailable",
+           g_renderDataVisualAddInstructionOriginal ? L"available" : L"unavailable");
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
@@ -3370,14 +3584,46 @@ static void MaintainMeshLayer()
     }
 }
 
+static void* FindObservedImageForWindow(void* topLevelWindow3D, HWND hwnd)
+{
+    if (!hwnd ||
+        !HasExactDwmVtableTrusted(topLevelWindow3D, g_topLevelWindow3DVtable))
+    {
+        return nullptr;
+    }
+
+    void* windowData = FindWindowDataForTopLevelWindow3D(topLevelWindow3D);
+    if (!windowData || GetHwndFromWindowData(windowData) != hwnd)
+    {
+        return nullptr;
+    }
+
+    ObservedRenderImage* observed =
+        FindObservedRenderImage(topLevelWindow3D, false);
+    if (!observed ||
+        observed->sequence.load(std::memory_order_acquire) == 0)
+    {
+        return nullptr;
+    }
+
+    void* imageProxy = observed->imageProxy.load(std::memory_order_acquire);
+    if (!IsReadableMemory(imageProxy, sizeof(void*)))
+    {
+        return nullptr;
+    }
+    void* vtable = *static_cast<void**>(imageProxy);
+    return IsDwmImageAddress(vtable, sizeof(void*)) ? imageProxy : nullptr;
+}
+
 static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                                void* topLevelWindow,
-                               void* sourceVisualProxy, bool clientSource)
+                               void* imageProxy)
 {
     if (!IsOnDwmSceneThread() ||
         !g_meshLayerBackendAvailable.load(std::memory_order_acquire) ||
         !hwnd || !topLevelWindow ||
-        !IsVisualProxyPointerValid(sourceVisualProxy))
+        !IsReadableMemory(imageProxy, sizeof(void*)) ||
+        !IsDwmImageAddress(*static_cast<void**>(imageProxy), sizeof(void*)))
     {
         return;
     }
@@ -3387,7 +3633,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         if (g_meshLayerState.slotIndex == slotIndex &&
             g_meshLayerState.generation == generation &&
             g_meshLayerState.hwnd == hwnd &&
-            g_meshLayerState.sourceVisualProxy == sourceVisualProxy)
+            g_meshLayerState.sourceVisualProxy == imageProxy)
         {
             return;
         }
@@ -3404,15 +3650,6 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     g_meshLayerAttemptSlot = slotIndex;
     g_meshLayerAttemptGeneration = generation;
 
-    auto createProxy = reinterpret_cast<CCompositorCreateProxy_t>(
-        g_meshLayerSymbols.createCachedImage);
-    auto updateCachedImage = reinterpret_cast<CCachedVisualImageProxyUpdate_t>(
-        g_meshLayerSymbols.cachedImageUpdate);
-    auto snapshotCachedImage =
-        reinterpret_cast<CCachedVisualImageProxySnapshot_t>(
-            g_meshLayerSymbols.cachedImageSnapshot);
-    auto freezeCachedImage = reinterpret_cast<CCachedVisualImageProxyFreeze_t>(
-        g_meshLayerSymbols.cachedImageFreeze);
     auto createMesh = reinterpret_cast<CCompositorCreateProxy_t>(
         g_meshLayerSymbols.createMeshGeometry);
     auto updateMesh = reinterpret_cast<CMeshGeometry2dProxyUpdate_t>(
@@ -3444,7 +3681,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     pending.hwnd = hwnd;
     pending.slotIndex = slotIndex;
     pending.generation = generation;
-    pending.sourceVisualProxy = sourceVisualProxy;
+    pending.sourceVisualProxy = imageProxy;
     const wchar_t* stage = L"Prerequisites";
     long result = E_NOINTERFACE;
     bool attachAttempted = false;
@@ -3462,19 +3699,12 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     RECT sourceBounds = {};
     POINT clientOrigin = {};
     bool hasWindowRect = GetWindowRect(hwnd, &windowRect) != FALSE;
-    bool hasSourceBounds = clientSource
-                               ? GetClientRect(hwnd, &sourceBounds) != FALSE
-                               : hasWindowRect;
-    if (!clientSource && hasWindowRect)
-    {
-        sourceBounds = {0, 0, windowRect.right - windowRect.left,
-                        windowRect.bottom - windowRect.top};
-    }
-    bool hasClientOrigin = !clientSource || ClientToScreen(hwnd, &clientOrigin);
-    double originX = clientSource && hasWindowRect && hasClientOrigin
+    bool hasSourceBounds = GetClientRect(hwnd, &sourceBounds) != FALSE;
+    bool hasClientOrigin = ClientToScreen(hwnd, &clientOrigin) != FALSE;
+    double originX = hasWindowRect && hasClientOrigin
                          ? static_cast<double>(clientOrigin.x - windowRect.left)
                          : 0.0;
-    double originY = clientSource && hasWindowRect && hasClientOrigin
+    double originY = hasWindowRect && hasClientOrigin
                          ? static_cast<double>(clientOrigin.y - windowRect.top)
                          : 0.0;
     double width = hasSourceBounds
@@ -3484,39 +3714,14 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                         ? static_cast<double>(sourceBounds.bottom - sourceBounds.top)
                         : 0.0;
 
-    if (IsDwmObjectPointerValid(compositor, g_compositorVtable) &&
-        hostVisual && width > 0.0 && height > 0.0 && createProxy &&
-        updateCachedImage && snapshotCachedImage && freezeCachedImage &&
+    if (IsDwmObjectPointerValid(compositor, g_compositorVtable) && imageProxy &&
+        hostVisual && width > 0.0 && height > 0.0 &&
         createMesh && updateMesh && createGroup && updateGroup &&
         createInstruction && createRenderVisual && addInstruction &&
         updateRenderData && setParent && getVisualProxy && removeChild &&
         insertChild)
     {
-        stage = L"CreateImage";
-        result = createProxy(compositor, &pending.cachedImage);
-        if (result >= 0 && pending.cachedImage)
-        {
-            MilRectF sourceRect = {0.0f, 0.0f, static_cast<float>(width),
-                                   static_cast<float>(height)};
-            MilSizeD size = {width, height};
-            constexpr int absoluteMappingMode = 0;
-            stage = L"UpdateImage";
-            result = updateCachedImage(pending.cachedImage, sourceRect, size,
-                                       nullptr, nullptr, sourceVisualProxy,
-                                       absoluteMappingMode);
-        }
-        RECT snapshotRect = {0, 0, static_cast<LONG>(width),
-                             static_cast<LONG>(height)};
-        if (result >= 0 && pending.cachedImage)
-        {
-            stage = L"SnapshotImage";
-            result = snapshotCachedImage(pending.cachedImage, snapshotRect);
-        }
-        if (result >= 0 && pending.cachedImage)
-        {
-            stage = L"FreezeImage";
-            result = freezeCachedImage(pending.cachedImage);
-        }
+        result = S_OK;
 
         D2DPoint3F positions[GRID_POINT_COUNT] = {};
         D2DPoint2F textureCoordinates[GRID_POINT_COUNT] = {};
@@ -3605,7 +3810,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         if (result >= 0 && pending.renderVisual)
         {
             stage = L"CreateInstruction";
-            result = createInstruction(pending.groupProxy, pending.cachedImage,
+            result = createInstruction(pending.groupProxy, imageProxy,
                                        &pending.instruction);
         }
         if (result >= 0 && pending.instruction)
@@ -3648,20 +3853,20 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         }
     }
 
-    bool succeeded = result >= 0 && pending.cachedImage && pending.meshProxy &&
+    bool succeeded = result >= 0 && imageProxy && pending.meshProxy &&
                      pending.groupProxy && pending.instruction &&
                      pending.renderVisual;
     if (succeeded)
     {
         g_meshLayerState = pending;
         g_meshLayerActive.store(true, std::memory_order_release);
-        Wh_Log(L"4x4 static-warp layer attached: Slot=%d HWND=%p Source=%p "
+        Wh_Log(L"4x4 live-image static-warp layer attached: Slot=%d HWND=%p Image=%p "
                L"Root=%p Host=%p HostProxy=%p LayerProxy=%p "
-               L"sourceKind=%s snapshot=frozen order=topmost shape=hourglass "
+               L"sourceKind=ObservedBaseImage ownerMatch=1 live=yes "
+               L"order=topmost shape=hourglass "
                L"origin=%.0f,%.0f size=%.0fx%.0f",
-               slotIndex, hwnd, sourceVisualProxy, rootVisual, hostVisual,
+               slotIndex, hwnd, imageProxy, rootVisual, hostVisual,
                hostVisualProxy, renderVisualProxy,
-               clientSource ? L"CanvasRoot" : L"CompleteWindowRoot",
                originX, originY, width, height);
         return;
     }
@@ -3681,11 +3886,11 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     }
     Wh_Log(L"4x4 mesh layer failed: Slot=%d HWND=%p Stage=%s "
            L"result=0x%08X Root=%p Host=%p HostProxy=%p LayerProxy=%p "
-           L"sourceKind=%s origin=%.0f,%.0f size=%.0fx%.0f",
+           L"sourceKind=ObservedBaseImage Image=%p origin=%.0f,%.0f "
+           L"size=%.0fx%.0f",
            slotIndex, hwnd, stage, static_cast<unsigned int>(result),
            rootVisual, hostVisual, hostVisualProxy, renderVisualProxy,
-           clientSource ? L"CanvasRoot" : L"CompleteWindowRoot", originX,
-           originY, width, height);
+           imageProxy, originX, originY, width, height);
 }
 
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
@@ -3824,22 +4029,22 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         }
         if (rendererMode == RendererMode::MeshLayer && topLevelVisualProxy)
         {
-            void* meshSourceVisualProxy = nullptr;
-            if (g_getCanvasRootVisualProxy && topLevelWindow)
+            void* imageProxy =
+                FindObservedImageForWindow(topLevelWindow3D, hwnd);
+            if (imageProxy)
             {
-                void* canvasProxy = g_getCanvasRootVisualProxy(topLevelWindow);
-                if (IsVisualProxyPointerValid(canvasProxy))
-                {
-                    meshSourceVisualProxy = canvasProxy;
-                }
+                TryAttachMeshLayer(i, generation, hwnd, topLevelWindow,
+                                   imageProxy);
             }
-            bool clientSource = meshSourceVisualProxy &&
-                                meshSourceVisualProxy != topLevelVisualProxy;
-            TryAttachMeshLayer(
-                i, generation, hwnd, topLevelWindow,
-                meshSourceVisualProxy ? meshSourceVisualProxy
-                                      : topLevelVisualProxy,
-                clientSource);
+            else if (g_meshImagePendingLogSlot != i ||
+                     g_meshImagePendingLogGeneration != generation)
+            {
+                g_meshImagePendingLogSlot = i;
+                g_meshImagePendingLogGeneration = generation;
+                Wh_Log(L"4x4 live image source pending: Slot=%d HWND=%p "
+                       L"TopLevelWindow3D=%p",
+                       i, hwnd, topLevelWindow3D);
+            }
         }
         bool logBinding = false;
         bool logBindingFailure = false;
