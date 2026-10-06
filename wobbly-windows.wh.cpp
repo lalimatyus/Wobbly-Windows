@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.214
+// @version         0.215
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -430,6 +430,9 @@ using CCachedVisualImageProxyUpdate_t = long(__cdecl*)(
     void* pThis, const MilRectF& sourceRect, const MilSizeD& size,
     const void* rectAnimation, const void* sizeAnimation, void* visualProxy,
     int mappingMode);
+using CCachedVisualImageProxySnapshot_t = long(__cdecl*)(
+    void* pThis, const RECT& snapshotRect);
+using CCachedVisualImageProxyFreeze_t = long(__cdecl*)(void* pThis);
 using CRenderDataVisualCreate_t = long(__cdecl*)(void** visual);
 using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void* pThis,
                                                           void* instruction);
@@ -467,13 +470,14 @@ struct MeshLayerSymbols
 
     bool HasImagePipeline() const
     {
-        return createCachedImage && cachedImageUpdate;
+        return createCachedImage && cachedImageUpdate && cachedImageSnapshot &&
+               cachedImageFreeze;
     }
 
     bool HasVisualPipeline() const
     {
         return createRenderDataVisual && addRenderInstruction && setVisualParent &&
-               removeVisualFromParent && getVisualParent;
+               removeVisualFromParent;
     }
 
     bool IsComplete() const
@@ -3390,6 +3394,11 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         g_meshLayerSymbols.createCachedImage);
     auto updateCachedImage = reinterpret_cast<CCachedVisualImageProxyUpdate_t>(
         g_meshLayerSymbols.cachedImageUpdate);
+    auto snapshotCachedImage =
+        reinterpret_cast<CCachedVisualImageProxySnapshot_t>(
+            g_meshLayerSymbols.cachedImageSnapshot);
+    auto freezeCachedImage = reinterpret_cast<CCachedVisualImageProxyFreeze_t>(
+        g_meshLayerSymbols.cachedImageFreeze);
     auto createMesh = reinterpret_cast<CCompositorCreateProxy_t>(
         g_meshLayerSymbols.createMeshGeometry);
     auto updateMesh = reinterpret_cast<CMeshGeometry2dProxyUpdate_t>(
@@ -3406,8 +3415,6 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         g_meshLayerSymbols.addRenderInstruction);
     auto setParent = reinterpret_cast<CVisualSetParent_t>(
         g_meshLayerSymbols.setVisualParent);
-    auto getParent = reinterpret_cast<CVisualGetTransformParent_t>(
-        g_meshLayerSymbols.getVisualParent);
 
     MeshLayerState pending = {};
     pending.hwnd = hwnd;
@@ -3424,19 +3431,17 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                            ? g_topLevelWindowGetRootVisual(topLevelWindow,
                                                           completeWindowRoot)
                            : nullptr;
-    void* parentVisual = IsNativeVisualPointerValid(rootVisual) && getParent
-                             ? getParent(rootVisual)
-                             : nullptr;
+    void* hostVisual = IsNativeVisualPointerValid(rootVisual) ? rootVisual : nullptr;
     RECT rect = {};
     bool hasRect = GetWindowRect(hwnd, &rect) != FALSE;
     double width = hasRect ? static_cast<double>(rect.right - rect.left) : 0.0;
     double height = hasRect ? static_cast<double>(rect.bottom - rect.top) : 0.0;
 
     if (IsDwmObjectPointerValid(compositor, g_compositorVtable) &&
-        IsNativeVisualPointerValid(parentVisual) && width > 0.0 && height > 0.0 &&
-        createProxy && updateCachedImage && createMesh && updateMesh &&
-        createGroup && updateGroup && createInstruction && createRenderVisual &&
-        addInstruction && setParent)
+        hostVisual && width > 0.0 && height > 0.0 && createProxy &&
+        updateCachedImage && snapshotCachedImage && freezeCachedImage &&
+        createMesh && updateMesh && createGroup && updateGroup &&
+        createInstruction && createRenderVisual && addInstruction && setParent)
     {
         stage = L"CreateImage";
         result = createProxy(compositor, &pending.cachedImage);
@@ -3450,6 +3455,18 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             result = updateCachedImage(pending.cachedImage, sourceRect, size,
                                        nullptr, nullptr, sourceVisualProxy,
                                        absoluteMappingMode);
+        }
+        RECT snapshotRect = {0, 0, static_cast<LONG>(width),
+                             static_cast<LONG>(height)};
+        if (result >= 0 && pending.cachedImage)
+        {
+            stage = L"SnapshotImage";
+            result = snapshotCachedImage(pending.cachedImage, snapshotRect);
+        }
+        if (result >= 0 && pending.cachedImage)
+        {
+            stage = L"FreezeImage";
+            result = freezeCachedImage(pending.cachedImage);
         }
 
         D2DPoint3F positions[GRID_POINT_COUNT] = {};
@@ -3526,7 +3543,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         {
             stage = L"Attach";
             attachAttempted = true;
-            result = setParent(pending.renderVisual, parentVisual);
+            result = setParent(pending.renderVisual, hostVisual);
         }
     }
 
@@ -3538,12 +3555,14 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         g_meshLayerState = pending;
         g_meshLayerActive.store(true, std::memory_order_release);
         Wh_Log(L"4x4 identity layer attached: Slot=%d HWND=%p Source=%p "
-               L"Root=%p Parent=%p size=%.0fx%.0f",
-               slotIndex, hwnd, sourceVisualProxy, rootVisual, parentVisual,
+               L"Root=%p Host=%p snapshot=frozen size=%.0fx%.0f",
+               slotIndex, hwnd, sourceVisualProxy, rootVisual, hostVisual,
                width, height);
         return;
     }
 
+    auto getParent = reinterpret_cast<CVisualGetTransformParent_t>(
+        g_meshLayerSymbols.getVisualParent);
     if (attachAttempted && pending.renderVisual && getParent &&
         getParent(pending.renderVisual))
     {
@@ -3556,9 +3575,9 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         ReleaseMeshLayerResources(pending);
     }
     Wh_Log(L"4x4 identity layer failed: Slot=%d HWND=%p Stage=%s "
-           L"result=0x%08X Root=%p Parent=%p size=%.0fx%.0f",
+           L"result=0x%08X Root=%p Host=%p size=%.0fx%.0f",
            slotIndex, hwnd, stage, static_cast<unsigned int>(result),
-           rootVisual, parentVisual, width, height);
+           rootVisual, hostVisual, width, height);
 }
 
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
