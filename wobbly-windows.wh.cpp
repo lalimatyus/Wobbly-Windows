@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.212
+// @version         0.213
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -90,6 +90,13 @@ the combined mod is not offered under GPLv2.
   $name: Snap and maximize wobble
   $description: Animate Snap, maximize and restore transitions.
 
+- Renderer: "affine"
+  $name: Renderer
+  $description: The 4x4 mesh-layer backend is under development and currently falls back to the stable affine renderer.
+  $options:
+  - "affine": "Affine (stable)"
+  - "mesh-layer": "True 4x4 mesh layer (experimental)"
+
 - AdvancedMode:
   - enable: false
     $name: Enable
@@ -125,7 +132,6 @@ the combined mod is not offered under GPLv2.
 #include <regex>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <vector>
 
 #include <windhawk_utils.h>
@@ -143,6 +149,12 @@ namespace
 // and generations reject stale results. Each slot owns one factory proxy ref;
 // visuals bind its underlying composition resource, not the wrapper itself.
 
+enum class RendererMode : unsigned char
+{
+    Affine,
+    MeshLayer,
+};
+
 struct WobblySettings
 {
     bool resizeWobbleEnabled;
@@ -150,12 +162,15 @@ struct WobblySettings
     double stiffness;
     double drag;
     double moveFactor;
+    RendererMode rendererMode;
 };
 
 static constexpr WobblySettings PHYSICS_PRESETS[] = {
-    {false, false, 15.0, 80.0, 10.0}, {false, false, 10.0, 85.0, 10.0},
-    {false, false, 6.0, 90.0, 10.0},  {false, false, 3.0, 92.0, 20.0},
-    {false, false, 1.0, 97.0, 25.0}};
+    {false, false, 15.0, 80.0, 10.0, RendererMode::Affine},
+    {false, false, 10.0, 85.0, 10.0, RendererMode::Affine},
+    {false, false, 6.0, 90.0, 10.0, RendererMode::Affine},
+    {false, false, 3.0, 92.0, 20.0, RendererMode::Affine},
+    {false, false, 1.0, 97.0, 25.0, RendererMode::Affine}};
 
 WobblySettings g_settings = {};
 SRWLOCK g_settingsLock = SRWLOCK_INIT;
@@ -296,7 +311,6 @@ std::atomic<HWND> g_pendingInteractiveTransitionWindow = nullptr;
 std::atomic<LPARAM> g_pendingInteractiveTransitionFlags = 0;
 RECT g_realDraggedWindowRect = {};
 RECT g_lastDraggedWindowRect = {};
-RECT g_lastDraggedVisualRect = {};
 bool g_lastDraggedWindowZoomed = false;
 bool g_finalizingMoveSize = false;
 std::atomic_bool g_realDragging = false;
@@ -332,14 +346,6 @@ using CTopLevelWindowGetVisualProxy_t = void*(__cdecl*)(void* pThis);
 CTopLevelWindowGetVisualProxy_t g_getCanvasRootVisualProxy = nullptr;
 using CTopLevelWindowGetRootVisual_t = void*(__cdecl*)(void* pThis, int rootVisualType);
 CTopLevelWindowGetRootVisual_t g_topLevelWindowGetRootVisual = nullptr;
-using CWindowBorderCloneVisualTree_t =
-    long(__cdecl*)(void* pThis, void** clonedVisual, int cloneOptions);
-CWindowBorderCloneVisualTree_t g_windowBorderCloneVisualTreeOriginal = nullptr;
-using CTopLevelWindowCloneVisualTreeForLivePreview_t =
-    long(__cdecl*)(void* pThis, bool includeRenderData,
-                   void** clonedTopLevelWindow);
-CTopLevelWindowCloneVisualTreeForLivePreview_t
-    g_topLevelWindowCloneVisualTreeForLivePreviewOriginal = nullptr;
 void* g_transitionWrapperGetVisualWeakFunction = nullptr;
 void* g_transitionWrapperGetVisualProxyWeakFunction = nullptr;
 using CTopLevelWindowGetWindowData_t = void*(__cdecl*)(void* pThis);
@@ -360,7 +366,6 @@ InteractiveStateThrobKind g_interactiveStateThrob = InteractiveStateThrobKind::N
 LPARAM g_interactiveStateThrobDirection = 0;
 bool g_interactiveStateThrobFromPointerEdge = false;
 double g_resizeCoordinateScale = 1.0;
-double g_visualCoordinateScale = 1.0;
 using GetDpiForMonitor_t = HRESULT(WINAPI*)(HMONITOR monitor, int dpiType, UINT* dpiX, UINT* dpiY);
 HMODULE g_shcoreModule = nullptr;
 GetDpiForMonitor_t g_getDpiForMonitor = nullptr;
@@ -384,136 +389,53 @@ using CVisualProxySetTransform_t = long(__cdecl*)(void* pThis, void* transform);
 CVisualProxySetTransform_t g_cVisualProxySetTransform = nullptr;
 using CCompositorCreateMatrixTransformProxy_t = long(__cdecl*)(void* pThis, void** transformProxy);
 CCompositorCreateMatrixTransformProxy_t g_createMatrixTransformProxy = nullptr;
-struct D2DPoint3F
+
+// The mesh-layer renderer is intentionally isolated from the stable affine
+// renderer. Version 0.116 only resolves and validates its prerequisites; it
+// performs no mesh-layer writes yet.
+struct MeshLayerSymbols
 {
-    float x;
-    float y;
-    float z;
+    void* meshGeometryUpdate = nullptr;
+    void* createMeshGeometry = nullptr;
+    void* createGeometryGroup = nullptr;
+    void* geometryGroupUpdate = nullptr;
+    void* createMeshInstruction = nullptr;
+    void* createCachedImage = nullptr;
+    void* cachedImageUpdate = nullptr;
+    void* cachedImageSnapshot = nullptr;
+    void* cachedImageFreeze = nullptr;
+    void* createRenderDataVisual = nullptr;
+    void* addRenderInstruction = nullptr;
+    void* updateRenderData = nullptr;
+    void* insertVisualChild = nullptr;
+    void* removeVisualChild = nullptr;
+
+    bool HasGeometryPipeline() const
+    {
+        return meshGeometryUpdate && createMeshGeometry && createGeometryGroup &&
+               geometryGroupUpdate && createMeshInstruction;
+    }
+
+    bool HasImagePipeline() const
+    {
+        return createCachedImage && cachedImageUpdate && cachedImageSnapshot &&
+               cachedImageFreeze;
+    }
+
+    bool HasVisualPipeline() const
+    {
+        return createRenderDataVisual && addRenderInstruction && updateRenderData &&
+               insertVisualChild && removeVisualChild;
+    }
+
+    bool IsComplete() const
+    {
+        return HasGeometryPipeline() && HasImagePipeline() && HasVisualPipeline();
+    }
 };
-struct MilPoint2DValue
-{
-    double x;
-    double y;
-};
-static_assert(sizeof(D2DPoint3F) == 12);
-static_assert(sizeof(MilPoint2DValue) == 16);
-struct MilRectF
-{
-    float left;
-    float top;
-    float right;
-    float bottom;
-};
-struct MilSizeD
-{
-    double width;
-    double height;
-};
-using CMeshGeometry2dProxyUpdate_t = long(__cdecl*)(
-    void* pThis, int mode, const D2DPoint3F* positions,
-    const MilPoint2DValue* textureCoordinates, unsigned int vertexCount,
-    const unsigned int* indices, unsigned int indexCount);
-using CCompositorCreateMeshGeometry2dProxy_t = long(__cdecl*)(void* pThis,
-                                                               void** meshProxy);
-using CCompositorCreateGeometry2dGroupProxy_t = long(__cdecl*)(void* pThis,
-                                                                void** groupProxy);
-using CCompositorCreateBitmapSourceProxy_t = long(__cdecl*)(void* pThis,
-                                                             void** bitmapProxy);
-using CCompositorCreateVisualSurfaceProxy_t = long(__cdecl*)(
-    void* pThis, void* sharedHandle, void** surfaceProxy);
-using CGeometry2dGroupProxyUpdate_t = long(__cdecl*)(void* pThis, void* meshProxy);
-using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(void* geometryGroupProxy,
-                                                       void* bitmapSourceProxy,
-                                                       void** instruction);
-using CDrawBitmapInstructionCreate_t = long(__cdecl*)(void* imageProxy,
-                                                       void** instruction);
-using CDrawTileImageInstructionCreate_t = long(__cdecl*)(
-    void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
-    float opacity, void** instruction);
-using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void* pThis,
-                                                          void* instruction);
-using CRenderDataVisualClearInstructions_t = long(__cdecl*)(void* pThis);
-using CRenderDataVisualUpdateRenderData_t = long(__cdecl*)(void* pThis);
-using CTopLevelWindow3DEnsureRenderData_t = long(__cdecl*)(void* pThis);
-using CVisualProxySetContent_t = long(__cdecl*)(void* pThis,
-                                                const void* content);
-using CVisualProxyInsertChild_t = long(__cdecl*)(void* pThis, void* child,
-                                                 void* reference, bool insertAbove);
-using CVisualProxyRemoveChild_t = long(__cdecl*)(void* pThis, void* child);
-using CVisualSetContent_t = long(__cdecl*)(void* pThis, void* content);
-using CVisualSetParent_t = long(__cdecl*)(void* pThis, void* parent);
-using CVisualRemoveSelfFromParent_t = long(__cdecl*)(void* pThis);
-using CVisualGetTransformParent_t = void*(__cdecl*)(void* pThis);
-using CVisualGetVisualProxyForStructure_t = void*(__cdecl*)(void* pThis);
-using CRedirectVisualProxySetRedirectedVisual_t = long(__cdecl*)(void* pThis,
-                                                                 void* visual);
-using CCompositorCreateCachedVisualImageProxy_t = long(__cdecl*)(void* pThis,
-                                                                  void** proxy);
-using CCachedVisualImageProxyUpdate_t = long(__cdecl*)(
-    void* pThis, const MilRectF& sourceRect, const MilSizeD& size,
-    const void* rectAnimation, const void* sizeAnimation, void* visualProxy,
-    int mappingMode);
-using CCachedVisualImageProxySnapshot_t = long(__cdecl*)(
-    void* pThis, const RECT& sourceRect);
-using CCachedVisualImageProxyFreeze_t = long(__cdecl*)(void* pThis);
-using CRenderDataVisualCreate_t = long(__cdecl*)(void** visual);
-CMeshGeometry2dProxyUpdate_t g_meshGeometry2dProxyUpdate = nullptr;
-CCompositorCreateMeshGeometry2dProxy_t g_createMeshGeometry2dProxy = nullptr;
-CCompositorCreateGeometry2dGroupProxy_t g_createGeometry2dGroupProxy = nullptr;
-CCompositorCreateBitmapSourceProxy_t g_createBitmapSourceProxyOriginal = nullptr;
-CCompositorCreateVisualSurfaceProxy_t
-    g_createVisualSurfaceProxyOriginal = nullptr;
-CGeometry2dGroupProxyUpdate_t g_geometry2dGroupProxyUpdate = nullptr;
-CDrawMesh2DInstructionCreate_t g_drawMesh2DInstructionCreate = nullptr;
-void* g_createTouchDragVisualFunction = nullptr;
-void* g_touchDragVisualNotifyFunction = nullptr;
-void* g_touchDragVisualStopFunction = nullptr;
-void* g_touchDragVisualCreateMeshInstructionFunction = nullptr;
-CDrawBitmapInstructionCreate_t g_drawBitmapInstructionCreateOriginal = nullptr;
-CDrawTileImageInstructionCreate_t g_drawTileImageInstructionCreateOriginal =
-    nullptr;
-CRenderDataVisualAddInstruction_t g_renderDataVisualAddInstruction = nullptr;
-CRenderDataVisualClearInstructions_t g_renderDataVisualClearInstructions =
-    nullptr;
-CRenderDataVisualUpdateRenderData_t g_renderDataVisualUpdateRenderData = nullptr;
-CTopLevelWindow3DEnsureRenderData_t
-    g_topLevelWindow3DEnsureRenderDataOriginal = nullptr;
-using CTopLevelWindow3DEnsureSecondaryWindowRepresentation_t =
-    long(__cdecl*)(void* pThis, bool forceRecreate);
-CTopLevelWindow3DEnsureSecondaryWindowRepresentation_t
-    g_topLevelWindow3DEnsureSecondaryWindowRepresentationOriginal = nullptr;
-using CTopLevelWindow3DSetParent_t =
-    long(__cdecl*)(void* pThis, void* parent);
-CTopLevelWindow3DSetParent_t g_topLevelWindow3DSetParentOriginal = nullptr;
-using CTopLevelWindow3DShowWindow_t =
-    long(__cdecl*)(void* pThis, bool show, bool activate);
-CTopLevelWindow3DShowWindow_t g_topLevelWindow3DShowWindowOriginal = nullptr;
-size_t g_renderDataInstructionsOffset = SIZE_MAX;
-size_t g_renderDataInstructionCountOffset = SIZE_MAX;
-size_t g_ensureRenderDataPointerOffsets[16] = {};
-unsigned int g_ensureRenderDataPointerOffsetCount = 0;
-CVisualProxySetContent_t g_visualProxySetContentOriginal = nullptr;
-CVisualProxyInsertChild_t g_visualProxyInsertChildOriginal = nullptr;
-CVisualProxyRemoveChild_t g_visualProxyRemoveChildOriginal = nullptr;
-CVisualSetContent_t g_visualSetContentOriginal = nullptr;
-CVisualSetParent_t g_visualSetParentOriginal = nullptr;
-CVisualRemoveSelfFromParent_t g_visualRemoveSelfFromParentOriginal = nullptr;
-using CVisualVisibility_t = void(__cdecl*)(void* pThis);
-CVisualVisibility_t g_visualHideOriginal = nullptr;
-CVisualVisibility_t g_visualUnhideOriginal = nullptr;
-using CVisualSetOpacity_t = void(__cdecl*)(void* pThis, double opacity);
-CVisualSetOpacity_t g_visualSetOpacityOriginal = nullptr;
-CVisualGetTransformParent_t g_visualGetTransformParent = nullptr;
-CVisualGetVisualProxyForStructure_t g_visualGetVisualProxyForStructure = nullptr;
-void* g_visualCollectionInsertRelativeFunction = nullptr;
-CRedirectVisualProxySetRedirectedVisual_t
-    g_redirectVisualProxySetRedirectedVisualOriginal = nullptr;
-CCompositorCreateCachedVisualImageProxy_t
-    g_createCachedVisualImageProxy = nullptr;
-CCachedVisualImageProxyUpdate_t g_cachedVisualImageProxyUpdate = nullptr;
-CCachedVisualImageProxySnapshot_t g_cachedVisualImageProxySnapshot = nullptr;
-CCachedVisualImageProxyFreeze_t g_cachedVisualImageProxyFreeze = nullptr;
-CRenderDataVisualCreate_t g_renderDataVisualCreate = nullptr;
+
+MeshLayerSymbols g_meshLayerSymbols;
+std::atomic_bool g_meshLayerBackendAvailable = false;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
@@ -552,11 +474,6 @@ std::atomic<void*> g_visualProxyVtable = nullptr;
 std::atomic<void*> g_redirectVisualProxyVtable = nullptr;
 std::atomic<void*> g_containerVisualProxyVtable = nullptr;
 std::atomic<void*> g_matrixTransformProxyVtable = nullptr;
-std::atomic<void*> g_bitmapSourceProxyVtable = nullptr;
-std::atomic<void*> g_visualSurfaceProxyVtable = nullptr;
-std::atomic<void*> g_cachedVisualImageProxyVtable = nullptr;
-std::atomic<void*> g_clientAreaVtable = nullptr;
-std::atomic<void*> g_visualCollectionVtable = nullptr;
 std::atomic<void*> g_dwmCompositor = nullptr;
 std::atomic<void*> g_desktopManager = nullptr;
 void* g_desktopManagerVtableSymbol = nullptr;
@@ -568,19 +485,10 @@ void* g_visualProxyVtableSymbol = nullptr;
 void* g_redirectVisualProxyVtableSymbol = nullptr;
 void* g_containerVisualProxyVtableSymbol = nullptr;
 void* g_matrixTransformProxyVtableSymbol = nullptr;
-void* g_bitmapSourceProxyVtableSymbol = nullptr;
-void* g_visualSurfaceProxyVtableSymbol = nullptr;
-void* g_cachedVisualImageProxyVtableSymbol = nullptr;
-void* g_clientAreaVtableSymbol = nullptr;
-void* g_visualCollectionVtableSymbol = nullptr;
 size_t g_desktopManagerCompositorOffset = SIZE_MAX;
 size_t g_desktopManagerThreadIdOffset = SIZE_MAX;
 size_t g_canvasVisualOwnerOffset = SIZE_MAX;
 size_t g_visualProxyOffset = SIZE_MAX;
-size_t g_visualParentOffset = SIZE_MAX;
-size_t g_visualContentOffset = SIZE_MAX;
-size_t g_visualCollectionArrayOffset = SIZE_MAX;
-size_t g_visualCollectionCountOffset = SIZE_MAX;
 size_t g_transitionVisualProxyOffset = SIZE_MAX;
 size_t g_topLevelWindowWindowDataOffset = SIZE_MAX;
 static bool IsDwmObjectPointerValid(void* object, std::atomic<void*>& expectedVtable);
@@ -724,146 +632,6 @@ static void* ReadPointerMember(void* object, size_t offset)
                : nullptr;
 }
 
-static bool IsWritableMemory(void* address, size_t size)
-{
-    if (!address || !size)
-    {
-        return false;
-    }
-    uintptr_t current = reinterpret_cast<uintptr_t>(address);
-    if (current > UINTPTR_MAX - size)
-    {
-        return false;
-    }
-    uintptr_t finish = current + size;
-    while (current < finish)
-    {
-        MEMORY_BASIC_INFORMATION mbi = {};
-        if (!VirtualQuery(reinterpret_cast<void*>(current), &mbi, sizeof(mbi)) ||
-            mbi.State != MEM_COMMIT ||
-            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
-        {
-            return false;
-        }
-        DWORD protection = mbi.Protect & 0xFF;
-        if (protection != PAGE_READWRITE &&
-            protection != PAGE_WRITECOPY &&
-            protection != PAGE_EXECUTE_READWRITE &&
-            protection != PAGE_EXECUTE_WRITECOPY)
-        {
-            return false;
-        }
-        uintptr_t regionEnd =
-            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-        if (regionEnd <= current)
-        {
-            return false;
-        }
-        current = std::min(regionEnd, finish);
-    }
-    return true;
-}
-
-static bool GetRenderDataInstructionList(void* renderVisual,
-                                         void*** instructions,
-                                         int** countAddress, int* count)
-{
-    if (instructions)
-    {
-        *instructions = nullptr;
-    }
-    if (countAddress)
-    {
-        *countAddress = nullptr;
-    }
-    if (count)
-    {
-        *count = 0;
-    }
-    if (!renderVisual ||
-        g_renderDataInstructionsOffset == SIZE_MAX ||
-        g_renderDataInstructionCountOffset == SIZE_MAX)
-    {
-        return false;
-    }
-    BYTE* visualBytes = static_cast<BYTE*>(renderVisual);
-    int* countField = reinterpret_cast<int*>(
-        visualBytes + g_renderDataInstructionCountOffset);
-    if (!IsReadableMemory(countField, sizeof(*countField)))
-    {
-        return false;
-    }
-    int currentCount = *countField;
-    if (currentCount <= 0 || currentCount > 64)
-    {
-        return false;
-    }
-    void** array = static_cast<void**>(
-        ReadPointerMember(renderVisual, g_renderDataInstructionsOffset));
-    if (!IsReadableMemory(array,
-                          static_cast<size_t>(currentCount) * sizeof(*array)))
-    {
-        return false;
-    }
-    if (instructions)
-    {
-        *instructions = array;
-    }
-    if (countAddress)
-    {
-        *countAddress = countField;
-    }
-    if (count)
-    {
-        *count = currentCount;
-    }
-    return true;
-}
-
-static bool FindRenderDataInstructionIndex(void* renderVisual,
-                                           void* instruction,
-                                           unsigned int* instructionCount,
-                                           int* instructionIndex)
-{
-    if (instructionCount)
-    {
-        *instructionCount = 0;
-    }
-    if (instructionIndex)
-    {
-        *instructionIndex = -1;
-    }
-    if (!renderVisual || !instruction ||
-        g_renderDataInstructionsOffset == SIZE_MAX ||
-        g_renderDataInstructionCountOffset == SIZE_MAX)
-    {
-        return false;
-    }
-    void** instructions = nullptr;
-    int count = 0;
-    if (!GetRenderDataInstructionList(renderVisual, &instructions, nullptr,
-                                      &count))
-    {
-        return false;
-    }
-    if (instructionCount)
-    {
-        *instructionCount = static_cast<unsigned int>(count);
-    }
-    for (int index = 0; index < count; index++)
-    {
-        if (instructions[index] == instruction)
-        {
-            if (instructionIndex)
-            {
-                *instructionIndex = index;
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
 static void* GetTopLevelVisualProxy(void* topLevelWindow,
                                     const wchar_t** source = nullptr)
 {
@@ -1003,146 +771,6 @@ std::atomic<unsigned int> g_abandonedProxyCount = 0;
 std::atomic<void*> g_windowListForSceneWake = nullptr;
 std::atomic_bool g_sceneOwnershipResetPending = false;
 std::atomic<ULONGLONG> g_lastBindPrerequisiteLog = 0;
-std::atomic_bool g_nativeMeshCanaryPending = false;
-std::atomic_bool g_nativeMeshCanarySucceeded = false;
-// Discovery stays read-only until both the exact owner and a reversible
-// replacement transaction are proven. Older slot-replacement experiments
-// could leave an identity mesh instruction alive after the mod was unloaded.
-// Keep the experimental implementation compiled, but don't detour DWM's
-// render/visual pipeline in the affine safety baseline.
-static constexpr bool NATIVE_MESH_EXPERIMENT_ENABLED = false;
-static constexpr bool NATIVE_MESH_WRITE_PROBE_ENABLED = false;
-static constexpr bool NATIVE_MESH_TRANSACTION_PROBE_ENABLED = false;
-std::atomic_bool g_liveBaseImageMeshCanaryStarted = false;
-std::atomic_bool g_liveBaseImageMeshCanarySucceeded = false;
-std::atomic_bool g_liveBaseImageMeshAnimationLogged = false;
-std::atomic<HWND> g_liveBaseImageMeshTargetHwnd = nullptr;
-std::atomic_bool g_meshSourceProbePending = false;
-std::atomic_bool g_meshSourceProbeCompleted = false;
-std::atomic_bool g_cachedVisualImageCanaryCompleted = false;
-struct VisibleMeshCanaryState
-{
-    void* cachedVisual;
-    void* meshProxy;
-    void* groupProxy;
-    void* instruction;
-    void* pinnedImageProxy;
-    void* renderVisual;
-    HWND hwnd;
-    ULONGLONG detachAt;
-    struct
-    {
-        void* meshProxy;
-        void* groupProxy;
-        void* instruction;
-    } additionalNativeBindings[3];
-    unsigned int nativeBindingCount;
-    double width;
-    double height;
-};
-VisibleMeshCanaryState g_visibleMeshCanary = {};
-std::atomic_bool g_visibleMeshCanaryActive = false;
-std::atomic_bool g_visibleMeshCanaryCleanupRequested = false;
-std::atomic<HWND> g_visibleMeshCanaryHwnd = nullptr;
-struct NativeMeshPublishLease
-{
-    void* renderVisual;
-    void** instructionArray;
-    int* countAddress;
-    void* originalInstruction;
-    void* meshInstruction;
-    HWND hwnd;
-    int instructionIndex;
-    int instructionCount;
-};
-NativeMeshPublishLease g_nativeMeshPublishLease = {};
-struct NativeRenderSlotProbeState
-{
-    HWND hwnd;
-    void* renderVisual;
-    void** instructionArray;
-    int* countAddress;
-    void* instruction;
-    void* imageProxy;
-    uintptr_t fingerprint;
-    int instructionIndex;
-    int instructionCount;
-    unsigned int samples;
-    unsigned int arrayChanges;
-    unsigned int slotChanges;
-    unsigned int missingSamples;
-};
-NativeRenderSlotProbeState g_nativeRenderSlotProbe = {};
-SRWLOCK g_nativeRenderSlotProbeLock = SRWLOCK_INIT;
-std::atomic_uint g_nativePublishProbeSamples = 0;
-std::atomic_uint g_nativePublishProbeChanges = 0;
-std::atomic_uint g_nativePublishProbeMissing = 0;
-static constexpr unsigned int OBSERVED_VISUAL_PROXY_COUNT = 4096;
-static constexpr unsigned int OBSERVED_VISUAL_PROXY_PROBES = 32;
-struct ObservedVisualProxy
-{
-    std::atomic<void*> proxy;
-    std::atomic<void*> parent;
-    std::atomic<void*> content;
-    std::atomic<void*> redirectTarget;
-};
-ObservedVisualProxy g_observedVisualProxies[OBSERVED_VISUAL_PROXY_COUNT] = {};
-ObservedVisualProxy g_observedVisuals[OBSERVED_VISUAL_PROXY_COUNT] = {};
-struct ObservedBitmapInstruction
-{
-    std::atomic<void*> instruction;
-    std::atomic<void*> imageProxy;
-};
-enum class MeshSourceKind
-{
-    None,
-    Bitmap,
-    VisualSurface,
-    AmbiguousProxy,
-};
-static MeshSourceKind GetMeshSourceKind(void* object);
-static bool ReadBaseImageResourceId(void* imageProxy,
-                                    unsigned int* resourceId);
-static bool FindUniqueBaseImageInstruction(
-    void* renderVisual, unsigned int requiredResourceId,
-    void** instruction, void** imageProxy, int* instructionIndex,
-    int* instructionCount, unsigned int* candidateCount);
-static void ObserveNativeRenderSlotStability(void* renderVisual,
-                                             void* windowData, HWND hwnd,
-                                             const wchar_t* eventName);
-struct ObservedRenderImage
-{
-    std::atomic<void*> visual;
-    std::atomic<void*> instruction;
-    std::atomic<void*> imageProxy;
-    std::atomic<void*> imageVtable;
-    std::atomic<void*> ownerWindowData;
-    std::atomic<HWND> ownerHwnd;
-    std::atomic<int> sourceKind;
-    std::atomic<unsigned int> capturedInstructionCount;
-    std::atomic<int> capturedInstructionIndex;
-};
-ObservedBitmapInstruction
-    g_observedBitmapInstructions[OBSERVED_VISUAL_PROXY_COUNT] = {};
-ObservedRenderImage g_observedRenderImages[OBSERVED_VISUAL_PROXY_COUNT] = {};
-std::atomic<void*>
-    g_observedBitmapSourceProxies[OBSERVED_VISUAL_PROXY_COUNT] = {};
-std::atomic<void*>
-    g_observedVisualSurfaceProxies[OBSERVED_VISUAL_PROXY_COUNT] = {};
-std::atomic<unsigned int> g_observedBitmapSourceCreateCount = 0;
-std::atomic<unsigned int> g_observedVisualSurfaceCreateCount = 0;
-std::atomic<unsigned int> g_observedDrawBitmapCreateCount = 0;
-std::atomic<unsigned int> g_observedDrawTileCreateCount = 0;
-std::atomic<unsigned int> g_observedImageInstructionMatchedAddCount = 0;
-std::atomic<unsigned int> g_ensureRenderDataCallCount = 0;
-std::atomic<unsigned int> g_ensureRenderDataMappedCount = 0;
-std::atomic<unsigned int> g_ensureRenderDataPopulatedCount = 0;
-std::atomic<unsigned int> g_windowBorderCloneCallCount = 0;
-std::atomic<unsigned int> g_livePreviewCloneCallCount = 0;
-std::atomic<unsigned int> g_secondaryRepresentationCallCount = 0;
-std::atomic<unsigned int> g_topLevelWindow3DSetParentCallCount = 0;
-std::atomic<unsigned int> g_topLevelWindow3DShowWindowCallCount = 0;
-std::atomic<unsigned int> g_trackedVisualVisibilityCallCount = 0;
 ULONGLONG g_lastObservedScenePassCounter = 0;
 ULONGLONG g_lastSceneProgressTimestamp = 0;
 HANDLE g_animationTimer = nullptr;
@@ -1168,48 +796,9 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly = false
 static void RestorePendingAnimationIdentities();
 static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
-static void RunNativeMeshCanary();
-static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
-                                               void* originalInstruction,
-                                               void* imageProxy,
-                                               void* windowData, HWND hwnd);
-static bool RebindLiveBaseImageMeshCanary(void* imageProxy, HWND hwnd);
-static bool RestoreNativeMeshPublishLease(const wchar_t* stage);
-static void InstallRequestedLiveBaseImageMeshCanary();
-static long UpdateNativeMeshGeometry(void* meshProxy,
-                                      const WobbleMesh* mesh = nullptr,
-                                      double identityWidth = 0.0,
-                                      double identityHeight = 0.0);
-static void MaintainVisibleMeshCanary();
-static void RequestVisibleMeshCleanupForHwnd(HWND hwnd);
-static long __cdecl VisualProxySetContentHook(void* pThis, const void* content);
-static long __cdecl VisualProxyInsertChildHook(void* pThis, void* child,
-                                               void* reference, bool insertAbove);
-static long __cdecl VisualProxyRemoveChildHook(void* pThis, void* child);
-static long __cdecl VisualSetContentHook(void* pThis, void* content);
-static long __cdecl VisualSetParentHook(void* pThis, void* parent);
-static long __cdecl VisualRemoveSelfFromParentHook(void* pThis);
-static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
-                                                     void** instruction);
-static long __cdecl DrawTileImageInstructionCreateHook(
-    void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
-    float opacity, void** instruction);
-static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
-                                                        void* instruction);
-static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis);
-static long __cdecl RenderDataVisualClearInstructionsHook(void* pThis);
-static long __cdecl TopLevelWindow3DEnsureRenderDataHook(void* pThis);
-static long __cdecl CreateBitmapSourceProxyHook(void* pThis,
-                                                 void** bitmapProxy);
-static long __cdecl CreateVisualSurfaceProxyHook(void* pThis,
-                                                  void* sharedHandle,
-                                                  void** surfaceProxy);
-static long __cdecl RedirectVisualProxySetRedirectedVisualHook(void* pThis,
-                                                               void* visual);
 static bool HasAnyAnimationSlots();
 static int GetPointIndex(int x, int y);
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy);
-static bool CreateMatrixTransformProxy(void** matrixTransformProxy);
 static void RequestDwmScenePass();
 static void MarkAnimationSlotForDwmObjectRefresh(void* windowData);
 static void MarkObservedSnapTransition(HWND hwnd, bool transitionStarted);
@@ -1240,48 +829,6 @@ static void QueueMaximizedStateCheck(HWND hwnd)
     }
 }
 
-struct NativeRenderCallSnapshot
-{
-    void** instructionArray;
-    int* countAddress;
-    void* instruction;
-    void* imageProxy;
-    uintptr_t fingerprint;
-    int instructionIndex;
-    int instructionCount;
-    unsigned int candidateCount;
-    bool listValid;
-    bool unique;
-};
-
-static NativeRenderCallSnapshot CaptureNativeRenderCallSnapshot(
-    void* renderVisual)
-{
-    NativeRenderCallSnapshot snapshot = {};
-    snapshot.instructionIndex = -1;
-    snapshot.listValid = GetRenderDataInstructionList(
-        renderVisual, &snapshot.instructionArray, &snapshot.countAddress,
-        &snapshot.instructionCount);
-    if (!snapshot.listValid)
-    {
-        return snapshot;
-    }
-    for (int index = 0; index < snapshot.instructionCount; index++)
-    {
-        uintptr_t value = reinterpret_cast<uintptr_t>(
-            snapshot.instructionArray[index]);
-        snapshot.fingerprint ^=
-            value + static_cast<uintptr_t>(0x9E3779B9u) +
-            (snapshot.fingerprint << 6) + (snapshot.fingerprint >> 2);
-    }
-    int uniqueInstructionCount = 0;
-    snapshot.unique = FindUniqueBaseImageInstruction(
-        renderVisual, 0, &snapshot.instruction, &snapshot.imageProxy,
-        &snapshot.instructionIndex, &uniqueInstructionCount,
-        &snapshot.candidateCount);
-    return snapshot;
-}
-
 static constexpr LONGLONG WINDOW_STATE_EDGE_TOLERANCE = 32;
 
 static bool GetMonitorWorkArea(const RECT& rect, RECT& workArea)
@@ -1303,109 +850,6 @@ static bool GetMonitorWorkArea(const RECT& rect, RECT& workArea)
     }
     workArea = monitorInfo.rcWork;
     return true;
-}
-
-static void ObserveNativeRenderSlotStability(void* renderVisual,
-                                             void* windowData, HWND hwnd,
-                                             const wchar_t* eventName)
-{
-    if (!renderVisual || !windowData || !hwnd ||
-        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire) != hwnd ||
-        GetHwndFromWindowData(windowData) != hwnd)
-    {
-        return;
-    }
-
-    void** instructions = nullptr;
-    int* countAddress = nullptr;
-    int instructionCount = 0;
-    bool listValid = GetRenderDataInstructionList(
-        renderVisual, &instructions, &countAddress, &instructionCount);
-    uintptr_t fingerprint = 0;
-    if (listValid)
-    {
-        for (int index = 0; index < instructionCount; index++)
-        {
-            uintptr_t value = reinterpret_cast<uintptr_t>(instructions[index]);
-            fingerprint ^= value + static_cast<uintptr_t>(0x9E3779B9u) +
-                           (fingerprint << 6) + (fingerprint >> 2);
-        }
-    }
-
-    void* instruction = nullptr;
-    void* imageProxy = nullptr;
-    int instructionIndex = -1;
-    int uniqueInstructionCount = 0;
-    unsigned int candidateCount = 0;
-    bool unique = listValid && FindUniqueBaseImageInstruction(
-                                   renderVisual, 0, &instruction, &imageProxy,
-                                   &instructionIndex, &uniqueInstructionCount,
-                                   &candidateCount);
-
-    bool logSample = false;
-    bool changed = false;
-    NativeRenderSlotProbeState snapshot = {};
-    AcquireSRWLockExclusive(&g_nativeRenderSlotProbeLock);
-    bool newTarget = g_nativeRenderSlotProbe.hwnd != hwnd ||
-                     g_nativeRenderSlotProbe.renderVisual != renderVisual;
-    if (newTarget)
-    {
-        g_nativeRenderSlotProbe = {};
-        g_nativeRenderSlotProbe.hwnd = hwnd;
-        g_nativeRenderSlotProbe.renderVisual = renderVisual;
-    }
-    else if (g_nativeRenderSlotProbe.samples)
-    {
-        bool arrayChanged =
-            g_nativeRenderSlotProbe.instructionArray != instructions ||
-            g_nativeRenderSlotProbe.countAddress != countAddress ||
-            g_nativeRenderSlotProbe.instructionCount != instructionCount;
-        bool slotChanged =
-            g_nativeRenderSlotProbe.instruction != instruction ||
-            g_nativeRenderSlotProbe.imageProxy != imageProxy ||
-            g_nativeRenderSlotProbe.instructionIndex != instructionIndex ||
-            g_nativeRenderSlotProbe.fingerprint != fingerprint;
-        if (arrayChanged)
-        {
-            g_nativeRenderSlotProbe.arrayChanges++;
-        }
-        if (slotChanged)
-        {
-            g_nativeRenderSlotProbe.slotChanges++;
-        }
-        changed = arrayChanged || slotChanged;
-    }
-    g_nativeRenderSlotProbe.samples++;
-    if (!listValid || !unique)
-    {
-        g_nativeRenderSlotProbe.missingSamples++;
-    }
-    g_nativeRenderSlotProbe.instructionArray = instructions;
-    g_nativeRenderSlotProbe.countAddress = countAddress;
-    g_nativeRenderSlotProbe.instruction = instruction;
-    g_nativeRenderSlotProbe.imageProxy = imageProxy;
-    g_nativeRenderSlotProbe.fingerprint = fingerprint;
-    g_nativeRenderSlotProbe.instructionIndex = instructionIndex;
-    g_nativeRenderSlotProbe.instructionCount = instructionCount;
-    snapshot = g_nativeRenderSlotProbe;
-    logSample = newTarget || changed || snapshot.samples == 4 ||
-                snapshot.samples == 12 || snapshot.samples == 32 ||
-                ((!listValid || !unique) && snapshot.missingSamples <= 2);
-    ReleaseSRWLockExclusive(&g_nativeRenderSlotProbeLock);
-
-    if (logSample)
-    {
-        Wh_Log(L"True 4x4 native slot stability: event=%s sample=%u "
-               L"HWND=%p visual=%p list=%p countField=%p index=%d/%d "
-               L"instruction=%p image=%p fingerprint=0x%llX "
-               L"candidates=%u listValid=%d unique=%d arrayChanges=%u "
-               L"slotChanges=%u missing=%u (read-only)",
-               eventName, snapshot.samples, hwnd, renderVisual, instructions,
-               countAddress, instructionIndex, instructionCount, instruction,
-               imageProxy, static_cast<unsigned long long>(fingerprint),
-               candidateCount, listValid, unique, snapshot.arrayChanges,
-               snapshot.slotChanges, snapshot.missingSamples);
-    }
 }
 
 static bool WindowStateEdgesClose(LONG first, LONG second)
@@ -1988,320 +1432,6 @@ static size_t FindOffsetFromFunction(void* function, size_t defaultValue)
         bytesRead += result.length;
     }
     return defaultValue;
-}
-
-static bool FindRenderDataInstructionLayout(void* function,
-                                            size_t* instructionsOffset,
-                                            size_t* countOffset)
-{
-    if (!instructionsOffset || !countOffset ||
-        !IsDwmFunctionPointerValid(function))
-    {
-        return false;
-    }
-    const std::regex countPattern(
-        R"(movsxd\s+\w+,\s*(?:dword ptr )?\[rcx\s*\+\s*0x([0-9a-f]{1,8})\])",
-        std::regex_constants::icase);
-    const std::regex arrayPattern(
-        R"(lea\s+\w+,\s*\[rcx\s*\+\s*0x([0-9a-f]{1,8})\])",
-        std::regex_constants::icase);
-    size_t candidateCount = SIZE_MAX;
-    size_t candidateArray = SIZE_MAX;
-    BYTE* instruction = static_cast<BYTE*>(function);
-    size_t bytesRead = 0;
-    for (int i = 0; i < 48 && bytesRead < 256; i++)
-    {
-        WH_DISASM_RESULT result = {};
-        if (!IsDwmExecutableAddress(instruction) ||
-            !Wh_Disasm(instruction, &result) || result.length == 0)
-        {
-            break;
-        }
-        std::string_view text = result.text;
-        std::match_results<std::string_view::const_iterator> match;
-        if (candidateCount == SIZE_MAX &&
-            std::regex_match(text.begin(), text.end(), match, countPattern))
-        {
-            candidateCount = std::stoull(match[1].str(), nullptr, 16);
-        }
-        else if (candidateArray == SIZE_MAX &&
-                 std::regex_match(text.begin(), text.end(), match,
-                                  arrayPattern))
-        {
-            candidateArray = std::stoull(match[1].str(), nullptr, 16);
-        }
-        if (candidateArray != SIZE_MAX && candidateCount != SIZE_MAX)
-        {
-            break;
-        }
-        if (text == "ret")
-        {
-            break;
-        }
-        instruction += result.length;
-        bytesRead += result.length;
-    }
-    if (candidateArray > 0x1000 || candidateCount > 0x1000 ||
-        candidateCount != candidateArray + 0x18)
-    {
-        return false;
-    }
-    *instructionsOffset = candidateArray;
-    *countOffset = candidateCount;
-    return true;
-}
-
-static bool FindVisualCollectionLayout(void* function, size_t* arrayOffset,
-                                       size_t* countOffset)
-{
-    if (!arrayOffset || !countOffset ||
-        !IsDwmFunctionPointerValid(function))
-    {
-        return false;
-    }
-
-    std::string thisAliases[12] = {"rcx"};
-    unsigned int aliasCount = 1;
-    auto findAlias = [&](const std::string& name) -> int
-    {
-        for (unsigned int i = 0; i < aliasCount; i++)
-        {
-            if (thisAliases[i] == name)
-            {
-                return static_cast<int>(i);
-            }
-        }
-        return -1;
-    };
-    auto removeAlias = [&](const std::string& name)
-    {
-        int index = findAlias(name);
-        if (index >= 0)
-        {
-            thisAliases[index] = thisAliases[--aliasCount];
-        }
-    };
-    auto addAlias = [&](const std::string& name)
-    {
-        if (findAlias(name) < 0 && aliasCount < ARRAYSIZE(thisAliases))
-        {
-            thisAliases[aliasCount++] = name;
-        }
-    };
-
-    const std::regex movePattern(
-        R"(^mov\s+(r[a-z0-9]+),\s*(r[a-z0-9]+)$)",
-        std::regex_constants::icase);
-    const std::regex countPattern(
-        R"(^mov\s+(?:e[a-z0-9]+|r[0-9]+d),\s*(?:dword ptr\s*)?\[(r[a-z0-9]+)\s*\+\s*0x([0-9a-f]{1,8})\]$)",
-        std::regex_constants::icase);
-    const std::regex arrayPattern(
-        R"(^lea\s+(r[a-z0-9]+),\s*\[(r[a-z0-9]+)\s*\+\s*0x([0-9a-f]{1,8})\]$)",
-        std::regex_constants::icase);
-    size_t countCandidates[8] = {};
-    size_t arrayCandidates[8] = {};
-    unsigned int countCandidateCount = 0;
-    unsigned int arrayCandidateCount = 0;
-    auto addCandidate = [](size_t* candidates, unsigned int* count,
-                           size_t value)
-    {
-        if (value > 0x100 || value % sizeof(void*) != 0)
-        {
-            return;
-        }
-        for (unsigned int i = 0; i < *count; i++)
-        {
-            if (candidates[i] == value)
-            {
-                return;
-            }
-        }
-        if (*count < 8)
-        {
-            candidates[(*count)++] = value;
-        }
-    };
-
-    BYTE* instruction = static_cast<BYTE*>(function);
-    size_t bytesRead = 0;
-    for (int i = 0; i < 96 && bytesRead < 512; i++)
-    {
-        WH_DISASM_RESULT result = {};
-        if (!IsDwmExecutableAddress(instruction) ||
-            !Wh_Disasm(instruction, &result) || result.length == 0)
-        {
-            break;
-        }
-        std::string text = result.text;
-        std::smatch match;
-        if (std::regex_match(text, match, movePattern))
-        {
-            const std::string destination = match[1].str();
-            if (findAlias(match[2].str()) >= 0)
-            {
-                addAlias(destination);
-            }
-            else
-            {
-                removeAlias(destination);
-            }
-        }
-        else if (std::regex_match(text, match, countPattern) &&
-                 findAlias(match[1].str()) >= 0)
-        {
-            addCandidate(countCandidates, &countCandidateCount,
-                         std::stoull(match[2].str(), nullptr, 16));
-        }
-        else if (std::regex_match(text, match, arrayPattern))
-        {
-            const std::string destination = match[1].str();
-            if (findAlias(match[2].str()) >= 0)
-            {
-                addCandidate(arrayCandidates, &arrayCandidateCount,
-                             std::stoull(match[3].str(), nullptr, 16));
-            }
-            removeAlias(destination);
-        }
-        if (text == "ret")
-        {
-            break;
-        }
-        instruction += result.length;
-        bytesRead += result.length;
-    }
-
-    size_t matchedArray = SIZE_MAX;
-    size_t matchedCount = SIZE_MAX;
-    unsigned int matches = 0;
-    for (unsigned int i = 0; i < arrayCandidateCount; i++)
-    {
-        for (unsigned int j = 0; j < countCandidateCount; j++)
-        {
-            if (countCandidates[j] == arrayCandidates[i] + 0x18)
-            {
-                matchedArray = arrayCandidates[i];
-                matchedCount = countCandidates[j];
-                matches++;
-            }
-        }
-    }
-    if (matches != 1)
-    {
-        return false;
-    }
-    *arrayOffset = matchedArray;
-    *countOffset = matchedCount;
-    return true;
-}
-
-static unsigned int FindEnsureRenderDataPointerOffsets(
-    void* function, size_t* offsets, unsigned int capacity)
-{
-    if (!offsets || capacity == 0 || !IsDwmFunctionPointerValid(function))
-    {
-        return 0;
-    }
-
-    std::string thisAliases[16] = {"rcx"};
-    unsigned int aliasCount = 1;
-    auto findAlias = [&](const std::string& name) -> int
-    {
-        for (unsigned int i = 0; i < aliasCount; i++)
-        {
-            if (thisAliases[i] == name)
-            {
-                return static_cast<int>(i);
-            }
-        }
-        return -1;
-    };
-    auto removeAlias = [&](const std::string& name)
-    {
-        int index = findAlias(name);
-        if (index >= 0)
-        {
-            thisAliases[index] = thisAliases[--aliasCount];
-        }
-    };
-    auto addAlias = [&](const std::string& name)
-    {
-        if (findAlias(name) < 0 && aliasCount < ARRAYSIZE(thisAliases))
-        {
-            thisAliases[aliasCount++] = name;
-        }
-    };
-    auto addOffset = [&](size_t offset, unsigned int count)
-    {
-        if (offset < 0x20 || offset > 0x800 ||
-            offset % sizeof(void*) != 0)
-        {
-            return count;
-        }
-        for (unsigned int i = 0; i < count; i++)
-        {
-            if (offsets[i] == offset)
-            {
-                return count;
-            }
-        }
-        if (count < capacity)
-        {
-            offsets[count++] = offset;
-        }
-        return count;
-    };
-
-    const std::regex movePattern(
-        R"(^mov\s+(r[a-z0-9]+),\s*(r[a-z0-9]+)$)",
-        std::regex_constants::icase);
-    const std::regex loadPattern(
-        R"(^mov\s+(r[a-z0-9]+),\s*(?:qword ptr\s*)?\[(r[a-z0-9]+)\s*\+\s*0x([0-9a-f]{1,8})\]$)",
-        std::regex_constants::icase);
-    BYTE* instruction = static_cast<BYTE*>(function);
-    size_t bytesRead = 0;
-    unsigned int count = 0;
-    for (int i = 0; i < 256 && bytesRead < 1024; i++)
-    {
-        WH_DISASM_RESULT result = {};
-        if (!IsDwmExecutableAddress(instruction) ||
-            !Wh_Disasm(instruction, &result) || result.length == 0)
-        {
-            break;
-        }
-        std::string text = result.text;
-        std::smatch match;
-        if (std::regex_match(text, match, loadPattern))
-        {
-            const std::string destination = match[1].str();
-            const std::string base = match[2].str();
-            if (findAlias(base) >= 0)
-            {
-                count = addOffset(
-                    std::stoull(match[3].str(), nullptr, 16), count);
-            }
-            removeAlias(destination);
-        }
-        else if (std::regex_match(text, match, movePattern))
-        {
-            const std::string destination = match[1].str();
-            const std::string source = match[2].str();
-            if (findAlias(source) >= 0)
-            {
-                addAlias(destination);
-            }
-            else
-            {
-                removeAlias(destination);
-            }
-        }
-        if (text == "ret")
-        {
-            break;
-        }
-        instruction += result.length;
-        bytesRead += result.length;
-    }
-    return count;
 }
 
 static size_t FindDesktopManagerThreadIdOffset(void* function)
@@ -3259,7 +2389,6 @@ static void __cdecl TopLevelWindow3DSetWindowDataHook(void* pThis, void* windowD
 
 static void __cdecl WindowDataDestructorHook(void* pThis)
 {
-    RequestVisibleMeshCleanupForHwnd(GetHwndFromTrustedWindowData(pThis));
     ClearDwmWindowMappingByWindowData(pThis);
     g_windowDataDestructorOriginal(pThis);
 }
@@ -3284,7 +2413,6 @@ static long __cdecl EnsureTopLevelWindowHook(void* pThis, void* windowData)
 static void __cdecl TopLevelWindowDestructorHook(void* pThis)
 {
     void* windowData = ClearDwmWindowMappingByTopLevelWindow(pThis);
-    RequestVisibleMeshCleanupForHwnd(GetHwndFromTrustedWindowData(windowData));
     if (windowData && !g_unloading.load(std::memory_order_acquire))
     {
         MarkAnimationSlotForDwmObjectRefresh(windowData);
@@ -3296,1076 +2424,6 @@ static void __cdecl TopLevelWindow3DDestructorHook(void* pThis)
 {
     ClearDwmWindowMappingByTopLevelWindow3D(pThis);
     g_topLevelWindow3DDestructorOriginal(pThis);
-}
-
-static ObservedVisualProxy* FindObservedNode(ObservedVisualProxy* table,
-                                             void* object, bool create)
-{
-    if (!object)
-    {
-        return nullptr;
-    }
-    uintptr_t hash = reinterpret_cast<uintptr_t>(object) >> 4;
-    hash ^= hash >> 17;
-    for (unsigned int probe = 0; probe < OBSERVED_VISUAL_PROXY_PROBES; probe++)
-    {
-        ObservedVisualProxy& entry =
-            table[(hash + probe) % OBSERVED_VISUAL_PROXY_COUNT];
-        void* observed = entry.proxy.load(std::memory_order_acquire);
-        if (observed == object)
-        {
-            return &entry;
-        }
-        if (!observed)
-        {
-            if (!create)
-            {
-                return nullptr;
-            }
-            void* expected = nullptr;
-            if (entry.proxy.compare_exchange_strong(
-                    expected, object, std::memory_order_acq_rel,
-                    std::memory_order_acquire))
-            {
-                entry.parent.store(nullptr, std::memory_order_relaxed);
-                entry.content.store(nullptr, std::memory_order_relaxed);
-                entry.redirectTarget.store(nullptr, std::memory_order_relaxed);
-                return &entry;
-            }
-            if (expected == object)
-            {
-                return &entry;
-            }
-        }
-    }
-    return nullptr;
-}
-
-static ObservedVisualProxy* FindObservedVisualProxy(void* proxy, bool create)
-{
-    return FindObservedNode(g_observedVisualProxies, proxy, create);
-}
-
-static ObservedVisualProxy* FindObservedVisual(void* visual, bool create)
-{
-    return FindObservedNode(g_observedVisuals, visual, create);
-}
-
-static bool FindObservedExactSourceProxy(std::atomic<void*>* table,
-                                          void* proxy, bool create)
-{
-    if (!proxy)
-    {
-        return false;
-    }
-    uintptr_t hash = reinterpret_cast<uintptr_t>(proxy) >> 4;
-    hash ^= hash >> 17;
-    for (unsigned int probe = 0; probe < OBSERVED_VISUAL_PROXY_PROBES; probe++)
-    {
-        std::atomic<void*>& entry =
-            table[(hash + probe) % OBSERVED_VISUAL_PROXY_COUNT];
-        void* observed = entry.load(std::memory_order_acquire);
-        if (observed == proxy)
-        {
-            return true;
-        }
-        if (!observed)
-        {
-            if (!create)
-            {
-                return false;
-            }
-            void* expected = nullptr;
-            if (entry.compare_exchange_strong(
-                    expected, proxy, std::memory_order_acq_rel,
-                    std::memory_order_acquire) || expected == proxy)
-            {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-static bool FindObservedBitmapSourceProxy(void* proxy, bool create)
-{
-    return FindObservedExactSourceProxy(g_observedBitmapSourceProxies, proxy,
-                                         create);
-}
-
-static bool FindObservedVisualSurfaceProxy(void* proxy, bool create)
-{
-    return FindObservedExactSourceProxy(g_observedVisualSurfaceProxies, proxy,
-                                         create);
-}
-
-static long __cdecl CreateBitmapSourceProxyHook(void* pThis,
-                                                 void** bitmapProxy)
-{
-    long result = g_createBitmapSourceProxyOriginal(pThis, bitmapProxy);
-    if (result >= 0 && bitmapProxy && *bitmapProxy &&
-        !g_unloading.load(std::memory_order_acquire))
-    {
-        FindObservedBitmapSourceProxy(*bitmapProxy, true);
-        g_observedBitmapSourceCreateCount.fetch_add(1,
-                                                     std::memory_order_relaxed);
-    }
-    return result;
-}
-
-static long __cdecl CreateVisualSurfaceProxyHook(void* pThis,
-                                                  void* sharedHandle,
-                                                  void** surfaceProxy)
-{
-    long result = g_createVisualSurfaceProxyOriginal(
-        pThis, sharedHandle, surfaceProxy);
-    if (result >= 0 && surfaceProxy && *surfaceProxy &&
-        !g_unloading.load(std::memory_order_acquire))
-    {
-        FindObservedVisualSurfaceProxy(*surfaceProxy, true);
-        g_observedVisualSurfaceCreateCount.fetch_add(
-            1, std::memory_order_relaxed);
-    }
-    return result;
-}
-
-template <typename Entry>
-static Entry* FindObservedImageEntry(Entry* table, void* key, bool create)
-{
-    if (!key)
-    {
-        return nullptr;
-    }
-    uintptr_t hash = reinterpret_cast<uintptr_t>(key) >> 4;
-    hash ^= hash >> 17;
-    for (unsigned int probe = 0; probe < OBSERVED_VISUAL_PROXY_PROBES; probe++)
-    {
-        Entry& entry =
-            table[(hash + probe) % OBSERVED_VISUAL_PROXY_COUNT];
-        void* observed = nullptr;
-        if constexpr (std::is_same_v<Entry, ObservedBitmapInstruction>)
-        {
-            observed = entry.instruction.load(std::memory_order_acquire);
-        }
-        else
-        {
-            observed = entry.visual.load(std::memory_order_acquire);
-        }
-        if (observed == key)
-        {
-            return &entry;
-        }
-        if (!observed)
-        {
-            if (!create)
-            {
-                return nullptr;
-            }
-            std::atomic<void*>& keySlot = [&]() -> std::atomic<void*>&
-            {
-                if constexpr (std::is_same_v<Entry, ObservedBitmapInstruction>)
-                {
-                    return entry.instruction;
-                }
-                else
-                {
-                    return entry.visual;
-                }
-            }();
-            void* expected = nullptr;
-            if (keySlot.compare_exchange_strong(
-                    expected, key, std::memory_order_acq_rel,
-                    std::memory_order_acquire))
-            {
-                entry.imageProxy.store(nullptr, std::memory_order_relaxed);
-                if constexpr (std::is_same_v<Entry, ObservedRenderImage>)
-                {
-                    entry.instruction.store(nullptr,
-                                            std::memory_order_relaxed);
-                    entry.imageVtable.store(nullptr,
-                                            std::memory_order_relaxed);
-                    entry.ownerWindowData.store(nullptr,
-                                                std::memory_order_relaxed);
-                    entry.ownerHwnd.store(nullptr,
-                                          std::memory_order_relaxed);
-                    entry.sourceKind.store(
-                        static_cast<int>(MeshSourceKind::None),
-                        std::memory_order_relaxed);
-                    entry.capturedInstructionCount.store(
-                        0, std::memory_order_relaxed);
-                    entry.capturedInstructionIndex.store(
-                        -1, std::memory_order_relaxed);
-                }
-                return &entry;
-            }
-            if (expected == key)
-            {
-                return &entry;
-            }
-        }
-    }
-    return nullptr;
-}
-
-static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
-                                                     void** instruction)
-{
-    long result =
-        g_drawBitmapInstructionCreateOriginal(imageProxy, instruction);
-    if (result >= 0 && instruction && *instruction && imageProxy &&
-        !g_unloading.load(std::memory_order_acquire))
-    {
-        g_observedDrawBitmapCreateCount.fetch_add(1,
-                                                   std::memory_order_relaxed);
-        if (ObservedBitmapInstruction* entry = FindObservedImageEntry(
-                g_observedBitmapInstructions, *instruction, true))
-        {
-            entry->imageProxy.store(imageProxy, std::memory_order_release);
-        }
-    }
-    return result;
-}
-
-static long __cdecl DrawTileImageInstructionCreateHook(
-    void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
-    float opacity, void** instruction)
-{
-    long result = g_drawTileImageInstructionCreateOriginal(
-        imageProxy, sourceRect, destinationOffset, opacity, instruction);
-    if (result >= 0 && instruction && *instruction && imageProxy &&
-        !g_unloading.load(std::memory_order_acquire))
-    {
-        g_observedDrawTileCreateCount.fetch_add(1,
-                                                 std::memory_order_relaxed);
-        if (ObservedBitmapInstruction* entry = FindObservedImageEntry(
-                g_observedBitmapInstructions, *instruction, true))
-        {
-            entry->imageProxy.store(imageProxy, std::memory_order_release);
-        }
-    }
-    return result;
-}
-
-static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
-                                                        void* instruction)
-{
-    ObservedBitmapInstruction* source =
-        pThis && instruction
-            ? FindObservedImageEntry(g_observedBitmapInstructions,
-                                     instruction, false)
-            : nullptr;
-    void* imageProxy = source
-                           ? source->imageProxy.load(std::memory_order_acquire)
-                           : nullptr;
-    HWND ownerHwnd = nullptr;
-    void* ownerWindowData = nullptr;
-    long result = E_NOINTERFACE;
-    if (imageProxy && !g_unloading.load(std::memory_order_acquire))
-    {
-        ownerWindowData = RegisterAnimationTopLevelWindow3D(pThis, &ownerHwnd);
-    }
-    // Publish the original first. The guarded one-shot canary below only
-    // replaces its proven list slot after the insertion layout is validated.
-    result = g_renderDataVisualAddInstruction(pThis, instruction);
-    if (result >= 0 && imageProxy &&
-        !g_unloading.load(std::memory_order_acquire))
-    {
-        g_observedImageInstructionMatchedAddCount.fetch_add(
-            1, std::memory_order_relaxed);
-        if (ObservedRenderImage* entry = FindObservedImageEntry(
-                g_observedRenderImages, pThis, true))
-        {
-            unsigned int capturedInstructionCount = 0;
-            int capturedInstructionIndex = -1;
-            FindRenderDataInstructionIndex(
-                pThis, instruction, &capturedInstructionCount,
-                &capturedInstructionIndex);
-            void* imageVtable = nullptr;
-            if (IsReadableMemory(imageProxy, sizeof(void*)))
-            {
-                void* candidate = *reinterpret_cast<void**>(imageProxy);
-                if (IsDwmImageAddress(candidate, sizeof(void*)))
-                {
-                    imageVtable = candidate;
-                }
-            }
-            entry->instruction.store(instruction, std::memory_order_relaxed);
-            entry->imageVtable.store(imageVtable, std::memory_order_relaxed);
-            entry->ownerWindowData.store(ownerWindowData,
-                                         std::memory_order_relaxed);
-            entry->ownerHwnd.store(ownerHwnd, std::memory_order_relaxed);
-            entry->sourceKind.store(
-                static_cast<int>(GetMeshSourceKind(imageProxy)),
-                std::memory_order_relaxed);
-            entry->capturedInstructionCount.store(
-                capturedInstructionCount, std::memory_order_relaxed);
-            entry->capturedInstructionIndex.store(
-                capturedInstructionIndex, std::memory_order_relaxed);
-            entry->imageProxy.store(imageProxy, std::memory_order_release);
-        }
-    }
-    return result;
-}
-
-static bool RestoreNativeMeshPublishLease(const wchar_t* stage)
-{
-    if (!g_nativeMeshPublishLease.renderVisual)
-    {
-        return true;
-    }
-    NativeMeshPublishLease lease = g_nativeMeshPublishLease;
-    void** currentInstructions = nullptr;
-    int* currentCountAddress = nullptr;
-    int currentCount = 0;
-    bool exact = GetRenderDataInstructionList(
-                     lease.renderVisual, &currentInstructions,
-                     &currentCountAddress, &currentCount) &&
-                 currentInstructions == lease.instructionArray &&
-                 currentCountAddress == lease.countAddress &&
-                 currentCount == lease.instructionCount &&
-                 lease.instructionIndex >= 0 &&
-                 lease.instructionIndex < currentCount &&
-                 IsWritableMemory(currentInstructions + lease.instructionIndex,
-                                  sizeof(void*)) &&
-                 currentInstructions[lease.instructionIndex] ==
-                     lease.meshInstruction;
-    if (!exact)
-    {
-        Wh_Log(L"True 4x4 scene lease restore deferred: stage=%s HWND=%p "
-               L"visual=%p expectedList=%p currentList=%p index=%d/%d",
-               stage, lease.hwnd, lease.renderVisual, lease.instructionArray,
-               currentInstructions, lease.instructionIndex, currentCount);
-        return false;
-    }
-    currentInstructions[lease.instructionIndex] = lease.originalInstruction;
-    g_nativeMeshPublishLease = {};
-    Wh_Log(L"True 4x4 scene lease restored: stage=%s HWND=%p visual=%p "
-           L"index=%d/%d",
-           stage, lease.hwnd, lease.renderVisual, lease.instructionIndex,
-           lease.instructionCount);
-    return true;
-}
-
-static long __cdecl RenderDataVisualClearInstructionsHook(void* pThis)
-{
-    if (pThis && g_nativeMeshPublishLease.renderVisual == pThis)
-    {
-        RestoreNativeMeshPublishLease(L"ClearInstructions");
-    }
-    return g_renderDataVisualClearInstructions(pThis);
-}
-
-static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
-{
-    if (g_nativeMeshPublishLease.renderVisual)
-    {
-        RestoreNativeMeshPublishLease(L"UpdateRenderDataReentry");
-    }
-    HWND probeHwnd = nullptr;
-    void* probeWindowData = nullptr;
-    bool probeTarget = false;
-    NativeRenderCallSnapshot before = {};
-    if (pThis && !g_unloading.load(std::memory_order_acquire))
-    {
-        probeWindowData =
-            RegisterAnimationTopLevelWindow3D(pThis, &probeHwnd);
-        probeTarget = probeWindowData && probeHwnd &&
-                      GetHwndFromWindowData(probeWindowData) == probeHwnd &&
-                      g_liveBaseImageMeshTargetHwnd.load(
-                          std::memory_order_acquire) == probeHwnd;
-        if (probeTarget)
-        {
-            before = CaptureNativeRenderCallSnapshot(pThis);
-        }
-    }
-    bool prepared = false;
-    bool rebound = false;
-    bool substituted = false;
-    bool leased = false;
-    void* meshInstruction = nullptr;
-    if (NATIVE_MESH_TRANSACTION_PROBE_ENABLED && probeTarget &&
-        before.listValid && before.unique && before.instruction &&
-        before.imageProxy && before.instructionIndex >= 0 &&
-        g_nativeMeshCanarySucceeded.load(std::memory_order_acquire))
-    {
-        if (!g_visibleMeshCanaryActive.load(std::memory_order_acquire))
-        {
-            prepared = TryInstallLiveBaseImageMeshCanary(
-                pThis, before.instruction, before.imageProxy,
-                probeWindowData, probeHwnd);
-        }
-        if (g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
-            g_visibleMeshCanary.hwnd == probeHwnd &&
-            g_visibleMeshCanary.pinnedImageProxy != before.imageProxy)
-        {
-            rebound = RebindLiveBaseImageMeshCanary(before.imageProxy,
-                                                     probeHwnd);
-            if (!rebound)
-            {
-                g_visibleMeshCanaryCleanupRequested.store(
-                    true, std::memory_order_release);
-                RequestDwmScenePass();
-            }
-        }
-        if (g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
-            g_visibleMeshCanary.hwnd == probeHwnd &&
-            g_visibleMeshCanary.pinnedImageProxy == before.imageProxy)
-        {
-            meshInstruction = g_visibleMeshCanary.instruction;
-            if (meshInstruction &&
-                IsWritableMemory(before.instructionArray +
-                                     before.instructionIndex,
-                                 sizeof(void*)) &&
-                before.instructionArray[before.instructionIndex] ==
-                    before.instruction)
-            {
-                before.instructionArray[before.instructionIndex] =
-                    meshInstruction;
-                substituted = true;
-            }
-        }
-    }
-    long result = g_renderDataVisualUpdateRenderData(pThis);
-    if (substituted)
-    {
-        void** currentInstructions = nullptr;
-        int* currentCountAddress = nullptr;
-        int currentCount = 0;
-        if (GetRenderDataInstructionList(
-                pThis, &currentInstructions, &currentCountAddress,
-                &currentCount) &&
-            currentInstructions == before.instructionArray &&
-            currentCountAddress == before.countAddress &&
-            currentCount == before.instructionCount &&
-            before.instructionIndex < currentCount &&
-            currentInstructions[before.instructionIndex] == meshInstruction &&
-            IsWritableMemory(currentInstructions + before.instructionIndex,
-                             sizeof(void*)))
-        {
-            g_nativeMeshPublishLease = {
-                pThis,
-                currentInstructions,
-                currentCountAddress,
-                before.instruction,
-                meshInstruction,
-                probeHwnd,
-                before.instructionIndex,
-                before.instructionCount};
-            leased = true;
-        }
-        if (!leased)
-        {
-            g_visibleMeshCanaryCleanupRequested.store(
-                true, std::memory_order_release);
-            RequestDwmScenePass();
-        }
-        Wh_Log(L"True 4x4 transactional publish: HWND=%p index=%d/%d "
-               L"prepared=%d rebound=%d substituted=1 sceneLease=%d "
-               L"result=0x%08X",
-               probeHwnd, before.instructionIndex, before.instructionCount,
-               prepared, rebound, leased,
-               static_cast<unsigned int>(result));
-    }
-    if (probeTarget)
-    {
-        NativeRenderCallSnapshot after =
-            CaptureNativeRenderCallSnapshot(pThis);
-        bool changed =
-            before.instructionArray != after.instructionArray ||
-            before.countAddress != after.countAddress ||
-            before.instruction != after.instruction ||
-            before.imageProxy != after.imageProxy ||
-            before.fingerprint != after.fingerprint ||
-            before.instructionIndex != after.instructionIndex ||
-            before.instructionCount != after.instructionCount ||
-            before.listValid != after.listValid ||
-            before.unique != after.unique;
-        unsigned int sample = g_nativePublishProbeSamples.fetch_add(
-                                  1, std::memory_order_relaxed) +
-                              1;
-        unsigned int changes = changed
-                                   ? g_nativePublishProbeChanges.fetch_add(
-                                         1, std::memory_order_relaxed) +
-                                         1
-                                   : g_nativePublishProbeChanges.load(
-                                         std::memory_order_relaxed);
-        bool missing = !before.listValid || !before.unique ||
-                       !after.listValid || !after.unique;
-        unsigned int missingCount = missing
-                                        ? g_nativePublishProbeMissing.fetch_add(
-                                              1, std::memory_order_relaxed) +
-                                              1
-                                        : g_nativePublishProbeMissing.load(
-                                              std::memory_order_relaxed);
-        if (sample <= 8 || changed || sample % 64 == 0)
-        {
-            Wh_Log(L"True 4x4 native publish-call stability: sample=%u "
-                   L"HWND=%p result=0x%08X changed=%d changes=%u "
-                   L"missing=%u before={list=%p countField=%p index=%d/%d "
-                   L"instruction=%p image=%p fingerprint=0x%llX valid=%d "
-                   L"unique=%d candidates=%u} after={list=%p countField=%p "
-                   L"index=%d/%d instruction=%p image=%p fingerprint=0x%llX "
-                   L"valid=%d unique=%d candidates=%u} (read-only)",
-                   sample, probeHwnd, static_cast<unsigned int>(result),
-                   changed, changes, missingCount, before.instructionArray,
-                   before.countAddress, before.instructionIndex,
-                   before.instructionCount, before.instruction,
-                   before.imageProxy,
-                   static_cast<unsigned long long>(before.fingerprint),
-                   before.listValid, before.unique, before.candidateCount,
-                   after.instructionArray, after.countAddress,
-                   after.instructionIndex, after.instructionCount,
-                   after.instruction, after.imageProxy,
-                   static_cast<unsigned long long>(after.fingerprint),
-                   after.listValid, after.unique, after.candidateCount);
-        }
-    }
-    return result;
-}
-
-static void* FindTopLevelWindowForCompleteRoot(void* root, void** windowData,
-                                                HWND* hwnd)
-{
-    if (windowData)
-    {
-        *windowData = nullptr;
-    }
-    if (hwnd)
-    {
-        *hwnd = nullptr;
-    }
-    if (!root || !g_topLevelWindowGetRootVisual)
-    {
-        return nullptr;
-    }
-
-    struct Candidate
-    {
-        void* windowData;
-        void* topLevelWindow;
-    };
-    Candidate candidates[MAX_DWM_WINDOW_MAPPINGS] = {};
-    unsigned int candidateCount = 0;
-    AcquireSRWLockShared(&g_dwmWindowMappingsLock);
-    for (const DwmWindowObjectMapping& mapping : g_dwmWindowMappings)
-    {
-        if (mapping.windowData && mapping.topLevelWindow &&
-            candidateCount < ARRAYSIZE(candidates))
-        {
-            candidates[candidateCount++] =
-                {mapping.windowData, mapping.topLevelWindow};
-        }
-    }
-    ReleaseSRWLockShared(&g_dwmWindowMappingsLock);
-
-    constexpr int completeWindowRoot = 0;
-    for (unsigned int index = 0; index < candidateCount; index++)
-    {
-        const Candidate& candidate = candidates[index];
-        if (!IsTopLevelWindowForWindowData(candidate.topLevelWindow,
-                                            candidate.windowData) ||
-            g_topLevelWindowGetRootVisual(candidate.topLevelWindow,
-                                           completeWindowRoot) != root)
-        {
-            continue;
-        }
-        HWND candidateHwnd = GetHwndFromWindowData(candidate.windowData);
-        if (!candidateHwnd)
-        {
-            return nullptr;
-        }
-        if (windowData)
-        {
-            *windowData = candidate.windowData;
-        }
-        if (hwnd)
-        {
-            *hwnd = candidateHwnd;
-        }
-        return candidate.topLevelWindow;
-    }
-    return nullptr;
-}
-
-static long __cdecl CWindowBorderCloneVisualTreeHook(void* pThis,
-                                                      void** clonedVisual,
-                                                      int cloneOptions)
-{
-    long result = g_windowBorderCloneVisualTreeOriginal(
-        pThis, clonedVisual, cloneOptions);
-    if (g_unloading.load(std::memory_order_acquire) || !pThis)
-    {
-        return result;
-    }
-
-    void* windowData = nullptr;
-    HWND hwnd = nullptr;
-    void* topLevelWindow =
-        FindTopLevelWindowForCompleteRoot(pThis, &windowData, &hwnd);
-    if (!topLevelWindow)
-    {
-        return result;
-    }
-
-    void* clone = result >= 0 && clonedVisual ? *clonedVisual : nullptr;
-    void* sourceProxy = ReadPointerMember(pThis, g_visualProxyOffset);
-    void* cloneProxy = ReadPointerMember(clone, g_visualProxyOffset);
-    void* sourceParent = ReadPointerMember(pThis, g_visualParentOffset);
-    void* cloneParent = ReadPointerMember(clone, g_visualParentOffset);
-    void* sourceVtable =
-        IsReadableMemory(pThis, sizeof(void*))
-            ? *reinterpret_cast<void**>(pThis)
-            : nullptr;
-    void* cloneVtable =
-        IsReadableMemory(clone, sizeof(void*))
-            ? *reinterpret_cast<void**>(clone)
-            : nullptr;
-    unsigned int callNumber =
-        g_windowBorderCloneCallCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    DWORD sceneThreadId = g_dwmSceneThreadId.load(std::memory_order_acquire);
-    HWND dragHwnd = g_realDraggedWindow.load(std::memory_order_acquire);
-    HWND meshTarget =
-        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire);
-    Wh_Log(L"True 4x4 complete-root clone observed: call=%u result=0x%08X "
-           L"HWND=%p WindowData=%p CTopLevelWindow=%p options=%d "
-           L"source=%p sourceVtable=%p sourceParent=%p sourceProxy=%p "
-           L"clone=%p cloneVtable=%p cloneParent=%p cloneProxy=%p "
-           L"sceneThread=%d activeDrag=%d meshTarget=%d (read-only)",
-           callNumber, static_cast<unsigned int>(result), hwnd, windowData,
-           topLevelWindow, cloneOptions, pThis, sourceVtable, sourceParent,
-           sourceProxy, clone, cloneVtable, cloneParent, cloneProxy,
-           sceneThreadId != 0 && sceneThreadId == GetCurrentThreadId(),
-           dragHwnd == hwnd, meshTarget == hwnd);
-    return result;
-}
-
-static long __cdecl CTopLevelWindowCloneVisualTreeForLivePreviewHook(
-    void* pThis, bool includeRenderData, void** clonedTopLevelWindow)
-{
-    long result = g_topLevelWindowCloneVisualTreeForLivePreviewOriginal(
-        pThis, includeRenderData, clonedTopLevelWindow);
-    if (g_unloading.load(std::memory_order_acquire) || !pThis)
-    {
-        return result;
-    }
-
-    void* clone = result >= 0 && clonedTopLevelWindow
-                      ? *clonedTopLevelWindow
-                      : nullptr;
-    bool sourceValid =
-        IsDwmObjectPointerValid(pThis, g_topLevelWindowVtable);
-    bool cloneValid =
-        IsDwmObjectPointerValid(clone, g_topLevelWindowVtable);
-    void* sourceWindowData =
-        sourceValid && g_topLevelWindowGetWindowData
-            ? g_topLevelWindowGetWindowData(pThis)
-            : nullptr;
-    void* cloneWindowData =
-        cloneValid && g_topLevelWindowGetWindowData
-            ? g_topLevelWindowGetWindowData(clone)
-            : nullptr;
-    HWND sourceHwnd = GetHwndFromWindowData(sourceWindowData);
-    HWND cloneHwnd = GetHwndFromWindowData(cloneWindowData);
-
-    constexpr int completeWindowRoot = 0;
-    void* sourceRoot =
-        sourceValid && g_topLevelWindowGetRootVisual
-            ? g_topLevelWindowGetRootVisual(pThis, completeWindowRoot)
-            : nullptr;
-    void* cloneRoot =
-        cloneValid && g_topLevelWindowGetRootVisual
-            ? g_topLevelWindowGetRootVisual(clone, completeWindowRoot)
-            : nullptr;
-    void* sourceProxy = ReadPointerMember(sourceRoot, g_visualProxyOffset);
-    void* cloneProxy = ReadPointerMember(cloneRoot, g_visualProxyOffset);
-    unsigned int callNumber =
-        g_livePreviewCloneCallCount.fetch_add(1,
-                                               std::memory_order_relaxed) +
-        1;
-    HWND dragHwnd = g_realDraggedWindow.load(std::memory_order_acquire);
-    HWND meshTarget =
-        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire);
-    DWORD sceneThreadId = g_dwmSceneThreadId.load(std::memory_order_acquire);
-    Wh_Log(L"True 4x4 live-preview clone observed: call=%u result=0x%08X "
-           L"includeRenderData=%d source=%p sourceValid=%d "
-           L"sourceWindowData=%p sourceHWND=%p sourceRoot=%p "
-           L"sourceProxy=%p clone=%p cloneValid=%d cloneWindowData=%p "
-           L"cloneHWND=%p cloneRoot=%p cloneProxy=%p sameWindowData=%d "
-           L"sceneThread=%d activeDrag=%d meshTarget=%d (read-only)",
-           callNumber, static_cast<unsigned int>(result), includeRenderData,
-           pThis, sourceValid, sourceWindowData, sourceHwnd, sourceRoot,
-           sourceProxy, clone, cloneValid, cloneWindowData, cloneHwnd,
-           cloneRoot, cloneProxy,
-           sourceWindowData && sourceWindowData == cloneWindowData,
-           sceneThreadId != 0 && sceneThreadId == GetCurrentThreadId(),
-           sourceHwnd && dragHwnd == sourceHwnd,
-           sourceHwnd && meshTarget == sourceHwnd);
-    return result;
-}
-
-static void LogTopLevelWindow3DRepresentationState(
-    const wchar_t* eventName, unsigned int callNumber, void* pThis,
-    long result, int argument1, int argument2, void* requestedParent,
-    void* parentBefore)
-{
-    HWND hwnd = nullptr;
-    void* windowData = RegisterAnimationTopLevelWindow3D(pThis, &hwnd);
-    if (!windowData || !hwnd)
-    {
-        return;
-    }
-    int instructionCount = 0;
-    GetRenderDataInstructionList(pThis, nullptr, nullptr,
-                                 &instructionCount);
-    void* parentAfter = ReadPointerMember(pThis, g_visualParentOffset);
-    void* transitionProxy = GetTransitionVisualProxy(pThis);
-    void* sourceImage =
-        g_ensureRenderDataPointerOffsetCount > 0
-            ? ReadPointerMember(pThis, g_ensureRenderDataPointerOffsets[0])
-            : nullptr;
-    HWND dragHwnd = g_realDraggedWindow.load(std::memory_order_acquire);
-    ObserveNativeRenderSlotStability(pThis, windowData, hwnd, eventName);
-    Wh_Log(L"True 4x4 secondary representation: event=%s call=%u "
-           L"result=0x%08X object=%p WindowData=%p HWND=%p arg1=%d "
-           L"arg2=%d requestedParent=%p parentBefore=%p parentAfter=%p "
-           L"transitionProxy=%p sourceImage=%p instructions=%d "
-           L"activeDrag=%d (read-only)",
-           eventName, callNumber, static_cast<unsigned int>(result), pThis,
-           windowData, hwnd, argument1, argument2, requestedParent,
-           parentBefore, parentAfter, transitionProxy, sourceImage,
-           instructionCount, dragHwnd == hwnd);
-}
-
-static long __cdecl TopLevelWindow3DEnsureSecondaryWindowRepresentationHook(
-    void* pThis, bool forceRecreate)
-{
-    long result = g_topLevelWindow3DEnsureSecondaryWindowRepresentationOriginal(
-        pThis, forceRecreate);
-    if (!g_unloading.load(std::memory_order_acquire))
-    {
-        unsigned int callNumber = g_secondaryRepresentationCallCount.fetch_add(
-                                      1, std::memory_order_relaxed) +
-                                  1;
-        LogTopLevelWindow3DRepresentationState(
-            L"EnsureSecondary", callNumber, pThis, result, forceRecreate, 0,
-            nullptr, nullptr);
-    }
-    return result;
-}
-
-static long __cdecl TopLevelWindow3DSetParentHook(void* pThis, void* parent)
-{
-    void* parentBefore = ReadPointerMember(pThis, g_visualParentOffset);
-    long result = g_topLevelWindow3DSetParentOriginal(pThis, parent);
-    if (!g_unloading.load(std::memory_order_acquire))
-    {
-        unsigned int callNumber =
-            g_topLevelWindow3DSetParentCallCount.fetch_add(
-                1, std::memory_order_relaxed) +
-            1;
-        LogTopLevelWindow3DRepresentationState(
-            L"SetParent", callNumber, pThis, result, 0, 0, parent,
-            parentBefore);
-    }
-    return result;
-}
-
-static long __cdecl TopLevelWindow3DShowWindowHook(void* pThis, bool show,
-                                                   bool activate)
-{
-    void* parentBefore = ReadPointerMember(pThis, g_visualParentOffset);
-    long result =
-        g_topLevelWindow3DShowWindowOriginal(pThis, show, activate);
-    if (!g_unloading.load(std::memory_order_acquire))
-    {
-        unsigned int callNumber =
-            g_topLevelWindow3DShowWindowCallCount.fetch_add(
-                1, std::memory_order_relaxed) +
-            1;
-        LogTopLevelWindow3DRepresentationState(
-            L"ShowWindow", callNumber, pThis, result, show, activate, nullptr,
-            parentBefore);
-    }
-    return result;
-}
-
-static bool FindTrackedTopLevelVisual(void* visual, void** windowData,
-                                      HWND* hwnd, const wchar_t** kind)
-{
-    *windowData = nullptr;
-    *hwnd = nullptr;
-    *kind = L"None";
-    if (!visual)
-    {
-        return false;
-    }
-    AcquireSRWLockShared(&g_dwmWindowMappingsLock);
-    for (const DwmWindowObjectMapping& mapping : g_dwmWindowMappings)
-    {
-        if (mapping.topLevelWindow == visual)
-        {
-            *windowData = mapping.windowData;
-            *kind = L"CTopLevelWindow";
-            break;
-        }
-        if (mapping.topLevelWindow3D == visual)
-        {
-            *windowData = mapping.windowData;
-            *kind = L"CTopLevelWindow3D";
-            break;
-        }
-    }
-    ReleaseSRWLockShared(&g_dwmWindowMappingsLock);
-    *hwnd = GetHwndFromWindowData(*windowData);
-    return *hwnd != nullptr;
-}
-
-static unsigned int ReadVisualFlags(void* visual)
-{
-    BYTE* flags = visual ? static_cast<BYTE*>(visual) + 0x5c : nullptr;
-    return IsReadableMemory(flags, sizeof(*flags)) ? *flags : UINT_MAX;
-}
-
-static void LogTrackedVisualState(const wchar_t* eventName, void* visual,
-                                  double opacity, unsigned int flagsBefore,
-                                  unsigned int flagsAfter)
-{
-    void* windowData = nullptr;
-    HWND hwnd = nullptr;
-    const wchar_t* kind = nullptr;
-    if (!FindTrackedTopLevelVisual(visual, &windowData, &hwnd, &kind))
-    {
-        return;
-    }
-    unsigned int callNumber =
-        g_trackedVisualVisibilityCallCount.fetch_add(
-            1, std::memory_order_relaxed) +
-        1;
-    void* parent = ReadPointerMember(visual, g_visualParentOffset);
-    void* proxy = ReadPointerMember(visual, g_visualProxyOffset);
-    Wh_Log(L"True 4x4 tracked visual state: event=%s call=%u kind=%s "
-           L"visual=%p WindowData=%p HWND=%p opacity=%.3f "
-           L"flagsBefore=0x%02X flagsAfter=0x%02X parent=%p proxy=%p "
-           L"(read-only observation)",
-           eventName, callNumber, kind, visual, windowData, hwnd, opacity,
-           flagsBefore, flagsAfter, parent, proxy);
-}
-
-static void __cdecl VisualHideHook(void* pThis)
-{
-    unsigned int flagsBefore = ReadVisualFlags(pThis);
-    g_visualHideOriginal(pThis);
-    LogTrackedVisualState(L"Hide", pThis, -1.0, flagsBefore,
-                          ReadVisualFlags(pThis));
-}
-
-static void __cdecl VisualUnhideHook(void* pThis)
-{
-    unsigned int flagsBefore = ReadVisualFlags(pThis);
-    g_visualUnhideOriginal(pThis);
-    LogTrackedVisualState(L"Unhide", pThis, -1.0, flagsBefore,
-                          ReadVisualFlags(pThis));
-}
-
-static void __cdecl VisualSetOpacityHook(void* pThis, double opacity)
-{
-    unsigned int flagsBefore = ReadVisualFlags(pThis);
-    g_visualSetOpacityOriginal(pThis, opacity);
-    LogTrackedVisualState(L"SetOpacity", pThis, opacity, flagsBefore,
-                          ReadVisualFlags(pThis));
-}
-
-static long __cdecl TopLevelWindow3DEnsureRenderDataHook(void* pThis)
-{
-    long result = g_topLevelWindow3DEnsureRenderDataOriginal(pThis);
-    unsigned int callNumber =
-        g_ensureRenderDataCallCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (result < 0 || !pThis ||
-        g_unloading.load(std::memory_order_acquire))
-    {
-        return result;
-    }
-
-    HWND hwnd = nullptr;
-    void* windowData = RegisterAnimationTopLevelWindow3D(pThis, &hwnd);
-    void** observedInstructions = nullptr;
-    int observedInstructionCount = 0;
-    GetRenderDataInstructionList(pThis, &observedInstructions, nullptr,
-                                 &observedInstructionCount);
-    if (observedInstructionCount > 0)
-    {
-        g_ensureRenderDataPopulatedCount.fetch_add(1,
-                                                   std::memory_order_relaxed);
-    }
-    if (windowData && hwnd)
-    {
-        g_ensureRenderDataMappedCount.fetch_add(1,
-                                                std::memory_order_relaxed);
-    }
-    if (callNumber <= 12)
-    {
-        Wh_Log(L"True 4x4 EnsureRenderData observed: call=%u result=0x%08X "
-               L"object=%p WindowData=%p HWND=%p instructions=%d",
-               callNumber, static_cast<unsigned int>(result), pThis,
-               windowData, hwnd, observedInstructionCount);
-    }
-    if (!windowData || !hwnd)
-    {
-        return result;
-    }
-    if (ObservedRenderImage* entry = FindObservedImageEntry(
-            g_observedRenderImages, pThis, true))
-    {
-        entry->ownerWindowData.store(windowData, std::memory_order_relaxed);
-        entry->ownerHwnd.store(hwnd, std::memory_order_release);
-    }
-    ObserveNativeRenderSlotStability(pThis, windowData, hwnd,
-                                     L"EnsureRenderData");
-
-    if (!NATIVE_MESH_WRITE_PROBE_ENABLED ||
-        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire) != hwnd ||
-        g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
-        !g_nativeMeshCanarySucceeded.load(std::memory_order_acquire))
-    {
-        return result;
-    }
-
-    void* instruction = nullptr;
-    void* imageProxy = nullptr;
-    int instructionIndex = -1;
-    int instructionCount = 0;
-    unsigned int candidateCount = 0;
-    if (FindUniqueBaseImageInstruction(
-            pThis, 0, &instruction, &imageProxy, &instructionIndex,
-            &instructionCount, &candidateCount) &&
-        TryInstallLiveBaseImageMeshCanary(
-            pThis, instruction, imageProxy, windowData, hwnd))
-    {
-        Wh_Log(L"True 4x4 native EnsureRenderData boundary: installed "
-               L"HWND=%p index=%d/%d candidates=%u",
-               hwnd, instructionIndex, instructionCount, candidateCount);
-    }
-    return result;
-}
-
-static bool IsObservedMeshSource(void* content)
-{
-    if (!content || !IsReadableMemory(content, sizeof(void*)))
-    {
-        return false;
-    }
-    void* vtable = *reinterpret_cast<void**>(content);
-    return vtable == g_bitmapSourceProxyVtable.load(std::memory_order_acquire) ||
-           vtable == g_visualSurfaceProxyVtable.load(std::memory_order_acquire);
-}
-
-static long __cdecl VisualProxySetContentHook(void* pThis, const void* content)
-{
-    long result = g_visualProxySetContentOriginal(pThis, content);
-    if (result >= 0 && !g_unloading.load(std::memory_order_acquire))
-    {
-        if (ObservedVisualProxy* entry = FindObservedVisualProxy(pThis, true))
-        {
-            entry->content.store(const_cast<void*>(content), std::memory_order_release);
-        }
-        if (IsObservedMeshSource(const_cast<void*>(content)))
-        {
-            g_meshSourceProbePending.store(true, std::memory_order_release);
-        }
-    }
-    return result;
-}
-
-static long __cdecl VisualProxyInsertChildHook(void* pThis, void* child,
-                                               void* reference, bool insertAbove)
-{
-    long result =
-        g_visualProxyInsertChildOriginal(pThis, child, reference, insertAbove);
-    if (result >= 0 && child && !g_unloading.load(std::memory_order_acquire))
-    {
-        if (ObservedVisualProxy* entry = FindObservedVisualProxy(child, true))
-        {
-            entry->parent.store(pThis, std::memory_order_release);
-        }
-        FindObservedVisualProxy(pThis, true);
-    }
-    return result;
-}
-
-static long __cdecl VisualProxyRemoveChildHook(void* pThis, void* child)
-{
-    long result = g_visualProxyRemoveChildOriginal(pThis, child);
-    if (result >= 0 && child)
-    {
-        if (ObservedVisualProxy* entry = FindObservedVisualProxy(child, false))
-        {
-            void* expected = pThis;
-            entry->parent.compare_exchange_strong(
-                expected, nullptr, std::memory_order_acq_rel,
-                std::memory_order_acquire);
-        }
-    }
-    return result;
-}
-
-static long __cdecl VisualSetContentHook(void* pThis, void* content)
-{
-    long result = g_visualSetContentOriginal(pThis, content);
-    if (result >= 0 && !g_unloading.load(std::memory_order_acquire))
-    {
-        if (ObservedVisualProxy* entry = FindObservedVisual(pThis, true))
-        {
-            entry->content.store(content, std::memory_order_release);
-        }
-        if (IsObservedMeshSource(content))
-        {
-            g_meshSourceProbePending.store(true, std::memory_order_release);
-        }
-    }
-    return result;
-}
-
-static long __cdecl VisualSetParentHook(void* pThis, void* parent)
-{
-    long result = g_visualSetParentOriginal(pThis, parent);
-    if (result >= 0 && !g_unloading.load(std::memory_order_acquire))
-    {
-        if (ObservedVisualProxy* entry = FindObservedVisual(pThis, true))
-        {
-            entry->parent.store(parent, std::memory_order_release);
-        }
-        FindObservedVisual(parent, true);
-    }
-    return result;
-}
-
-static long __cdecl VisualRemoveSelfFromParentHook(void* pThis)
-{
-    long result = g_visualRemoveSelfFromParentOriginal(pThis);
-    if (result >= 0)
-    {
-        if (ObservedVisualProxy* entry = FindObservedVisual(pThis, false))
-        {
-            entry->parent.store(nullptr, std::memory_order_release);
-        }
-    }
-    return result;
-}
-
-static long __cdecl RedirectVisualProxySetRedirectedVisualHook(void* pThis,
-                                                               void* visual)
-{
-    long result =
-        g_redirectVisualProxySetRedirectedVisualOriginal(pThis, visual);
-    if (result >= 0 && !g_unloading.load(std::memory_order_acquire))
-    {
-        if (ObservedVisualProxy* entry = FindObservedVisualProxy(pThis, true))
-        {
-            entry->redirectTarget.store(visual, std::memory_order_release);
-        }
-        g_meshSourceProbePending.store(true, std::memory_order_release);
-    }
-    return result;
 }
 
 static void ResetAnimationSlotsForSceneOwnerChange()
@@ -4652,20 +2710,6 @@ static bool InitializeDwmHooks()
          &g_topLevelWindowGetRootVisual,
          nullptr,
          true},
-        {{L"public: virtual long __cdecl CWindowBorder::CloneVisualTree("
-           L"class CVisual * *,enum CloneOptions)"},
-         &g_windowBorderCloneVisualTreeOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? CWindowBorderCloneVisualTreeHook
-                                        : nullptr,
-         true},
-        {{L"public: long __cdecl "
-           L"CTopLevelWindow::CloneVisualTreeForLivePreview("
-           L"bool,class CTopLevelWindow * *)"},
-         &g_topLevelWindowCloneVisualTreeForLivePreviewOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED
-             ? CTopLevelWindowCloneVisualTreeForLivePreviewHook
-             : nullptr,
-         true},
         {{L"public: virtual class CTopLevelWindow3D * __cdecl "
             L"winrt::Udwm::Transitions::implementation::TopLevelWindow3DWrapper::GetVisualWeak(void)"},
          &g_transitionWrapperGetVisualWeakFunction, nullptr, true},
@@ -4705,232 +2749,50 @@ static bool InitializeDwmHooks()
           L"public: long __cdecl CMeshGeometry2dProxy::Update("
            L"int,struct MilPoint3F const *,struct MilPoint2D const *,"
            L"unsigned int,unsigned int const *,unsigned int)"},
-         &g_meshGeometry2dProxyUpdate,
-         nullptr,
-         true},
+         &g_meshLayerSymbols.meshGeometryUpdate, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateMeshGeometry2dProxy("
            L"class CMeshGeometry2dProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CMeshGeometry2dProxy>(class CMeshGeometry2dProxy * *)"},
-         &g_createMeshGeometry2dProxy,
-         nullptr,
-         true},
+         &g_meshLayerSymbols.createMeshGeometry, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateGeometry2dGroupProxy("
            L"class CGeometry2dGroupProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CGeometry2dGroupProxy>(class CGeometry2dGroupProxy * *)"},
-         &g_createGeometry2dGroupProxy,
-         nullptr,
-         true},
-        {{L"public: long __cdecl CCompositor::CreateBitmapSourceProxy("
-           L"class CBitmapSourceProxy * *)",
-          L"protected: long __cdecl CCompositor::CreateProxy<"
-           L"class CBitmapSourceProxy>(class CBitmapSourceProxy * *)"},
-         &g_createBitmapSourceProxyOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? CreateBitmapSourceProxyHook
-                                        : nullptr,
-         true},
-        {{L"public: long __cdecl "
-           L"CCompositor::CreateVisualSurfaceProxyFromSharedHandle("
-           L"void *,class CVisualSurfaceProxy * *)",
-          L"protected: long __cdecl CCompositor::CreateProxyFromSharedHandle<"
-           L"class CVisualSurfaceProxy>(void *,"
-           L"class CVisualSurfaceProxy * *)"},
-         &g_createVisualSurfaceProxyOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? CreateVisualSurfaceProxyHook
-                                        : nullptr,
-         true},
-        {{L"protected: long __cdecl CCompositor::CreateProxy<"
-           L"class CCachedVisualImageProxy>("
-           L"class CCachedVisualImageProxy * *)"},
-         &g_createCachedVisualImageProxy,
-         nullptr,
-         true},
-        {{L"public: long __cdecl CCachedVisualImageProxy::Update("
-           L"struct MilRectF const &,struct MilSizeD const &,"
-           L"class CRectResourceProxy const *,"
-           L"class CSizeResourceProxy const *,class CVisualProxy *,"
-           L"enum MilBrushMappingMode::Enum)"},
-         &g_cachedVisualImageProxyUpdate,
-         nullptr,
-         true},
-        {{L"public: long __cdecl CCachedVisualImageProxy::Snapshot("
-           L"struct tagRECT const &)"},
-         &g_cachedVisualImageProxySnapshot,
-         nullptr,
-         true},
-        {{L"public: long __cdecl CCachedVisualImageProxy::Freeze(void)"},
-         &g_cachedVisualImageProxyFreeze,
-         nullptr,
-         true},
+         &g_meshLayerSymbols.createGeometryGroup, nullptr, true},
         {{L"public: long __cdecl CGeometry2dGroupProxy::Update("
            L"class CMeshGeometry2dProxy const *)"},
-         &g_geometry2dGroupProxyUpdate,
-         nullptr,
-         true},
+         &g_meshLayerSymbols.geometryGroupUpdate, nullptr, true},
         {{L"public: static long __cdecl CDrawMesh2DInstruction::Create("
            L"class CGeometry2dGroupProxy *,class CBitmapSourceProxy *,"
            L"class CDrawMesh2DInstruction * *)"},
-         &g_drawMesh2DInstructionCreate,
-         nullptr,
-         true},
-        {{L"long __cdecl CreateTouchVisual<class CTouchDragVisual>("
-           L"unsigned __int64,class CTouchDragVisual * *)"},
-         &g_createTouchDragVisualFunction,
-         nullptr,
-         true},
-        {{L"public: long __cdecl CTouchDragVisual::NotifyTouchDrag("
-           L"struct tagPOINT const *)"},
-         &g_touchDragVisualNotifyFunction,
-         nullptr,
-         true},
-        {{L"public: virtual void __cdecl CTouchDragVisual::Stop(void)"},
-         &g_touchDragVisualStopFunction,
-         nullptr,
-         true},
-        {{L"private: long __cdecl "
-           L"CTouchDragVisual::CreateDrawMesh2DInstruction("
-           L"struct Mesh2D const *,class CGeometry2dGroupProxy * *,"
-           L"class CMeshGeometry2dProxy * *)"},
-         &g_touchDragVisualCreateMeshInstructionFunction,
-         nullptr,
-         true},
-        {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
-           L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
-         &g_drawBitmapInstructionCreateOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? DrawBitmapInstructionCreateHook
-                                        : nullptr,
-         true},
-        {{L"public: static long __cdecl CDrawTileImageInstruction::Create("
-           L"class CBaseImageProxy *,struct tagRECT const &,"
-           L"struct tagPOINT const &,float,"
-           L"class CDrawTileImageInstruction * *)"},
-         &g_drawTileImageInstructionCreateOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? DrawTileImageInstructionCreateHook
-                                        : nullptr,
-         true},
-        {{L"public: long __cdecl CRenderDataVisual::AddInstruction("
-           L"class CRenderDataInstruction *)"},
-         &g_renderDataVisualAddInstruction,
-         NATIVE_MESH_EXPERIMENT_ENABLED
-             ? RenderDataVisualAddInstructionHook
-             : nullptr,
-         true},
-        {{L"public: long __cdecl CRenderDataVisual::ClearInstructions(void)"},
-         &g_renderDataVisualClearInstructions,
-         NATIVE_MESH_EXPERIMENT_ENABLED
-             ? RenderDataVisualClearInstructionsHook
-             : nullptr,
-         true},
-        {{L"public: virtual long __cdecl "
-           L"CRenderDataVisual::UpdateRenderData(void)"},
-         &g_renderDataVisualUpdateRenderData,
-         NATIVE_MESH_EXPERIMENT_ENABLED
-             ? RenderDataVisualUpdateRenderDataHook
-             : nullptr,
-         true},
-        {{L"private: long __cdecl CTopLevelWindow3D::EnsureRenderData(void)",
-          L"protected: long __cdecl CTopLevelWindow3D::EnsureRenderData(void)",
-          L"public: long __cdecl CTopLevelWindow3D::EnsureRenderData(void)"},
-         &g_topLevelWindow3DEnsureRenderDataOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED
-             ? TopLevelWindow3DEnsureRenderDataHook
-             : nullptr,
-         true},
-        {{L"public: long __cdecl "
-           L"CTopLevelWindow3D::EnsureSecondaryWindowRepresentation(bool)"},
-         &g_topLevelWindow3DEnsureSecondaryWindowRepresentationOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED
-             ? TopLevelWindow3DEnsureSecondaryWindowRepresentationHook
-             : nullptr,
-         true},
-        {{L"public: virtual long __cdecl "
-           L"CTopLevelWindow3D::SetParent(class CVisual *)"},
-         &g_topLevelWindow3DSetParentOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? TopLevelWindow3DSetParentHook
-                                        : nullptr,
-         true},
-        {{L"public: long __cdecl CTopLevelWindow3D::ShowWindow(bool,bool)"},
-         &g_topLevelWindow3DShowWindowOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? TopLevelWindow3DShowWindowHook
-                                        : nullptr,
-         true},
+         &g_meshLayerSymbols.createMeshInstruction, nullptr, true},
+        {{L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CCachedVisualImageProxy>(class CCachedVisualImageProxy * *)"},
+         &g_meshLayerSymbols.createCachedImage, nullptr, true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Update("
+           L"struct MilRectF const &,struct MilSizeD const &,"
+           L"class CRectResourceProxy const *,class CSizeResourceProxy const *,"
+           L"class CVisualProxy *,enum MilBrushMappingMode::Enum)"},
+         &g_meshLayerSymbols.cachedImageUpdate, nullptr, true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Snapshot("
+           L"struct tagRECT const &)"},
+         &g_meshLayerSymbols.cachedImageSnapshot, nullptr, true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Freeze(void)"},
+         &g_meshLayerSymbols.cachedImageFreeze, nullptr, true},
         {{L"public: static long __cdecl CRenderDataVisual::Create("
            L"class CRenderDataVisual * *)"},
-         &g_renderDataVisualCreate,
-         nullptr,
-         true},
-        {{L"public: long __cdecl CVisualProxy::SetContent("
-           L"class CResourceProxy const *)"},
-         &g_visualProxySetContentOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualProxySetContentHook
-                                        : nullptr,
-         true},
+         &g_meshLayerSymbols.createRenderDataVisual, nullptr, true},
+        {{L"public: long __cdecl CRenderDataVisual::AddInstruction("
+           L"class CRenderDataInstruction *)"},
+         &g_meshLayerSymbols.addRenderInstruction, nullptr, true},
+        {{L"public: virtual long __cdecl CRenderDataVisual::UpdateRenderData(void)"},
+         &g_meshLayerSymbols.updateRenderData, nullptr, true},
         {{L"public: long __cdecl CVisualProxy::InsertChild("
            L"class CVisualProxy *,class CVisualProxy *,bool)"},
-         &g_visualProxyInsertChildOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualProxyInsertChildHook
-                                        : nullptr,
-         true},
-        {{L"public: long __cdecl CVisualProxy::RemoveChild("
-           L"class CVisualProxy *)"},
-         &g_visualProxyRemoveChildOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualProxyRemoveChildHook
-                                        : nullptr,
-         true},
-        {{L"public: long __cdecl CRedirectVisualProxy::SetRedirectedVisual("
-           L"class CVisualProxy *)"},
-         &g_redirectVisualProxySetRedirectedVisualOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED
-             ? RedirectVisualProxySetRedirectedVisualHook
-             : nullptr,
-         true},
-        {{L"public: virtual long __cdecl CVisual::SetContent("
-           L"class CResourceProxy *)"},
-         &g_visualSetContentOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualSetContentHook : nullptr,
-         true},
-        {{L"public: virtual long __cdecl CVisual::SetParent(class CVisual *)",
-          L"public: virtual long __cdecl CVisual::SetParent("
-           L"class CContainerVisual *)"},
-         &g_visualSetParentOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualSetParentHook : nullptr,
-         true},
-        {{L"public: long __cdecl CVisual::RemoveSelfFromParent(void)"},
-         &g_visualRemoveSelfFromParentOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED
-             ? VisualRemoveSelfFromParentHook
-             : nullptr,
-         true},
-        {{L"public: void __cdecl CVisual::Hide(void)"},
-         &g_visualHideOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualHideHook : nullptr,
-         true},
-        {{L"public: void __cdecl CVisual::Unhide(void)"},
-         &g_visualUnhideOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualUnhideHook : nullptr,
-         true},
-        {{L"public: virtual void __cdecl CVisual::SetOpacity(double)"},
-         &g_visualSetOpacityOriginal,
-         NATIVE_MESH_EXPERIMENT_ENABLED ? VisualSetOpacityHook : nullptr,
-         true},
-        {{L"public: virtual class CVisual * __cdecl "
-           L"CVisual::GetTransformParent(void)const",
-          L"public: virtual class CVisual * __cdecl "
-           L"CVisual::GetTransformParent(void)const "},
-         &g_visualGetTransformParent,
-         nullptr,
-         true},
-        {{L"public: virtual class CVisualProxy * __cdecl "
-           L"CVisual::GetVisualProxyForStructure(void)"},
-         &g_visualGetVisualProxyForStructure,
-         nullptr,
-         true},
-        {{L"public: long __cdecl VisualCollection::InsertRelative("
-           L"class CVisual *,class CVisual *,bool,bool)"},
-         &g_visualCollectionInsertRelativeFunction,
-         nullptr,
-         true},
+         &g_meshLayerSymbols.insertVisualChild, nullptr, true},
+        {{L"public: long __cdecl CVisualProxy::RemoveChild(class CVisualProxy *)"},
+         &g_meshLayerSymbols.removeVisualChild, nullptr, true},
         {{L"public: unsigned long __cdecl CBaseObject::Release(void)"},
          &g_cBaseObjectRelease,
          nullptr,
@@ -5028,26 +2890,6 @@ static bool InitializeDwmHooks()
         {{L"const CMatrixTransformProxy::`vftable'"},
          &g_matrixTransformProxyVtableSymbol,
          nullptr,
-         true},
-        {{L"const CBitmapSourceProxy::`vftable'"},
-         &g_bitmapSourceProxyVtableSymbol,
-         nullptr,
-         true},
-        {{L"const CVisualSurfaceProxy::`vftable'"},
-         &g_visualSurfaceProxyVtableSymbol,
-         nullptr,
-         true},
-        {{L"const CCachedVisualImageProxy::`vftable'"},
-         &g_cachedVisualImageProxyVtableSymbol,
-         nullptr,
-         true},
-        {{L"const CClientArea::`vftable'"},
-         &g_clientAreaVtableSymbol,
-         nullptr,
-         true},
-        {{L"const VisualCollection::`vftable'"},
-         &g_visualCollectionVtableSymbol,
-         nullptr,
          true}};
     if (!WindhawkUtils::HookSymbols(udwm, udwmDllHooks, ARRAYSIZE(udwmDllHooks)))
     {
@@ -5069,113 +2911,30 @@ static bool InitializeDwmHooks()
     keepValid(g_topLevelWindow3DStartAnimationOriginal);
     keepValid(g_getCanvasRootVisualProxy);
     keepValid(g_topLevelWindowGetRootVisual);
-    keepValid(g_windowBorderCloneVisualTreeOriginal);
-    keepValid(g_topLevelWindowCloneVisualTreeForLivePreviewOriginal);
     keepValid(g_topLevelWindowGetWindowData);
     keepValid(g_desktopManagerPostStartAnimations);
-    keepValid(g_meshGeometry2dProxyUpdate);
-    keepValid(g_createMeshGeometry2dProxy);
-    keepValid(g_createGeometry2dGroupProxy);
-    keepValid(g_createBitmapSourceProxyOriginal);
-    keepValid(g_createVisualSurfaceProxyOriginal);
-    keepValid(g_geometry2dGroupProxyUpdate);
-    keepValid(g_drawMesh2DInstructionCreate);
-    keepValid(g_createTouchDragVisualFunction);
-    keepValid(g_touchDragVisualNotifyFunction);
-    keepValid(g_touchDragVisualStopFunction);
-    keepValid(g_touchDragVisualCreateMeshInstructionFunction);
-    keepValid(g_drawBitmapInstructionCreateOriginal);
-    keepValid(g_drawTileImageInstructionCreateOriginal);
-    keepValid(g_renderDataVisualAddInstruction);
-    keepValid(g_renderDataVisualClearInstructions);
-    keepValid(g_renderDataVisualUpdateRenderData);
-    keepValid(g_topLevelWindow3DEnsureRenderDataOriginal);
-    keepValid(g_topLevelWindow3DEnsureSecondaryWindowRepresentationOriginal);
-    keepValid(g_topLevelWindow3DSetParentOriginal);
-    keepValid(g_topLevelWindow3DShowWindowOriginal);
-    keepValid(g_renderDataVisualCreate);
-    keepValid(g_createCachedVisualImageProxy);
-    keepValid(g_cachedVisualImageProxyUpdate);
-    keepValid(g_cachedVisualImageProxySnapshot);
-    keepValid(g_cachedVisualImageProxyFreeze);
-    keepValid(g_visualProxySetContentOriginal);
-    keepValid(g_visualProxyInsertChildOriginal);
-    keepValid(g_visualProxyRemoveChildOriginal);
-    keepValid(g_redirectVisualProxySetRedirectedVisualOriginal);
-    keepValid(g_visualSetContentOriginal);
-    keepValid(g_visualSetParentOriginal);
-    keepValid(g_visualRemoveSelfFromParentOriginal);
-    keepValid(g_visualHideOriginal);
-    keepValid(g_visualUnhideOriginal);
-    keepValid(g_visualSetOpacityOriginal);
-    keepValid(g_visualGetTransformParent);
-    keepValid(g_visualGetVisualProxyForStructure);
-    keepValid(g_visualCollectionInsertRelativeFunction);
-    g_visualParentOffset = FindOffsetFromFunction(
-        reinterpret_cast<void*>(g_visualGetTransformParent), SIZE_MAX);
-    g_visualContentOffset = FindOffsetFromFunction(
-        reinterpret_cast<void*>(g_visualSetContentOriginal), SIZE_MAX);
-    g_visualCollectionArrayOffset = SIZE_MAX;
-    g_visualCollectionCountOffset = SIZE_MAX;
-    bool hasVisualCollectionLayout = FindVisualCollectionLayout(
-        g_visualCollectionInsertRelativeFunction,
-        &g_visualCollectionArrayOffset, &g_visualCollectionCountOffset);
-    g_renderDataInstructionsOffset = SIZE_MAX;
-    g_renderDataInstructionCountOffset = SIZE_MAX;
-    bool hasRenderListLayout = FindRenderDataInstructionLayout(
-        reinterpret_cast<void*>(g_renderDataVisualClearInstructions),
-        &g_renderDataInstructionsOffset,
-        &g_renderDataInstructionCountOffset);
-    g_ensureRenderDataPointerOffsetCount =
-        FindEnsureRenderDataPointerOffsets(
-            reinterpret_cast<void*>(
-                g_topLevelWindow3DEnsureRenderDataOriginal),
-            g_ensureRenderDataPointerOffsets,
-            ARRAYSIZE(g_ensureRenderDataPointerOffsets));
-    Wh_Log(L"True 4x4 render-list probe: clear=%s ensureHook=%s layout=%s "
-           L"instructions=0x%zx count=0x%zx sourceOffsets=%u (read-only)",
-           g_renderDataVisualClearInstructions ? L"available" : L"unavailable",
-           g_topLevelWindow3DEnsureRenderDataOriginal ? L"available"
-                                                      : L"unavailable",
-           hasRenderListLayout ? L"available" : L"unavailable",
-           g_renderDataInstructionsOffset, g_renderDataInstructionCountOffset,
-           g_ensureRenderDataPointerOffsetCount);
-    Wh_Log(L"True 4x4 observation hooks: proxyContent=%p proxyInsert=%p "
-           L"visualContent=%p visualParent=%p visualRemove=%p getParent=%p "
-           L"getProxy=%p redirect=%p parentOffset=0x%zx contentOffset=0x%zx "
-           L"childLayout=%s childArray=0x%zx childCount=0x%zx",
-           g_visualProxySetContentOriginal, g_visualProxyInsertChildOriginal,
-           g_visualSetContentOriginal, g_visualSetParentOriginal,
-           g_visualRemoveSelfFromParentOriginal,
-           g_visualGetTransformParent,
-           g_visualGetVisualProxyForStructure,
-           g_redirectVisualProxySetRedirectedVisualOriginal,
-           g_visualParentOffset, g_visualContentOffset,
-           hasVisualCollectionLayout ? L"available" : L"unavailable",
-           g_visualCollectionArrayOffset,
-           g_visualCollectionCountOffset);
-    bool hasNativeMeshGeometry =
-        g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
-        g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate;
-    bool hasMeshBitmapRenderer =
-        hasNativeMeshGeometry && g_drawMesh2DInstructionCreate;
-    Wh_Log(L"True 4x4 mesh probe: geometry=%s bitmapRenderer=%s "
-           L"bitmapObserver=%s tileObserver=%s "
-           L"transactionalProbe=%s",
-           hasNativeMeshGeometry ? L"available" : L"unavailable",
-           hasMeshBitmapRenderer ? L"available" : L"unavailable",
-           g_drawBitmapInstructionCreateOriginal ? L"available"
-                                                  : L"unavailable",
-            g_drawTileImageInstructionCreateOriginal ? L"available"
-                                                     : L"unavailable",
-            NATIVE_MESH_TRANSACTION_PROBE_ENABLED ? L"enabled" : L"disabled");
-    Wh_Log(L"True 4x4 native touch path: create=%s notify=%s stop=%s "
-           L"meshBuilder=%s (probe only)",
-           g_createTouchDragVisualFunction ? L"available" : L"unavailable",
-           g_touchDragVisualNotifyFunction ? L"available" : L"unavailable",
-           g_touchDragVisualStopFunction ? L"available" : L"unavailable",
-           g_touchDragVisualCreateMeshInstructionFunction ? L"available"
-                                                          : L"unavailable");
+    keepValid(g_meshLayerSymbols.meshGeometryUpdate);
+    keepValid(g_meshLayerSymbols.createMeshGeometry);
+    keepValid(g_meshLayerSymbols.createGeometryGroup);
+    keepValid(g_meshLayerSymbols.geometryGroupUpdate);
+    keepValid(g_meshLayerSymbols.createMeshInstruction);
+    keepValid(g_meshLayerSymbols.createCachedImage);
+    keepValid(g_meshLayerSymbols.cachedImageUpdate);
+    keepValid(g_meshLayerSymbols.cachedImageSnapshot);
+    keepValid(g_meshLayerSymbols.cachedImageFreeze);
+    keepValid(g_meshLayerSymbols.createRenderDataVisual);
+    keepValid(g_meshLayerSymbols.addRenderInstruction);
+    keepValid(g_meshLayerSymbols.updateRenderData);
+    keepValid(g_meshLayerSymbols.insertVisualChild);
+    keepValid(g_meshLayerSymbols.removeVisualChild);
+    g_meshLayerBackendAvailable.store(g_meshLayerSymbols.IsComplete(),
+                                      std::memory_order_release);
+    Wh_Log(L"4x4 mesh-layer prerequisites: geometry=%s image=%s visual=%s "
+           L"complete=%s (probe only; affine renderer remains active)",
+           g_meshLayerSymbols.HasGeometryPipeline() ? L"available" : L"unavailable",
+           g_meshLayerSymbols.HasImagePipeline() ? L"available" : L"unavailable",
+           g_meshLayerSymbols.HasVisualPipeline() ? L"available" : L"unavailable",
+           g_meshLayerSymbols.IsComplete() ? L"yes" : L"no");
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
@@ -5213,66 +2972,6 @@ static bool InitializeDwmHooks()
         hasExactVisualProxyVtable || hasExactRedirectProxyVtable || hasExactContainerProxyVtable;
     bool hasExactMatrixProxyVtable =
         cacheVtableSymbol(g_matrixTransformProxyVtableSymbol, g_matrixTransformProxyVtable);
-    bool hasExactBitmapSourceProxyVtable =
-        cacheVtableSymbol(g_bitmapSourceProxyVtableSymbol, g_bitmapSourceProxyVtable);
-    bool hasExactVisualSurfaceProxyVtable =
-        cacheVtableSymbol(g_visualSurfaceProxyVtableSymbol, g_visualSurfaceProxyVtable);
-    bool hasExactCachedVisualImageProxyVtable = cacheVtableSymbol(
-        g_cachedVisualImageProxyVtableSymbol, g_cachedVisualImageProxyVtable);
-    bool hasExactClientAreaVtable =
-        cacheVtableSymbol(g_clientAreaVtableSymbol, g_clientAreaVtable);
-    bool hasExactVisualCollectionVtable = cacheVtableSymbol(
-        g_visualCollectionVtableSymbol, g_visualCollectionVtable);
-    Wh_Log(L"True 4x4 child-tree probe: collection=%s layout=%s "
-           L"array=0x%zx count=0x%zx (read-only)",
-           hasExactVisualCollectionVtable ? L"available" : L"unavailable",
-           hasVisualCollectionLayout ? L"available" : L"unavailable",
-           g_visualCollectionArrayOffset,
-           g_visualCollectionCountOffset);
-    Wh_Log(L"True 4x4 clone observers: border=%s livePreview=%s "
-           L"(read-only)",
-           g_windowBorderCloneVisualTreeOriginal ? L"available"
-                                                  : L"unavailable",
-           g_topLevelWindowCloneVisualTreeForLivePreviewOriginal
-               ? L"available"
-               : L"unavailable");
-    Wh_Log(L"True 4x4 secondary representation observers: ensure=%s "
-           L"parent=%s show=%s (read-only)",
-           g_topLevelWindow3DEnsureSecondaryWindowRepresentationOriginal
-               ? L"available"
-               : L"unavailable",
-           g_topLevelWindow3DSetParentOriginal ? L"available"
-                                                : L"unavailable",
-           g_topLevelWindow3DShowWindowOriginal ? L"available"
-                                                 : L"unavailable");
-    Wh_Log(L"True 4x4 visibility observers: hide=%s unhide=%s opacity=%s "
-           L"(read-only)",
-           g_visualHideOriginal ? L"available" : L"unavailable",
-           g_visualUnhideOriginal ? L"available" : L"unavailable",
-           g_visualSetOpacityOriginal ? L"available" : L"unavailable");
-    Wh_Log(L"True 4x4 source probe: bitmap=%s visualSurface=%s "
-           L"bitmapCreationObserver=%s surfaceCreationObserver=%s "
-           L"vtableAlias=%d",
-           hasExactBitmapSourceProxyVtable ? L"available" : L"unavailable",
-           hasExactVisualSurfaceProxyVtable ? L"available" : L"unavailable",
-           g_createBitmapSourceProxyOriginal ? L"available" : L"unavailable",
-           g_createVisualSurfaceProxyOriginal ? L"available" : L"unavailable",
-           g_bitmapSourceProxyVtable.load(std::memory_order_acquire) ==
-               g_visualSurfaceProxyVtable.load(std::memory_order_acquire));
-    Wh_Log(L"True 4x4 GPU source probe: cachedVisual=%s clientArea=%s "
-           L"create=%s update=%s snapshot=%s freeze=%s "
-           L"meshInstruction=%s renderVisual=%s publish=%s",
-           hasExactCachedVisualImageProxyVtable ? L"available" : L"unavailable",
-           hasExactClientAreaVtable ? L"available" : L"unavailable",
-           g_createCachedVisualImageProxy ? L"available" : L"unavailable",
-           g_cachedVisualImageProxyUpdate ? L"available" : L"unavailable",
-           g_cachedVisualImageProxySnapshot ? L"available" : L"unavailable",
-           g_cachedVisualImageProxyFreeze ? L"available" : L"unavailable",
-           g_drawMesh2DInstructionCreate ? L"available" : L"unavailable",
-           g_renderDataVisualCreate && g_renderDataVisualAddInstruction
-               ? L"available"
-               : L"unavailable",
-           g_renderDataVisualUpdateRenderData ? L"available" : L"unavailable");
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
@@ -5479,432 +3178,6 @@ static bool InitializeDwmHooks()
         return false;
     }
     return true;
-}
-
-static MeshSourceKind GetMeshSourceKind(void* object)
-{
-    if (!object || !IsReadableMemory(object, sizeof(void*)))
-    {
-        return MeshSourceKind::None;
-    }
-    if (FindObservedBitmapSourceProxy(object, false))
-    {
-        return MeshSourceKind::Bitmap;
-    }
-    if (FindObservedVisualSurfaceProxy(object, false))
-    {
-        return MeshSourceKind::VisualSurface;
-    }
-    void* vtable = *reinterpret_cast<void**>(object);
-    void* bitmapVtable =
-        g_bitmapSourceProxyVtable.load(std::memory_order_acquire);
-    void* visualSurfaceVtable =
-        g_visualSurfaceProxyVtable.load(std::memory_order_acquire);
-    if (visualSurfaceVtable && visualSurfaceVtable != bitmapVtable &&
-        vtable == visualSurfaceVtable)
-    {
-        return MeshSourceKind::VisualSurface;
-    }
-    if ((bitmapVtable && vtable == bitmapVtable) ||
-        (visualSurfaceVtable && vtable == visualSurfaceVtable))
-    {
-        return MeshSourceKind::AmbiguousProxy;
-    }
-    return MeshSourceKind::None;
-}
-
-static bool ReadBaseImageResourceId(void* imageProxy,
-                                    unsigned int* resourceId)
-{
-    void* backing = ReadPointerMember(imageProxy, 0x10);
-    if (!resourceId || !backing)
-    {
-        return false;
-    }
-    const BYTE* field = static_cast<const BYTE*>(backing) + 0x18;
-    if (!IsReadableMemory(field, sizeof(*resourceId)))
-    {
-        return false;
-    }
-    *resourceId = *reinterpret_cast<const unsigned int*>(field);
-    return *resourceId != 0;
-}
-
-static bool FindUniqueBaseImageInstruction(
-    void* renderVisual, unsigned int requiredResourceId,
-    void** instruction, void** imageProxy, int* instructionIndex,
-    int* instructionCount, unsigned int* candidateCount)
-{
-    if (instruction)
-    {
-        *instruction = nullptr;
-    }
-    if (imageProxy)
-    {
-        *imageProxy = nullptr;
-    }
-    if (instructionIndex)
-    {
-        *instructionIndex = -1;
-    }
-    if (instructionCount)
-    {
-        *instructionCount = 0;
-    }
-    if (candidateCount)
-    {
-        *candidateCount = 0;
-    }
-
-    void** instructions = nullptr;
-    int count = 0;
-    if (!GetRenderDataInstructionList(renderVisual, &instructions, nullptr,
-                                      &count))
-    {
-        return false;
-    }
-    if (instructionCount)
-    {
-        *instructionCount = count;
-    }
-
-    unsigned int matches = 0;
-    void* matchedInstruction = nullptr;
-    void* matchedImage = nullptr;
-    int matchedIndex = -1;
-    for (int index = 0; index < count; index++)
-    {
-        void* candidateInstruction = instructions[index];
-        void* candidateImage = ReadPointerMember(candidateInstruction, 0x10);
-        unsigned int resourceId = 0;
-        if (!candidateInstruction || !candidateImage ||
-            !IsReadableMemory(candidateImage, sizeof(void*)) ||
-            !IsDwmImageAddress(*reinterpret_cast<void**>(candidateImage),
-                               sizeof(void*)) ||
-            GetMeshSourceKind(candidateImage) != MeshSourceKind::None ||
-            !ReadBaseImageResourceId(candidateImage, &resourceId) ||
-            (requiredResourceId && resourceId != requiredResourceId))
-        {
-            continue;
-        }
-        matches++;
-        matchedInstruction = candidateInstruction;
-        matchedImage = candidateImage;
-        matchedIndex = index;
-    }
-    if (candidateCount)
-    {
-        *candidateCount = matches;
-    }
-    if (matches != 1)
-    {
-        return false;
-    }
-    if (instruction)
-    {
-        *instruction = matchedInstruction;
-    }
-    if (imageProxy)
-    {
-        *imageProxy = matchedImage;
-    }
-    if (instructionIndex)
-    {
-        *instructionIndex = matchedIndex;
-    }
-    return true;
-}
-
-static long UpdateNativeMeshGeometry(void* meshProxy, const WobbleMesh* mesh,
-                                     double identityWidth,
-                                     double identityHeight)
-{
-    if (!meshProxy || !g_meshGeometry2dProxyUpdate ||
-        (mesh && (mesh->width <= 0.0 || mesh->height <= 0.0)) ||
-        (!mesh && (identityWidth <= 0.0 || identityHeight <= 0.0)))
-    {
-        return E_INVALIDARG;
-    }
-    D2DPoint3F positions[GRID_POINT_COUNT] = {};
-    MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
-    unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
-    Vec2 anchorDisplacement = {};
-    if (mesh)
-    {
-        if (mesh->dragPointIndex >= 0 &&
-            mesh->dragPointIndex < GRID_POINT_COUNT)
-        {
-            const WobblePoint& anchor = mesh->points[mesh->dragPointIndex];
-            anchorDisplacement = {
-                anchor.position.x - anchor.basePosition.x,
-                anchor.position.y - anchor.basePosition.y};
-        }
-        else
-        {
-            for (const WobblePoint& point : mesh->points)
-            {
-                anchorDisplacement.x +=
-                    point.position.x - point.basePosition.x;
-                anchorDisplacement.y +=
-                    point.position.y - point.basePosition.y;
-            }
-            anchorDisplacement.x /= GRID_POINT_COUNT;
-            anchorDisplacement.y /= GRID_POINT_COUNT;
-        }
-    }
-    // This diagnostic gain makes non-affine deformation unmistakable. The
-    // production value will be tuned after the native path is visually proven.
-    constexpr double nativeResidualGain = 4.0;
-    for (int y = 0; y < GRID_HEIGHT; y++)
-    {
-        for (int x = 0; x < GRID_WIDTH; x++)
-        {
-            int index = GetPointIndex(x, y);
-            double width = mesh ? mesh->width : identityWidth;
-            double height = mesh ? mesh->height : identityHeight;
-            double baseX = static_cast<double>(x) * width /
-                           (GRID_WIDTH - 1);
-            double baseY = static_cast<double>(y) * height /
-                           (GRID_HEIGHT - 1);
-            double renderedX = baseX;
-            double renderedY = baseY;
-            if (mesh)
-            {
-                const WobblePoint& point = mesh->points[index];
-                baseX = point.basePosition.x;
-                baseY = point.basePosition.y;
-                renderedX = baseX +
-                            ((point.position.x - baseX) -
-                             anchorDisplacement.x) * nativeResidualGain;
-                renderedY = baseY +
-                            ((point.position.y - baseY) -
-                             anchorDisplacement.y) * nativeResidualGain;
-            }
-            if (!std::isfinite(baseX) || !std::isfinite(baseY) ||
-                !std::isfinite(renderedX) || !std::isfinite(renderedY))
-            {
-                return E_INVALIDARG;
-            }
-            renderedX = std::clamp(renderedX, -width * 8.0, width * 8.0);
-            renderedY = std::clamp(renderedY, -height * 8.0, height * 8.0);
-            positions[index] = {static_cast<float>(renderedX),
-                                static_cast<float>(renderedY), 0.0f};
-            textureCoordinates[index] = {baseX, baseY};
-        }
-    }
-    unsigned int indexCount = 0;
-    for (int y = 0; y < GRID_HEIGHT - 1; y++)
-    {
-        for (int x = 0; x < GRID_WIDTH - 1; x++)
-        {
-            unsigned int topLeft = GetPointIndex(x, y);
-            unsigned int topRight = GetPointIndex(x + 1, y);
-            unsigned int bottomLeft = GetPointIndex(x, y + 1);
-            unsigned int bottomRight = GetPointIndex(x + 1, y + 1);
-            indices[indexCount++] = topLeft;
-            indices[indexCount++] = bottomLeft;
-            indices[indexCount++] = topRight;
-            indices[indexCount++] = topRight;
-            indices[indexCount++] = bottomLeft;
-            indices[indexCount++] = bottomRight;
-        }
-    }
-    return g_meshGeometry2dProxyUpdate(
-        meshProxy, 0, positions, textureCoordinates, GRID_POINT_COUNT,
-        indices, indexCount);
-}
-
-static void* GetNativeMeshProxy(unsigned int index)
-{
-    if (index == 0)
-    {
-        return g_visibleMeshCanary.meshProxy;
-    }
-    return index <= ARRAYSIZE(g_visibleMeshCanary.additionalNativeBindings)
-               ? g_visibleMeshCanary.additionalNativeBindings[index - 1]
-                     .meshProxy
-               : nullptr;
-}
-
-static void* GetNativeGeometryGroupProxy(unsigned int index)
-{
-    if (index == 0)
-    {
-        return g_visibleMeshCanary.groupProxy;
-    }
-    return index <= ARRAYSIZE(g_visibleMeshCanary.additionalNativeBindings)
-               ? g_visibleMeshCanary.additionalNativeBindings[index - 1]
-                     .groupProxy
-               : nullptr;
-}
-
-static long UpdateAllNativeMeshGeometry(const WobbleMesh* mesh = nullptr)
-{
-    long result = S_OK;
-    for (unsigned int index = 0;
-         index < g_visibleMeshCanary.nativeBindingCount; index++)
-    {
-        void* meshProxy = GetNativeMeshProxy(index);
-        long updateResult = UpdateNativeMeshGeometry(
-            meshProxy, mesh, g_visibleMeshCanary.width,
-            g_visibleMeshCanary.height);
-        void* groupProxy = GetNativeGeometryGroupProxy(index);
-        if (updateResult >= 0)
-        {
-            updateResult = groupProxy && g_geometry2dGroupProxyUpdate
-                               ? g_geometry2dGroupProxyUpdate(groupProxy,
-                                                              meshProxy)
-                               : E_NOINTERFACE;
-        }
-        if (updateResult < 0 && result >= 0)
-        {
-            result = updateResult;
-        }
-    }
-    return result;
-}
-
-static long RepublishOriginalRenderData(HWND hwnd)
-{
-    void* windowList = g_windowListForSceneWake.load(std::memory_order_acquire);
-    if (!hwnd || !g_renderDataVisualUpdateRenderData ||
-        !IsDwmObjectPointerValid(windowList, g_windowListVtable) ||
-        !g_findWindowDataByHwnd)
-    {
-        return E_NOINTERFACE;
-    }
-    void* windowData = FindWindowDataByHwnd(windowList, hwnd);
-    void* topLevelWindow = nullptr;
-    void* renderVisual = nullptr;
-    if (!windowData || GetHwndFromWindowData(windowData) != hwnd ||
-        !ResolveDwmWindowObjects(windowData, &topLevelWindow, &renderVisual) ||
-        !IsDwmObjectPointerValid(renderVisual, g_topLevelWindow3DVtable))
-    {
-        return E_NOINTERFACE;
-    }
-    return g_renderDataVisualUpdateRenderData(renderVisual);
-}
-
-static void RequestVisibleMeshCleanupForHwnd(HWND hwnd)
-{
-    if (!hwnd ||
-        g_visibleMeshCanaryHwnd.load(std::memory_order_acquire) != hwnd ||
-        !g_visibleMeshCanaryActive.load(std::memory_order_acquire))
-    {
-        return;
-    }
-    g_visibleMeshCanaryCleanupRequested.store(true,
-                                               std::memory_order_release);
-    RequestDwmScenePass();
-}
-
-static void MaintainVisibleMeshCanary()
-{
-    if (!IsOnDwmSceneThread() ||
-        !g_visibleMeshCanaryActive.load(std::memory_order_acquire))
-    {
-        return;
-    }
-    if (g_nativeMeshPublishLease.renderVisual &&
-        !RestoreNativeMeshPublishLease(L"MeshCleanup"))
-    {
-        // Never release a mesh instruction while a DWM render list might
-        // still reference it. ClearInstructions or the enclosing scene call
-        // will provide another exact restoration point.
-        return;
-    }
-    bool forced = g_unloading.load(std::memory_order_acquire) ||
-                  g_visibleMeshCanaryCleanupRequested.load(
-                      std::memory_order_acquire);
-    bool nativeBinding = !g_visibleMeshCanary.renderVisual &&
-                         g_visibleMeshCanary.nativeBindingCount > 0;
-    bool detach = forced ||
-                  (!nativeBinding && g_visibleMeshCanary.detachAt &&
-                   GetTickCount64() >= g_visibleMeshCanary.detachAt);
-    if (!detach)
-    {
-        return;
-    }
-    VisibleMeshCanaryState state = g_visibleMeshCanary;
-    long detachResult = E_NOINTERFACE;
-    if (!state.renderVisual && state.meshProxy &&
-        g_meshGeometry2dProxyUpdate)
-    {
-        detachResult = RepublishOriginalRenderData(state.hwnd);
-        if (detachResult < 0)
-        {
-            detachResult = UpdateAllNativeMeshGeometry();
-        }
-    }
-    if (state.renderVisual && g_visualRemoveSelfFromParentOriginal)
-    {
-        detachResult = g_visualRemoveSelfFromParentOriginal(state.renderVisual);
-    }
-    if (state.renderVisual && g_cBaseObjectRelease)
-    {
-        g_cBaseObjectRelease(state.renderVisual);
-    }
-    if (state.instruction && g_cBaseObjectRelease)
-    {
-        g_cBaseObjectRelease(state.instruction);
-    }
-    if (state.pinnedImageProxy && g_cBaseObjectRelease)
-    {
-        g_cBaseObjectRelease(state.pinnedImageProxy);
-    }
-    if (state.groupProxy && g_cBaseObjectRelease)
-    {
-        g_cBaseObjectRelease(state.groupProxy);
-    }
-    if (state.meshProxy && g_cBaseObjectRelease)
-    {
-        g_cBaseObjectRelease(state.meshProxy);
-    }
-    if (state.cachedVisual && g_cBaseObjectRelease)
-    {
-        g_cBaseObjectRelease(state.cachedVisual);
-    }
-    for (unsigned int index = 1; index < state.nativeBindingCount; index++)
-    {
-        auto& binding = state.additionalNativeBindings[index - 1];
-        if (binding.instruction && g_cBaseObjectRelease)
-        {
-            g_cBaseObjectRelease(binding.instruction);
-        }
-        if (binding.groupProxy && g_cBaseObjectRelease)
-        {
-            g_cBaseObjectRelease(binding.groupProxy);
-        }
-        if (binding.meshProxy && g_cBaseObjectRelease)
-        {
-            g_cBaseObjectRelease(binding.meshProxy);
-        }
-    }
-    g_visibleMeshCanary = {};
-    g_visibleMeshCanaryHwnd.store(nullptr, std::memory_order_release);
-    g_visibleMeshCanaryCleanupRequested.store(false,
-                                               std::memory_order_release);
-    g_visibleMeshCanaryActive.store(false, std::memory_order_release);
-    if (!g_unloading.load(std::memory_order_acquire))
-    {
-        g_liveBaseImageMeshCanaryStarted.store(false,
-                                                std::memory_order_release);
-        g_liveBaseImageMeshCanarySucceeded.store(false,
-                                                  std::memory_order_release);
-        g_liveBaseImageMeshAnimationLogged.store(false,
-                                                  std::memory_order_release);
-    }
-    RequestDwmScenePass();
-    if (state.renderVisual)
-    {
-        Wh_Log(L"True 4x4 visible warped canary: detached result=0x%08X HWND=%p",
-               static_cast<unsigned int>(detachResult), state.hwnd);
-    }
-    else
-    {
-        Wh_Log(L"True 4x4 native transaction canary: restored original result=0x%08X HWND=%p",
-               static_cast<unsigned int>(detachResult), state.hwnd);
-    }
 }
 
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
@@ -6174,1045 +3447,6 @@ static void BackfillExistingDwmWindowMappings()
     }
 }
 
-static void RunNativeMeshCanary()
-{
-    if (!g_nativeMeshCanaryPending.load(std::memory_order_acquire) ||
-        !IsOnDwmSceneThread())
-    {
-        return;
-    }
-    void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
-    if (!IsDwmObjectPointerValid(compositor, g_compositorVtable))
-    {
-        return;
-    }
-    // Consume the one-shot canary before entering private DWM code. A failure
-    // keeps the stable affine renderer active and is never retried in-process.
-    g_nativeMeshCanaryPending.store(false, std::memory_order_release);
-    long result = E_NOINTERFACE;
-    const wchar_t* stage = L"Prerequisites";
-    void* meshProxy = nullptr;
-    void* groupProxy = nullptr;
-    if (g_createMeshGeometry2dProxy && g_meshGeometry2dProxyUpdate &&
-        g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate &&
-        g_cBaseObjectRelease)
-    {
-        D2DPoint3F positions[GRID_POINT_COUNT] = {};
-        MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
-        unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
-        for (int y = 0; y < GRID_HEIGHT; y++)
-        {
-            for (int x = 0; x < GRID_WIDTH; x++)
-            {
-                int index = GetPointIndex(x, y);
-                float px = static_cast<float>(x) / (GRID_WIDTH - 1);
-                float py = static_cast<float>(y) / (GRID_HEIGHT - 1);
-                positions[index] = {px, py, 0.0f};
-                textureCoordinates[index] = {px, py};
-            }
-        }
-        unsigned int indexCount = 0;
-        for (int y = 0; y < GRID_HEIGHT - 1; y++)
-        {
-            for (int x = 0; x < GRID_WIDTH - 1; x++)
-            {
-                unsigned int topLeft = GetPointIndex(x, y);
-                unsigned int topRight = GetPointIndex(x + 1, y);
-                unsigned int bottomLeft = GetPointIndex(x, y + 1);
-                unsigned int bottomRight = GetPointIndex(x + 1, y + 1);
-                indices[indexCount++] = topLeft;
-                indices[indexCount++] = bottomLeft;
-                indices[indexCount++] = topRight;
-                indices[indexCount++] = topRight;
-                indices[indexCount++] = bottomLeft;
-                indices[indexCount++] = bottomRight;
-            }
-        }
-        stage = L"CreateMesh";
-        result = g_createMeshGeometry2dProxy(compositor, &meshProxy);
-        if (result >= 0 && meshProxy)
-        {
-            stage = L"UpdateMesh";
-            result = g_meshGeometry2dProxyUpdate(
-                meshProxy, 0, positions, textureCoordinates, GRID_POINT_COUNT,
-                indices, indexCount);
-        }
-        if (result >= 0)
-        {
-            stage = L"CreateGroup";
-            result = g_createGeometry2dGroupProxy(compositor, &groupProxy);
-        }
-        if (result >= 0 && groupProxy)
-        {
-            stage = L"UpdateGroup";
-            result = g_geometry2dGroupProxyUpdate(groupProxy, meshProxy);
-        }
-    }
-    if (groupProxy)
-    {
-        g_cBaseObjectRelease(groupProxy);
-    }
-    if (meshProxy)
-    {
-        g_cBaseObjectRelease(meshProxy);
-    }
-    bool succeeded = result >= 0 && groupProxy && meshProxy;
-    g_nativeMeshCanarySucceeded.store(succeeded, std::memory_order_release);
-    Wh_Log(L"True 4x4 mesh canary: %s stage=%s result=0x%08X vertices=%u indices=%u",
-           succeeded ? L"passed" : L"failed", stage,
-           static_cast<unsigned int>(result), GRID_POINT_COUNT,
-           (GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6);
-}
-
-static bool RebindLiveBaseImageMeshCanary(void* imageProxy, HWND hwnd)
-{
-    if (!IsOnDwmSceneThread() || !imageProxy || !hwnd ||
-        !g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
-        g_visibleMeshCanary.hwnd != hwnd ||
-        !g_visibleMeshCanary.groupProxy ||
-        !g_visibleMeshCanary.instruction ||
-        !g_visibleMeshCanary.pinnedImageProxy ||
-        !g_drawMesh2DInstructionCreate || !g_cBaseObjectRelease)
-    {
-        return false;
-    }
-    if (g_visibleMeshCanary.pinnedImageProxy == imageProxy)
-    {
-        return true;
-    }
-    if (GetMeshSourceKind(imageProxy) != MeshSourceKind::None ||
-        !IsReadableMemory(imageProxy, sizeof(void*)))
-    {
-        return false;
-    }
-
-    void* imageVtable = *reinterpret_cast<void**>(imageProxy);
-    void* imageBacking = ReadPointerMember(imageProxy, 0x10);
-    unsigned int imageResourceId = 0;
-    auto* imageReferenceCount = reinterpret_cast<volatile LONG*>(
-        static_cast<BYTE*>(imageProxy) + sizeof(void*));
-    if (!IsDwmImageAddress(imageVtable, sizeof(void*)) || !imageBacking ||
-        !ReadBaseImageResourceId(imageProxy, &imageResourceId) ||
-        !IsWritableMemory(const_cast<LONG*>(imageReferenceCount),
-                          sizeof(*imageReferenceCount)))
-    {
-        return false;
-    }
-
-    InterlockedIncrement(imageReferenceCount);
-    void* replacementInstruction = nullptr;
-    long result = g_drawMesh2DInstructionCreate(
-        g_visibleMeshCanary.groupProxy, imageProxy, &replacementInstruction);
-    if (result < 0 || !replacementInstruction)
-    {
-        g_cBaseObjectRelease(imageProxy);
-        Wh_Log(L"True 4x4 native transaction source rebind failed: "
-               L"result=0x%08X HWND=%p image=%p resourceId=%u",
-               static_cast<unsigned int>(result), hwnd, imageProxy,
-               imageResourceId);
-        return false;
-    }
-
-    void* previousInstruction = g_visibleMeshCanary.instruction;
-    void* previousImage = g_visibleMeshCanary.pinnedImageProxy;
-    unsigned int previousResourceId = 0;
-    ReadBaseImageResourceId(previousImage, &previousResourceId);
-    g_visibleMeshCanary.instruction = replacementInstruction;
-    g_visibleMeshCanary.pinnedImageProxy = imageProxy;
-
-    // Every transaction restores the DWM slot before returning, so the old
-    // instruction and its explicit image pin are no longer reachable here.
-    g_cBaseObjectRelease(previousInstruction);
-    g_cBaseObjectRelease(previousImage);
-    Wh_Log(L"True 4x4 native transaction source rebound: HWND=%p "
-           L"oldImage=%p oldResourceId=%u newImage=%p newResourceId=%u",
-           hwnd, previousImage, previousResourceId, imageProxy,
-           imageResourceId);
-    return true;
-}
-
-static bool TryInstallLiveBaseImageMeshCanary(void* renderVisual,
-                                               void* originalInstruction,
-                                               void* imageProxy,
-                                               void* windowData, HWND hwnd)
-{
-    if (!IsOnDwmSceneThread() || !renderVisual || !originalInstruction ||
-        !windowData || !hwnd || GetHwndFromWindowData(windowData) != hwnd ||
-        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire) != hwnd ||
-        !imageProxy ||
-        g_visibleMeshCanaryActive.load(std::memory_order_acquire) ||
-        !g_nativeMeshCanarySucceeded.load(std::memory_order_acquire) ||
-        GetMeshSourceKind(imageProxy) != MeshSourceKind::None ||
-        !IsReadableMemory(imageProxy, sizeof(void*)) ||
-        !g_createMeshGeometry2dProxy || !g_meshGeometry2dProxyUpdate ||
-        !g_createGeometry2dGroupProxy || !g_geometry2dGroupProxyUpdate ||
-        !g_drawMesh2DInstructionCreate || !g_cBaseObjectRelease)
-    {
-        return false;
-    }
-
-    unsigned int originalCount = 0;
-    int originalIndex = -1;
-    if (!FindRenderDataInstructionIndex(renderVisual, originalInstruction,
-                                        &originalCount, &originalIndex))
-    {
-        return false;
-    }
-    RECT bounds = {};
-    if (!GetWindowRect(hwnd, &bounds) || bounds.right <= bounds.left ||
-        bounds.bottom <= bounds.top)
-    {
-        return false;
-    }
-    double width = static_cast<double>(bounds.right - bounds.left);
-    double height = static_cast<double>(bounds.bottom - bounds.top);
-    void* imageVtable = *reinterpret_cast<void**>(imageProxy);
-    if (!IsDwmImageAddress(imageVtable, sizeof(void*)))
-    {
-        return false;
-    }
-    unsigned int imageResourceId = 0;
-    void* imageBacking = ReadPointerMember(imageProxy, 0x10);
-    auto* imageReferenceCount = reinterpret_cast<volatile LONG*>(
-        static_cast<BYTE*>(imageProxy) + sizeof(void*));
-    if (!ReadBaseImageResourceId(imageProxy, &imageResourceId) ||
-        !imageBacking ||
-        !IsWritableMemory(const_cast<LONG*>(imageReferenceCount),
-                          sizeof(*imageReferenceCount)))
-    {
-        Wh_Log(L"True 4x4 native slot source unresolved: HWND=%p "
-               L"image=%p backing=%p resourceId=%u",
-               hwnd, imageProxy, imageBacking, imageResourceId);
-        return false;
-    }
-
-    // UpdateRenderData can run before a taskbar-restored window becomes the
-    // foreground window. The live CWindowData/HWND match above is the stable
-    // ownership proof; foreground state is only transient UI state.
-    bool expected = false;
-    if (!g_liveBaseImageMeshCanaryStarted.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel,
-            std::memory_order_acquire))
-    {
-        return false;
-    }
-
-    long result = E_NOINTERFACE;
-    const wchar_t* stage = L"CreateMesh";
-    void* meshProxy = nullptr;
-    void* groupProxy = nullptr;
-    bool imagePinned = false;
-    void* meshInstruction = nullptr;
-    D2DPoint3F positions[GRID_POINT_COUNT] = {};
-    MilPoint2DValue textureCoordinates[GRID_POINT_COUNT] = {};
-    unsigned int indices[(GRID_WIDTH - 1) * (GRID_HEIGHT - 1) * 6] = {};
-    for (int y = 0; y < GRID_HEIGHT; y++)
-    {
-        for (int x = 0; x < GRID_WIDTH; x++)
-        {
-            int index = GetPointIndex(x, y);
-            float tx = static_cast<float>(x) / (GRID_WIDTH - 1);
-            float ty = static_cast<float>(y) / (GRID_HEIGHT - 1);
-            positions[index] = {tx * static_cast<float>(width),
-                                ty * static_cast<float>(height),
-                                0.0f};
-            textureCoordinates[index] = {tx * static_cast<float>(width),
-                                         ty * static_cast<float>(height)};
-        }
-    }
-    unsigned int indexCount = 0;
-    for (int y = 0; y < GRID_HEIGHT - 1; y++)
-    {
-        for (int x = 0; x < GRID_WIDTH - 1; x++)
-        {
-            unsigned int topLeft = GetPointIndex(x, y);
-            unsigned int topRight = GetPointIndex(x + 1, y);
-            unsigned int bottomLeft = GetPointIndex(x, y + 1);
-            unsigned int bottomRight = GetPointIndex(x + 1, y + 1);
-            indices[indexCount++] = topLeft;
-            indices[indexCount++] = bottomLeft;
-            indices[indexCount++] = topRight;
-            indices[indexCount++] = topRight;
-            indices[indexCount++] = bottomLeft;
-            indices[indexCount++] = bottomRight;
-        }
-    }
-
-    void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
-    if (IsDwmObjectPointerValid(compositor, g_compositorVtable))
-    {
-        result = g_createMeshGeometry2dProxy(compositor, &meshProxy);
-    }
-    if (result >= 0 && meshProxy)
-    {
-        stage = L"UpdateMesh";
-        result = g_meshGeometry2dProxyUpdate(
-            meshProxy, 0, positions, textureCoordinates, GRID_POINT_COUNT,
-            indices, indexCount);
-    }
-    if (result >= 0)
-    {
-        stage = L"CreateGroup";
-        result = g_createGeometry2dGroupProxy(compositor, &groupProxy);
-    }
-    if (result >= 0 && groupProxy)
-    {
-        stage = L"UpdateGroup";
-        result = g_geometry2dGroupProxyUpdate(groupProxy, meshProxy);
-    }
-    if (result >= 0)
-    {
-        stage = L"PinImageSource";
-        InterlockedIncrement(imageReferenceCount);
-        imagePinned = true;
-    }
-    if (result >= 0)
-    {
-        stage = L"CreateInstruction";
-        result = g_drawMesh2DInstructionCreate(groupProxy, imageProxy,
-                                                &meshInstruction);
-    }
-    if (result >= 0 && meshInstruction)
-    {
-        stage = L"Prepared";
-    }
-
-    bool succeeded = result >= 0 && meshProxy && groupProxy && meshInstruction;
-    g_liveBaseImageMeshCanarySucceeded.store(succeeded,
-                                               std::memory_order_release);
-    if (!succeeded)
-    {
-        // A transient render-list rebuild must not permanently consume the
-        // one-shot installation gate. A later valid publish can retry.
-        g_liveBaseImageMeshCanaryStarted.store(false,
-                                                std::memory_order_release);
-    }
-    if (succeeded)
-    {
-        g_visibleMeshCanary = {};
-        g_visibleMeshCanary.meshProxy = meshProxy;
-        g_visibleMeshCanary.groupProxy = groupProxy;
-        g_visibleMeshCanary.instruction = meshInstruction;
-        g_visibleMeshCanary.pinnedImageProxy = imageProxy;
-        g_visibleMeshCanary.hwnd = hwnd;
-        g_visibleMeshCanary.detachAt = 0;
-        g_visibleMeshCanary.nativeBindingCount = 1;
-        g_visibleMeshCanary.width = width;
-        g_visibleMeshCanary.height = height;
-        meshProxy = nullptr;
-        groupProxy = nullptr;
-        imagePinned = false;
-        meshInstruction = nullptr;
-        g_visibleMeshCanaryCleanupRequested.store(false,
-                                                   std::memory_order_release);
-        g_visibleMeshCanaryHwnd.store(hwnd, std::memory_order_release);
-        g_visibleMeshCanaryActive.store(true, std::memory_order_release);
-        RequestDwmScenePass();
-    }
-    if (meshInstruction)
-    {
-        g_cBaseObjectRelease(meshInstruction);
-    }
-    if (imagePinned)
-    {
-        g_cBaseObjectRelease(imageProxy);
-    }
-    if (groupProxy)
-    {
-        g_cBaseObjectRelease(groupProxy);
-    }
-    if (meshProxy)
-    {
-        g_cBaseObjectRelease(meshProxy);
-    }
-
-    Wh_Log(L"True 4x4 native transaction canary: %s stage=%s "
-           L"result=0x%08X HWND=%p visual=%p original=%p index=%d/%u "
-           L"image=%p imageVtable=%p imageBacking=%p directSource=1 "
-           L"resourceId=%u target=active-drag "
-           L"size=%.0fx%.0f",
-           succeeded ? L"installed" : L"failed", stage,
-           static_cast<unsigned int>(result), hwnd, renderVisual,
-           originalInstruction, originalIndex, originalCount, imageProxy,
-           imageVtable, imageBacking, imageResourceId,
-           width, height);
-    return succeeded;
-}
-
-static void* FindVisualChildCollection(void* visual, size_t* memberOffset,
-                                       bool* indirect)
-{
-    if (memberOffset)
-    {
-        *memberOffset = SIZE_MAX;
-    }
-    if (indirect)
-    {
-        *indirect = false;
-    }
-    void* expectedVtable =
-        g_visualCollectionVtable.load(std::memory_order_acquire);
-    if (!visual || !expectedVtable ||
-        !IsReadableMemory(visual, 0x108))
-    {
-        return nullptr;
-    }
-
-    void* match = nullptr;
-    size_t matchOffset = SIZE_MAX;
-    bool matchIndirect = false;
-    unsigned int matchCount = 0;
-    auto accept = [&](void* candidate, size_t offset, bool isIndirect)
-    {
-        if (!candidate || !IsReadableMemory(candidate, sizeof(void*)) ||
-            *reinterpret_cast<void**>(candidate) != expectedVtable)
-        {
-            return;
-        }
-        if (candidate == match)
-        {
-            return;
-        }
-        match = candidate;
-        matchOffset = offset;
-        matchIndirect = isIndirect;
-        matchCount++;
-    };
-    for (size_t offset = 0; offset <= 0x100; offset += sizeof(void*))
-    {
-        BYTE* embedded = static_cast<BYTE*>(visual) + offset;
-        accept(embedded, offset, false);
-        accept(ReadPointerMember(visual, offset), offset, true);
-    }
-    if (matchCount != 1)
-    {
-        return nullptr;
-    }
-    if (memberOffset)
-    {
-        *memberOffset = matchOffset;
-    }
-    if (indirect)
-    {
-        *indirect = matchIndirect;
-    }
-    return match;
-}
-
-static bool GetVisualChildren(void* visual, void*** children, int* count,
-                              size_t* collectionOffset, bool* indirect)
-{
-    if (children)
-    {
-        *children = nullptr;
-    }
-    if (count)
-    {
-        *count = 0;
-    }
-    if (g_visualCollectionArrayOffset == SIZE_MAX ||
-        g_visualCollectionCountOffset == SIZE_MAX)
-    {
-        return false;
-    }
-    void* collection =
-        FindVisualChildCollection(visual, collectionOffset, indirect);
-    if (!collection)
-    {
-        return false;
-    }
-    BYTE* countField = static_cast<BYTE*>(collection) +
-                       g_visualCollectionCountOffset;
-    if (!IsReadableMemory(countField, sizeof(int)))
-    {
-        return false;
-    }
-    int childCount = *reinterpret_cast<int*>(countField);
-    if (childCount < 0 || childCount > 64)
-    {
-        return false;
-    }
-    void** childArray = static_cast<void**>(
-        ReadPointerMember(collection, g_visualCollectionArrayOffset));
-    if (childCount > 0 &&
-        (!childArray ||
-         !IsReadableMemory(childArray,
-                           static_cast<size_t>(childCount) * sizeof(void*))))
-    {
-        return false;
-    }
-    if (children)
-    {
-        *children = childArray;
-    }
-    if (count)
-    {
-        *count = childCount;
-    }
-    return true;
-}
-
-static void ProbeNativeRepresentationAncestry(HWND hwnd, void* completeRoot,
-                                               void* secondaryVisual)
-{
-    static HWND lastHwnd = nullptr;
-    static void* lastCompleteRoot = nullptr;
-    static void* lastSecondaryVisual = nullptr;
-    if (!hwnd || !completeRoot || !secondaryVisual ||
-        g_visualParentOffset == SIZE_MAX ||
-        (lastHwnd == hwnd && lastCompleteRoot == completeRoot &&
-         lastSecondaryVisual == secondaryVisual))
-    {
-        return;
-    }
-    lastHwnd = hwnd;
-    lastCompleteRoot = completeRoot;
-    lastSecondaryVisual = secondaryVisual;
-
-    struct VisualAncestry
-    {
-        void* nodes[16];
-        unsigned int count;
-    };
-    auto collect = [](void* start)
-    {
-        VisualAncestry ancestry = {};
-        void* current = start;
-        while (current && ancestry.count < ARRAYSIZE(ancestry.nodes) &&
-               IsReadableMemory(current, sizeof(void*)))
-        {
-            bool duplicate = false;
-            for (unsigned int index = 0; index < ancestry.count; index++)
-            {
-                duplicate |= ancestry.nodes[index] == current;
-            }
-            if (duplicate)
-            {
-                break;
-            }
-            void* vtable = *reinterpret_cast<void**>(current);
-            if (!IsDwmImageAddress(vtable, sizeof(void*)))
-            {
-                break;
-            }
-            ancestry.nodes[ancestry.count++] = current;
-            current = ReadPointerMember(current, g_visualParentOffset);
-        }
-        return ancestry;
-    };
-
-    VisualAncestry live = collect(completeRoot);
-    VisualAncestry secondary = collect(secondaryVisual);
-    void* common = nullptr;
-    int liveCommonDepth = -1;
-    int secondaryCommonDepth = -1;
-    for (unsigned int liveIndex = 0; liveIndex < live.count && !common;
-         liveIndex++)
-    {
-        for (unsigned int secondaryIndex = 0;
-             secondaryIndex < secondary.count; secondaryIndex++)
-        {
-            if (live.nodes[liveIndex] == secondary.nodes[secondaryIndex])
-            {
-                common = live.nodes[liveIndex];
-                liveCommonDepth = static_cast<int>(liveIndex);
-                secondaryCommonDepth = static_cast<int>(secondaryIndex);
-                break;
-            }
-        }
-    }
-    int liveChildIndex = -1;
-    int secondaryChildIndex = -1;
-    int commonChildCount = 0;
-    if (common && liveCommonDepth > 0 && secondaryCommonDepth > 0)
-    {
-        void** commonChildren = nullptr;
-        if (GetVisualChildren(common, &commonChildren, &commonChildCount,
-                              nullptr, nullptr))
-        {
-            void* liveChild = live.nodes[liveCommonDepth - 1];
-            void* secondaryChild =
-                secondary.nodes[secondaryCommonDepth - 1];
-            for (int index = 0; index < commonChildCount; index++)
-            {
-                if (commonChildren[index] == liveChild)
-                {
-                    liveChildIndex = index;
-                }
-                if (commonChildren[index] == secondaryChild)
-                {
-                    secondaryChildIndex = index;
-                }
-            }
-        }
-    }
-
-    auto logChain = [hwnd](const wchar_t* name,
-                           const VisualAncestry& ancestry)
-    {
-        for (unsigned int index = 0; index < ancestry.count; index++)
-        {
-            void* visual = ancestry.nodes[index];
-            void* vtable = *reinterpret_cast<void**>(visual);
-            void* parent = ReadPointerMember(visual, g_visualParentOffset);
-            void* proxy = ReadPointerMember(visual, g_visualProxyOffset);
-            int childCount = 0;
-            size_t collectionOffset = SIZE_MAX;
-            bool indirect = false;
-            bool hasChildren = GetVisualChildren(
-                visual, nullptr, &childCount, &collectionOffset, &indirect);
-            Wh_Log(L"True 4x4 ancestry %s[%u]: HWND=%p visual=%p "
-                   L"vtable=%p parent=%p proxy=%p childLayout=%d "
-                   L"children=%d collectionOffset=0x%zx indirect=%d "
-                   L"(read-only)",
-                   name, index, hwnd, visual, vtable, parent, proxy,
-                   hasChildren, childCount, collectionOffset, indirect);
-        }
-    };
-    logChain(L"live", live);
-    logChain(L"secondary", secondary);
-    Wh_Log(L"True 4x4 ancestry summary: HWND=%p liveRoot=%p "
-           L"secondary=%p liveDepth=%u secondaryDepth=%u common=%p "
-           L"liveCommonDepth=%d secondaryCommonDepth=%d commonChildren=%d "
-           L"liveChildIndex=%d secondaryChildIndex=%d (read-only)",
-           hwnd, completeRoot, secondaryVisual, live.count,
-           secondary.count, common, liveCommonDepth, secondaryCommonDepth,
-           commonChildCount, liveChildIndex, secondaryChildIndex);
-}
-
-static void ProbeCompleteWindowRootTree(HWND hwnd, void* topLevelWindow)
-{
-    static HWND lastHwnd = nullptr;
-    static void* lastRoot = nullptr;
-    if (!hwnd || !topLevelWindow || !g_topLevelWindowGetRootVisual ||
-        g_visualProxyOffset == SIZE_MAX ||
-        g_visualParentOffset == SIZE_MAX ||
-        g_visualContentOffset == SIZE_MAX)
-    {
-        return;
-    }
-
-    constexpr int completeWindowRoot = 0;
-    void* root =
-        g_topLevelWindowGetRootVisual(topLevelWindow, completeWindowRoot);
-    if (!root || (lastHwnd == hwnd && lastRoot == root))
-    {
-        return;
-    }
-    lastHwnd = hwnd;
-    lastRoot = root;
-
-    struct PendingVisual
-    {
-        void* visual;
-        void* expectedParent;
-        unsigned int depth;
-    };
-    PendingVisual pending[64] = {{root, nullptr, 0}};
-    void* visited[64] = {};
-    unsigned int pendingBegin = 0;
-    unsigned int pendingEnd = 1;
-    unsigned int visitedCount = 0;
-    unsigned int contentCount = 0;
-    while (pendingBegin < pendingEnd && visitedCount < ARRAYSIZE(visited))
-    {
-        PendingVisual item = pending[pendingBegin++];
-        if (!item.visual || !IsReadableMemory(item.visual, sizeof(void*)))
-        {
-            continue;
-        }
-        bool seen = false;
-        for (unsigned int i = 0; i < visitedCount; i++)
-        {
-            if (visited[i] == item.visual)
-            {
-                seen = true;
-                break;
-            }
-        }
-        if (seen)
-        {
-            continue;
-        }
-        visited[visitedCount] = item.visual;
-        unsigned int nodeIndex = visitedCount++;
-
-        void* visualVtable = *reinterpret_cast<void**>(item.visual);
-        if (!IsDwmImageAddress(visualVtable, sizeof(void*)))
-        {
-            Wh_Log(L"True 4x4 root tree[%u]: HWND=%p depth=%u visual=%p "
-                   L"invalidVtable=%p",
-                   nodeIndex, hwnd, item.depth, item.visual, visualVtable);
-            continue;
-        }
-        void* parent = ReadPointerMember(item.visual, g_visualParentOffset);
-        void* proxy = ReadPointerMember(item.visual, g_visualProxyOffset);
-        void* content = ReadPointerMember(item.visual, g_visualContentOffset);
-        void* proxyVtable =
-            proxy && IsReadableMemory(proxy, sizeof(void*))
-                ? *reinterpret_cast<void**>(proxy)
-                : nullptr;
-        void* contentVtable =
-            content && IsReadableMemory(content, sizeof(void*))
-                ? *reinterpret_cast<void**>(content)
-                : nullptr;
-        void* redirect = nullptr;
-        if (ObservedVisualProxy* entry = FindObservedVisualProxy(proxy, false))
-        {
-            redirect = entry->redirectTarget.load(std::memory_order_acquire);
-        }
-        unsigned int resourceId = 0;
-        if (content)
-        {
-            contentCount++;
-            ReadBaseImageResourceId(content, &resourceId);
-        }
-
-        void** children = nullptr;
-        int childCount = 0;
-        size_t collectionOffset = SIZE_MAX;
-        bool indirectCollection = false;
-        bool hasChildren = GetVisualChildren(
-            item.visual, &children, &childCount, &collectionOffset,
-            &indirectCollection);
-        void** renderInstructions = nullptr;
-        int renderInstructionCount = 0;
-        bool hasRenderList = content && GetRenderDataInstructionList(
-            item.visual, &renderInstructions, nullptr,
-            &renderInstructionCount);
-        Wh_Log(L"True 4x4 root tree[%u]: HWND=%p depth=%u visual=%p "
-               L"visualVtable=%p parent=%p parentMatch=%d proxy=%p "
-               L"proxyVtable=%p content=%p contentVtable=%p contentKind=%d "
-               L"resourceId=%u redirect=%p collection=%s offset=0x%zx "
-               L"indirect=%d children=%d renderList=%s instructions=%d",
-               nodeIndex, hwnd, item.depth, item.visual, visualVtable,
-               parent, !item.expectedParent || parent == item.expectedParent,
-               proxy, proxyVtable, content, contentVtable,
-               static_cast<int>(GetMeshSourceKind(content)), resourceId,
-               redirect, hasChildren ? L"valid" : L"unavailable",
-               collectionOffset, indirectCollection, childCount,
-               hasRenderList ? L"valid" : L"unavailable",
-               renderInstructionCount);
-
-        if (hasRenderList)
-        {
-            for (int i = 0; i < renderInstructionCount; i++)
-            {
-                void* instruction = renderInstructions[i];
-                void* instructionVtable =
-                    instruction && IsReadableMemory(instruction, sizeof(void*))
-                        ? *reinterpret_cast<void**>(instruction)
-                        : nullptr;
-                void* source = ReadPointerMember(instruction, 0x10);
-                void* sourceVtable =
-                    source && IsReadableMemory(source, sizeof(void*))
-                        ? *reinterpret_cast<void**>(source)
-                        : nullptr;
-                void* backing = ReadPointerMember(source, 0x10);
-                unsigned int sourceResourceId = 0;
-                bool hasResourceId =
-                    ReadBaseImageResourceId(source, &sourceResourceId);
-                Wh_Log(L"True 4x4 root tree[%u] instruction[%d]: "
-                       L"instruction=%p instructionVtable=%p "
-                       L"instructionVtableInDwm=%d source=%p "
-                       L"sourceVtable=%p sourceVtableInDwm=%d "
-                       L"sourceKind=%d backing=%p resourceId=%u "
-                       L"resourceValid=%d",
-                       nodeIndex, i, instruction, instructionVtable,
-                       IsDwmImageAddress(instructionVtable, sizeof(void*)),
-                       source, sourceVtable,
-                       IsDwmImageAddress(sourceVtable, sizeof(void*)),
-                       static_cast<int>(GetMeshSourceKind(source)), backing,
-                       sourceResourceId, hasResourceId);
-            }
-        }
-
-        if (!hasChildren || item.depth >= 8)
-        {
-            continue;
-        }
-        for (int i = 0; i < childCount && pendingEnd < ARRAYSIZE(pending);
-             i++)
-        {
-            void* child = children[i];
-            if (!child || !IsReadableMemory(child, sizeof(void*)))
-            {
-                Wh_Log(L"True 4x4 root tree[%u] child[%d]: invalid=%p",
-                       nodeIndex, i, child);
-                continue;
-            }
-            void* childVtable = *reinterpret_cast<void**>(child);
-            if (!IsDwmImageAddress(childVtable, sizeof(void*)))
-            {
-                Wh_Log(L"True 4x4 root tree[%u] child[%d]: visual=%p "
-                       L"invalidVtable=%p",
-                       nodeIndex, i, child, childVtable);
-                continue;
-            }
-            pending[pendingEnd++] =
-                {child, item.visual, item.depth + 1};
-        }
-    }
-    Wh_Log(L"True 4x4 root tree summary: HWND=%p root=%p nodes=%u "
-           L"contents=%u queued=%u truncated=%d (read-only)",
-           hwnd, root, visitedCount, contentCount, pendingEnd,
-           pendingBegin < pendingEnd || pendingEnd == ARRAYSIZE(pending));
-}
-
-static void InstallRequestedLiveBaseImageMeshCanary()
-{
-    if (!IsOnDwmSceneThread() ||
-        g_visibleMeshCanaryActive.load(std::memory_order_acquire))
-    {
-        return;
-    }
-    HWND target =
-        g_liveBaseImageMeshTargetHwnd.load(std::memory_order_acquire);
-    if (!target || !IsWindow(target))
-    {
-        return;
-    }
-    void* windowList =
-        g_windowListForSceneWake.load(std::memory_order_acquire);
-    void* currentWindowData =
-        IsDwmObjectPointerValid(windowList, g_windowListVtable) &&
-                g_findWindowDataByHwnd
-            ? FindWindowDataByHwnd(windowList, target)
-            : nullptr;
-    if (!currentWindowData ||
-        GetHwndFromWindowData(currentWindowData) != target)
-    {
-        return;
-    }
-    if (!NATIVE_MESH_WRITE_PROBE_ENABLED)
-    {
-        void* topLevelWindow = nullptr;
-        void* topLevelWindow3D = nullptr;
-        if (ResolveDwmWindowObjects(currentWindowData, &topLevelWindow,
-                                    &topLevelWindow3D))
-        {
-            ProbeCompleteWindowRootTree(target, topLevelWindow);
-            constexpr int completeWindowRoot = 0;
-            void* completeRoot = g_topLevelWindowGetRootVisual
-                                     ? g_topLevelWindowGetRootVisual(
-                                           topLevelWindow, completeWindowRoot)
-                                     : nullptr;
-            ProbeNativeRepresentationAncestry(target, completeRoot,
-                                               topLevelWindow3D);
-        }
-        return;
-    }
-    unsigned int ownerMatches = 0;
-    unsigned int liveInstructionMatches = 0;
-    unsigned int ownerRenderLists = 0;
-    unsigned int ownerListCandidates = 0;
-    for (ObservedRenderImage& entry : g_observedRenderImages)
-    {
-        if (entry.ownerHwnd.load(std::memory_order_acquire) != target)
-        {
-            continue;
-        }
-        ownerMatches++;
-        void* renderVisual = entry.visual.load(std::memory_order_acquire);
-        void* instruction = entry.instruction.load(std::memory_order_acquire);
-        void* imageProxy = entry.imageProxy.load(std::memory_order_acquire);
-        if (!renderVisual)
-        {
-            continue;
-        }
-
-        if (instruction && imageProxy &&
-            FindRenderDataInstructionIndex(renderVisual, instruction,
-                                           nullptr, nullptr))
-        {
-            liveInstructionMatches++;
-            if (TryInstallLiveBaseImageMeshCanary(
-                    renderVisual, instruction, imageProxy, currentWindowData,
-                    target))
-            {
-                long result = g_renderDataVisualUpdateRenderData(renderVisual);
-                Wh_Log(L"True 4x4 targeted publish: HWND=%p result=0x%08X",
-                       target, static_cast<unsigned int>(result));
-                return;
-            }
-        }
-
-        // The observed instruction can be replaced when DWM rebuilds the
-        // render list, while the owning render visual remains stable. Search
-        // only that proven visual for the same live image resource instead of
-        // walking arbitrary DWM objects from the animation loop.
-        unsigned int observedResourceId = 0;
-        if (imageProxy)
-        {
-            ReadBaseImageResourceId(imageProxy, &observedResourceId);
-        }
-        void* replacementInstruction = nullptr;
-        void* replacementImageProxy = nullptr;
-        int replacementIndex = -1;
-        int ownerInstructionCount = 0;
-        unsigned int replacementCount = 0;
-        bool uniqueOwnerCandidate = FindUniqueBaseImageInstruction(
-            renderVisual, observedResourceId, &replacementInstruction,
-            &replacementImageProxy, &replacementIndex,
-            &ownerInstructionCount, &replacementCount);
-        ownerRenderLists += ownerInstructionCount > 0;
-        ownerListCandidates += replacementCount;
-        if (uniqueOwnerCandidate &&
-            TryInstallLiveBaseImageMeshCanary(
-                renderVisual, replacementInstruction, replacementImageProxy,
-                currentWindowData, target))
-        {
-            long result = g_renderDataVisualUpdateRenderData(renderVisual);
-            Wh_Log(L"True 4x4 owner-list targeted publish: HWND=%p "
-                   L"index=%d/%d resourceId=%u result=0x%08X",
-                   target, replacementIndex, ownerInstructionCount,
-                   observedResourceId, static_cast<unsigned int>(result));
-            return;
-        }
-    }
-
-    // Existing windows can keep a render list that was built before our
-    // observation hooks were installed. CTopLevelWindow3D is also the
-    // CRenderDataVisual base on this verified ABI, so inspect its current list
-    // directly. CDrawBitmapInstruction stores its CBaseImageProxy at +0x10;
-    // accept the field only when the image vtable, backing and resource ID all
-    // validate as live uDWM objects.
-    void* topLevelWindow = nullptr;
-    void* renderVisual = nullptr;
-    void** instructions = nullptr;
-    int instructionCount = 0;
-    unsigned int directCandidates = 0;
-    void* directInstruction = nullptr;
-    void* directImageProxy = nullptr;
-    int directInstructionIndex = -1;
-    unsigned int directSourceCandidates = 0;
-    void* directSourceImage = nullptr;
-    size_t directSourceOffset = SIZE_MAX;
-    void* probedSourceImage = nullptr;
-    void* probedSourceVtable = nullptr;
-    void* probedSourceBacking = nullptr;
-    unsigned int probedSourceResourceId = 0;
-    MeshSourceKind probedSourceKind = MeshSourceKind::None;
-    if (ResolveDwmWindowObjects(currentWindowData, &topLevelWindow,
-                                &renderVisual) &&
-        IsDwmObjectPointerValid(renderVisual, g_topLevelWindow3DVtable))
-    {
-        ProbeCompleteWindowRootTree(target, topLevelWindow);
-        for (unsigned int index = 0;
-             index < g_ensureRenderDataPointerOffsetCount; index++)
-        {
-            size_t offset = g_ensureRenderDataPointerOffsets[index];
-            void* imageProxy = ReadPointerMember(renderVisual, offset);
-            if (index == 0)
-            {
-                directSourceOffset = offset;
-                probedSourceImage = imageProxy;
-                if (imageProxy &&
-                    IsReadableMemory(imageProxy, sizeof(void*)))
-                {
-                    probedSourceVtable =
-                        *reinterpret_cast<void**>(imageProxy);
-                    probedSourceBacking =
-                        ReadPointerMember(imageProxy, 0x10);
-                    probedSourceKind = GetMeshSourceKind(imageProxy);
-                    ReadBaseImageResourceId(
-                        imageProxy, &probedSourceResourceId);
-                }
-            }
-            if (!imageProxy || !IsReadableMemory(imageProxy, sizeof(void*)) ||
-                !IsDwmImageAddress(*reinterpret_cast<void**>(imageProxy),
-                                   sizeof(void*)) ||
-                GetMeshSourceKind(imageProxy) != MeshSourceKind::None)
-            {
-                continue;
-            }
-            unsigned int resourceId = 0;
-            if (!ReadBaseImageResourceId(imageProxy, &resourceId))
-            {
-                continue;
-            }
-            directSourceCandidates++;
-            directSourceImage = imageProxy;
-            directSourceOffset = offset;
-        }
-        GetRenderDataInstructionList(renderVisual, &instructions, nullptr,
-                                     &instructionCount);
-        if (instructions)
-        {
-            for (int index = 0; index < instructionCount; index++)
-            {
-                void* instruction = instructions[index];
-                void* imageProxy = ReadPointerMember(instruction, 0x10);
-                if (!instruction || !imageProxy ||
-                    !IsReadableMemory(imageProxy, sizeof(void*)) ||
-                    !IsDwmImageAddress(*reinterpret_cast<void**>(imageProxy),
-                                       sizeof(void*)) ||
-                    GetMeshSourceKind(imageProxy) != MeshSourceKind::None)
-                {
-                    continue;
-                }
-                unsigned int resourceId = 0;
-                if (!ReadBaseImageResourceId(imageProxy, &resourceId))
-                {
-                    continue;
-                }
-                directCandidates++;
-                directInstruction = instruction;
-                directImageProxy = imageProxy;
-                directInstructionIndex = index;
-            }
-        }
-    }
-    if (directCandidates == 1 &&
-        TryInstallLiveBaseImageMeshCanary(
-            renderVisual, directInstruction, directImageProxy,
-            currentWindowData, target))
-    {
-        long result = g_renderDataVisualUpdateRenderData(renderVisual);
-        Wh_Log(L"True 4x4 direct targeted publish: HWND=%p index=%d/%d "
-               L"result=0x%08X",
-               target, directInstructionIndex, instructionCount,
-               static_cast<unsigned int>(result));
-        return;
-    }
-
-    static HWND lastMissTarget = nullptr;
-    static ULONGLONG lastMissTime = 0;
-    ULONGLONG now = GetTickCount64();
-    if (lastMissTarget != target || now - lastMissTime >= 1000)
-    {
-        lastMissTarget = target;
-        lastMissTime = now;
-        Wh_Log(L"True 4x4 target pending: HWND=%p WindowData=%p "
-               L"ownerMatches=%u liveInstructions=%u renderVisual=%p "
-               L"ownerLists=%u ownerCandidates=%u "
-               L"directInstructions=%d directCandidates=%u "
-               L"sourceOffsets=%u sourceCandidates=%u "
-               L"sourceOffset=0x%zx sourceImage=%p sourceVtable=%p "
-               L"sourceBacking=%p sourceResourceId=%u sourceKind=%d "
-               L"topLevelWindow=%p "
-               L"ensureCalls=%u ensureMapped=%u ensurePopulated=%u "
-               L"drawBitmap=%u matchedAdds=%u",
-               target, currentWindowData, ownerMatches,
-               liveInstructionMatches, renderVisual, ownerRenderLists,
-               ownerListCandidates, instructionCount, directCandidates,
-               g_ensureRenderDataPointerOffsetCount,
-               directSourceCandidates, directSourceOffset,
-               probedSourceImage ? probedSourceImage : directSourceImage,
-               probedSourceVtable, probedSourceBacking,
-               probedSourceResourceId,
-               static_cast<int>(probedSourceKind), topLevelWindow,
-               g_ensureRenderDataCallCount.load(std::memory_order_relaxed),
-               g_ensureRenderDataMappedCount.load(std::memory_order_relaxed),
-               g_ensureRenderDataPopulatedCount.load(
-                   std::memory_order_relaxed),
-               g_observedDrawBitmapCreateCount.load(
-                   std::memory_order_relaxed),
-               g_observedImageInstructionMatchedAddCount.load(
-                   std::memory_order_relaxed));
-    }
-}
-
 static void SubmitPendingWobblySceneWork()
 {
     if (!IsOnDwmSceneThread())
@@ -7224,17 +3458,10 @@ static void SubmitPendingWobblySceneWork()
     g_sceneWakeScheduled.store(false, std::memory_order_release);
     g_sceneWakePostTimestamp.store(0, std::memory_order_release);
     g_scenePassCounter.fetch_add(1, std::memory_order_release);
-    MaintainVisibleMeshCanary();
-    InstallRequestedLiveBaseImageMeshCanary();
     // Restore retiring/quiet windows before discovery, creation or normal rendering.
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
     {
-        if (NATIVE_MESH_WRITE_PROBE_ENABLED ||
-            NATIVE_MESH_TRANSACTION_PROBE_ENABLED)
-        {
-            RunNativeMeshCanary();
-        }
         BackfillExistingDwmWindowMappings();
         EnsurePendingMatrixTransformProxies();
         for (int i = 0; i < MAX_ANIMATION_SLOTS; i++)
@@ -7259,10 +3486,7 @@ static void SubmitPendingWobblySceneWork()
 
 static bool HasPendingWobblySceneWork()
 {
-    return g_nativeMeshCanaryPending.load(std::memory_order_acquire) ||
-           g_visibleMeshCanaryCleanupRequested.load(
-               std::memory_order_acquire) ||
-           g_sceneRequestedSerial.load(std::memory_order_acquire) >
+    return g_sceneRequestedSerial.load(std::memory_order_acquire) >
                g_sceneSubmittedSerial.load(std::memory_order_acquire) ||
            g_existingWindowBackfillIndex.load(std::memory_order_acquire) <
                g_existingWindowBackfillCount.load(std::memory_order_acquire) ||
@@ -7297,7 +3521,6 @@ static long __cdecl ForceUpdateSceneHook(void* pThis)
     long result = g_windowListForceUpdateSceneOriginal(pThis);
     if (outermostPass)
     {
-        RestoreNativeMeshPublishLease(L"ForceUpdateSceneReturn");
         BindAnimationTransformsAfterNativeScene();
         g_insideWobblyScenePass = false;
     }
@@ -7325,7 +3548,6 @@ static long __cdecl UpdateSceneHook(void* pThis)
     long result = g_windowListUpdateSceneOriginal(pThis);
     if (outermostPass)
     {
-        RestoreNativeMeshPublishLease(L"UpdateSceneReturn");
         BindAnimationTransformsAfterNativeScene();
         g_insideWobblyScenePass = false;
     }
@@ -7373,7 +3595,6 @@ static void __cdecl AdvanceTimelinesHook(void* pThis, double currentTime)
     if (canSubmit && !g_insideWobblyScenePass)
     {
         g_insideWobblyScenePass = true;
-        RestoreNativeMeshPublishLease(L"AdvanceTimelinesReturn");
         BindAnimationTransformsAfterNativeScene();
         g_insideWobblyScenePass = false;
     }
@@ -7467,7 +3688,6 @@ static void __cdecl DesktopManagerHandleThreadMessageHook(UINT message,
     }
     if (nativeSceneUpdated)
     {
-        RestoreNativeMeshPublishLease(L"ThreadWakeSceneReturn");
         // uDWM can replace the root transform while maximizing or restoring.
         BindPendingAnimationSlotTransforms(true);
     }
@@ -8187,7 +4407,6 @@ static void ResetDragInputState()
     g_interactiveStateThrobDirection = 0;
     g_interactiveStateThrobFromPointerEdge = false;
     g_resizeCoordinateScale = 1.0;
-    g_visualCoordinateScale = 1.0;
     g_dragAnimationSlot = -1;
     g_hasLastMousePosition = false;
     g_lastMousePosition = {};
@@ -8195,7 +4414,6 @@ static void ResetDragInputState()
     g_monitorTransitionRebaseUntil = 0;
     g_realDraggedWindowRect = {};
     g_lastDraggedWindowRect = {};
-    g_lastDraggedVisualRect = {};
     g_lastDraggedWindowZoomed = false;
     g_finalizingMoveSize = false;
 }
@@ -8767,16 +4985,6 @@ static bool IsResizeHitTestResult(LRESULT hitTestResult)
     }
 }
 
-static bool GetPhysicalExtendedFrameBounds(HWND hwnd, RECT& bounds)
-{
-    constexpr DWORD dwmwaExtendedFrameBounds = 9;
-    bounds = {};
-    return hwnd && g_dwmGetWindowAttribute &&
-           SUCCEEDED(g_dwmGetWindowAttribute(hwnd, dwmwaExtendedFrameBounds,
-                                             &bounds, sizeof(bounds))) &&
-           bounds.right > bounds.left && bounds.bottom > bounds.top;
-}
-
 static bool IsCursorOnResizableFrame(HWND hwnd, const POINT& mousePosition,
                                      const RECT& rect, bool includeTopEdge)
 {
@@ -8793,32 +5001,13 @@ static bool IsCursorOnResizableFrame(HWND hwnd, const POINT& mousePosition,
                  GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
     int frameY = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
                  GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-    RECT hitRect = rect;
-    bool physicalBounds = GetPhysicalExtendedFrameBounds(hwnd, hitRect);
-    if (physicalBounds && g_getDpiForMonitor)
-    {
-        HMONITOR monitor = MonitorFromRect(&hitRect, MONITOR_DEFAULTTONEAREST);
-        UINT monitorDpiX = 0;
-        UINT monitorDpiY = 0;
-        if (monitor &&
-            SUCCEEDED(g_getDpiForMonitor(monitor, 0, &monitorDpiX, &monitorDpiY)) &&
-            monitorDpiX && dpi)
-        {
-            double scale = static_cast<double>(monitorDpiX) / static_cast<double>(dpi);
-            frameX = static_cast<int>(std::ceil(static_cast<double>(frameX) * scale));
-            frameY = static_cast<int>(std::ceil(static_cast<double>(frameY) * scale));
-        }
-    }
-    frameX = std::clamp(frameX, 4, 48);
-    frameY = std::clamp(frameY, 4, 48);
-    LONG localX = mousePosition.x - hitRect.left;
-    LONG localY = mousePosition.y - hitRect.top;
-    LONG width = hitRect.right - hitRect.left;
-    LONG height = hitRect.bottom - hitRect.top;
-    LONG outsideMarginX = physicalBounds ? frameX : 1;
-    LONG outsideMarginY = physicalBounds ? frameY : 1;
-    if (localX < -outsideMarginX || localY < -outsideMarginY ||
-        localX > width + outsideMarginX || localY > height + outsideMarginY)
+    frameX = std::clamp(frameX, 4, 32);
+    frameY = std::clamp(frameY, 4, 32);
+    LONG localX = mousePosition.x - rect.left;
+    LONG localY = mousePosition.y - rect.top;
+    LONG width = rect.right - rect.left;
+    LONG height = rect.bottom - rect.top;
+    if (localX < -1 || localY < -1 || localX > width + 1 || localY > height + 1)
     {
         return false;
     }
@@ -8896,85 +5085,31 @@ static void UninitializeDpiSupport()
     }
 }
 
-struct WindowVisualCoordinates
-{
-    RECT rect = {};
-    Vec2 cursor = {};
-    double scaleX = 1.0;
-    double scaleY = 1.0;
-    bool converted = false;
-};
-
-static WindowVisualCoordinates GetWindowVisualCoordinates(HWND hwnd,
-                                                           const RECT& fallbackRect,
-                                                           const POINT& physicalCursor)
-{
-    WindowVisualCoordinates result = {
-        fallbackRect,
-        {static_cast<double>(physicalCursor.x), static_cast<double>(physicalCursor.y)}};
-    if (!hwnd || !g_dwmGetWindowAttribute)
-    {
-        return result;
-    }
-    RECT physicalRect = {};
-    if (!GetPhysicalExtendedFrameBounds(hwnd, physicalRect))
-    {
-        return result;
-    }
-    POINT logicalTopLeft = {physicalRect.left, physicalRect.top};
-    POINT logicalBottomRight = {physicalRect.right, physicalRect.bottom};
-    if (!PhysicalToLogicalPointForPerMonitorDPI(hwnd, &logicalTopLeft) ||
-        !PhysicalToLogicalPointForPerMonitorDPI(hwnd, &logicalBottomRight) ||
-        logicalBottomRight.x <= logicalTopLeft.x ||
-        logicalBottomRight.y <= logicalTopLeft.y)
-    {
-        return result;
-    }
-    result.rect = {logicalTopLeft.x, logicalTopLeft.y,
-                   logicalBottomRight.x, logicalBottomRight.y};
-    result.scaleX = static_cast<double>(logicalBottomRight.x - logicalTopLeft.x) /
-                    static_cast<double>(physicalRect.right - physicalRect.left);
-    result.scaleY = static_cast<double>(logicalBottomRight.y - logicalTopLeft.y) /
-                    static_cast<double>(physicalRect.bottom - physicalRect.top);
-    result.cursor = {
-        static_cast<double>(logicalTopLeft.x) +
-            static_cast<double>(physicalCursor.x - physicalRect.left) * result.scaleX,
-        static_cast<double>(logicalTopLeft.y) +
-            static_cast<double>(physicalCursor.y - physicalRect.top) * result.scaleY};
-    result.converted = true;
-    return result;
-}
-
-// Keep resize physics in the same coordinate space used by the stable 0.115
-// renderer. DWM can scale system-DPI window surfaces on a different monitor;
-// converting the extended frame back into logical coordinates mixes two DWM
-// visual spaces during resize and can trip dwmcore's consistency checks.
 static double GetResizeVisualCoordinateScale(HWND hwnd, const RECT& windowRect)
 {
     if (!hwnd || !g_getDpiForMonitor)
     {
         return 1.0;
     }
-
     HMONITOR monitor = MonitorFromRect(&windowRect, MONITOR_DEFAULTTONEAREST);
     UINT monitorDpiX = 0;
     UINT monitorDpiY = 0;
     if (!monitor ||
-        FAILED(g_getDpiForMonitor(monitor, 0, &monitorDpiX, &monitorDpiY)) ||
+        FAILED(g_getDpiForMonitor(monitor,
+                                  0, // MDT_EFFECTIVE_DPI
+                                  &monitorDpiX, &monitorDpiY)) ||
         monitorDpiX == 0)
     {
         return 1.0;
     }
-
     UINT windowDpi = GetDpiForWindow(hwnd);
     if (windowDpi == 0)
     {
         return 1.0;
     }
-
-    return std::clamp(static_cast<double>(windowDpi) /
-                          static_cast<double>(monitorDpiX),
-                      0.50, 2.00);
+    // Correct system-DPI surfaces transformed by DWM on another monitor.
+    return std::clamp(static_cast<double>(windowDpi) / static_cast<double>(monitorDpiX), 0.50,
+                      2.00);
 }
 
 static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, double width,
@@ -9134,7 +5269,7 @@ static void HandleMoveSizeStart(HWND hwnd)
         return;
     }
     POINT mousePosition = {};
-    if (!GetPhysicalCursorPos(&mousePosition))
+    if (!GetCursorPos(&mousePosition))
     {
         return;
     }
@@ -9144,15 +5279,9 @@ static void HandleMoveSizeStart(HWND hwnd)
     {
         return;
     }
-    WindowVisualCoordinates visualCoordinates =
-        GetWindowVisualCoordinates(hwnd, rect, mousePosition);
-    int visualWidth = visualCoordinates.rect.right - visualCoordinates.rect.left;
-    int visualHeight = visualCoordinates.rect.bottom - visualCoordinates.rect.top;
-    if (visualWidth <= 0 || visualHeight <= 0)
-    {
-        return;
-    }
     WobblySettings activeSettings = GetSettingsSnapshot();
+    Vec2 localMousePosition = {static_cast<double>(mousePosition.x - rect.left),
+                               static_cast<double>(mousePosition.y - rect.top)};
     bool startedWindowZoomed = IsZoomed(hwnd) != FALSE || IsApproximatelyMonitorWorkArea(rect);
     bool operationResizing = false;
     bool operationTypeKnown = startedWindowZoomed ||
@@ -9161,57 +5290,15 @@ static void HandleMoveSizeStart(HWND hwnd)
     {
         return;
     }
-
     g_resizeCoordinateScale =
-        operationTypeKnown && operationResizing
-            ? GetResizeVisualCoordinateScale(hwnd, rect)
-            : 1.0;
-
-    Vec2 rawLocalMousePosition = {};
-    Vec2 localMousePosition = {};
-    double meshWidth = 0.0;
-    double meshHeight = 0.0;
+        operationTypeKnown && operationResizing ? GetResizeVisualCoordinateScale(hwnd, rect) : 1.0;
     if (operationTypeKnown && operationResizing)
     {
-        rawLocalMousePosition = {
-            static_cast<double>(mousePosition.x - rect.left) * g_resizeCoordinateScale,
-            static_cast<double>(mousePosition.y - rect.top) * g_resizeCoordinateScale};
-        localMousePosition = rawLocalMousePosition;
-        meshWidth = static_cast<double>(width) * g_resizeCoordinateScale;
-        meshHeight = static_cast<double>(height) * g_resizeCoordinateScale;
-        g_visualCoordinateScale = g_resizeCoordinateScale;
-
-        Wh_Log(L"STABLE RESIZE COORDINATES: HWND=%p Scale=%.4f "
-               L"NativeSize=%dx%d MeshSize=%.1fx%.1f Grab=(%.1f,%.1f)",
-               hwnd, g_resizeCoordinateScale, width, height, meshWidth, meshHeight,
-               localMousePosition.x, localMousePosition.y);
+        localMousePosition.x *= g_resizeCoordinateScale;
+        localMousePosition.y *= g_resizeCoordinateScale;
     }
-    else
-    {
-        rawLocalMousePosition = {
-            visualCoordinates.cursor.x - static_cast<double>(visualCoordinates.rect.left),
-            visualCoordinates.cursor.y - static_cast<double>(visualCoordinates.rect.top)};
-        localMousePosition = {
-            std::clamp(rawLocalMousePosition.x, 0.0, static_cast<double>(visualWidth)),
-            std::clamp(rawLocalMousePosition.y, 0.0, static_cast<double>(visualHeight))};
-        meshWidth = static_cast<double>(visualWidth);
-        meshHeight = static_cast<double>(visualHeight);
-        g_visualCoordinateScale = visualCoordinates.scaleX;
-
-        if (visualCoordinates.converted &&
-            (std::abs(visualCoordinates.scaleX - 1.0) > 0.001 ||
-             std::abs(visualCoordinates.scaleY - 1.0) > 0.001))
-        {
-            Wh_Log(L"MIXED-DPI VISUAL COORDINATES: HWND=%p Scale=(%.4f,%.4f) "
-                   L"NativeSize=%dx%d VisualSize=%dx%d Resize=0 Grab=(%.1f,%.1f) "
-                   L"RawGrab=(%.1f,%.1f)",
-                   hwnd, visualCoordinates.scaleX, visualCoordinates.scaleY,
-                   width, height, visualWidth, visualHeight,
-                   localMousePosition.x, localMousePosition.y,
-                   rawLocalMousePosition.x, rawLocalMousePosition.y);
-        }
-    }
-
+    double meshWidth = static_cast<double>(width) * g_resizeCoordinateScale;
+    double meshHeight = static_cast<double>(height) * g_resizeCoordinateScale;
     int slotIndex =
         AcquireAnimationSlot(hwnd, activeSettings, meshWidth, meshHeight, localMousePosition);
     if (slotIndex < 0)
@@ -9231,27 +5318,9 @@ static void HandleMoveSizeStart(HWND hwnd)
     }
     ReleaseSRWLockExclusive(&g_animationSlotsLock);
     g_dragAnimationSlot = slotIndex;
-    if constexpr (NATIVE_MESH_EXPERIMENT_ENABLED)
-    {
-        HWND previousMeshTarget =
-            g_liveBaseImageMeshTargetHwnd.exchange(hwnd, std::memory_order_acq_rel);
-        if (previousMeshTarget != hwnd)
-        {
-            g_liveBaseImageMeshCanaryStarted.store(false, std::memory_order_release);
-            g_liveBaseImageMeshCanarySucceeded.store(false, std::memory_order_release);
-            g_liveBaseImageMeshAnimationLogged.store(false, std::memory_order_release);
-        }
-        HWND activeMeshWindow =
-            g_visibleMeshCanaryHwnd.load(std::memory_order_acquire);
-        if (activeMeshWindow && activeMeshWindow != hwnd)
-        {
-            RequestVisibleMeshCleanupForHwnd(activeMeshWindow);
-        }
-    }
     g_realDraggedWindow = hwnd;
     g_realDraggedWindowRect = rect;
     g_lastDraggedWindowRect = rect;
-    g_lastDraggedVisualRect = visualCoordinates.rect;
     g_lastDraggedWindowZoomed = startedWindowZoomed;
     g_dragStartedWindowZoomed = startedWindowZoomed;
     g_waitingForInitialRestore = startedWindowZoomed;
@@ -9283,8 +5352,6 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
     }
     struct RenderSnapshot
     {
-        bool retiring;
-        bool dragging;
         ULONGLONG generation;
         ULONGLONG meshRevision;
         HWND hwnd;
@@ -9305,8 +5372,6 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
           (slot.retiring || slot.meshIdentityPending || !slot.mesh.active ||
            g_unloading.load(std::memory_order_acquire)))))
     {
-        snapshot.retiring = slot.retiring;
-        snapshot.dragging = slot.dragging;
         snapshot.generation = slot.generation;
         snapshot.meshRevision = slot.meshRevision;
         snapshot.hwnd = slot.hwnd;
@@ -9360,101 +5425,6 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
                    static_cast<unsigned int>(updateResult));
         }
     };
-    bool nativeMeshTarget =
-        g_visibleMeshCanaryActive.load(std::memory_order_acquire) &&
-        !g_visibleMeshCanary.renderVisual &&
-        g_visibleMeshCanary.hwnd == snapshot.hwnd &&
-        g_visibleMeshCanary.nativeBindingCount > 0 &&
-        GetTickCount64() >= g_visibleMeshCanary.detachAt;
-    bool nativeMeshApplied = false;
-    if (nativeMeshTarget)
-    {
-        double maximumDisplacement = 0.0;
-        double maximumResidual = 0.0;
-        if (!identityUpdate)
-        {
-            Vec2 anchorDisplacement = {};
-            if (snapshot.mesh.dragPointIndex >= 0 &&
-                snapshot.mesh.dragPointIndex < GRID_POINT_COUNT)
-            {
-                const WobblePoint& anchor =
-                    snapshot.mesh.points[snapshot.mesh.dragPointIndex];
-                anchorDisplacement = {
-                    anchor.position.x - anchor.basePosition.x,
-                    anchor.position.y - anchor.basePosition.y};
-            }
-            else
-            {
-                for (const WobblePoint& point : snapshot.mesh.points)
-                {
-                    anchorDisplacement.x +=
-                        point.position.x - point.basePosition.x;
-                    anchorDisplacement.y +=
-                        point.position.y - point.basePosition.y;
-                }
-                anchorDisplacement.x /= GRID_POINT_COUNT;
-                anchorDisplacement.y /= GRID_POINT_COUNT;
-            }
-            for (int i = 0; i < GRID_POINT_COUNT; i++)
-            {
-                double dx = snapshot.mesh.points[i].position.x -
-                            snapshot.mesh.points[i].basePosition.x;
-                double dy = snapshot.mesh.points[i].position.y -
-                            snapshot.mesh.points[i].basePosition.y;
-                maximumDisplacement = std::max(
-                    maximumDisplacement, std::sqrt(dx * dx + dy * dy));
-                dx -= anchorDisplacement.x;
-                dy -= anchorDisplacement.y;
-                maximumResidual = std::max(
-                    maximumResidual, std::sqrt(dx * dx + dy * dy));
-            }
-        }
-        long nativeResult = UpdateAllNativeMeshGeometry(
-            identityUpdate ? nullptr : &snapshot.mesh);
-        if (nativeResult >= 0)
-        {
-            if (!identityUpdate && maximumDisplacement > 1.0 &&
-                !g_liveBaseImageMeshAnimationLogged.exchange(
-                    true, std::memory_order_acq_rel))
-            {
-                const WobblePoint& corner = snapshot.mesh.points[0];
-                const WobblePoint& inner = snapshot.mesh.points[5];
-                Wh_Log(L"True 4x4 native animation active: HWND=%p "
-                       L"bindings=%u MaxDisplacement=%.2f MaxResidual=%.2f "
-                       L"residualGain=4 size=%.0fx%.0f "
-                       L"cornerDelta=(%.2f,%.2f) innerDelta=(%.2f,%.2f)",
-                       snapshot.hwnd,
-                       g_visibleMeshCanary.nativeBindingCount,
-                       maximumDisplacement, maximumResidual,
-                       snapshot.mesh.width, snapshot.mesh.height,
-                       corner.position.x - corner.basePosition.x,
-                       corner.position.y - corner.basePosition.y,
-                       inner.position.x - inner.basePosition.x,
-                       inner.position.y - inner.basePosition.y);
-            }
-            if (identityUpdate)
-            {
-                MilMatrix3x2D identityMatrix = {1.0, 0.0, 0.0, 1.0,
-                                                0.0, 0.0};
-                long matrixResult = UpdateMatrixTransformProxy(
-                    snapshot.matrixTransformProxy, identityMatrix);
-                finishUpdate(matrixResult, matrixResult >= 0);
-                return;
-            }
-            // Keep the established whole-window affine motion and add only the
-            // non-rigid residual through the native mesh.
-            nativeMeshApplied = true;
-        }
-        else
-        {
-            g_visibleMeshCanaryCleanupRequested.store(
-                true, std::memory_order_release);
-            RequestDwmScenePass();
-            Wh_Log(L"True 4x4 native animation update failed for HWND=%p: "
-                   L"0x%08X; using affine fallback",
-                   snapshot.hwnd, static_cast<unsigned int>(nativeResult));
-        }
-    }
     if (identityUpdate)
     {
         MilMatrix3x2D identityMatrix = {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
@@ -9579,13 +5549,6 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
     translationY = std::clamp(translationY, -emergencyTranslationLimit, emergencyTranslationLimit);
     MilMatrix3x2D matrix = {m11, m12, m21, m22, translationX, translationY};
     long updateResult = UpdateMatrixTransformProxy(snapshot.matrixTransformProxy, matrix);
-    if (updateResult < 0 && nativeMeshApplied)
-    {
-        UpdateAllNativeMeshGeometry();
-        g_visibleMeshCanaryCleanupRequested.store(true,
-                                                   std::memory_order_release);
-        RequestDwmScenePass();
-    }
     finishUpdate(updateResult, false);
 }
 
@@ -9617,13 +5580,6 @@ static void StopAllAnimations()
         g_sceneRequestedSerial.fetch_add(1, std::memory_order_acq_rel);
         PostPendingDwmSceneWake(true);
     }
-    if (g_visibleMeshCanaryActive.load(std::memory_order_acquire))
-    {
-        g_visibleMeshCanaryCleanupRequested.store(true,
-                                                   std::memory_order_release);
-        g_sceneRequestedSerial.fetch_add(1, std::memory_order_acq_rel);
-        PostPendingDwmSceneWake(true);
-    }
     ULONGLONG hookWaitDeadline = GetTickCount64() + DWM_UNLOAD_CLEANUP_TIMEOUT_MS;
     bool cleanupTimedOut = false;
     for (;;)
@@ -9647,9 +5603,7 @@ static void StopAllAnimations()
         // Wakes carry only an instance token, not pointers; keep their counter
         // intact for late acknowledgments, but don't mistake them for resources.
         bool wakePending = g_sceneWakeOutstanding.load(std::memory_order_acquire) != 0;
-        bool visibleCanaryActive =
-            g_visibleMeshCanaryActive.load(std::memory_order_acquire);
-        if (!hookUsers && !retainedProxies && !visibleCanaryActive)
+        if (!hookUsers && !retainedProxies)
         {
             break;
         }
@@ -9663,7 +5617,7 @@ static void StopAllAnimations()
             break;
         }
         ULONGLONG lastWakePost = g_sceneWakePostTimestamp.load(std::memory_order_acquire);
-        if ((retainedProxies || visibleCanaryActive) &&
+        if (retainedProxies &&
             (!wakePending || !lastWakePost || now - lastWakePost >= 50))
         {
             PostPendingDwmSceneWake(true);
@@ -9996,17 +5950,7 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         g_moveTypeKnown = true;
     }
     POINT mousePosition = {};
-    if (!GetPhysicalCursorPos(&mousePosition))
-    {
-        return;
-    }
-    WindowVisualCoordinates visualCoordinates =
-        GetWindowVisualCoordinates(hwnd, rect, mousePosition);
-    int currentVisualWidth =
-        visualCoordinates.rect.right - visualCoordinates.rect.left;
-    int currentVisualHeight =
-        visualCoordinates.rect.bottom - visualCoordinates.rect.top;
-    if (currentVisualWidth <= 0 || currentVisualHeight <= 0)
+    if (!GetCursorPos(&mousePosition))
     {
         return;
     }
@@ -10071,22 +6015,11 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     {
         snapIntentDirection = mouseEdgeState.direction;
     }
-    double previousCoordinateScale = g_visualCoordinateScale;
-    double coordinateScale =
-        g_realResizing ? g_resizeCoordinateScale : visualCoordinates.scaleX;
-    bool coordinateScaleChanged =
-        !g_realResizing && std::abs(coordinateScale - previousCoordinateScale) > 0.001;
-    g_visualCoordinateScale = coordinateScale;
-    double windowDeltaX = g_realResizing
-                              ? static_cast<double>(rect.left - g_lastDraggedWindowRect.left) *
-                                    coordinateScale
-                              : static_cast<double>(visualCoordinates.rect.left -
-                                                    g_lastDraggedVisualRect.left);
-    double windowDeltaY = g_realResizing
-                              ? static_cast<double>(rect.top - g_lastDraggedWindowRect.top) *
-                                    coordinateScale
-                              : static_cast<double>(visualCoordinates.rect.top -
-                                                    g_lastDraggedVisualRect.top);
+    double coordinateScale = g_realResizing ? g_resizeCoordinateScale : 1.0;
+    double windowDeltaX =
+        static_cast<double>(rect.left - g_lastDraggedWindowRect.left) * coordinateScale;
+    double windowDeltaY =
+        static_cast<double>(rect.top - g_lastDraggedWindowRect.top) * coordinateScale;
     int previousWidth = g_lastDraggedWindowRect.right - g_lastDraggedWindowRect.left;
     int previousHeight = g_lastDraggedWindowRect.bottom - g_lastDraggedWindowRect.top;
     bool sizeChanged = currentWidth != previousWidth || currentHeight != previousHeight;
@@ -10107,37 +6040,18 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     }
     bool dpiReflow = !g_realResizing && sizeChanged && !zoomStateChanged &&
                      g_interactiveStateThrob == InteractiveStateThrobKind::None;
-    if (dpiReflow || coordinateScaleChanged)
+    if (dpiReflow)
     {
         g_monitorTransitionRebaseUntil = now + 750;
     }
     bool largeNativeCatchUp = std::abs(windowDeltaX) > 64.0 || std::abs(windowDeltaY) > 64.0;
     bool rebaseMonitorTransition =
         !g_realResizing && now <= g_monitorTransitionRebaseUntil &&
-        (monitorChanged || dpiReflow || coordinateScaleChanged || largeNativeCatchUp);
-    double currentMeshWidth = g_realResizing
-                                  ? static_cast<double>(currentWidth) * coordinateScale
-                                  : static_cast<double>(currentVisualWidth);
-    double currentMeshHeight = g_realResizing
-                                   ? static_cast<double>(currentHeight) * coordinateScale
-                                   : static_cast<double>(currentVisualHeight);
-    Vec2 localMousePosition = {};
-    if (g_realResizing)
-    {
-        localMousePosition = {
-            static_cast<double>(mousePosition.x - rect.left) * coordinateScale,
-            static_cast<double>(mousePosition.y - rect.top) * coordinateScale};
-    }
-    else
-    {
-        localMousePosition = {
-            std::clamp(visualCoordinates.cursor.x -
-                           static_cast<double>(visualCoordinates.rect.left),
-                       0.0, currentMeshWidth),
-            std::clamp(visualCoordinates.cursor.y -
-                           static_cast<double>(visualCoordinates.rect.top),
-                       0.0, currentMeshHeight)};
-    }
+        (monitorChanged || dpiReflow || largeNativeCatchUp);
+    Vec2 localMousePosition = {static_cast<double>(mousePosition.x - rect.left) * coordinateScale,
+                               static_cast<double>(mousePosition.y - rect.top) * coordinateScale};
+    double currentMeshWidth = static_cast<double>(currentWidth) * coordinateScale;
+    double currentMeshHeight = static_cast<double>(currentHeight) * coordinateScale;
     AcquireSRWLockExclusive(&g_animationSlotsLock);
     WindowAnimationSlot& slot = g_animationSlots[slotIndex];
     if (!slot.active || slot.hwnd != hwnd)
@@ -10162,7 +6076,6 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         slot.meshRevision++;
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
         g_lastDraggedWindowRect = rect;
-        g_lastDraggedVisualRect = visualCoordinates.rect;
         g_lastDraggedWindowZoomed = IsZoomed(hwnd) != FALSE;
         g_lastMousePosition = mousePosition;
         RequestDwmScenePass();
@@ -10171,7 +6084,8 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     auto startInteractiveStateThrob = [&](InteractiveStateThrobKind kind, bool maximizing,
                                           Vec2 direction)
     {
-        InitializeMesh(slot.mesh, currentMeshWidth, currentMeshHeight);
+        InitializeMesh(slot.mesh, static_cast<double>(currentWidth),
+                       static_cast<double>(currentHeight));
         ApplyWindowStateThrob(slot.mesh, maximizing, true, slot.settings, direction);
         ClearWindowStateThrobConstraints(slot.mesh);
         BeginDrag(slot.mesh, localMousePosition);
@@ -10247,14 +6161,16 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     {
         // Per-monitor DPI changes can make the native window catch up in one
         // large step. Treat that step as new geometry, not as wobble velocity.
-        InitializeMesh(slot.mesh, currentMeshWidth, currentMeshHeight);
+        InitializeMesh(slot.mesh, static_cast<double>(currentWidth),
+                       static_cast<double>(currentHeight));
         BeginDrag(slot.mesh, localMousePosition);
         slot.windowStateThrob = false;
     }
     else if (sizeChanged)
     {
         // Only IsZoomed transitions trigger state wobble during a move.
-        InitializeMesh(slot.mesh, currentMeshWidth, currentMeshHeight);
+        InitializeMesh(slot.mesh, static_cast<double>(currentWidth),
+                       static_cast<double>(currentHeight));
         if (zoomStateChanged && slot.settings.windowStateWobbleEnabled)
         {
             ApplyWindowStateThrob(slot.mesh, windowZoomed, false, slot.settings,
@@ -10279,7 +6195,6 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     slot.meshRevision++;
     ReleaseSRWLockExclusive(&g_animationSlotsLock);
     g_lastDraggedWindowRect = rect;
-    g_lastDraggedVisualRect = visualCoordinates.rect;
     g_lastDraggedWindowZoomed = windowZoomed;
     g_lastMousePosition = mousePosition;
 }
@@ -10294,8 +6209,7 @@ static void HandleMoveSizeEnd(HWND hwnd)
     }
     int slotIndex = g_dragAnimationSlot;
     POINT releaseMousePosition = {};
-    bool hasReleaseMousePosition =
-        !g_realResizing && GetPhysicalCursorPos(&releaseMousePosition);
+    bool hasReleaseMousePosition = !g_realResizing && GetCursorPos(&releaseMousePosition);
     MonitorEdgeState releaseEdgeState = hasReleaseMousePosition
                                             ? GetPointMonitorEdgeState(releaseMousePosition)
                                             : MonitorEdgeState{};
@@ -11106,11 +7020,6 @@ static void CALLBACK WinEventCallback(HWINEVENTHOOK, DWORD event, HWND hwnd, LON
     {
         if (idObject == OBJID_WINDOW)
         {
-            RequestVisibleMeshCleanupForHwnd(hwnd);
-            HWND expected = hwnd;
-            g_liveBaseImageMeshTargetHwnd.compare_exchange_strong(
-                expected, nullptr, std::memory_order_acq_rel,
-                std::memory_order_acquire);
             ForgetObservedWindowState(hwnd);
         }
         break;
@@ -11432,6 +7341,10 @@ static void LoadSettings()
         wobbliness = wobblinessPreset[0] - L'0';
     }
     WobblySettings settings = PHYSICS_PRESETS[wobbliness];
+    auto rendererSetting = WindhawkUtils::StringSetting::make(L"Renderer");
+    settings.rendererMode = std::wstring_view(rendererSetting.get()) == L"mesh-layer"
+                                ? RendererMode::MeshLayer
+                                : RendererMode::Affine;
     bool advancedMode = Wh_GetIntSetting(L"AdvancedMode.enable") != 0;
     settings.resizeWobbleEnabled = Wh_GetIntSetting(L"EnableResizeWobble") != 0;
     settings.windowStateWobbleEnabled =
@@ -11454,12 +7367,15 @@ static void LoadSettings()
     Wh_Log(L"Settings: "
            L"WobblinessPreset=%d, "
            L"Advanced=%d, "
+           L"Renderer=%s, "
            L"ResizeWobble=%d, "
            L"WindowStateWobble=%d, "
            L"Stiffness=%.2f, "
            L"Drag=%.2f, "
            L"MoveFactor=%.2f",
-           wobbliness, advancedMode, settings.resizeWobbleEnabled,
+           wobbliness, advancedMode,
+           settings.rendererMode == RendererMode::MeshLayer ? L"mesh-layer" : L"affine",
+           settings.resizeWobbleEnabled,
            settings.windowStateWobbleEnabled, settings.stiffness, settings.drag,
            settings.moveFactor);
 }
@@ -11509,16 +7425,6 @@ BOOL Wh_ModInit()
     }
     g_desktopManagerThreadIdOffset = SIZE_MAX;
     g_topLevelWindow3DWindowDataOffset = SIZE_MAX;
-    g_renderDataInstructionsOffset = SIZE_MAX;
-    g_renderDataInstructionCountOffset = SIZE_MAX;
-    g_visualParentOffset = SIZE_MAX;
-    g_visualContentOffset = SIZE_MAX;
-    g_visualCollectionArrayOffset = SIZE_MAX;
-    g_visualCollectionCountOffset = SIZE_MAX;
-    g_visualCollectionVtable.store(nullptr, std::memory_order_release);
-    std::fill_n(g_ensureRenderDataPointerOffsets,
-                ARRAYSIZE(g_ensureRenderDataPointerOffsets), SIZE_MAX);
-    g_ensureRenderDataPointerOffsetCount = 0;
     g_dwmSceneThreadId.store(0, std::memory_order_release);
     g_dwmCompositor.store(nullptr, std::memory_order_release);
     g_desktopManager.store(nullptr, std::memory_order_release);
@@ -11546,66 +7452,6 @@ BOOL Wh_ModInit()
     g_abandonedProxyCount.store(0, std::memory_order_release);
     g_sceneOwnershipResetPending.store(false, std::memory_order_release);
     g_lastBindPrerequisiteLog.store(0, std::memory_order_release);
-    g_nativeMeshCanaryPending.store(false, std::memory_order_release);
-    g_nativeMeshCanarySucceeded.store(false, std::memory_order_release);
-    g_liveBaseImageMeshCanaryStarted.store(false, std::memory_order_release);
-    g_liveBaseImageMeshCanarySucceeded.store(false,
-                                              std::memory_order_release);
-    g_liveBaseImageMeshAnimationLogged.store(false,
-                                              std::memory_order_release);
-    g_liveBaseImageMeshTargetHwnd.store(nullptr,
-                                         std::memory_order_release);
-    g_meshSourceProbePending.store(false, std::memory_order_release);
-    g_meshSourceProbeCompleted.store(false, std::memory_order_release);
-    g_cachedVisualImageCanaryCompleted.store(false, std::memory_order_release);
-    g_visibleMeshCanary = {};
-    g_nativeMeshPublishLease = {};
-    g_visibleMeshCanaryActive.store(false, std::memory_order_release);
-    g_visibleMeshCanaryCleanupRequested.store(false,
-                                               std::memory_order_release);
-    g_visibleMeshCanaryHwnd.store(nullptr, std::memory_order_release);
-    g_nativeRenderSlotProbe = {};
-    g_nativePublishProbeSamples.store(0, std::memory_order_release);
-    g_nativePublishProbeChanges.store(0, std::memory_order_release);
-    g_nativePublishProbeMissing.store(0, std::memory_order_release);
-    auto resetObservedNodes = [](ObservedVisualProxy* table)
-    {
-        for (unsigned int index = 0; index < OBSERVED_VISUAL_PROXY_COUNT; index++)
-        {
-            table[index].content.store(nullptr, std::memory_order_relaxed);
-            table[index].parent.store(nullptr, std::memory_order_relaxed);
-            table[index].redirectTarget.store(nullptr, std::memory_order_relaxed);
-            table[index].proxy.store(nullptr, std::memory_order_relaxed);
-        }
-    };
-    resetObservedNodes(g_observedVisualProxies);
-    resetObservedNodes(g_observedVisuals);
-    for (std::atomic<void*>& proxy : g_observedBitmapSourceProxies)
-    {
-        proxy.store(nullptr, std::memory_order_relaxed);
-    }
-    for (std::atomic<void*>& proxy : g_observedVisualSurfaceProxies)
-    {
-        proxy.store(nullptr, std::memory_order_relaxed);
-    }
-    g_observedBitmapSourceCreateCount.store(0, std::memory_order_relaxed);
-    g_observedVisualSurfaceCreateCount.store(0, std::memory_order_relaxed);
-    g_observedDrawBitmapCreateCount.store(0, std::memory_order_relaxed);
-    g_observedDrawTileCreateCount.store(0, std::memory_order_relaxed);
-    g_observedImageInstructionMatchedAddCount.store(
-        0, std::memory_order_relaxed);
-    g_ensureRenderDataCallCount.store(0, std::memory_order_relaxed);
-    g_ensureRenderDataMappedCount.store(0, std::memory_order_relaxed);
-    g_ensureRenderDataPopulatedCount.store(0, std::memory_order_relaxed);
-    g_windowBorderCloneCallCount.store(0, std::memory_order_relaxed);
-    g_livePreviewCloneCallCount.store(0, std::memory_order_relaxed);
-    g_secondaryRepresentationCallCount.store(0, std::memory_order_relaxed);
-    g_topLevelWindow3DSetParentCallCount.store(0,
-                                               std::memory_order_relaxed);
-    g_topLevelWindow3DShowWindowCallCount.store(0,
-                                                std::memory_order_relaxed);
-    g_trackedVisualVisibilityCallCount.store(0,
-                                              std::memory_order_relaxed);
     ResetExistingWindowBackfill();
     g_lastObservedScenePassCounter = 0;
     g_lastSceneProgressTimestamp = 0;
@@ -11634,13 +7480,6 @@ void Wh_ModAfterInit()
     // Windhawk activates detours after Wh_ModInit returns. Queue the first
     // scene pass only now so already-open windows cannot miss the wake.
     QueueExistingWindowBackfill();
-    if (NATIVE_MESH_EXPERIMENT_ENABLED &&
-        g_meshGeometry2dProxyUpdate && g_createMeshGeometry2dProxy &&
-        g_createGeometry2dGroupProxy && g_geometry2dGroupProxyUpdate)
-    {
-        g_nativeMeshCanaryPending.store(true, std::memory_order_release);
-        RequestDwmScenePass();
-    }
 }
 
 void Wh_ModSettingsChanged()
@@ -11652,10 +7491,6 @@ void Wh_ModSettingsChanged()
 void Wh_ModBeforeUninit()
 {
     g_unloading.store(true, std::memory_order_release);
-    g_nativeMeshCanaryPending.store(false, std::memory_order_release);
-    g_meshSourceProbePending.store(false, std::memory_order_release);
-    g_visibleMeshCanaryCleanupRequested.store(true,
-                                               std::memory_order_release);
     Wh_Log(L"Preparing to unload");
     // Restore scene resources before Windhawk removes the hooks.
     StopWindowEventThread();
