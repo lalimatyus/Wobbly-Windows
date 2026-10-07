@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.221
+// @version         0.222
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3620,6 +3620,43 @@ static void* FindObservedImageForWindow(void* topLevelWindow3D, HWND hwnd)
     return IsDwmImageAddress(vtable, sizeof(void*)) ? imageProxy : nullptr;
 }
 
+static void* FindPrimaryBitmapSourceProxy(void* imageProxy,
+                                          size_t* subobjectOffset)
+{
+    if (subobjectOffset)
+    {
+        *subobjectOffset = SIZE_MAX;
+    }
+    void* expectedVtable =
+        g_bitmapSourceProxyVtable.load(std::memory_order_acquire);
+    if (!imageProxy || !expectedVtable)
+    {
+        return nullptr;
+    }
+
+    uintptr_t imageAddress = reinterpret_cast<uintptr_t>(imageProxy);
+    constexpr size_t maxBaseAdjustment = 0x80;
+    for (size_t offset = 0; offset <= maxBaseAdjustment;
+         offset += sizeof(void*))
+    {
+        if (imageAddress < offset)
+        {
+            break;
+        }
+        void* candidate = reinterpret_cast<void*>(imageAddress - offset);
+        if (IsReadableMemory(candidate, sizeof(void*)) &&
+            *static_cast<void**>(candidate) == expectedVtable)
+        {
+            if (subobjectOffset)
+            {
+                *subobjectOffset = offset;
+            }
+            return candidate;
+        }
+    }
+    return nullptr;
+}
+
 static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                                void* topLevelWindow,
                                void* imageProxy)
@@ -4044,14 +4081,29 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                     g_meshImageObservedLogSlot = i;
                     g_meshImageObservedLogGeneration = generation;
                     void* imageVtable = *static_cast<void**>(imageProxy);
+                    size_t subobjectOffset = SIZE_MAX;
+                    void* primaryBitmap = FindPrimaryBitmapSourceProxy(
+                        imageProxy, &subobjectOffset);
+                    void* bitmapVtable = g_bitmapSourceProxyVtable.load(
+                        std::memory_order_acquire);
+                    long long vtableDelta = bitmapVtable
+                                                ? static_cast<long long>(
+                                                      reinterpret_cast<intptr_t>(
+                                                          imageVtable) -
+                                                      reinterpret_cast<intptr_t>(
+                                                          bitmapVtable))
+                                                : 0;
                     Wh_Log(L"4x4 direct source observed: Slot=%d HWND=%p "
                            L"TopLevelWindow3D=%p Image=%p Vtable=%p "
-                           L"bitmap=%d visualSurface=%d rendering=disabled",
+                           L"bitmap=%d visualSurface=%d vtableDelta=%lld "
+                           L"primaryBitmap=%p subobjectOffset=0x%zx "
+                           L"rendering=disabled",
                            i, hwnd, topLevelWindow3D, imageProxy, imageVtable,
                            imageVtable == g_bitmapSourceProxyVtable.load(
                                               std::memory_order_acquire),
                            imageVtable == g_visualSurfaceProxyVtable.load(
-                                              std::memory_order_acquire));
+                                              std::memory_order_acquire),
+                           vtableDelta, primaryBitmap, subobjectOffset);
                 }
                 if (g_meshLayerBackendAvailable.load(
                         std::memory_order_acquire))
