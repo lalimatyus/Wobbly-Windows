@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.220
+// @version         0.221
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -548,6 +548,8 @@ int g_meshLayerAttemptSlot = -1;
 ULONGLONG g_meshLayerAttemptGeneration = 0;
 int g_meshImagePendingLogSlot = -1;
 ULONGLONG g_meshImagePendingLogGeneration = 0;
+int g_meshImageObservedLogSlot = -1;
+ULONGLONG g_meshImageObservedLogGeneration = 0;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
@@ -586,6 +588,8 @@ std::atomic<void*> g_visualProxyVtable = nullptr;
 std::atomic<void*> g_redirectVisualProxyVtable = nullptr;
 std::atomic<void*> g_containerVisualProxyVtable = nullptr;
 std::atomic<void*> g_matrixTransformProxyVtable = nullptr;
+std::atomic<void*> g_bitmapSourceProxyVtable = nullptr;
+std::atomic<void*> g_visualSurfaceProxyVtable = nullptr;
 std::atomic<void*> g_dwmCompositor = nullptr;
 std::atomic<void*> g_desktopManager = nullptr;
 void* g_desktopManagerVtableSymbol = nullptr;
@@ -597,6 +601,8 @@ void* g_visualProxyVtableSymbol = nullptr;
 void* g_redirectVisualProxyVtableSymbol = nullptr;
 void* g_containerVisualProxyVtableSymbol = nullptr;
 void* g_matrixTransformProxyVtableSymbol = nullptr;
+void* g_bitmapSourceProxyVtableSymbol = nullptr;
+void* g_visualSurfaceProxyVtableSymbol = nullptr;
 size_t g_desktopManagerCompositorOffset = SIZE_MAX;
 size_t g_desktopManagerThreadIdOffset = SIZE_MAX;
 size_t g_canvasVisualOwnerOffset = SIZE_MAX;
@@ -915,9 +921,6 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                                void* imageProxy);
 static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
                                                      void** instruction);
-static long __cdecl DrawTileImageInstructionCreateHook(
-    void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
-    float opacity, void** instruction);
 static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                                         void* instruction);
 static bool HasAnyAnimationSlots();
@@ -2863,20 +2866,6 @@ static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
     return result;
 }
 
-static long __cdecl DrawTileImageInstructionCreateHook(
-    void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
-    float opacity, void** instruction)
-{
-    long result = g_drawTileImageInstructionCreateOriginal(
-        imageProxy, sourceRect, destinationOffset, opacity, instruction);
-    if (result >= 0 && instruction && *instruction &&
-        !g_unloading.load(std::memory_order_acquire))
-    {
-        RememberObservedBitmapInstruction(*instruction, imageProxy);
-    }
-    return result;
-}
-
 static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                                         void* instruction)
 {
@@ -3044,7 +3033,7 @@ static bool InitializeDwmHooks()
            L"struct tagPOINT const &,float,"
            L"class CDrawTileImageInstruction * *)"},
          &g_drawTileImageInstructionCreateOriginal,
-         DrawTileImageInstructionCreateHook,
+         nullptr,
          true},
         {{L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CCachedVisualImageProxy>(class CCachedVisualImageProxy * *)"},
@@ -3185,6 +3174,14 @@ static bool InitializeDwmHooks()
         {{L"const CMatrixTransformProxy::`vftable'"},
          &g_matrixTransformProxyVtableSymbol,
          nullptr,
+         true},
+        {{L"const CBitmapSourceProxy::`vftable'"},
+         &g_bitmapSourceProxyVtableSymbol,
+         nullptr,
+         true},
+        {{L"const CVisualSurfaceProxy::`vftable'"},
+         &g_visualSurfaceProxyVtableSymbol,
+         nullptr,
          true}};
     if (!WindhawkUtils::HookSymbols(udwm, udwmDllHooks, ARRAYSIZE(udwmDllHooks)))
     {
@@ -3234,20 +3231,19 @@ static bool InitializeDwmHooks()
         g_drawBitmapInstructionCreateOriginal &&
             g_renderDataVisualAddInstructionOriginal,
         std::memory_order_release);
-    bool meshLayerComplete = g_meshLayerSymbols.IsComplete() &&
-                             g_meshImageObservationAvailable.load(
-                                 std::memory_order_acquire);
-    g_meshLayerBackendAvailable.store(meshLayerComplete,
-                                      std::memory_order_release);
+    // Borrowed DWM image proxies aren't rendered until their exact subtype and
+    // lifetime ownership are proven. The stable affine renderer remains active.
+    g_meshLayerBackendAvailable.store(false, std::memory_order_release);
     Wh_Log(L"4x4 mesh-layer prerequisites: geometry=%s image=%s visual=%s "
-           L"complete=%s (direct live-image test; affine renderer remains active)",
+           L"complete=no (direct-source lifetime audit; affine renderer active)",
            g_meshLayerSymbols.HasGeometryPipeline() ? L"available" : L"unavailable",
            g_meshLayerSymbols.HasImagePipeline() ? L"available" : L"unavailable",
-           g_meshLayerSymbols.HasVisualPipeline() ? L"available" : L"unavailable",
-           meshLayerComplete ? L"yes" : L"no");
-    Wh_Log(L"4x4 direct image observation: bitmap=%s tile=%s owner=%s",
+           g_meshLayerSymbols.HasVisualPipeline() ? L"available" : L"unavailable");
+    Wh_Log(L"4x4 direct image observation: bitmap=%s tile=%s owner=%s "
+           L"rendering=disabled",
            g_drawBitmapInstructionCreateOriginal ? L"available" : L"unavailable",
-           g_drawTileImageInstructionCreateOriginal ? L"available" : L"unavailable",
+           g_drawTileImageInstructionCreateOriginal ? L"resolved-unhooked"
+                                                    : L"unavailable",
            g_renderDataVisualAddInstructionOriginal ? L"available" : L"unavailable");
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
@@ -3286,6 +3282,15 @@ static bool InitializeDwmHooks()
         hasExactVisualProxyVtable || hasExactRedirectProxyVtable || hasExactContainerProxyVtable;
     bool hasExactMatrixProxyVtable =
         cacheVtableSymbol(g_matrixTransformProxyVtableSymbol, g_matrixTransformProxyVtable);
+    bool hasExactBitmapSourceVtable =
+        cacheVtableSymbol(g_bitmapSourceProxyVtableSymbol,
+                          g_bitmapSourceProxyVtable);
+    bool hasExactVisualSurfaceVtable =
+        cacheVtableSymbol(g_visualSurfaceProxyVtableSymbol,
+                          g_visualSurfaceProxyVtable);
+    Wh_Log(L"4x4 direct source types: bitmap=%s visualSurface=%s",
+           hasExactBitmapSourceVtable ? L"available" : L"unavailable",
+           hasExactVisualSurfaceVtable ? L"available" : L"unavailable");
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
@@ -4033,8 +4038,27 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                 FindObservedImageForWindow(topLevelWindow3D, hwnd);
             if (imageProxy)
             {
-                TryAttachMeshLayer(i, generation, hwnd, topLevelWindow,
-                                   imageProxy);
+                if (g_meshImageObservedLogSlot != i ||
+                    g_meshImageObservedLogGeneration != generation)
+                {
+                    g_meshImageObservedLogSlot = i;
+                    g_meshImageObservedLogGeneration = generation;
+                    void* imageVtable = *static_cast<void**>(imageProxy);
+                    Wh_Log(L"4x4 direct source observed: Slot=%d HWND=%p "
+                           L"TopLevelWindow3D=%p Image=%p Vtable=%p "
+                           L"bitmap=%d visualSurface=%d rendering=disabled",
+                           i, hwnd, topLevelWindow3D, imageProxy, imageVtable,
+                           imageVtable == g_bitmapSourceProxyVtable.load(
+                                              std::memory_order_acquire),
+                           imageVtable == g_visualSurfaceProxyVtable.load(
+                                              std::memory_order_acquire));
+                }
+                if (g_meshLayerBackendAvailable.load(
+                        std::memory_order_acquire))
+                {
+                    TryAttachMeshLayer(i, generation, hwnd, topLevelWindow,
+                                       imageProxy);
+                }
             }
             else if (g_meshImagePendingLogSlot != i ||
                      g_meshImagePendingLogGeneration != generation)
