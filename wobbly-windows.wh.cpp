@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.226
+// @version         0.227
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -833,6 +833,7 @@ static void* GetTransitionVisualProxy(void* topLevelWindow3D)
 }
 
 static constexpr int MAX_ANIMATION_SLOTS = 6;
+ULONGLONG g_meshImageRefreshGeneration[MAX_ANIMATION_SLOTS] = {};
 static constexpr ULONGLONG DWM_SCENE_WAKE_FRESHNESS_MS = 250;
 static constexpr ULONGLONG DWM_SCENE_OWNER_STALE_MS = 1000;
 static constexpr ULONGLONG DWM_SCENE_STALL_TIMEOUT_MS = 3000;
@@ -4427,6 +4428,24 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         {
             void* imageProxy =
                 FindObservedImageForWindow(topLevelWindow3D, hwnd);
+            if (!imageProxy && topLevelWindow3D &&
+                g_meshImageRefreshGeneration[i] != generation)
+            {
+                g_meshImageRefreshGeneration[i] = generation;
+                auto updateRenderData =
+                    reinterpret_cast<CRenderDataVisualUpdateRenderData_t>(
+                        g_meshLayerSymbols.updateRenderData);
+                long refreshResult = updateRenderData
+                                         ? updateRenderData(topLevelWindow3D)
+                                         : E_NOINTERFACE;
+                imageProxy = FindObservedImageForWindow(topLevelWindow3D,
+                                                        hwnd);
+                Wh_Log(L"4x4 live image observation refresh: Slot=%d HWND=%p "
+                       L"TopLevelWindow3D=%p result=0x%08X observed=%d",
+                       i, hwnd, topLevelWindow3D,
+                       static_cast<unsigned int>(refreshResult),
+                       imageProxy != nullptr);
+            }
             if (imageProxy)
             {
                 if (g_meshImageObservedLogSlot != i ||
