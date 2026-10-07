@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.225
+// @version         0.226
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1578,6 +1578,8 @@ static void ClearObservedImageForVisual(void* visual)
 
 static void ClearAllObservedImages()
 {
+    unsigned int pinsBefore =
+        g_observedImagePinCount.load(std::memory_order_acquire);
     for (ObservedBitmapInstruction& entry : g_observedBitmapInstructions)
     {
         void* image = entry.imageProxy.exchange(nullptr,
@@ -1602,6 +1604,12 @@ static void ClearAllObservedImages()
         entry.store(nullptr, std::memory_order_release);
     }
     g_observedImageCleanupPending.store(false, std::memory_order_release);
+    if (pinsBefore)
+    {
+        Wh_Log(L"4x4 source lifetime cleanup: released=%u remaining=%u",
+               pinsBefore,
+               g_observedImagePinCount.load(std::memory_order_acquire));
+    }
 }
 
 static bool InitializeDwmModuleLayout(HMODULE module)
@@ -4791,7 +4799,8 @@ static void __cdecl DesktopManagerHandleThreadMessageHook(UINT message,
         {
         }
     };
-    if (g_unloading.load(std::memory_order_acquire) && !HasAnyAnimationSlots())
+    if (g_unloading.load(std::memory_order_acquire) &&
+        !HasPendingWobblySceneWork())
     {
         // Cleanup can finish through a native scene pass before this wake arrives.
         acknowledgeWake();
