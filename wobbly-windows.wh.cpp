@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.224
+// @version         0.225
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -219,6 +219,7 @@ size_t g_windowDataTopLevelWindowOffset = SIZE_MAX;
 size_t g_windowDataTopLevelWindow3DOffset = SIZE_MAX;
 size_t g_topLevelWindow3DWindowDataOffset = SIZE_MAX;
 static bool IsReadableMemory(const void* address, size_t size);
+static bool IsWritableMemory(const void* address, size_t size);
 
 static HWND GetHwndFromWindowData(void* windowData)
 {
@@ -538,6 +539,9 @@ std::atomic<void*> g_observedCreatedBitmapSources[OBSERVED_IMAGE_COUNT] = {};
 std::atomic<void*> g_observedCreatedVisualSurfaces[OBSERVED_IMAGE_COUNT] = {};
 std::atomic<ULONGLONG> g_observedImageSequence = 0;
 std::atomic_bool g_meshImageObservationAvailable = false;
+std::atomic_size_t g_baseObjectReferenceCountOffset = SIZE_MAX;
+std::atomic_uint g_observedImagePinCount = 0;
+std::atomic_bool g_observedImageCleanupPending = false;
 
 struct MeshLayerState
 {
@@ -1421,6 +1425,183 @@ static bool IsReadableMemory(const void* address, size_t size)
         current = std::min(regionEnd, finish);
     }
     return true;
+}
+
+static bool IsWritableMemory(const void* address, size_t size)
+{
+    if (!address || size == 0)
+    {
+        return false;
+    }
+    uintptr_t current = reinterpret_cast<uintptr_t>(address);
+    if (current > UINTPTR_MAX - size)
+    {
+        return false;
+    }
+    uintptr_t finish = current + size;
+    while (current < finish)
+    {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (!VirtualQuery(reinterpret_cast<const void*>(current), &mbi,
+                          sizeof(mbi)) ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+        {
+            return false;
+        }
+        DWORD protection = mbi.Protect & 0xFF;
+        if (protection != PAGE_READWRITE && protection != PAGE_WRITECOPY &&
+            protection != PAGE_EXECUTE_READWRITE &&
+            protection != PAGE_EXECUTE_WRITECOPY)
+        {
+            return false;
+        }
+        uintptr_t regionEnd =
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd <= current)
+        {
+            return false;
+        }
+        current = std::min(regionEnd, finish);
+    }
+    return true;
+}
+
+static size_t DecodeBaseObjectReferenceCountOffset()
+{
+    if (!g_cBaseObjectRelease ||
+        !IsReadableMemory(reinterpret_cast<void*>(g_cBaseObjectRelease), 48))
+    {
+        return SIZE_MAX;
+    }
+    const auto* code = reinterpret_cast<const unsigned char*>(
+        g_cBaseObjectRelease);
+    // MSVC emits: mov ebx,-1; lock xadd dword ptr [rcx+disp8],ebx.
+    // Accept only that complete sequence, never a guessed structure offset.
+    for (size_t i = 0; i + 8 <= 48; i++)
+    {
+        if (code[i] != 0x83 || code[i + 1] != 0xCB ||
+            code[i + 2] != 0xFF || code[i + 3] != 0xF0 ||
+            code[i + 4] != 0x0F || code[i + 5] != 0xC1 ||
+            code[i + 6] != 0x59)
+        {
+            continue;
+        }
+        size_t offset = code[i + 7];
+        if (offset >= sizeof(void*) && offset <= 0x80 &&
+            offset % alignof(LONG) == 0)
+        {
+            return offset;
+        }
+    }
+    return SIZE_MAX;
+}
+
+static bool RetainObservedImage(void* imageProxy)
+{
+    if (!imageProxy || !IsReadableMemory(imageProxy, sizeof(void*)))
+    {
+        return false;
+    }
+    if (g_cBaseObjectAddRef)
+    {
+        g_cBaseObjectAddRef(imageProxy);
+        g_observedImagePinCount.fetch_add(1, std::memory_order_acq_rel);
+        return true;
+    }
+    size_t offset =
+        g_baseObjectReferenceCountOffset.load(std::memory_order_acquire);
+    if (offset == SIZE_MAX)
+    {
+        return false;
+    }
+    auto* referenceCount = reinterpret_cast<volatile LONG*>(
+        static_cast<BYTE*>(imageProxy) + offset);
+    if (!IsWritableMemory(const_cast<LONG*>(referenceCount), sizeof(LONG)))
+    {
+        return false;
+    }
+    LONG current = InterlockedCompareExchange(referenceCount, 0, 0);
+    if (current <= 0 || current >= 0x40000000)
+    {
+        return false;
+    }
+    InterlockedIncrement(referenceCount);
+    g_observedImagePinCount.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+static void ReleaseObservedImage(void* imageProxy)
+{
+    if (!imageProxy || !g_cBaseObjectRelease)
+    {
+        return;
+    }
+    g_cBaseObjectRelease(imageProxy);
+    unsigned int pins =
+        g_observedImagePinCount.load(std::memory_order_acquire);
+    while (pins &&
+           !g_observedImagePinCount.compare_exchange_weak(
+               pins, pins - 1, std::memory_order_acq_rel,
+               std::memory_order_acquire))
+    {
+    }
+}
+
+static void ClearObservedImageForVisual(void* visual)
+{
+    if (!visual)
+    {
+        return;
+    }
+    size_t hash = (reinterpret_cast<uintptr_t>(visual) >> 4) %
+                  OBSERVED_IMAGE_COUNT;
+    for (unsigned int probe = 0; probe < OBSERVED_IMAGE_PROBES; probe++)
+    {
+        ObservedRenderImage& entry =
+            g_observedRenderImages[(hash + probe) % OBSERVED_IMAGE_COUNT];
+        if (entry.visual.load(std::memory_order_acquire) != visual)
+        {
+            continue;
+        }
+        void* image = entry.imageProxy.exchange(nullptr,
+                                                 std::memory_order_acq_rel);
+        entry.sequence.store(0, std::memory_order_release);
+        void* expected = visual;
+        entry.visual.compare_exchange_strong(expected, nullptr,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire);
+        ReleaseObservedImage(image);
+        return;
+    }
+}
+
+static void ClearAllObservedImages()
+{
+    for (ObservedBitmapInstruction& entry : g_observedBitmapInstructions)
+    {
+        void* image = entry.imageProxy.exchange(nullptr,
+                                                 std::memory_order_acq_rel);
+        entry.instruction.store(nullptr, std::memory_order_release);
+        ReleaseObservedImage(image);
+    }
+    for (ObservedRenderImage& entry : g_observedRenderImages)
+    {
+        void* image = entry.imageProxy.exchange(nullptr,
+                                                 std::memory_order_acq_rel);
+        entry.sequence.store(0, std::memory_order_release);
+        entry.visual.store(nullptr, std::memory_order_release);
+        ReleaseObservedImage(image);
+    }
+    for (std::atomic<void*>& entry : g_observedCreatedBitmapSources)
+    {
+        entry.store(nullptr, std::memory_order_release);
+    }
+    for (std::atomic<void*>& entry : g_observedCreatedVisualSurfaces)
+    {
+        entry.store(nullptr, std::memory_order_release);
+    }
+    g_observedImageCleanupPending.store(false, std::memory_order_release);
 }
 
 static bool InitializeDwmModuleLayout(HMODULE module)
@@ -2565,6 +2746,7 @@ static void __cdecl TopLevelWindowDestructorHook(void* pThis)
 
 static void __cdecl TopLevelWindow3DDestructorHook(void* pThis)
 {
+    ClearObservedImageForVisual(pThis);
     ClearDwmWindowMappingByTopLevelWindow3D(pThis);
     g_topLevelWindow3DDestructorOriginal(pThis);
 }
@@ -2916,7 +3098,7 @@ static ObservedRenderImage* FindObservedRenderImage(void* visual, bool create)
     return nullptr;
 }
 
-static void RememberObservedBitmapInstruction(void* instruction,
+static bool RememberObservedBitmapInstruction(void* instruction,
                                                void* imageProxy)
 {
     if (instruction && imageProxy)
@@ -2924,19 +3106,31 @@ static void RememberObservedBitmapInstruction(void* instruction,
         if (ObservedBitmapInstruction* entry =
                 FindObservedBitmapInstruction(instruction, true))
         {
-            entry->imageProxy.store(imageProxy, std::memory_order_release);
+            void* oldImage = entry->imageProxy.exchange(
+                imageProxy, std::memory_order_acq_rel);
+            ReleaseObservedImage(oldImage);
+            return true;
         }
     }
+    return false;
 }
 
 static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
                                                      void** instruction)
 {
+    bool retained =
+        !g_unloading.load(std::memory_order_acquire) &&
+        RetainObservedImage(imageProxy);
     long result = g_drawBitmapInstructionCreateOriginal(imageProxy, instruction);
-    if (result >= 0 && instruction && *instruction &&
-        !g_unloading.load(std::memory_order_acquire))
+    if (result >= 0 && instruction && *instruction && retained &&
+        !g_unloading.load(std::memory_order_acquire) &&
+        RememberObservedBitmapInstruction(*instruction, imageProxy))
     {
-        RememberObservedBitmapInstruction(*instruction, imageProxy);
+        return result;
+    }
+    if (retained)
+    {
+        ReleaseObservedImage(imageProxy);
     }
     return result;
 }
@@ -2946,28 +3140,37 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
 {
     long result =
         g_renderDataVisualAddInstructionOriginal(pThis, instruction);
-    if (result >= 0 && pThis && instruction &&
+    ObservedBitmapInstruction* source =
+        FindObservedBitmapInstruction(instruction, false);
+    void* imageProxy = source
+                           ? source->imageProxy.exchange(
+                                 nullptr, std::memory_order_acq_rel)
+                           : nullptr;
+    if (source)
+    {
+        void* expected = instruction;
+        source->instruction.compare_exchange_strong(
+            expected, nullptr, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+    if (result >= 0 && pThis && imageProxy &&
         !g_unloading.load(std::memory_order_acquire))
     {
-        ObservedBitmapInstruction* source =
-            FindObservedBitmapInstruction(instruction, false);
-        void* imageProxy = source
-                               ? source->imageProxy.load(std::memory_order_acquire)
-                               : nullptr;
-        if (imageProxy)
+        if (ObservedRenderImage* entry =
+                FindObservedRenderImage(pThis, true))
         {
-            if (ObservedRenderImage* entry =
-                    FindObservedRenderImage(pThis, true))
-            {
-                entry->imageProxy.store(imageProxy, std::memory_order_relaxed);
-                entry->sequence.store(
-                    g_observedImageSequence.fetch_add(
-                        1, std::memory_order_acq_rel) +
-                        1,
-                    std::memory_order_release);
-            }
+            void* oldImage = entry->imageProxy.exchange(
+                imageProxy, std::memory_order_acq_rel);
+            entry->sequence.store(
+                g_observedImageSequence.fetch_add(
+                    1, std::memory_order_acq_rel) +
+                    1,
+                std::memory_order_release);
+            imageProxy = nullptr;
+            ReleaseObservedImage(oldImage);
         }
     }
+    ReleaseObservedImage(imageProxy);
     return result;
 }
 
@@ -3325,6 +3528,11 @@ static bool InitializeDwmHooks()
     keepValid(g_meshLayerSymbols.getVisualParent);
     keepValid(g_meshLayerSymbols.getVisualProxy);
     keepValid(g_cBaseObjectAddRef);
+    size_t referenceCountOffset = g_cBaseObjectAddRef
+                                      ? 0
+                                      : DecodeBaseObjectReferenceCountOffset();
+    g_baseObjectReferenceCountOffset.store(referenceCountOffset,
+                                           std::memory_order_release);
     g_meshImageObservationAvailable.store(
         g_drawBitmapInstructionCreateOriginal &&
             g_renderDataVisualAddInstructionOriginal,
@@ -3396,11 +3604,14 @@ static bool InitializeDwmHooks()
     {
         const auto* code = reinterpret_cast<const unsigned char*>(
             g_cBaseObjectRelease);
-        Wh_Log(L"4x4 source lifetime probe: AddRef=%s Release=%p "
+        Wh_Log(L"4x4 source lifetime probe: AddRef=%s fallback=%s "
+               L"refcountOffset=0x%zx Release=%p "
                L"bytes=%02X %02X %02X %02X %02X %02X %02X %02X "
                L"%02X %02X %02X %02X %02X %02X %02X %02X "
                L"%02X %02X %02X %02X %02X %02X %02X %02X",
                g_cBaseObjectAddRef ? L"available" : L"unavailable",
+               referenceCountOffset == SIZE_MAX ? L"unavailable" : L"decoded",
+               referenceCountOffset == SIZE_MAX ? 0 : referenceCountOffset,
                reinterpret_cast<void*>(g_cBaseObjectRelease),
                code[0], code[1], code[2], code[3], code[4], code[5],
                code[6], code[7], code[8], code[9], code[10], code[11],
@@ -4233,14 +4444,16 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                            L"TopLevelWindow3D=%p Image=%p Vtable=%p "
                            L"bitmap=%d visualSurface=%d vtableDelta=%lld "
                            L"primaryBitmap=%p subobjectOffset=0x%zx "
-                           L"createdKind=%d rendering=disabled",
+                           L"createdKind=%d pinnedImages=%u rendering=disabled",
                            i, hwnd, topLevelWindow3D, imageProxy, imageVtable,
                            imageVtable == g_bitmapSourceProxyVtable.load(
                                               std::memory_order_acquire),
                            imageVtable == g_visualSurfaceProxyVtable.load(
                                               std::memory_order_acquire),
                            vtableDelta, primaryBitmap, subobjectOffset,
-                           creationKind);
+                           creationKind,
+                           g_observedImagePinCount.load(
+                               std::memory_order_acquire));
                 }
                 if (g_meshLayerBackendAvailable.load(
                         std::memory_order_acquire))
@@ -4406,6 +4619,10 @@ static void SubmitPendingWobblySceneWork()
     g_sceneWakePostTimestamp.store(0, std::memory_order_release);
     g_scenePassCounter.fetch_add(1, std::memory_order_release);
     MaintainMeshLayer();
+    if (g_observedImageCleanupPending.load(std::memory_order_acquire))
+    {
+        ClearAllObservedImages();
+    }
     // Restore retiring/quiet windows before discovery, creation or normal rendering.
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
@@ -4435,6 +4652,7 @@ static void SubmitPendingWobblySceneWork()
 static bool HasPendingWobblySceneWork()
 {
     return g_meshLayerActive.load(std::memory_order_acquire) ||
+           g_observedImageCleanupPending.load(std::memory_order_acquire) ||
            g_sceneRequestedSerial.load(std::memory_order_acquire) >
                g_sceneSubmittedSerial.load(std::memory_order_acquire) ||
            g_existingWindowBackfillIndex.load(std::memory_order_acquire) <
@@ -6519,6 +6737,11 @@ static void StopAllAnimations()
     int slotsToRetire[MAX_ANIMATION_SLOTS] = {};
     bool sceneCleanupNeeded = false;
     int retireCount = CollectActiveAnimationSlots(slotsToRetire, &sceneCleanupNeeded);
+    if (g_observedImagePinCount.load(std::memory_order_acquire) != 0)
+    {
+        g_observedImageCleanupPending.store(true, std::memory_order_release);
+        sceneCleanupNeeded = true;
+    }
     sceneCleanupNeeded = sceneCleanupNeeded ||
                          g_meshLayerActive.load(std::memory_order_acquire);
     for (int i = 0; i < retireCount; i++)
@@ -6556,7 +6779,9 @@ static void StopAllAnimations()
         bool wakePending = g_sceneWakeOutstanding.load(std::memory_order_acquire) != 0;
         bool meshLayerRetained =
             g_meshLayerActive.load(std::memory_order_acquire);
-        if (!hookUsers && !retainedProxies && !meshLayerRetained)
+        unsigned int imagePins =
+            g_observedImagePinCount.load(std::memory_order_acquire);
+        if (!hookUsers && !retainedProxies && !meshLayerRetained && !imagePins)
         {
             break;
         }
@@ -6564,13 +6789,14 @@ static void StopAllAnimations()
         if (now >= hookWaitDeadline)
         {
             Wh_Log(L"DWM cleanup timeout: pendingIdentities=%u retainedProxies=%u "
-                   L"hookUsers=%u wakePending=%d",
-                   pendingIdentities, retainedProxies, hookUsers, wakePending);
+                   L"imagePins=%u hookUsers=%u wakePending=%d",
+                   pendingIdentities, retainedProxies, imagePins, hookUsers,
+                   wakePending);
             cleanupTimedOut = true;
             break;
         }
         ULONGLONG lastWakePost = g_sceneWakePostTimestamp.load(std::memory_order_acquire);
-        if ((retainedProxies || meshLayerRetained) &&
+        if ((retainedProxies || meshLayerRetained || imagePins) &&
             (!wakePending || !lastWakePost || now - lastWakePost >= 50))
         {
             PostPendingDwmSceneWake(true);
