@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.223
+// @version         0.224
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -561,7 +561,9 @@ ULONGLONG g_meshImagePendingLogGeneration = 0;
 int g_meshImageObservedLogSlot = -1;
 ULONGLONG g_meshImageObservedLogGeneration = 0;
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
+using CBaseObjectAddRef_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
+CBaseObjectAddRef_t g_cBaseObjectAddRef = nullptr;
 using CTopLevelWindowConstructor_t = void*(__cdecl*)(void* pThis, void* windowData, bool unknown);
 CTopLevelWindowConstructor_t g_topLevelWindowConstructorFunction = nullptr;
 CTopLevelWindowConstructor_t g_topLevelWindowConstructorOriginal = nullptr;
@@ -3170,6 +3172,10 @@ static bool InitializeDwmHooks()
          &g_cBaseObjectRelease,
          nullptr,
          true},
+        {{L"public: unsigned long __cdecl CBaseObject::AddRef(void)"},
+         &g_cBaseObjectAddRef,
+         nullptr,
+         true},
         {{L"private: static class CDesktopManager * "
            L"CDesktopManager::s_pDesktopManagerInstance"},
          &g_desktopManagerInstanceAddress,
@@ -3318,6 +3324,7 @@ static bool InitializeDwmHooks()
     keepValid(g_meshLayerSymbols.removeVisualFromParent);
     keepValid(g_meshLayerSymbols.getVisualParent);
     keepValid(g_meshLayerSymbols.getVisualProxy);
+    keepValid(g_cBaseObjectAddRef);
     g_meshImageObservationAvailable.store(
         g_drawBitmapInstructionCreateOriginal &&
             g_renderDataVisualAddInstructionOriginal,
@@ -3384,6 +3391,22 @@ static bool InitializeDwmHooks()
     Wh_Log(L"4x4 direct source types: bitmap=%s visualSurface=%s",
            hasExactBitmapSourceVtable ? L"available" : L"unavailable",
            hasExactVisualSurfaceVtable ? L"available" : L"unavailable");
+    if (g_cBaseObjectRelease &&
+        IsReadableMemory(reinterpret_cast<void*>(g_cBaseObjectRelease), 24))
+    {
+        const auto* code = reinterpret_cast<const unsigned char*>(
+            g_cBaseObjectRelease);
+        Wh_Log(L"4x4 source lifetime probe: AddRef=%s Release=%p "
+               L"bytes=%02X %02X %02X %02X %02X %02X %02X %02X "
+               L"%02X %02X %02X %02X %02X %02X %02X %02X "
+               L"%02X %02X %02X %02X %02X %02X %02X %02X",
+               g_cBaseObjectAddRef ? L"available" : L"unavailable",
+               reinterpret_cast<void*>(g_cBaseObjectRelease),
+               code[0], code[1], code[2], code[3], code[4], code[5],
+               code[6], code[7], code[8], code[9], code[10], code[11],
+               code[12], code[13], code[14], code[15], code[16], code[17],
+               code[18], code[19], code[20], code[21], code[22], code[23]);
+    }
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
