@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.229
+// @version         0.230
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3380,8 +3380,25 @@ static bool DecodeRenderDataInstructionListLayout(void* updateRenderData,
     return false;
 }
 
-static unsigned int ObserveExistingBitmapInstructions(void* visual)
+struct ExistingInstructionScanResult
 {
+    LONG declaredCount = 0;
+    void* instructionArray = nullptr;
+    unsigned int readableInstructions = 0;
+    unsigned int bitmapInstructions = 0;
+    unsigned int observedImages = 0;
+    bool countReadable = false;
+    bool arrayReadable = false;
+    static constexpr unsigned int SAMPLE_COUNT = 6;
+    void* sampleInstructions[SAMPLE_COUNT]{};
+    void* sampleVtables[SAMPLE_COUNT]{};
+    unsigned int sampleCount = 0;
+};
+
+static ExistingInstructionScanResult ObserveExistingBitmapInstructions(
+    void* visual)
+{
+    ExistingInstructionScanResult result;
     size_t arrayOffset =
         g_renderDataInstructionArrayOffset.load(std::memory_order_acquire);
     size_t countOffset =
@@ -3391,43 +3408,55 @@ static unsigned int ObserveExistingBitmapInstructions(void* visual)
     if (!visual || arrayOffset == SIZE_MAX || countOffset == SIZE_MAX ||
         imageOffset == SIZE_MAX || !g_drawBitmapInstructionVtableSymbol)
     {
-        return 0;
+        return result;
     }
     const BYTE* countField = static_cast<const BYTE*>(visual) + countOffset;
     if (!IsReadableMemory(countField, sizeof(LONG)))
     {
-        return 0;
+        return result;
     }
-    LONG instructionCount = *reinterpret_cast<const LONG*>(countField);
-    if (instructionCount <= 0 || instructionCount > 256)
+    result.countReadable = true;
+    result.declaredCount = *reinterpret_cast<const LONG*>(countField);
+    result.instructionArray = ReadPointerMember(visual, arrayOffset);
+    if (result.declaredCount <= 0 || result.declaredCount > 256)
     {
-        return 0;
+        return result;
     }
-    void* instructionArray = ReadPointerMember(visual, arrayOffset);
-    size_t arraySize = static_cast<size_t>(instructionCount) * sizeof(void*);
-    if (!IsReadableMemory(instructionArray, arraySize))
+    size_t arraySize = static_cast<size_t>(result.declaredCount) * sizeof(void*);
+    if (!IsReadableMemory(result.instructionArray, arraySize))
     {
-        return 0;
+        return result;
     }
-    unsigned int observed = 0;
-    auto* instructions = static_cast<void**>(instructionArray);
-    for (LONG i = 0; i < instructionCount; i++)
+    result.arrayReadable = true;
+    auto* instructions = static_cast<void**>(result.instructionArray);
+    for (LONG i = 0; i < result.declaredCount; i++)
     {
         void* instruction = instructions[i];
-        if (!IsReadableMemory(instruction, sizeof(void*)) ||
-            *static_cast<void**>(instruction) !=
-                g_drawBitmapInstructionVtableSymbol)
+        if (!IsReadableMemory(instruction, sizeof(void*)))
         {
             continue;
         }
+        void* vtable = *static_cast<void**>(instruction);
+        result.readableInstructions++;
+        if (result.sampleCount < ExistingInstructionScanResult::SAMPLE_COUNT)
+        {
+            result.sampleInstructions[result.sampleCount] = instruction;
+            result.sampleVtables[result.sampleCount] = vtable;
+            result.sampleCount++;
+        }
+        if (vtable != g_drawBitmapInstructionVtableSymbol)
+        {
+            continue;
+        }
+        result.bitmapInstructions++;
         void* imageProxy = ReadPointerMember(instruction, imageOffset);
         if (RetainObservedImage(imageProxy))
         {
             RememberObservedRenderImage(visual, imageProxy);
-            observed++;
+            result.observedImages++;
         }
     }
-    return observed;
+    return result;
 }
 
 static bool InstallExistingBitmapInstructionObserver()
@@ -4756,21 +4785,36 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                                          : E_NOINTERFACE;
                 imageProxy = FindObservedImageForWindow(topLevelWindow3D,
                                                         hwnd);
-                unsigned int scannedInstructions = 0;
+                ExistingInstructionScanResult scan;
                 if (!imageProxy && refreshResult >= 0)
                 {
-                    scannedInstructions = ObserveExistingBitmapInstructions(
-                        topLevelWindow3D);
+                    scan = ObserveExistingBitmapInstructions(topLevelWindow3D);
                     imageProxy = FindObservedImageForWindow(topLevelWindow3D,
                                                             hwnd);
                 }
                 Wh_Log(L"4x4 live image observation replay: Slot=%d HWND=%p "
-                       L"TopLevelWindow3D=%p result=0x%08X scanned=%u "
-                       L"observed=%d",
+                       L"TopLevelWindow3D=%p result=0x%08X countReadable=%d "
+                       L"count=%d array=%p arrayReadable=%d readable=%u "
+                       L"bitmap=%u retained=%u observed=%d",
                        i, hwnd, topLevelWindow3D,
                        static_cast<unsigned int>(refreshResult),
-                       scannedInstructions,
+                       scan.countReadable, static_cast<int>(scan.declaredCount),
+                       scan.instructionArray, scan.arrayReadable,
+                       scan.readableInstructions, scan.bitmapInstructions,
+                       scan.observedImages,
                        imageProxy != nullptr);
+                for (unsigned int sample = 0; sample < scan.sampleCount; sample++)
+                {
+                    long long vtableDelta = static_cast<long long>(
+                        reinterpret_cast<intptr_t>(scan.sampleVtables[sample]) -
+                        reinterpret_cast<intptr_t>(
+                            g_drawBitmapInstructionVtableSymbol));
+                    Wh_Log(L"4x4 existing instruction[%u]: instruction=%p "
+                           L"vtable=%p bitmapVtable=%p delta=%lld",
+                           sample, scan.sampleInstructions[sample],
+                           scan.sampleVtables[sample],
+                           g_drawBitmapInstructionVtableSymbol, vtableDelta);
+                }
             }
             if (imageProxy)
             {
