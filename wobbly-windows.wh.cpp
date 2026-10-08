@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.228
+// @version         0.229
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -129,6 +129,7 @@ the combined mod is not offered under GPLv2.
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -523,6 +524,8 @@ CRenderDataVisualUpdateRenderData_t
     g_renderDataVisualUpdateRenderDataOriginal = nullptr;
 void* g_drawBitmapInstructionVtableSymbol = nullptr;
 std::atomic_size_t g_drawBitmapInstructionImageOffset = SIZE_MAX;
+std::atomic_size_t g_renderDataInstructionArrayOffset = SIZE_MAX;
+std::atomic_size_t g_renderDataInstructionCountOffset = SIZE_MAX;
 thread_local void* g_renderDataUpdateVisual = nullptr;
 
 static constexpr unsigned int OBSERVED_IMAGE_COUNT = 2048;
@@ -3287,6 +3290,146 @@ static size_t DecodeDrawBitmapInstructionImageOffset(void* writeInstruction)
     return SIZE_MAX;
 }
 
+static bool DecodeRenderDataInstructionListLayout(void* updateRenderData,
+                                                   size_t* arrayOffset,
+                                                   size_t* countOffset)
+{
+    if (!arrayOffset || !countOffset ||
+        !IsDwmFunctionPointerValid(updateRenderData) ||
+        !IsReadableMemory(updateRenderData, 0x200))
+    {
+        return false;
+    }
+    const auto* code = static_cast<const unsigned char*>(updateRenderData);
+    bool savesThisInRbx = false;
+    for (size_t i = 0; i + 3 <= 32; i++)
+    {
+        if (code[i] == 0x48 && code[i + 1] == 0x8B &&
+            code[i + 2] == 0xD9)
+        {
+            savesThisInRbx = true;
+            break;
+        }
+    }
+    if (!savesThisInRbx)
+    {
+        return false;
+    }
+    for (size_t i = 0; i + 7 <= 0x180; i++)
+    {
+        if (code[i] != 0x48 || code[i + 1] != 0x63 ||
+            (code[i + 2] & 0xC7) != 0x83)
+        {
+            continue;
+        }
+        uint32_t decodedCountOffset32 = 0;
+        std::memcpy(&decodedCountOffset32, code + i + 3,
+                    sizeof(decodedCountOffset32));
+        size_t decodedCountOffset = decodedCountOffset32;
+        if (decodedCountOffset < 0x20 || decodedCountOffset > 0x400 ||
+            decodedCountOffset % alignof(LONG) != 0)
+        {
+            continue;
+        }
+        size_t searchEnd = std::min<size_t>(i + 0x120, 0x1F8);
+        for (size_t j = i + 7; j + 7 <= searchEnd; j++)
+        {
+            if ((code[j] & 0xF8) != 0x48 || code[j + 1] != 0x8B ||
+                (code[j + 2] & 0xC7) != 0x83)
+            {
+                continue;
+            }
+            uint32_t decodedArrayOffset32 = 0;
+            std::memcpy(&decodedArrayOffset32, code + j + 3,
+                        sizeof(decodedArrayOffset32));
+            size_t decodedArrayOffset = decodedArrayOffset32;
+            if (decodedArrayOffset < 0x20 || decodedArrayOffset > 0x400 ||
+                decodedArrayOffset % alignof(void*) != 0 ||
+                decodedArrayOffset >= decodedCountOffset ||
+                decodedCountOffset - decodedArrayOffset > 0x40)
+            {
+                continue;
+            }
+            unsigned int destinationRegister =
+                ((code[j] & 0x04) ? 8U : 0U) |
+                ((code[j + 2] >> 3) & 7U);
+            bool indexedThroughArray = false;
+            for (size_t k = j + 7; k + 4 <= std::min(j + 24, searchEnd); k++)
+            {
+                if ((code[k] & 0xF0) != 0x40 || code[k + 1] != 0x8B ||
+                    (code[k + 2] & 0xC7) != 0x04)
+                {
+                    continue;
+                }
+                unsigned int baseRegister =
+                    ((code[k] & 0x01) ? 8U : 0U) | (code[k + 3] & 7U);
+                if (baseRegister == destinationRegister)
+                {
+                    indexedThroughArray = true;
+                    break;
+                }
+            }
+            if (indexedThroughArray)
+            {
+                *arrayOffset = decodedArrayOffset;
+                *countOffset = decodedCountOffset;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static unsigned int ObserveExistingBitmapInstructions(void* visual)
+{
+    size_t arrayOffset =
+        g_renderDataInstructionArrayOffset.load(std::memory_order_acquire);
+    size_t countOffset =
+        g_renderDataInstructionCountOffset.load(std::memory_order_acquire);
+    size_t imageOffset =
+        g_drawBitmapInstructionImageOffset.load(std::memory_order_acquire);
+    if (!visual || arrayOffset == SIZE_MAX || countOffset == SIZE_MAX ||
+        imageOffset == SIZE_MAX || !g_drawBitmapInstructionVtableSymbol)
+    {
+        return 0;
+    }
+    const BYTE* countField = static_cast<const BYTE*>(visual) + countOffset;
+    if (!IsReadableMemory(countField, sizeof(LONG)))
+    {
+        return 0;
+    }
+    LONG instructionCount = *reinterpret_cast<const LONG*>(countField);
+    if (instructionCount <= 0 || instructionCount > 256)
+    {
+        return 0;
+    }
+    void* instructionArray = ReadPointerMember(visual, arrayOffset);
+    size_t arraySize = static_cast<size_t>(instructionCount) * sizeof(void*);
+    if (!IsReadableMemory(instructionArray, arraySize))
+    {
+        return 0;
+    }
+    unsigned int observed = 0;
+    auto* instructions = static_cast<void**>(instructionArray);
+    for (LONG i = 0; i < instructionCount; i++)
+    {
+        void* instruction = instructions[i];
+        if (!IsReadableMemory(instruction, sizeof(void*)) ||
+            *static_cast<void**>(instruction) !=
+                g_drawBitmapInstructionVtableSymbol)
+        {
+            continue;
+        }
+        void* imageProxy = ReadPointerMember(instruction, imageOffset);
+        if (RetainObservedImage(imageProxy))
+        {
+            RememberObservedRenderImage(visual, imageProxy);
+            observed++;
+        }
+    }
+    return observed;
+}
+
 static bool InstallExistingBitmapInstructionObserver()
 {
     constexpr size_t writeInstructionSlot = 1;
@@ -3308,21 +3451,39 @@ static bool InstallExistingBitmapInstructionObserver()
     }
     g_drawBitmapInstructionImageOffset.store(imageOffset,
                                                std::memory_order_release);
-    if (!Wh_SetFunctionHook(
-            writeInstruction,
-            reinterpret_cast<void*>(
-                DrawBitmapInstructionWriteInstructionHook),
-            reinterpret_cast<void**>(
-                &g_drawBitmapInstructionWriteInstructionOriginal)))
+    size_t instructionArrayOffset = SIZE_MAX;
+    size_t instructionCountOffset = SIZE_MAX;
+    bool listLayoutReady = DecodeRenderDataInstructionListLayout(
+        reinterpret_cast<void*>(g_renderDataVisualUpdateRenderDataOriginal),
+        &instructionArrayOffset, &instructionCountOffset);
+    if (listLayoutReady)
+    {
+        g_renderDataInstructionArrayOffset.store(instructionArrayOffset,
+                                                  std::memory_order_release);
+        g_renderDataInstructionCountOffset.store(instructionCountOffset,
+                                                  std::memory_order_release);
+    }
+    bool writeHookReady = Wh_SetFunctionHook(
+        writeInstruction,
+        reinterpret_cast<void*>(DrawBitmapInstructionWriteInstructionHook),
+        reinterpret_cast<void**>(
+            &g_drawBitmapInstructionWriteInstructionOriginal));
+    if (!writeHookReady && !listLayoutReady)
     {
         g_drawBitmapInstructionImageOffset.store(SIZE_MAX,
                                                   std::memory_order_release);
-        Wh_Log(L"4x4 existing image observer unavailable: hook failed");
+        Wh_Log(L"4x4 existing image observer unavailable: hook and list "
+               L"layout failed");
         return false;
     }
     Wh_Log(L"4x4 existing image observer ready: WriteInstruction=%p "
-           L"imageOffset=0x%zx",
-           writeInstruction, imageOffset);
+           L"imageOffset=0x%zx hook=%s list=%s arrayOffset=0x%zx "
+           L"countOffset=0x%zx",
+           writeInstruction, imageOffset,
+           writeHookReady ? L"available" : L"unavailable",
+           listLayoutReady ? L"available" : L"unavailable",
+           listLayoutReady ? instructionArrayOffset : 0,
+           listLayoutReady ? instructionCountOffset : 0);
     return true;
 }
 
@@ -4595,10 +4756,20 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                                          : E_NOINTERFACE;
                 imageProxy = FindObservedImageForWindow(topLevelWindow3D,
                                                         hwnd);
+                unsigned int scannedInstructions = 0;
+                if (!imageProxy && refreshResult >= 0)
+                {
+                    scannedInstructions = ObserveExistingBitmapInstructions(
+                        topLevelWindow3D);
+                    imageProxy = FindObservedImageForWindow(topLevelWindow3D,
+                                                            hwnd);
+                }
                 Wh_Log(L"4x4 live image observation replay: Slot=%d HWND=%p "
-                       L"TopLevelWindow3D=%p result=0x%08X observed=%d",
+                       L"TopLevelWindow3D=%p result=0x%08X scanned=%u "
+                       L"observed=%d",
                        i, hwnd, topLevelWindow3D,
                        static_cast<unsigned int>(refreshResult),
+                       scannedInstructions,
                        imageProxy != nullptr);
             }
             if (imageProxy)
