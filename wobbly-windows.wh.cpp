@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.227
+// @version         0.228
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -433,6 +433,8 @@ using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(
     void* geometryGroupProxy, void* bitmapSourceProxy, void** instruction);
 using CDrawBitmapInstructionCreate_t = long(__cdecl*)(void* imageProxy,
                                                        void** instruction);
+using CDrawBitmapInstructionWriteInstruction_t = long(__cdecl*)(
+    void* pThis, void* renderDataBuilder, const void* visual);
 using CDrawTileImageInstructionCreate_t = long(__cdecl*)(
     void* imageProxy, const RECT& sourceRect, const POINT& destinationOffset,
     float opacity, void** instruction);
@@ -507,6 +509,8 @@ struct MeshLayerSymbols
 MeshLayerSymbols g_meshLayerSymbols;
 std::atomic_bool g_meshLayerBackendAvailable = false;
 CDrawBitmapInstructionCreate_t g_drawBitmapInstructionCreateOriginal = nullptr;
+CDrawBitmapInstructionWriteInstruction_t
+    g_drawBitmapInstructionWriteInstructionOriginal = nullptr;
 CDrawTileImageInstructionCreate_t g_drawTileImageInstructionCreateOriginal =
     nullptr;
 CCompositorCreateBitmapSourceProxy_t g_createBitmapSourceProxyOriginal =
@@ -515,6 +519,11 @@ CCompositorCreateVisualSurfaceProxy_t g_createVisualSurfaceProxyOriginal =
     nullptr;
 CRenderDataVisualAddInstruction_t
     g_renderDataVisualAddInstructionOriginal = nullptr;
+CRenderDataVisualUpdateRenderData_t
+    g_renderDataVisualUpdateRenderDataOriginal = nullptr;
+void* g_drawBitmapInstructionVtableSymbol = nullptr;
+std::atomic_size_t g_drawBitmapInstructionImageOffset = SIZE_MAX;
+thread_local void* g_renderDataUpdateVisual = nullptr;
 
 static constexpr unsigned int OBSERVED_IMAGE_COUNT = 2048;
 static constexpr unsigned int OBSERVED_IMAGE_PROBES = 24;
@@ -938,12 +947,15 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                                void* imageProxy);
 static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
                                                      void** instruction);
+static long __cdecl DrawBitmapInstructionWriteInstructionHook(
+    void* pThis, void* renderDataBuilder, const void* visual);
 static long __cdecl CreateBitmapSourceProxyHook(void* pThis, void** proxy);
 static long __cdecl CreateVisualSurfaceProxyHook(void* pThis,
                                                   void* sharedHandle,
                                                   void** proxy);
 static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
                                                         void* instruction);
+static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis);
 static bool HasAnyAnimationSlots();
 static int GetPointIndex(int x, int y);
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy);
@@ -3124,6 +3136,38 @@ static bool RememberObservedBitmapInstruction(void* instruction,
     return false;
 }
 
+// Takes ownership of one retained image reference.
+static bool RememberObservedRenderImage(void* visual, void* imageProxy)
+{
+    if (!visual || !imageProxy ||
+        g_unloading.load(std::memory_order_acquire))
+    {
+        ReleaseObservedImage(imageProxy);
+        return false;
+    }
+    ObservedRenderImage* entry = FindObservedRenderImage(visual, true);
+    if (!entry)
+    {
+        ReleaseObservedImage(imageProxy);
+        return false;
+    }
+    void* oldImage = entry->imageProxy.exchange(
+        imageProxy, std::memory_order_acq_rel);
+    entry->sequence.store(
+        g_observedImageSequence.fetch_add(1, std::memory_order_acq_rel) + 1,
+        std::memory_order_release);
+    if (oldImage == imageProxy)
+    {
+        // The entry already owned an identical reference. Keep that one.
+        ReleaseObservedImage(imageProxy);
+    }
+    else
+    {
+        ReleaseObservedImage(oldImage);
+    }
+    return true;
+}
+
 static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
                                                      void** instruction)
 {
@@ -3140,6 +3184,31 @@ static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
     if (retained)
     {
         ReleaseObservedImage(imageProxy);
+    }
+    return result;
+}
+
+static long __cdecl DrawBitmapInstructionWriteInstructionHook(
+    void* pThis, void* renderDataBuilder, const void* visual)
+{
+    size_t imageOffset =
+        g_drawBitmapInstructionImageOffset.load(std::memory_order_acquire);
+    void* imageProxy = ReadPointerMember(pThis, imageOffset);
+    bool retained = g_renderDataUpdateVisual &&
+                    !g_unloading.load(std::memory_order_acquire) &&
+                    RetainObservedImage(imageProxy);
+    long result = g_drawBitmapInstructionWriteInstructionOriginal(
+        pThis, renderDataBuilder, visual);
+    if (retained)
+    {
+        if (result >= 0)
+        {
+            RememberObservedRenderImage(g_renderDataUpdateVisual, imageProxy);
+        }
+        else
+        {
+            ReleaseObservedImage(imageProxy);
+        }
     }
     return result;
 }
@@ -3165,22 +3234,96 @@ static long __cdecl RenderDataVisualAddInstructionHook(void* pThis,
     if (result >= 0 && pThis && imageProxy &&
         !g_unloading.load(std::memory_order_acquire))
     {
-        if (ObservedRenderImage* entry =
-                FindObservedRenderImage(pThis, true))
-        {
-            void* oldImage = entry->imageProxy.exchange(
-                imageProxy, std::memory_order_acq_rel);
-            entry->sequence.store(
-                g_observedImageSequence.fetch_add(
-                    1, std::memory_order_acq_rel) +
-                    1,
-                std::memory_order_release);
-            imageProxy = nullptr;
-            ReleaseObservedImage(oldImage);
-        }
+        RememberObservedRenderImage(pThis, imageProxy);
+        imageProxy = nullptr;
     }
     ReleaseObservedImage(imageProxy);
     return result;
+}
+
+static long __cdecl RenderDataVisualUpdateRenderDataHook(void* pThis)
+{
+    void* previousVisual = g_renderDataUpdateVisual;
+    g_renderDataUpdateVisual = pThis;
+    long result = g_renderDataVisualUpdateRenderDataOriginal(pThis);
+    g_renderDataUpdateVisual = previousVisual;
+    return result;
+}
+
+static size_t DecodeDrawBitmapInstructionImageOffset(void* writeInstruction)
+{
+    if (!IsDwmFunctionPointerValid(writeInstruction) ||
+        !IsReadableMemory(writeInstruction, 32))
+    {
+        return SIZE_MAX;
+    }
+    const auto* code = static_cast<const unsigned char*>(writeInstruction);
+    // WriteInstruction begins by loading its image member from [this+disp8].
+    // A nearby load through RDX validates the IRenderDataBuilder argument.
+    for (size_t i = 0; i + 4 <= 12; i++)
+    {
+        if ((code[i] & 0xF8) != 0x48 || code[i + 1] != 0x8B ||
+            (code[i + 2] & 0xC7) != 0x41)
+        {
+            continue;
+        }
+        size_t offset = code[i + 3];
+        bool readsBuilder = false;
+        for (size_t j = i + 4; j + 3 <= 28; j++)
+        {
+            if ((code[j] & 0xF8) == 0x48 && code[j + 1] == 0x8B &&
+                (code[j + 2] & 0xC7) == 0x02)
+            {
+                readsBuilder = true;
+                break;
+            }
+        }
+        if (readsBuilder && offset >= sizeof(void*) && offset <= 0x80 &&
+            offset % alignof(void*) == 0)
+        {
+            return offset;
+        }
+    }
+    return SIZE_MAX;
+}
+
+static bool InstallExistingBitmapInstructionObserver()
+{
+    constexpr size_t writeInstructionSlot = 1;
+    if (!IsDwmImageAddress(g_drawBitmapInstructionVtableSymbol,
+                           sizeof(void*) * (writeInstructionSlot + 1)))
+    {
+        return false;
+    }
+    void* writeInstruction = static_cast<void**>(
+        g_drawBitmapInstructionVtableSymbol)[writeInstructionSlot];
+    size_t imageOffset =
+        DecodeDrawBitmapInstructionImageOffset(writeInstruction);
+    if (imageOffset == SIZE_MAX)
+    {
+        Wh_Log(L"4x4 existing image observer unavailable: "
+               L"WriteInstruction=%p validation failed",
+               writeInstruction);
+        return false;
+    }
+    g_drawBitmapInstructionImageOffset.store(imageOffset,
+                                               std::memory_order_release);
+    if (!Wh_SetFunctionHook(
+            writeInstruction,
+            reinterpret_cast<void*>(
+                DrawBitmapInstructionWriteInstructionHook),
+            reinterpret_cast<void**>(
+                &g_drawBitmapInstructionWriteInstructionOriginal)))
+    {
+        g_drawBitmapInstructionImageOffset.store(SIZE_MAX,
+                                                  std::memory_order_release);
+        Wh_Log(L"4x4 existing image observer unavailable: hook failed");
+        return false;
+    }
+    Wh_Log(L"4x4 existing image observer ready: WriteInstruction=%p "
+           L"imageOffset=0x%zx",
+           writeInstruction, imageOffset);
+    return true;
 }
 
 static bool InitializeDwmHooks()
@@ -3360,7 +3503,9 @@ static bool InitializeDwmHooks()
          RenderDataVisualAddInstructionHook,
          true},
         {{L"public: virtual long __cdecl CRenderDataVisual::UpdateRenderData(void)"},
-         &g_meshLayerSymbols.updateRenderData, nullptr, true},
+         &g_renderDataVisualUpdateRenderDataOriginal,
+         RenderDataVisualUpdateRenderDataHook,
+         true},
         {{L"public: long __cdecl CVisualProxy::InsertChild("
            L"class CVisualProxy *,class CVisualProxy *,bool)"},
          &g_meshLayerSymbols.insertVisualChild, nullptr, true},
@@ -3489,6 +3634,10 @@ static bool InitializeDwmHooks()
         {{L"const CVisualSurfaceProxy::`vftable'"},
          &g_visualSurfaceProxyVtableSymbol,
          nullptr,
+         true},
+        {{L"const CDrawBitmapInstruction::`vftable'"},
+         &g_drawBitmapInstructionVtableSymbol,
+         nullptr,
          true}};
     if (!WindhawkUtils::HookSymbols(udwm, udwmDllHooks, ARRAYSIZE(udwmDllHooks)))
     {
@@ -3529,7 +3678,9 @@ static bool InitializeDwmHooks()
     keepValid(g_renderDataVisualAddInstructionOriginal);
     g_meshLayerSymbols.addRenderInstruction =
         reinterpret_cast<void*>(g_renderDataVisualAddInstructionOriginal);
-    keepValid(g_meshLayerSymbols.updateRenderData);
+    keepValid(g_renderDataVisualUpdateRenderDataOriginal);
+    g_meshLayerSymbols.updateRenderData = reinterpret_cast<void*>(
+        g_renderDataVisualUpdateRenderDataOriginal);
     keepValid(g_meshLayerSymbols.insertVisualChild);
     keepValid(g_meshLayerSymbols.removeVisualChild);
     keepValid(g_meshLayerSymbols.setVisualParent);
@@ -3542,9 +3693,13 @@ static bool InitializeDwmHooks()
                                       : DecodeBaseObjectReferenceCountOffset();
     g_baseObjectReferenceCountOffset.store(referenceCountOffset,
                                            std::memory_order_release);
+    bool existingImageObserverReady =
+        g_renderDataVisualUpdateRenderDataOriginal &&
+        InstallExistingBitmapInstructionObserver();
     g_meshImageObservationAvailable.store(
-        g_drawBitmapInstructionCreateOriginal &&
-            g_renderDataVisualAddInstructionOriginal,
+        (g_drawBitmapInstructionCreateOriginal &&
+         g_renderDataVisualAddInstructionOriginal) ||
+            existingImageObserverReady,
         std::memory_order_release);
     // Borrowed DWM image proxies aren't rendered until their exact subtype and
     // lifetime ownership are proven. The stable affine renderer remains active.
@@ -3555,11 +3710,13 @@ static bool InitializeDwmHooks()
            g_meshLayerSymbols.HasImagePipeline() ? L"available" : L"unavailable",
            g_meshLayerSymbols.HasVisualPipeline() ? L"available" : L"unavailable");
     Wh_Log(L"4x4 direct image observation: bitmap=%s tile=%s owner=%s "
-           L"createBitmap=%s createVisualSurface=%s rendering=disabled",
+           L"existing=%s createBitmap=%s createVisualSurface=%s "
+           L"rendering=disabled",
            g_drawBitmapInstructionCreateOriginal ? L"available" : L"unavailable",
            g_drawTileImageInstructionCreateOriginal ? L"resolved-unhooked"
                                                     : L"unavailable",
            g_renderDataVisualAddInstructionOriginal ? L"available" : L"unavailable",
+           existingImageObserverReady ? L"available" : L"unavailable",
            g_createBitmapSourceProxyOriginal ? L"available" : L"unavailable",
            g_createVisualSurfaceProxyOriginal ? L"available" : L"unavailable");
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
@@ -4432,15 +4589,13 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                 g_meshImageRefreshGeneration[i] != generation)
             {
                 g_meshImageRefreshGeneration[i] = generation;
-                auto updateRenderData =
-                    reinterpret_cast<CRenderDataVisualUpdateRenderData_t>(
-                        g_meshLayerSymbols.updateRenderData);
-                long refreshResult = updateRenderData
-                                         ? updateRenderData(topLevelWindow3D)
+                long refreshResult = g_renderDataVisualUpdateRenderDataOriginal
+                                         ? RenderDataVisualUpdateRenderDataHook(
+                                               topLevelWindow3D)
                                          : E_NOINTERFACE;
                 imageProxy = FindObservedImageForWindow(topLevelWindow3D,
                                                         hwnd);
-                Wh_Log(L"4x4 live image observation refresh: Slot=%d HWND=%p "
+                Wh_Log(L"4x4 live image observation replay: Slot=%d HWND=%p "
                        L"TopLevelWindow3D=%p result=0x%08X observed=%d",
                        i, hwnd, topLevelWindow3D,
                        static_cast<unsigned int>(refreshResult),
