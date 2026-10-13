@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.234
+// @version         0.235
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4646,7 +4646,10 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                     positionY -= verticalInset;
                 }
                 positions[index] = {positionX, positionY, 0.0f};
-                textureCoordinates[index] = {tx, ty};
+                textureCoordinates[index] = {
+                    tx * static_cast<float>(width),
+                    ty * static_cast<float>(height),
+                };
             }
         }
         unsigned int indexCount = 0;
@@ -4749,7 +4752,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         Wh_Log(L"4x4 complete-window snapshot layer attached: Slot=%d HWND=%p Image=%p "
                L"Root=%p Host=%p HostProxy=%p LayerProxy=%p "
                L"sourceKind=CompleteWindowRootSnapshot live=no "
-               L"order=topmost shape=hourglass "
+               L"order=topmost shape=hourglass uv=pixels "
                L"origin=%.0f,%.0f size=%.0fx%.0f",
                slotIndex, hwnd, pending.cachedImage, rootVisual, hostVisual,
                hostVisualProxy, renderVisualProxy,
