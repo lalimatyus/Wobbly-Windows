@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.233
+// @version         0.234
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -948,8 +948,7 @@ static void EnsurePendingMatrixTransformProxies();
 static void MaintainMeshLayer();
 static void* FindObservedImageForWindow(void* topLevelWindow3D, HWND hwnd);
 static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
-                               void* topLevelWindow,
-                               void* imageProxy);
+                               void* topLevelWindow);
 static long __cdecl DrawBitmapInstructionCreateHook(void* imageProxy,
                                                      void** instruction);
 static long __cdecl DrawBitmapInstructionWriteInstructionHook(
@@ -3973,14 +3972,18 @@ static bool InitializeDwmHooks()
          g_renderDataVisualAddInstructionOriginal) ||
             existingImageObserverReady,
         std::memory_order_release);
-    // Borrowed DWM image proxies aren't rendered until their exact subtype and
-    // lifetime ownership are proven. The stable affine renderer remains active.
-    g_meshLayerBackendAvailable.store(false, std::memory_order_release);
+    bool snapshotLayerReady = g_meshLayerSymbols.HasGeometryPipeline() &&
+                              g_meshLayerSymbols.HasImagePipeline() &&
+                              g_meshLayerSymbols.HasVisualPipeline() &&
+                              g_cBaseObjectRelease;
+    g_meshLayerBackendAvailable.store(snapshotLayerReady,
+                                      std::memory_order_release);
     Wh_Log(L"4x4 mesh-layer prerequisites: geometry=%s image=%s visual=%s "
-           L"complete=no (direct-source lifetime audit; affine renderer active)",
+           L"complete=%s (complete-window snapshot canary; affine renderer active)",
            g_meshLayerSymbols.HasGeometryPipeline() ? L"available" : L"unavailable",
            g_meshLayerSymbols.HasImagePipeline() ? L"available" : L"unavailable",
-           g_meshLayerSymbols.HasVisualPipeline() ? L"available" : L"unavailable");
+           g_meshLayerSymbols.HasVisualPipeline() ? L"available" : L"unavailable",
+           snapshotLayerReady ? L"yes" : L"no");
     Wh_Log(L"4x4 direct image observation: bitmap=%s tile=%s owner=%s "
            L"existing=%s createBitmap=%s createVisualSurface=%s "
            L"rendering=disabled",
@@ -4470,14 +4473,11 @@ static void* FindPrimaryBitmapSourceProxy(void* imageProxy,
 }
 
 static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
-                               void* topLevelWindow,
-                               void* imageProxy)
+                               void* topLevelWindow)
 {
     if (!IsOnDwmSceneThread() ||
         !g_meshLayerBackendAvailable.load(std::memory_order_acquire) ||
-        !hwnd || !topLevelWindow ||
-        !IsReadableMemory(imageProxy, sizeof(void*)) ||
-        !IsDwmImageAddress(*static_cast<void**>(imageProxy), sizeof(void*)))
+        !hwnd || !topLevelWindow)
     {
         return;
     }
@@ -4486,8 +4486,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     {
         if (g_meshLayerState.slotIndex == slotIndex &&
             g_meshLayerState.generation == generation &&
-            g_meshLayerState.hwnd == hwnd &&
-            g_meshLayerState.sourceVisualProxy == imageProxy)
+            g_meshLayerState.hwnd == hwnd)
         {
             return;
         }
@@ -4514,6 +4513,15 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         g_meshLayerSymbols.geometryGroupUpdate);
     auto createInstruction = reinterpret_cast<CDrawMesh2DInstructionCreate_t>(
         g_meshLayerSymbols.createMeshInstruction);
+    auto createCachedImage = reinterpret_cast<CCompositorCreateProxy_t>(
+        g_meshLayerSymbols.createCachedImage);
+    auto updateCachedImage = reinterpret_cast<CCachedVisualImageProxyUpdate_t>(
+        g_meshLayerSymbols.cachedImageUpdate);
+    auto snapshotCachedImage =
+        reinterpret_cast<CCachedVisualImageProxySnapshot_t>(
+            g_meshLayerSymbols.cachedImageSnapshot);
+    auto freezeCachedImage = reinterpret_cast<CCachedVisualImageProxyFreeze_t>(
+        g_meshLayerSymbols.cachedImageFreeze);
     auto createRenderVisual = reinterpret_cast<CRenderDataVisualCreate_t>(
         g_meshLayerSymbols.createRenderDataVisual);
     auto addInstruction = reinterpret_cast<CRenderDataVisualAddInstruction_t>(
@@ -4535,7 +4543,6 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     pending.hwnd = hwnd;
     pending.slotIndex = slotIndex;
     pending.generation = generation;
-    pending.sourceVisualProxy = imageProxy;
     const wchar_t* stage = L"Prerequisites";
     long result = E_NOINTERFACE;
     bool attachAttempted = false;
@@ -4549,33 +4556,58 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                                                           completeWindowRoot)
                            : nullptr;
     void* hostVisual = IsNativeVisualPointerValid(rootVisual) ? rootVisual : nullptr;
+    void* sourceVisualProxy =
+        hostVisual && getVisualProxy ? getVisualProxy(hostVisual) : nullptr;
+    pending.sourceVisualProxy = sourceVisualProxy;
     RECT windowRect = {};
-    RECT sourceBounds = {};
-    POINT clientOrigin = {};
     bool hasWindowRect = GetWindowRect(hwnd, &windowRect) != FALSE;
-    bool hasSourceBounds = GetClientRect(hwnd, &sourceBounds) != FALSE;
-    bool hasClientOrigin = ClientToScreen(hwnd, &clientOrigin) != FALSE;
-    double originX = hasWindowRect && hasClientOrigin
-                         ? static_cast<double>(clientOrigin.x - windowRect.left)
-                         : 0.0;
-    double originY = hasWindowRect && hasClientOrigin
-                         ? static_cast<double>(clientOrigin.y - windowRect.top)
-                         : 0.0;
-    double width = hasSourceBounds
-                       ? static_cast<double>(sourceBounds.right - sourceBounds.left)
+    double originX = 0.0;
+    double originY = 0.0;
+    double width = hasWindowRect
+                       ? static_cast<double>(windowRect.right - windowRect.left)
                        : 0.0;
-    double height = hasSourceBounds
-                        ? static_cast<double>(sourceBounds.bottom - sourceBounds.top)
+    double height = hasWindowRect
+                        ? static_cast<double>(windowRect.bottom - windowRect.top)
                         : 0.0;
 
-    if (IsDwmObjectPointerValid(compositor, g_compositorVtable) && imageProxy &&
-        hostVisual && width > 0.0 && height > 0.0 &&
+    if (IsDwmObjectPointerValid(compositor, g_compositorVtable) && hostVisual &&
+        IsVisualProxyPointerValid(sourceVisualProxy) && width > 0.0 &&
+        height > 0.0 && createCachedImage && updateCachedImage &&
+        snapshotCachedImage && freezeCachedImage &&
         createMesh && updateMesh && createGroup && updateGroup &&
         createInstruction && createRenderVisual && addInstruction &&
         updateRenderData && setParent && getVisualProxy && removeChild &&
         insertChild)
     {
         result = S_OK;
+
+        MilRectF sourceRect = {0.0f, 0.0f, static_cast<float>(width),
+                               static_cast<float>(height)};
+        MilSizeD imageSize = {width, height};
+        RECT snapshotRect = {0, 0, static_cast<LONG>(std::lround(width)),
+                             static_cast<LONG>(std::lround(height))};
+        if (result >= 0)
+        {
+            stage = L"CreateCachedImage";
+            result = createCachedImage(compositor, &pending.cachedImage);
+        }
+        if (result >= 0 && pending.cachedImage)
+        {
+            stage = L"UpdateCachedImage";
+            result = updateCachedImage(pending.cachedImage, sourceRect,
+                                       imageSize, nullptr, nullptr,
+                                       sourceVisualProxy, 0);
+        }
+        if (result >= 0 && pending.cachedImage)
+        {
+            stage = L"SnapshotCachedImage";
+            result = snapshotCachedImage(pending.cachedImage, snapshotRect);
+        }
+        if (result >= 0 && pending.cachedImage)
+        {
+            stage = L"FreezeCachedImage";
+            result = freezeCachedImage(pending.cachedImage);
+        }
 
         D2DPoint3F positions[GRID_POINT_COUNT] = {};
         D2DPoint2F textureCoordinates[GRID_POINT_COUNT] = {};
@@ -4664,7 +4696,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         if (result >= 0 && pending.renderVisual)
         {
             stage = L"CreateInstruction";
-            result = createInstruction(pending.groupProxy, imageProxy,
+            result = createInstruction(pending.groupProxy, pending.cachedImage,
                                        &pending.instruction);
         }
         if (result >= 0 && pending.instruction)
@@ -4707,19 +4739,19 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         }
     }
 
-    bool succeeded = result >= 0 && imageProxy && pending.meshProxy &&
+    bool succeeded = result >= 0 && pending.cachedImage && pending.meshProxy &&
                      pending.groupProxy && pending.instruction &&
                      pending.renderVisual;
     if (succeeded)
     {
         g_meshLayerState = pending;
         g_meshLayerActive.store(true, std::memory_order_release);
-        Wh_Log(L"4x4 live-image static-warp layer attached: Slot=%d HWND=%p Image=%p "
+        Wh_Log(L"4x4 complete-window snapshot layer attached: Slot=%d HWND=%p Image=%p "
                L"Root=%p Host=%p HostProxy=%p LayerProxy=%p "
-               L"sourceKind=ObservedBaseImage ownerMatch=1 live=yes "
+               L"sourceKind=CompleteWindowRootSnapshot live=no "
                L"order=topmost shape=hourglass "
                L"origin=%.0f,%.0f size=%.0fx%.0f",
-               slotIndex, hwnd, imageProxy, rootVisual, hostVisual,
+               slotIndex, hwnd, pending.cachedImage, rootVisual, hostVisual,
                hostVisualProxy, renderVisualProxy,
                originX, originY, width, height);
         return;
@@ -4740,11 +4772,11 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     }
     Wh_Log(L"4x4 mesh layer failed: Slot=%d HWND=%p Stage=%s "
            L"result=0x%08X Root=%p Host=%p HostProxy=%p LayerProxy=%p "
-           L"sourceKind=ObservedBaseImage Image=%p origin=%.0f,%.0f "
+               L"sourceKind=CompleteWindowRootSnapshot Image=%p origin=%.0f,%.0f "
            L"size=%.0fx%.0f",
            slotIndex, hwnd, stage, static_cast<unsigned int>(result),
            rootVisual, hostVisual, hostVisualProxy, renderVisualProxy,
-           imageProxy, originX, originY, width, height);
+               pending.cachedImage, originX, originY, width, height);
 }
 
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
@@ -4883,6 +4915,10 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         }
         if (rendererMode == RendererMode::MeshLayer && topLevelVisualProxy)
         {
+            if (g_meshLayerBackendAvailable.load(std::memory_order_acquire))
+            {
+                TryAttachMeshLayer(i, generation, hwnd, topLevelWindow);
+            }
             void* imageProxy =
                 FindObservedImageForWindow(topLevelWindow3D, hwnd);
             if (!imageProxy && ObserveCachedImageForWindow(topLevelWindow3D,
@@ -4972,12 +5008,6 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                            creationKind,
                            g_observedImagePinCount.load(
                                std::memory_order_acquire));
-                }
-                if (g_meshLayerBackendAvailable.load(
-                        std::memory_order_acquire))
-                {
-                    TryAttachMeshLayer(i, generation, hwnd, topLevelWindow,
-                                       imageProxy);
                 }
             }
             else if (g_meshImagePendingLogSlot != i ||
