@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.235
+// @version         0.236
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4531,6 +4531,8 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             g_meshLayerSymbols.updateRenderData);
     auto setParent = reinterpret_cast<CVisualSetParent_t>(
         g_meshLayerSymbols.setVisualParent);
+    auto getParent = reinterpret_cast<CVisualGetTransformParent_t>(
+        g_meshLayerSymbols.getVisualParent);
     auto getVisualProxy =
         reinterpret_cast<CVisualGetVisualProxyForStructure_t>(
             g_meshLayerSymbols.getVisualProxy);
@@ -4555,9 +4557,17 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                            ? g_topLevelWindowGetRootVisual(topLevelWindow,
                                                           completeWindowRoot)
                            : nullptr;
-    void* hostVisual = IsNativeVisualPointerValid(rootVisual) ? rootVisual : nullptr;
+    void* rootParent = IsNativeVisualPointerValid(rootVisual) && getParent
+                           ? getParent(rootVisual)
+                           : nullptr;
+    void* hostVisual = rootParent != rootVisual &&
+                               IsNativeVisualPointerValid(rootParent)
+                           ? rootParent
+                           : nullptr;
     void* sourceVisualProxy =
-        hostVisual && getVisualProxy ? getVisualProxy(hostVisual) : nullptr;
+        IsNativeVisualPointerValid(rootVisual) && getVisualProxy
+            ? getVisualProxy(rootVisual)
+            : nullptr;
     pending.sourceVisualProxy = sourceVisualProxy;
     RECT windowRect = {};
     bool hasWindowRect = GetWindowRect(hwnd, &windowRect) != FALSE;
@@ -4576,7 +4586,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         snapshotCachedImage && freezeCachedImage &&
         createMesh && updateMesh && createGroup && updateGroup &&
         createInstruction && createRenderVisual && addInstruction &&
-        updateRenderData && setParent && getVisualProxy && removeChild &&
+         updateRenderData && setParent && getParent && getVisualProxy && removeChild &&
         insertChild)
     {
         result = S_OK;
@@ -4718,13 +4728,20 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             attachAttempted = true;
             result = setParent(pending.renderVisual, hostVisual);
         }
+        if (result >= 0 && pending.renderVisual &&
+            getParent(pending.renderVisual) != hostVisual)
+        {
+            stage = L"VerifyParent";
+            result = E_FAIL;
+        }
         if (result >= 0)
         {
             stage = L"ResolveLayerOrder";
             renderVisualProxy = getVisualProxy(pending.renderVisual);
             hostVisualProxy = getVisualProxy(hostVisual);
             if (!IsVisualProxyPointerValid(renderVisualProxy) ||
-                !IsVisualProxyPointerValid(hostVisualProxy))
+                !IsVisualProxyPointerValid(hostVisualProxy) ||
+                !IsVisualProxyPointerValid(sourceVisualProxy))
             {
                 result = E_NOINTERFACE;
             }
@@ -4737,8 +4754,8 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         if (result >= 0)
         {
             stage = L"InsertTopmost";
-            result = insertChild(hostVisualProxy, renderVisualProxy, nullptr,
-                                 true);
+            result = insertChild(hostVisualProxy, renderVisualProxy,
+                                 sourceVisualProxy, true);
         }
     }
 
@@ -4750,18 +4767,16 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         g_meshLayerState = pending;
         g_meshLayerActive.store(true, std::memory_order_release);
         Wh_Log(L"4x4 complete-window snapshot layer attached: Slot=%d HWND=%p Image=%p "
-               L"Root=%p Host=%p HostProxy=%p LayerProxy=%p "
+                L"Root=%p Host=%p RootProxy=%p HostProxy=%p LayerProxy=%p "
                L"sourceKind=CompleteWindowRootSnapshot live=no "
-               L"order=topmost shape=hourglass uv=pixels "
+                L"order=above-root shape=hourglass uv=pixels "
                L"origin=%.0f,%.0f size=%.0fx%.0f",
                slotIndex, hwnd, pending.cachedImage, rootVisual, hostVisual,
-               hostVisualProxy, renderVisualProxy,
+                sourceVisualProxy, hostVisualProxy, renderVisualProxy,
                originX, originY, width, height);
         return;
     }
 
-    auto getParent = reinterpret_cast<CVisualGetTransformParent_t>(
-        g_meshLayerSymbols.getVisualParent);
     if (attachAttempted && pending.renderVisual && getParent &&
         getParent(pending.renderVisual))
     {
@@ -4774,11 +4789,12 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         ReleaseMeshLayerResources(pending);
     }
     Wh_Log(L"4x4 mesh layer failed: Slot=%d HWND=%p Stage=%s "
-           L"result=0x%08X Root=%p Host=%p HostProxy=%p LayerProxy=%p "
+           L"result=0x%08X Root=%p Host=%p RootProxy=%p HostProxy=%p LayerProxy=%p "
                L"sourceKind=CompleteWindowRootSnapshot Image=%p origin=%.0f,%.0f "
            L"size=%.0fx%.0f",
            slotIndex, hwnd, stage, static_cast<unsigned int>(result),
-           rootVisual, hostVisual, hostVisualProxy, renderVisualProxy,
+            rootVisual, hostVisual, sourceVisualProxy, hostVisualProxy,
+            renderVisualProxy,
                pending.cachedImage, originX, originY, width, height);
 }
 
