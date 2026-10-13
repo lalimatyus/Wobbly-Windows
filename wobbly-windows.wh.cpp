@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.230
+// @version         0.231
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -450,6 +450,7 @@ using CRenderDataVisualCreate_t = long(__cdecl*)(void** visual);
 using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void* pThis,
                                                           void* instruction);
 using CRenderDataVisualUpdateRenderData_t = long(__cdecl*)(void* pThis);
+using CTopLevelWindow3DEnsureRenderData_t = long(__cdecl*)(void* pThis);
 using CVisualSetParent_t = long(__cdecl*)(void* pThis, void* parent);
 using CVisualRemoveSelfFromParent_t = long(__cdecl*)(void* pThis);
 using CVisualGetTransformParent_t = void*(__cdecl*)(void* pThis);
@@ -522,6 +523,8 @@ CRenderDataVisualAddInstruction_t
     g_renderDataVisualAddInstructionOriginal = nullptr;
 CRenderDataVisualUpdateRenderData_t
     g_renderDataVisualUpdateRenderDataOriginal = nullptr;
+CTopLevelWindow3DEnsureRenderData_t
+    g_topLevelWindow3DEnsureRenderData = nullptr;
 void* g_drawBitmapInstructionVtableSymbol = nullptr;
 std::atomic_size_t g_drawBitmapInstructionImageOffset = SIZE_MAX;
 std::atomic_size_t g_renderDataInstructionArrayOffset = SIZE_MAX;
@@ -3696,6 +3699,10 @@ static bool InitializeDwmHooks()
          &g_renderDataVisualUpdateRenderDataOriginal,
          RenderDataVisualUpdateRenderDataHook,
          true},
+        {{L"private: long __cdecl CTopLevelWindow3D::EnsureRenderData(void)"},
+         &g_topLevelWindow3DEnsureRenderData,
+         nullptr,
+         true},
         {{L"public: long __cdecl CVisualProxy::InsertChild("
            L"class CVisualProxy *,class CVisualProxy *,bool)"},
          &g_meshLayerSymbols.insertVisualChild, nullptr, true},
@@ -4779,24 +4786,34 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                 g_meshImageRefreshGeneration[i] != generation)
             {
                 g_meshImageRefreshGeneration[i] = generation;
+                long ensureResult = g_topLevelWindow3DEnsureRenderData
+                                        ? g_topLevelWindow3DEnsureRenderData(
+                                              topLevelWindow3D)
+                                        : E_NOINTERFACE;
+                ExistingInstructionScanResult scan;
+                if (ensureResult >= 0)
+                {
+                    scan = ObserveExistingBitmapInstructions(topLevelWindow3D);
+                }
                 long refreshResult = g_renderDataVisualUpdateRenderDataOriginal
                                          ? RenderDataVisualUpdateRenderDataHook(
                                                topLevelWindow3D)
                                          : E_NOINTERFACE;
                 imageProxy = FindObservedImageForWindow(topLevelWindow3D,
                                                         hwnd);
-                ExistingInstructionScanResult scan;
-                if (!imageProxy && refreshResult >= 0)
+                if (!imageProxy && ensureResult < 0 && refreshResult >= 0)
                 {
                     scan = ObserveExistingBitmapInstructions(topLevelWindow3D);
                     imageProxy = FindObservedImageForWindow(topLevelWindow3D,
                                                             hwnd);
                 }
                 Wh_Log(L"4x4 live image observation replay: Slot=%d HWND=%p "
-                       L"TopLevelWindow3D=%p result=0x%08X countReadable=%d "
+                       L"TopLevelWindow3D=%p ensure=0x%08X update=0x%08X "
+                       L"countReadable=%d "
                        L"count=%d array=%p arrayReadable=%d readable=%u "
                        L"bitmap=%u retained=%u observed=%d",
                        i, hwnd, topLevelWindow3D,
+                       static_cast<unsigned int>(ensureResult),
                        static_cast<unsigned int>(refreshResult),
                        scan.countReadable, static_cast<int>(scan.declaredCount),
                        scan.instructionArray, scan.arrayReadable,
