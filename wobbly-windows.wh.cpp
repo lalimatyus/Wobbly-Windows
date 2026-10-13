@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.232
+// @version         0.233
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -523,9 +523,11 @@ CRenderDataVisualAddInstruction_t
 CRenderDataVisualUpdateRenderData_t
     g_renderDataVisualUpdateRenderDataOriginal = nullptr;
 void* g_drawBitmapInstructionVtableSymbol = nullptr;
+void* g_topLevelWindow3DEnsureRenderDataFunction = nullptr;
 std::atomic_size_t g_drawBitmapInstructionImageOffset = SIZE_MAX;
 std::atomic_size_t g_renderDataInstructionArrayOffset = SIZE_MAX;
 std::atomic_size_t g_renderDataInstructionCountOffset = SIZE_MAX;
+std::atomic_size_t g_topLevelWindow3DCachedImageOffset = SIZE_MAX;
 thread_local void* g_renderDataUpdateVisual = nullptr;
 
 static constexpr unsigned int OBSERVED_IMAGE_COUNT = 2048;
@@ -3380,6 +3382,73 @@ static bool DecodeRenderDataInstructionListLayout(void* updateRenderData,
     return false;
 }
 
+static size_t DecodeTopLevelWindow3DCachedImageOffset(void* ensureRenderData)
+{
+    if (!IsDwmFunctionPointerValid(ensureRenderData) ||
+        !IsReadableMemory(ensureRenderData, 0x180))
+    {
+        return SIZE_MAX;
+    }
+    const auto* code = static_cast<const unsigned char*>(ensureRenderData);
+    bool savesThisInRbx = false;
+    for (size_t i = 0; i + 3 <= 32; i++)
+    {
+        if (code[i] == 0x48 && code[i + 1] == 0x8B &&
+            code[i + 2] == 0xD9)
+        {
+            savesThisInRbx = true;
+            break;
+        }
+    }
+    if (!savesThisInRbx)
+    {
+        return SIZE_MAX;
+    }
+    for (size_t i = 0; i + 7 <= 0x80; i++)
+    {
+        if (code[i] != 0x48 || code[i + 1] != 0x8B ||
+            code[i + 2] != 0x81)
+        {
+            continue;
+        }
+        uint32_t decodedOffset32 = 0;
+        std::memcpy(&decodedOffset32, code + i + 3,
+                    sizeof(decodedOffset32));
+        size_t decodedOffset = decodedOffset32;
+        if (decodedOffset < 0x100 || decodedOffset > 0x500 ||
+            decodedOffset % alignof(void*) != 0)
+        {
+            continue;
+        }
+        bool storesLoadedPointer = false;
+        bool testsLoadedPointer = false;
+        for (size_t j = i + 7; j + 4 <= std::min<size_t>(i + 32, 0x180);
+             j++)
+        {
+            storesLoadedPointer |= code[j] == 0x48 && code[j + 1] == 0x89 &&
+                                   code[j + 2] == 0x45;
+            testsLoadedPointer |= code[j] == 0x48 && code[j + 1] == 0x85 &&
+                                  code[j + 2] == 0xC0;
+        }
+        bool incrementsReference = false;
+        for (size_t j = i + 7; j + 4 <= std::min<size_t>(i + 0x90, 0x180);
+             j++)
+        {
+            if (code[j] == 0xF0 && code[j + 1] == 0xFF &&
+                code[j + 2] == 0x40 && code[j + 3] == 0x08)
+            {
+                incrementsReference = true;
+                break;
+            }
+        }
+        if (storesLoadedPointer && testsLoadedPointer && incrementsReference)
+        {
+            return decodedOffset;
+        }
+    }
+    return SIZE_MAX;
+}
+
 struct ExistingInstructionScanResult
 {
     LONG declaredCount = 0;
@@ -3492,6 +3561,13 @@ static bool InstallExistingBitmapInstructionObserver()
         g_renderDataInstructionCountOffset.store(instructionCountOffset,
                                                   std::memory_order_release);
     }
+    size_t cachedImageOffset = DecodeTopLevelWindow3DCachedImageOffset(
+        g_topLevelWindow3DEnsureRenderDataFunction);
+    if (cachedImageOffset != SIZE_MAX)
+    {
+        g_topLevelWindow3DCachedImageOffset.store(cachedImageOffset,
+                                                  std::memory_order_release);
+    }
     bool writeHookReady = Wh_SetFunctionHook(
         writeInstruction,
         reinterpret_cast<void*>(DrawBitmapInstructionWriteInstructionHook),
@@ -3507,12 +3583,14 @@ static bool InstallExistingBitmapInstructionObserver()
     }
     Wh_Log(L"4x4 existing image observer ready: WriteInstruction=%p "
            L"imageOffset=0x%zx hook=%s list=%s arrayOffset=0x%zx "
-           L"countOffset=0x%zx",
+           L"countOffset=0x%zx cachedImage=%s cachedImageOffset=0x%zx",
            writeInstruction, imageOffset,
            writeHookReady ? L"available" : L"unavailable",
            listLayoutReady ? L"available" : L"unavailable",
            listLayoutReady ? instructionArrayOffset : 0,
-           listLayoutReady ? instructionCountOffset : 0);
+           listLayoutReady ? instructionCountOffset : 0,
+           cachedImageOffset != SIZE_MAX ? L"available" : L"unavailable",
+           cachedImageOffset != SIZE_MAX ? cachedImageOffset : 0);
     return true;
 }
 
@@ -3695,6 +3773,10 @@ static bool InitializeDwmHooks()
         {{L"public: virtual long __cdecl CRenderDataVisual::UpdateRenderData(void)"},
          &g_renderDataVisualUpdateRenderDataOriginal,
          RenderDataVisualUpdateRenderDataHook,
+         true},
+        {{L"private: long __cdecl CTopLevelWindow3D::EnsureRenderData(void)"},
+         &g_topLevelWindow3DEnsureRenderDataFunction,
+         nullptr,
          true},
         {{L"public: long __cdecl CVisualProxy::InsertChild("
            L"class CVisualProxy *,class CVisualProxy *,bool)"},
@@ -4272,6 +4354,34 @@ static void MaintainMeshLayer()
     }
 }
 
+static bool ObserveCachedImageForWindow(void* topLevelWindow3D, HWND hwnd)
+{
+    size_t cachedImageOffset =
+        g_topLevelWindow3DCachedImageOffset.load(std::memory_order_acquire);
+    if (!hwnd || cachedImageOffset == SIZE_MAX ||
+        !HasExactDwmVtableTrusted(topLevelWindow3D, g_topLevelWindow3DVtable))
+    {
+        return false;
+    }
+    void* windowData = FindWindowDataForTopLevelWindow3D(topLevelWindow3D);
+    if (!windowData || GetHwndFromWindowData(windowData) != hwnd)
+    {
+        return false;
+    }
+    void* imageProxy = ReadPointerMember(topLevelWindow3D, cachedImageOffset);
+    if (!IsReadableMemory(imageProxy, sizeof(void*)))
+    {
+        return false;
+    }
+    void* vtable = *static_cast<void**>(imageProxy);
+    if (!IsDwmImageAddress(vtable, sizeof(void*)) ||
+        !RetainObservedImage(imageProxy))
+    {
+        return false;
+    }
+    return RememberObservedRenderImage(topLevelWindow3D, imageProxy);
+}
+
 static void* FindObservedImageForWindow(void* topLevelWindow3D, HWND hwnd)
 {
     if (!hwnd ||
@@ -4775,6 +4885,17 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         {
             void* imageProxy =
                 FindObservedImageForWindow(topLevelWindow3D, hwnd);
+            if (!imageProxy && ObserveCachedImageForWindow(topLevelWindow3D,
+                                                            hwnd))
+            {
+                imageProxy = FindObservedImageForWindow(topLevelWindow3D,
+                                                        hwnd);
+                Wh_Log(L"4x4 cached image source observed: Slot=%d HWND=%p "
+                       L"TopLevelWindow3D=%p Image=%p offset=0x%zx",
+                       i, hwnd, topLevelWindow3D, imageProxy,
+                       g_topLevelWindow3DCachedImageOffset.load(
+                           std::memory_order_acquire));
+            }
             if (!imageProxy && topLevelWindow3D &&
                 g_meshImageRefreshGeneration[i] != generation)
             {
