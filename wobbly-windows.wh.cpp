@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.240
+// @version         0.241
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -415,7 +415,7 @@ struct DiagnosticMesh
     unsigned int indices[54];
 };
 
-static DiagnosticMesh BuildDiagnosticMesh()
+static DiagnosticMesh BuildDiagnosticMesh(float bend = 1.0f)
 {
     DiagnosticMesh mesh = {};
     // Bounded, deliberately asymmetric bend to prove non-affine mesh rendering.
@@ -426,8 +426,8 @@ static DiagnosticMesh BuildDiagnosticMesh()
         for (unsigned int x = 0; x < 4; x++)
         {
             unsigned int i = y * 4 + x;
-            mesh.positions[i] = {32.0f + x * 80.0f + rowShiftX[y],
-                                 80.0f + y * (160.0f / 3.0f) + columnShiftY[x], 0.0f};
+            mesh.positions[i] = {32.0f + x * 80.0f + bend * rowShiftX[y],
+                                 80.0f + y * (160.0f / 3.0f) + bend * columnShiftY[x], 0.0f};
             mesh.uv[i] = {x * (64.0 / 3.0), y * (64.0 / 3.0)};
         }
     }
@@ -624,12 +624,16 @@ struct MeshLayerState
     int slotIndex = -1;
     ULONGLONG generation = 0;
     ULONGLONG expiresAt = 0;
+    ULONGLONG attachedAt = 0;
+    ULONGLONG lastGeometryUpdate = 0;
+    unsigned int geometryUpdates = 0;
     bool detachFailureLogged = false;
 };
 
 MeshLayerState g_meshLayerState;
 std::atomic_bool g_meshLayerActive = false;
 bool g_meshDiagnosticAttempted = false; // Scene thread only; one trial per load.
+ULONGLONG g_lastMeshDiagnosticWake = 0; // Animation thread only.
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 using CBaseObjectAddRef_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
@@ -3504,9 +3508,11 @@ static bool DetachMeshLayer(const wchar_t* reason)
         return false;
     }
     HWND hwnd = state.hwnd;
+    unsigned int geometryUpdates = state.geometryUpdates;
     ReleaseMeshLayerResources(state);
     g_meshLayerActive.store(false, std::memory_order_release);
-    Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s", hwnd, reason);
+    Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s geometryUpdates=%u",
+           hwnd, reason, geometryUpdates);
     return true;
 }
 
@@ -3529,9 +3535,34 @@ static void MaintainMeshLayer()
                !slot.mesh.resizing && !slot.windowStateThrob;
     }
     ReleaseSRWLockShared(&g_animationSlotsLock);
-    bool expired = GetTickCount64() >= g_meshLayerState.expiresAt;
+    ULONGLONG now = GetTickCount64();
+    bool expired = now >= g_meshLayerState.expiresAt;
     if (!keep || expired || g_unloading.load(std::memory_order_acquire))
+    {
         DetachMeshLayer(expired ? L"five-second-test-ended" : L"slot-ended-or-unload");
+        return;
+    }
+    if (now - g_meshLayerState.lastGeometryUpdate < 16)
+        return;
+
+    // Mutate only the separate test layer, always on DWM's scene thread.
+    double phase = (now - g_meshLayerState.attachedAt) * (2.0 * 3.141592653589793 / 1200.0);
+    DiagnosticMesh mesh = BuildDiagnosticMesh(static_cast<float>(std::cos(phase)));
+    long result = UploadDiagnosticMesh(g_meshLayerState.meshProxy, mesh,
+                                       g_meshLayerSymbols.updateMil,
+                                       g_meshLayerSymbols.updateD2D);
+    if (result < 0)
+    {
+        Wh_Log(L"4x4 diagnostic geometry update failed: HWND=%p result=0x%08X",
+               g_meshLayerState.hwnd, static_cast<unsigned int>(result));
+        g_meshLayerBackendAvailable.store(false, std::memory_order_release);
+        DetachMeshLayer(L"geometry-update-failed");
+        return;
+    }
+    g_meshLayerState.lastGeometryUpdate = now;
+    if (++g_meshLayerState.geometryUpdates == 1)
+        Wh_Log(L"4x4 diagnostic geometry updates submitted: HWND=%p periodMs=1200",
+               g_meshLayerState.hwnd);
 }
 
 static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
@@ -3643,12 +3674,14 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             result = E_UNEXPECTED;
             break;
         }
-        pending.expiresAt = GetTickCount64() + 5000;
+        pending.attachedAt = GetTickCount64();
+        pending.lastGeometryUpdate = pending.attachedAt;
+        pending.expiresAt = pending.attachedAt + 5000;
         g_meshLayerState = pending;
         g_meshLayerActive.store(true, std::memory_order_release);
         Wh_Log(L"4x4 diagnostic attached: Slot=%d HWND=%p Root=%p Collection=%p "
                L"Visual=%p BitmapSource=%p abi=MilPoint2D-double "
-               L"source=Checkerboard shape=static-wave size=240x160 uv=pixels "
+               L"source=Checkerboard shape=animated-wave size=240x160 uv=pixels "
                L"vertices=16 indices=54 placement=append durationMs=5000 affine=unchanged",
                slotIndex, hwnd, root, collection, pending.renderVisual, pending.bitmapSource);
         RequestDwmScenePass();
@@ -6402,6 +6435,12 @@ static void UpdateAnimationFrame()
             }
             PostPendingDwmSceneWake(true);
         }
+    }
+    if (g_meshLayerActive.load(std::memory_order_acquire) &&
+        (g_lastMeshDiagnosticWake == 0 || now - g_lastMeshDiagnosticWake >= 16))
+    {
+        g_lastMeshDiagnosticWake = now;
+        RequestDwmScenePass();
     }
     for (int i = 0; i < retireCount; i++)
     {
