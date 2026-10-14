@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.242
+// @version         0.243
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -408,11 +408,18 @@ using MeshUpdateD2D = long(__cdecl*)(
     void*, int, const D2DPoint3F*, const D2DPoint2F*, unsigned int,
     const unsigned int*, unsigned int);
 
+static constexpr unsigned int DIAGNOSTIC_MESH_CELLS = 20;
+static constexpr unsigned int DIAGNOSTIC_MESH_SIDE = DIAGNOSTIC_MESH_CELLS + 1;
+static constexpr unsigned int DIAGNOSTIC_MESH_VERTICES =
+    DIAGNOSTIC_MESH_SIDE * DIAGNOSTIC_MESH_SIDE;
+static constexpr unsigned int DIAGNOSTIC_MESH_INDICES =
+    DIAGNOSTIC_MESH_CELLS * DIAGNOSTIC_MESH_CELLS * 6;
+
 struct DiagnosticMesh
 {
-    D2DPoint3F positions[16];
-    MilPoint2D uv[16];
-    unsigned int indices[54];
+    D2DPoint3F positions[DIAGNOSTIC_MESH_VERTICES];
+    MilPoint2D uv[DIAGNOSTIC_MESH_VERTICES];
+    unsigned int indices[DIAGNOSTIC_MESH_INDICES];
 };
 
 struct DiagnosticPhysicsSnapshot
@@ -424,34 +431,55 @@ struct DiagnosticPhysicsSnapshot
     double width, height;
 };
 
+static void DiagnosticBernsteinBasis(double t, double basis[4])
+{
+    double s = 1.0 - t;
+    basis[0] = s * s * s;
+    basis[1] = 3.0 * s * s * t;
+    basis[2] = 3.0 * s * t * t;
+    basis[3] = t * t * t;
+}
+
 static DiagnosticMesh BuildDiagnosticMesh(float bend = 1.0f)
 {
     DiagnosticMesh mesh = {};
-    // Bounded, deliberately asymmetric bend to prove non-affine mesh rendering.
+    // The 4x4 control shape is sampled into 20x20 Bezier cells.
     constexpr float rowShiftX[4] = {0.0f, 48.0f, -16.0f, 0.0f};
     constexpr float columnShiftY[4] = {0.0f, -12.0f, 12.0f, 0.0f};
-    for (unsigned int y = 0; y < 4; y++)
+    for (unsigned int y = 0; y < DIAGNOSTIC_MESH_SIDE; y++)
     {
-        for (unsigned int x = 0; x < 4; x++)
+        double by[4];
+        DiagnosticBernsteinBasis(static_cast<double>(y) / DIAGNOSTIC_MESH_CELLS, by);
+        for (unsigned int x = 0; x < DIAGNOSTIC_MESH_SIDE; x++)
         {
-            unsigned int i = y * 4 + x;
-            mesh.positions[i] = {32.0f + x * 80.0f + bend * rowShiftX[y],
-                                 80.0f + y * (160.0f / 3.0f) + bend * columnShiftY[x], 0.0f};
-            mesh.uv[i] = {x * (64.0 / 3.0), y * (64.0 / 3.0)};
+            double bx[4], px = 0.0, py = 0.0;
+            DiagnosticBernsteinBasis(static_cast<double>(x) / DIAGNOSTIC_MESH_CELLS, bx);
+            for (unsigned int cy = 0; cy < 4; cy++)
+                for (unsigned int cx = 0; cx < 4; cx++)
+                {
+                    double weight = bx[cx] * by[cy];
+                    px += weight * (32.0 + cx * 80.0 + bend * rowShiftX[cy]);
+                    py += weight * (80.0 + cy * (160.0 / 3.0) +
+                                    bend * columnShiftY[cx]);
+                }
+            unsigned int i = y * DIAGNOSTIC_MESH_SIDE + x;
+            mesh.positions[i] = {static_cast<float>(px), static_cast<float>(py), 0.0f};
+            mesh.uv[i] = {x * (64.0 / DIAGNOSTIC_MESH_CELLS),
+                          y * (64.0 / DIAGNOSTIC_MESH_CELLS)};
         }
     }
     unsigned int n = 0;
-    for (unsigned int y = 0; y < 3; y++)
+    for (unsigned int y = 0; y < DIAGNOSTIC_MESH_CELLS; y++)
     {
-        for (unsigned int x = 0; x < 3; x++)
+        for (unsigned int x = 0; x < DIAGNOSTIC_MESH_CELLS; x++)
         {
-            unsigned int a = y * 4 + x;
+            unsigned int a = y * DIAGNOSTIC_MESH_SIDE + x;
             mesh.indices[n++] = a;
-            mesh.indices[n++] = a + 4;
+            mesh.indices[n++] = a + DIAGNOSTIC_MESH_SIDE;
             mesh.indices[n++] = a + 1;
             mesh.indices[n++] = a + 1;
-            mesh.indices[n++] = a + 4;
-            mesh.indices[n++] = a + 5;
+            mesh.indices[n++] = a + DIAGNOSTIC_MESH_SIDE;
+            mesh.indices[n++] = a + DIAGNOSTIC_MESH_SIDE + 1;
         }
     }
     return mesh;
@@ -519,15 +547,30 @@ static bool BuildPhysicsDiagnosticMesh(const DiagnosticPhysicsSnapshot& physics,
                              maxY > 0.0 ? 24.0 / maxY : 1.0});
     for (unsigned int attempt = 0; attempt < 9; ++attempt, scale *= 0.5)
     {
-        for (unsigned int i = 0; i < 16; ++i)
+        for (unsigned int y = 0; y < DIAGNOSTIC_MESH_SIDE; ++y)
         {
-            mesh.positions[i].x = static_cast<float>(
-                32.0 + (i % 4) * 80.0 + offsetX[i] * scale);
-            mesh.positions[i].y = static_cast<float>(
-                80.0 + (i / 4) * (160.0 / 3.0) + offsetY[i] * scale);
+            double by[4];
+            DiagnosticBernsteinBasis(static_cast<double>(y) / DIAGNOSTIC_MESH_CELLS, by);
+            for (unsigned int x = 0; x < DIAGNOSTIC_MESH_SIDE; ++x)
+            {
+                double bx[4], dx = 0.0, dy = 0.0;
+                DiagnosticBernsteinBasis(static_cast<double>(x) / DIAGNOSTIC_MESH_CELLS, bx);
+                for (unsigned int cy = 0; cy < 4; ++cy)
+                    for (unsigned int cx = 0; cx < 4; ++cx)
+                    {
+                        double weight = bx[cx] * by[cy];
+                        dx += weight * offsetX[cy * 4 + cx];
+                        dy += weight * offsetY[cy * 4 + cx];
+                    }
+                unsigned int i = y * DIAGNOSTIC_MESH_SIDE + x;
+                mesh.positions[i].x = static_cast<float>(
+                    32.0 + x * (240.0 / DIAGNOSTIC_MESH_CELLS) + dx * scale);
+                mesh.positions[i].y = static_cast<float>(
+                    80.0 + y * (160.0 / DIAGNOSTIC_MESH_CELLS) + dy * scale);
+            }
         }
         bool valid = true;
-        for (unsigned int i = 0; i < 54; i += 3)
+        for (unsigned int i = 0; i < DIAGNOSTIC_MESH_INDICES; i += 3)
         {
             const auto& a = mesh.positions[mesh.indices[i]];
             const auto& b = mesh.positions[mesh.indices[i + 1]];
@@ -551,12 +594,14 @@ static long UploadDiagnosticMesh(void* proxy, const DiagnosticMesh& mesh,
     if (!proxy || static_cast<bool>(mil) == static_cast<bool>(d2d))
         return E_NOINTERFACE;
     if (mil)
-        return mil(proxy, 0, mesh.positions, mesh.uv, 16, mesh.indices, 54);
+        return mil(proxy, 0, mesh.positions, mesh.uv,
+                   DIAGNOSTIC_MESH_VERTICES, mesh.indices, DIAGNOSTIC_MESH_INDICES);
 
-    D2DPoint2F uv[16];
-    for (unsigned int i = 0; i < 16; i++)
+    D2DPoint2F uv[DIAGNOSTIC_MESH_VERTICES];
+    for (unsigned int i = 0; i < DIAGNOSTIC_MESH_VERTICES; i++)
         uv[i] = {static_cast<float>(mesh.uv[i].x), static_cast<float>(mesh.uv[i].y)};
-    return d2d(proxy, 0, mesh.positions, uv, 16, mesh.indices, 54);
+    return d2d(proxy, 0, mesh.positions, uv,
+               DIAGNOSTIC_MESH_VERTICES, mesh.indices, DIAGNOSTIC_MESH_INDICES);
 }
 
 struct MeshHostLayout
@@ -3678,10 +3723,14 @@ static void MaintainMeshLayer()
     if (!physicsActive)
         mesh = BuildDiagnosticMesh(0.0f);
     double bendPx = 0.0;
-    for (unsigned int i = 0; i < 16; ++i)
+    for (unsigned int i = 0; i < DIAGNOSTIC_MESH_VERTICES; ++i)
     {
-        double dx = mesh.positions[i].x - (32.0 + (i % 4) * 80.0);
-        double dy = mesh.positions[i].y - (80.0 + (i / 4) * (160.0 / 3.0));
+        double dx = mesh.positions[i].x -
+                    (32.0 + (i % DIAGNOSTIC_MESH_SIDE) *
+                                (240.0 / DIAGNOSTIC_MESH_CELLS));
+        double dy = mesh.positions[i].y -
+                    (80.0 + (i / DIAGNOSTIC_MESH_SIDE) *
+                                (160.0 / DIAGNOSTIC_MESH_CELLS));
         bendPx = std::max(bendPx, std::hypot(dx, dy));
     }
     long result = UploadDiagnosticMesh(g_meshLayerState.meshProxy, mesh,
@@ -3823,11 +3872,13 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         pending.expiresAt = pending.attachedAt + 5000;
         g_meshLayerState = pending;
         g_meshLayerActive.store(true, std::memory_order_release);
-        Wh_Log(L"4x4 diagnostic attached: Slot=%d HWND=%p Root=%p Collection=%p "
+        Wh_Log(L"4x4 physics / 20x20 Bezier diagnostic attached: Slot=%d HWND=%p "
+               L"Root=%p Collection=%p "
                L"Visual=%p BitmapSource=%p abi=MilPoint2D-double "
                L"source=Checkerboard shape=physics-residual size=240x160 uv=pixels "
-               L"vertices=16 indices=54 placement=append durationMs=5000 affine=unchanged",
-               slotIndex, hwnd, root, collection, pending.renderVisual, pending.bitmapSource);
+               L"vertices=%u indices=%u placement=append durationMs=5000 affine=unchanged",
+               slotIndex, hwnd, root, collection, pending.renderVisual,
+               pending.bitmapSource, DIAGNOSTIC_MESH_VERTICES, DIAGNOSTIC_MESH_INDICES);
         RequestDwmScenePass();
         return;
     } while (false);
