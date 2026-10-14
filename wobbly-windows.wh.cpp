@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.241
+// @version         0.242
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -415,6 +415,15 @@ struct DiagnosticMesh
     unsigned int indices[54];
 };
 
+struct DiagnosticPhysicsSnapshot
+{
+    struct Point
+    {
+        double baseX, baseY, x, y;
+    } points[16];
+    double width, height;
+};
+
 static DiagnosticMesh BuildDiagnosticMesh(float bend = 1.0f)
 {
     DiagnosticMesh mesh = {};
@@ -446,6 +455,94 @@ static DiagnosticMesh BuildDiagnosticMesh(float bend = 1.0f)
         }
     }
     return mesh;
+}
+
+static bool BuildPhysicsDiagnosticMesh(const DiagnosticPhysicsSnapshot& physics,
+                                       DiagnosticMesh& mesh)
+{
+    if (!std::isfinite(physics.width) || !std::isfinite(physics.height) ||
+        physics.width < 1.0 || physics.height < 1.0)
+        return false;
+
+    double baseX = 0.0, baseY = 0.0, centerX = 0.0, centerY = 0.0;
+    for (const auto& point : physics.points)
+    {
+        if (!std::isfinite(point.baseX) || !std::isfinite(point.baseY) ||
+            !std::isfinite(point.x) || !std::isfinite(point.y))
+            return false;
+        baseX += point.baseX;
+        baseY += point.baseY;
+        centerX += point.x;
+        centerY += point.y;
+    }
+    baseX /= 16.0; baseY /= 16.0;
+    centerX /= 16.0; centerY /= 16.0;
+
+    double denominatorX = 0.0, denominatorY = 0.0;
+    double numeratorXX = 0.0, numeratorXY = 0.0;
+    double numeratorYX = 0.0, numeratorYY = 0.0;
+    for (const auto& point : physics.points)
+    {
+        double bx = point.baseX - baseX, by = point.baseY - baseY;
+        double px = point.x - centerX, py = point.y - centerY;
+        denominatorX += bx * bx;
+        denominatorY += by * by;
+        numeratorXX += bx * px;
+        numeratorXY += bx * py;
+        numeratorYX += by * px;
+        numeratorYY += by * py;
+    }
+    if (denominatorX < 1.0 || denominatorY < 1.0)
+        return false;
+    double m11 = numeratorXX / denominatorX, m12 = numeratorXY / denominatorX;
+    double m21 = numeratorYX / denominatorY, m22 = numeratorYY / denominatorY;
+
+    double offsetX[16], offsetY[16], maxX = 0.0, maxY = 0.0;
+    for (unsigned int i = 0; i < 16; ++i)
+    {
+        const auto& point = physics.points[i];
+        double bx = point.baseX - baseX, by = point.baseY - baseY;
+        // The parent already applies the affine approximation. Show only the
+        // remaining per-point curvature on the separate checkerboard layer.
+        offsetX[i] = ((point.x - centerX) - m11 * bx - m21 * by) *
+                     (480.0 / physics.width);
+        offsetY[i] = ((point.y - centerY) - m12 * bx - m22 * by) *
+                     (320.0 / physics.height);
+        if (!std::isfinite(offsetX[i]) || !std::isfinite(offsetY[i]))
+            return false;
+        maxX = std::max(maxX, std::abs(offsetX[i]));
+        maxY = std::max(maxY, std::abs(offsetY[i]));
+    }
+
+    mesh = BuildDiagnosticMesh(0.0f);
+    double scale = std::min({1.0, maxX > 0.0 ? 36.0 / maxX : 1.0,
+                             maxY > 0.0 ? 24.0 / maxY : 1.0});
+    for (unsigned int attempt = 0; attempt < 9; ++attempt, scale *= 0.5)
+    {
+        for (unsigned int i = 0; i < 16; ++i)
+        {
+            mesh.positions[i].x = static_cast<float>(
+                32.0 + (i % 4) * 80.0 + offsetX[i] * scale);
+            mesh.positions[i].y = static_cast<float>(
+                80.0 + (i / 4) * (160.0 / 3.0) + offsetY[i] * scale);
+        }
+        bool valid = true;
+        for (unsigned int i = 0; i < 54; i += 3)
+        {
+            const auto& a = mesh.positions[mesh.indices[i]];
+            const auto& b = mesh.positions[mesh.indices[i + 1]];
+            const auto& c = mesh.positions[mesh.indices[i + 2]];
+            double area = (b.x - a.x) * (c.y - a.y) -
+                          (b.y - a.y) * (c.x - a.x);
+            if (!std::isfinite(area) || area >= -1.0)
+            {
+                valid = false;
+                break;
+            }
+        }
+        if (valid) return true;
+    }
+    return false;
 }
 
 static long UploadDiagnosticMesh(void* proxy, const DiagnosticMesh& mesh,
@@ -626,7 +723,10 @@ struct MeshLayerState
     ULONGLONG expiresAt = 0;
     ULONGLONG attachedAt = 0;
     ULONGLONG lastGeometryUpdate = 0;
+    ULONGLONG lastMeshRevision = ULLONG_MAX;
     unsigned int geometryUpdates = 0;
+    double peakBendPx = 0.0;
+    bool bendLogged = false;
     bool detachFailureLogged = false;
 };
 
@@ -3509,10 +3609,11 @@ static bool DetachMeshLayer(const wchar_t* reason)
     }
     HWND hwnd = state.hwnd;
     unsigned int geometryUpdates = state.geometryUpdates;
+    double peakBendPx = state.peakBendPx;
     ReleaseMeshLayerResources(state);
     g_meshLayerActive.store(false, std::memory_order_release);
-    Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s geometryUpdates=%u",
-           hwnd, reason, geometryUpdates);
+    Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s geometryUpdates=%u "
+           L"peakBendPx=%.2f", hwnd, reason, geometryUpdates, peakBendPx);
     return true;
 }
 
@@ -3522,7 +3623,9 @@ static void MaintainMeshLayer()
         !g_meshLayerActive.load(std::memory_order_acquire))
         return;
 
-    bool keep = false;
+    bool keep = false, physicsActive = false;
+    ULONGLONG meshRevision = 0;
+    DiagnosticPhysicsSnapshot physics = {};
     AcquireSRWLockShared(&g_animationSlotsLock);
     if (g_meshLayerState.slotIndex >= 0 &&
         g_meshLayerState.slotIndex < MAX_ANIMATION_SLOTS)
@@ -3533,6 +3636,22 @@ static void MaintainMeshLayer()
                slot.hwnd == g_meshLayerState.hwnd &&
                slot.settings.rendererMode == RendererMode::MeshLayer &&
                !slot.mesh.resizing && !slot.windowStateThrob;
+        if (keep)
+        {
+            meshRevision = slot.meshRevision;
+            physicsActive = slot.mesh.active;
+            if (physicsActive)
+            {
+                physics.width = slot.mesh.width;
+                physics.height = slot.mesh.height;
+                for (unsigned int i = 0; i < 16; ++i)
+                {
+                    const auto& point = slot.mesh.points[i];
+                    physics.points[i] = {point.basePosition.x, point.basePosition.y,
+                                         point.position.x, point.position.y};
+                }
+            }
+        }
     }
     ReleaseSRWLockShared(&g_animationSlotsLock);
     ULONGLONG now = GetTickCount64();
@@ -3542,12 +3661,29 @@ static void MaintainMeshLayer()
         DetachMeshLayer(expired ? L"five-second-test-ended" : L"slot-ended-or-unload");
         return;
     }
-    if (now - g_meshLayerState.lastGeometryUpdate < 16)
+    if (meshRevision == g_meshLayerState.lastMeshRevision ||
+        now - g_meshLayerState.lastGeometryUpdate < 16)
         return;
 
-    // Mutate only the separate test layer, always on DWM's scene thread.
-    double phase = (now - g_meshLayerState.attachedAt) * (2.0 * 3.141592653589793 / 1200.0);
-    DiagnosticMesh mesh = BuildDiagnosticMesh(static_cast<float>(std::cos(phase)));
+    // The source window keeps its existing affine transform; only the test
+    // checkerboard gets the spring mesh's non-affine residual.
+    DiagnosticMesh mesh;
+    if (physicsActive && !BuildPhysicsDiagnosticMesh(physics, mesh))
+    {
+        Wh_Log(L"4x4 diagnostic physics snapshot invalid: HWND=%p revision=%llu",
+               g_meshLayerState.hwnd, meshRevision);
+        DetachMeshLayer(L"invalid-physics-snapshot");
+        return;
+    }
+    if (!physicsActive)
+        mesh = BuildDiagnosticMesh(0.0f);
+    double bendPx = 0.0;
+    for (unsigned int i = 0; i < 16; ++i)
+    {
+        double dx = mesh.positions[i].x - (32.0 + (i % 4) * 80.0);
+        double dy = mesh.positions[i].y - (80.0 + (i / 4) * (160.0 / 3.0));
+        bendPx = std::max(bendPx, std::hypot(dx, dy));
+    }
     long result = UploadDiagnosticMesh(g_meshLayerState.meshProxy, mesh,
                                        g_meshLayerSymbols.updateMil,
                                        g_meshLayerSymbols.updateD2D);
@@ -3560,9 +3696,17 @@ static void MaintainMeshLayer()
         return;
     }
     g_meshLayerState.lastGeometryUpdate = now;
+    g_meshLayerState.lastMeshRevision = meshRevision;
+    g_meshLayerState.peakBendPx = std::max(g_meshLayerState.peakBendPx, bendPx);
+    if (bendPx >= 2.0 && !g_meshLayerState.bendLogged)
+    {
+        g_meshLayerState.bendLogged = true;
+        Wh_Log(L"4x4 diagnostic physics bend visible: HWND=%p revision=%llu "
+               L"residualPx=%.2f", g_meshLayerState.hwnd, meshRevision, bendPx);
+    }
     if (++g_meshLayerState.geometryUpdates == 1)
-        Wh_Log(L"4x4 diagnostic geometry updates submitted: HWND=%p periodMs=1200",
-               g_meshLayerState.hwnd);
+        Wh_Log(L"4x4 diagnostic physics updates submitted: HWND=%p revision=%llu",
+               g_meshLayerState.hwnd, meshRevision);
 }
 
 static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
@@ -3640,7 +3784,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         result = api.createMesh(compositor, &pending.meshProxy);
         if (!requireObject(pending.meshProxy)) break;
         stage = L"UpdateMesh";
-        DiagnosticMesh mesh = BuildDiagnosticMesh();
+        DiagnosticMesh mesh = BuildDiagnosticMesh(0.0f);
         result = UploadDiagnosticMesh(pending.meshProxy, mesh, api.updateMil, api.updateD2D);
         if (result < 0) break;
         stage = L"CreateGroup";
@@ -3681,7 +3825,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         g_meshLayerActive.store(true, std::memory_order_release);
         Wh_Log(L"4x4 diagnostic attached: Slot=%d HWND=%p Root=%p Collection=%p "
                L"Visual=%p BitmapSource=%p abi=MilPoint2D-double "
-               L"source=Checkerboard shape=animated-wave size=240x160 uv=pixels "
+               L"source=Checkerboard shape=physics-residual size=240x160 uv=pixels "
                L"vertices=16 indices=54 placement=append durationMs=5000 affine=unchanged",
                slotIndex, hwnd, root, collection, pending.renderVisual, pending.bitmapSource);
         RequestDwmScenePass();
