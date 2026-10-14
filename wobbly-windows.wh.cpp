@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.244
+// @version         0.245
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -714,7 +714,6 @@ using CCachedVisualImageUpdate_t = long(__cdecl*)(
     void*, const MeshSourceRectF&, const MeshSourceSizeD&, const void*,
     const void*, void*, int);
 using CCachedVisualImageSnapshot_t = long(__cdecl*)(void*, const RECT&);
-using CCachedVisualImageFreeze_t = long(__cdecl*)(void*);
 using CGeometry2dGroupProxyUpdate_t = long(__cdecl*)(void*, void*);
 using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(void*, void*, void**);
 using CRenderDataVisualCreate_t = long(__cdecl*)(void**);
@@ -737,7 +736,6 @@ struct MeshLayerSymbols
     CCompositorCreateProxy_t createCachedImage = nullptr;
     CCachedVisualImageUpdate_t updateCachedImage = nullptr;
     CCachedVisualImageSnapshot_t snapshotCachedImage = nullptr;
-    CCachedVisualImageFreeze_t freezeCachedImage = nullptr;
     void* cachedImageVtable = nullptr;
     CRenderDataVisualCreate_t createVisual = nullptr;
     CRenderDataVisualAddInstruction_t addInstruction = nullptr;
@@ -756,7 +754,7 @@ struct MeshLayerSymbols
     bool HasWindowSourceProbe() const
     {
         return createCachedImage && updateCachedImage && snapshotCachedImage &&
-               freezeCachedImage && cachedImageVtable;
+               cachedImageVtable;
     }
     bool HasVisualPipeline() const
     {
@@ -773,6 +771,8 @@ std::atomic_bool g_meshLayerBackendAvailable = false;
 struct MeshLayerState
 {
     void* bitmapSource = nullptr;
+    void* liveWindowImage = nullptr;
+    RECT liveWindowRect = {};
     void* meshProxy = nullptr;
     void* groupProxy = nullptr;
     void* instruction = nullptr;
@@ -785,8 +785,11 @@ struct MeshLayerState
     ULONGLONG expiresAt = 0;
     ULONGLONG attachedAt = 0;
     ULONGLONG lastGeometryUpdate = 0;
+    ULONGLONG lastWindowSnapshot = 0;
+    ULONGLONG slowestWindowSnapshot = 0;
     ULONGLONG lastMeshRevision = ULLONG_MAX;
     unsigned int geometryUpdates = 0;
+    unsigned int windowSnapshots = 0;
     double peakBendPx = 0.0;
     bool bendLogged = false;
     bool detachFailureLogged = false;
@@ -3232,8 +3235,6 @@ static bool InitializeDwmHooks()
         {{L"public: long __cdecl CCachedVisualImageProxy::Snapshot("
            L"struct tagRECT const &)"},
          &g_meshLayerSymbols.snapshotCachedImage, nullptr, true},
-        {{L"public: long __cdecl CCachedVisualImageProxy::Freeze(void)"},
-         &g_meshLayerSymbols.freezeCachedImage, nullptr, true},
         {{L"public: static long __cdecl CRenderDataVisual::Create("
            L"class CRenderDataVisual * *)"},
          &g_meshLayerSymbols.createVisual, nullptr, true},
@@ -3389,7 +3390,6 @@ static bool InitializeDwmHooks()
     keepValid(g_meshLayerSymbols.createCachedImage);
     keepValid(g_meshLayerSymbols.updateCachedImage);
     keepValid(g_meshLayerSymbols.snapshotCachedImage);
-    keepValid(g_meshLayerSymbols.freezeCachedImage);
     keepValid(g_meshLayerSymbols.createVisual);
     keepValid(g_meshLayerSymbols.addInstruction);
     keepValid(g_meshLayerSymbols.updateRenderData);
@@ -3655,23 +3655,25 @@ static bool IsNativeVisualPointerValid(void* visual)
     return IsDwmImageAddress(*static_cast<void**>(visual), sizeof(void*));
 }
 
-static void ProbeCompleteWindowImage(void* compositor, void* root, HWND hwnd)
+static void ProbeCompleteWindowImage(void* compositor, void* root,
+                                     MeshLayerState& state)
 {
     auto& api = g_meshLayerSymbols;
     if (!api.HasWindowSourceProbe() ||
         !IsDwmImageAddress(api.cachedImageVtable, 3 * sizeof(void*)))
     {
         Wh_Log(L"4x4 window image probe unavailable: HWND=%p "
-               L"(checkerboard remains active)", hwnd);
+               L"(checkerboard remains active)", state.hwnd);
         return;
     }
 
     void* rootProxy = ReadPointerMember(root, g_visualProxyOffset);
     RECT bounds = {};
-    if (!IsVisualProxyPointerValid(rootProxy) || !GetWindowRect(hwnd, &bounds))
+    if (!IsVisualProxyPointerValid(rootProxy) ||
+        !GetWindowRect(state.hwnd, &bounds))
     {
         Wh_Log(L"4x4 window image probe skipped: HWND=%p rootProxy=%p "
-               L"(checkerboard remains active)", hwnd, rootProxy);
+               L"(checkerboard remains active)", state.hwnd, rootProxy);
         return;
     }
     LONG width = bounds.right - bounds.left;
@@ -3679,7 +3681,7 @@ static void ProbeCompleteWindowImage(void* compositor, void* root, HWND hwnd)
     if (width <= 0 || height <= 0 || width > 16384 || height > 16384)
     {
         Wh_Log(L"4x4 window image probe skipped: HWND=%p invalidSize=%ldx%ld",
-               hwnd, width, height);
+               state.hwnd, width, height);
         return;
     }
 
@@ -3692,6 +3694,7 @@ static void ProbeCompleteWindowImage(void* compositor, void* root, HWND hwnd)
     void* image = nullptr;
     const wchar_t* stage = L"CreateCachedImage";
     ULONGLONG started = GetTickCount64();
+    ULONGLONG snapshotTime = 0;
     long result = api.createCachedImage(compositor, &image);
     if (result >= 0 && !image) result = E_UNEXPECTED;
     if (result >= 0)
@@ -3710,25 +3713,37 @@ static void ProbeCompleteWindowImage(void* compositor, void* root, HWND hwnd)
     if (result >= 0)
     {
         stage = L"Snapshot";
+        ULONGLONG snapshotStarted = GetTickCount64();
         result = api.snapshotCachedImage(image, snapshotRect);
+        snapshotTime = GetTickCount64() - snapshotStarted;
     }
-    if (result >= 0)
+    if (result >= 0 && snapshotTime <= 16)
     {
-        stage = L"Freeze";
-        result = api.freezeCachedImage(image);
+        state.liveWindowImage = image;
+        state.liveWindowRect = snapshotRect;
+        state.lastWindowSnapshot = GetTickCount64();
+        state.slowestWindowSnapshot = snapshotTime;
+        state.windowSnapshots = 1;
+    }
+    else if (result >= 0)
+    {
+        stage = L"SnapshotTooSlow";
+        result = E_ABORT;
     }
     Wh_Log(L"4x4 window image probe: HWND=%p Stage=%s result=0x%08X "
            L"Root=%p RootProxy=%p CachedImage=%p size=%ldx%ld elapsedMs=%llu "
-           L"source=CompleteWindowRoot rendered=no affine=unchanged",
-           hwnd, stage, static_cast<unsigned int>(result), root, rootProxy,
-           image, width, height, GetTickCount64() - started);
-    if (image) g_cBaseObjectRelease(image);
+           L"source=CompleteWindowRoot snapshotCap=30fps frozen=no rendered=no "
+           L"affine=unchanged",
+           state.hwnd, stage, static_cast<unsigned int>(result), root,
+           rootProxy, image, width, height, GetTickCount64() - started);
+    if (result < 0 && image) g_cBaseObjectRelease(image);
 }
 
 static void ReleaseMeshLayerResources(MeshLayerState& state)
 {
     void* resources[] = {state.renderVisual, state.instruction, state.groupProxy,
-                         state.meshProxy, state.bitmapSource};
+                         state.meshProxy, state.bitmapSource,
+                         state.liveWindowImage};
     for (void* resource : resources)
         if (resource) g_cBaseObjectRelease(resource);
     if (state.bitmap) state.bitmap->Release();
@@ -3762,12 +3777,55 @@ static bool DetachMeshLayer(const wchar_t* reason)
     }
     HWND hwnd = state.hwnd;
     unsigned int geometryUpdates = state.geometryUpdates;
+    unsigned int windowSnapshots = state.windowSnapshots;
+    ULONGLONG slowestWindowSnapshot = state.slowestWindowSnapshot;
     double peakBendPx = state.peakBendPx;
     ReleaseMeshLayerResources(state);
     g_meshLayerActive.store(false, std::memory_order_release);
     Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s geometryUpdates=%u "
-           L"peakBendPx=%.2f", hwnd, reason, geometryUpdates, peakBendPx);
+           L"peakBendPx=%.2f windowSnapshots=%u slowestSnapshotMs=%llu",
+           hwnd, reason, geometryUpdates, peakBendPx, windowSnapshots,
+           slowestWindowSnapshot);
     return true;
+}
+
+static void RefreshCompleteWindowImage(MeshLayerState& state, ULONGLONG now)
+{
+    if (!state.liveWindowImage || now - state.lastWindowSnapshot < 33)
+        return;
+
+    RECT bounds = {};
+    if (!GetWindowRect(state.hwnd, &bounds) ||
+        bounds.right - bounds.left != state.liveWindowRect.right ||
+        bounds.bottom - bounds.top != state.liveWindowRect.bottom)
+    {
+        Wh_Log(L"4x4 live window source stopped: HWND=%p window-size-changed",
+               state.hwnd);
+        g_cBaseObjectRelease(state.liveWindowImage);
+        state.liveWindowImage = nullptr;
+        return;
+    }
+
+    ULONGLONG started = GetTickCount64();
+    long result = g_meshLayerSymbols.snapshotCachedImage(
+        state.liveWindowImage, state.liveWindowRect);
+    ULONGLONG elapsed = GetTickCount64() - started;
+    if (result < 0 || elapsed > 16)
+    {
+        Wh_Log(L"4x4 live window source stopped: HWND=%p result=0x%08X "
+               L"snapshotMs=%llu frames=%u (affine and checkerboard unchanged)",
+               state.hwnd, static_cast<unsigned int>(result), elapsed,
+               state.windowSnapshots);
+        g_cBaseObjectRelease(state.liveWindowImage);
+        state.liveWindowImage = nullptr;
+        return;
+    }
+    state.lastWindowSnapshot = GetTickCount64();
+    state.slowestWindowSnapshot = std::max(state.slowestWindowSnapshot, elapsed);
+    if (++state.windowSnapshots == 2)
+        Wh_Log(L"4x4 live window source snapshot requests accepted: "
+               L"HWND=%p targetFps=30 "
+               L"rendered=no frozen=no", state.hwnd);
 }
 
 static void MaintainMeshLayer()
@@ -3814,6 +3872,7 @@ static void MaintainMeshLayer()
         DetachMeshLayer(expired ? L"five-second-test-ended" : L"slot-ended-or-unload");
         return;
     }
+    RefreshCompleteWindowImage(g_meshLayerState, now);
     if (meshRevision == g_meshLayerState.lastMeshRevision ||
         now - g_meshLayerState.lastGeometryUpdate < 16)
         return;
@@ -3913,7 +3972,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             ReadPointerMember(collection, sizeof(void*)) != root)
             break;
 
-        ProbeCompleteWindowImage(compositor, root, hwnd);
+        ProbeCompleteWindowImage(compositor, root, pending);
         stage = L"RetainHost";
         if (g_cBaseObjectAddRef)
         {
