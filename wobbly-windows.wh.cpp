@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.243
+// @version         0.244
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -708,6 +708,13 @@ static bool TryIncrementLiveMeshRefCount(volatile LONG* count)
 
 using CCompositorCreateProxy_t = long(__cdecl*)(void*, void**);
 using CBitmapSourceSetBitmap_t = long(__cdecl*)(void*, IWICBitmap*);
+struct MeshSourceRectF { float left, top, right, bottom; };
+struct MeshSourceSizeD { double width, height; };
+using CCachedVisualImageUpdate_t = long(__cdecl*)(
+    void*, const MeshSourceRectF&, const MeshSourceSizeD&, const void*,
+    const void*, void*, int);
+using CCachedVisualImageSnapshot_t = long(__cdecl*)(void*, const RECT&);
+using CCachedVisualImageFreeze_t = long(__cdecl*)(void*);
 using CGeometry2dGroupProxyUpdate_t = long(__cdecl*)(void*, void*);
 using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(void*, void*, void**);
 using CRenderDataVisualCreate_t = long(__cdecl*)(void**);
@@ -727,6 +734,11 @@ struct MeshLayerSymbols
     CDrawMesh2DInstructionCreate_t createInstruction = nullptr;
     CCompositorCreateProxy_t createBitmap = nullptr;
     CBitmapSourceSetBitmap_t setBitmap = nullptr;
+    CCompositorCreateProxy_t createCachedImage = nullptr;
+    CCachedVisualImageUpdate_t updateCachedImage = nullptr;
+    CCachedVisualImageSnapshot_t snapshotCachedImage = nullptr;
+    CCachedVisualImageFreeze_t freezeCachedImage = nullptr;
+    void* cachedImageVtable = nullptr;
     CRenderDataVisualCreate_t createVisual = nullptr;
     CRenderDataVisualAddInstruction_t addInstruction = nullptr;
     CRenderDataVisualUpdateRenderData_t updateRenderData = nullptr;
@@ -741,6 +753,11 @@ struct MeshLayerSymbols
                createMesh && createGroup && updateGroup && createInstruction;
     }
     bool HasImagePipeline() const { return createBitmap && setBitmap; }
+    bool HasWindowSourceProbe() const
+    {
+        return createCachedImage && updateCachedImage && snapshotCachedImage &&
+               freezeCachedImage && cachedImageVtable;
+    }
     bool HasVisualPipeline() const
     {
         return createVisual && addInstruction && updateRenderData &&
@@ -3056,10 +3073,12 @@ static void InitializeMeshLayerDiagnostic()
                  g_cBaseObjectRelease;
     g_meshLayerBackendAvailable.store(ready, std::memory_order_release);
     Wh_Log(L"4x4 diagnostic prerequisites: geometry=%s bitmap=%s visual=%s "
-           L"abi=%s hostLayout=%s attach=%s source=Checkerboard oneShot=1 refOffset=0x%zx",
+           L"windowSourceProbe=%s abi=%s hostLayout=%s attach=%s "
+           L"source=Checkerboard oneShot=1 refOffset=0x%zx",
            symbols.HasGeometryPipeline() ? L"available" : L"unavailable",
            symbols.HasImagePipeline() ? L"available" : L"unavailable",
            symbols.HasVisualPipeline() ? L"available" : L"unavailable",
+           symbols.HasWindowSourceProbe() ? L"available" : L"unavailable",
            symbols.updateMil && !symbols.updateD2D ? L"MilPoint2D-double"
                : (symbols.updateD2D && !symbols.updateMil ? L"D2D_POINT_2F-float"
                                                           : L"unavailable-or-ambiguous"),
@@ -3202,6 +3221,19 @@ static bool InitializeDwmHooks()
          &g_meshLayerSymbols.createBitmap, nullptr, true},
         {{L"public: long __cdecl CBitmapSourceProxy::SetBitmap(struct IWICBitmap *)"},
          &g_meshLayerSymbols.setBitmap, nullptr, true},
+        {{L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CCachedVisualImageProxy>(class CCachedVisualImageProxy * *)"},
+         &g_meshLayerSymbols.createCachedImage, nullptr, true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Update("
+           L"struct MilRectF const &,struct MilSizeD const &,"
+           L"class CRectResourceProxy const *,class CSizeResourceProxy const *,"
+           L"class CVisualProxy *,enum MilBrushMappingMode::Enum)"},
+         &g_meshLayerSymbols.updateCachedImage, nullptr, true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Snapshot("
+           L"struct tagRECT const &)"},
+         &g_meshLayerSymbols.snapshotCachedImage, nullptr, true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Freeze(void)"},
+         &g_meshLayerSymbols.freezeCachedImage, nullptr, true},
         {{L"public: static long __cdecl CRenderDataVisual::Create("
            L"class CRenderDataVisual * *)"},
          &g_meshLayerSymbols.createVisual, nullptr, true},
@@ -3219,6 +3251,8 @@ static bool InitializeDwmHooks()
          &g_meshLayerSymbols.removeFromParent, nullptr, true},
         {{L"const VisualCollection::`vftable'"},
          &g_meshLayerSymbols.collectionVtable, nullptr, true},
+        {{L"const CCachedVisualImageProxy::`vftable'"},
+         &g_meshLayerSymbols.cachedImageVtable, nullptr, true},
         {{L"public: unsigned long __cdecl CBaseObject::Release(void)"},
          &g_cBaseObjectRelease,
          nullptr,
@@ -3352,6 +3386,10 @@ static bool InitializeDwmHooks()
     keepValid(g_meshLayerSymbols.createInstruction);
     keepValid(g_meshLayerSymbols.createBitmap);
     keepValid(g_meshLayerSymbols.setBitmap);
+    keepValid(g_meshLayerSymbols.createCachedImage);
+    keepValid(g_meshLayerSymbols.updateCachedImage);
+    keepValid(g_meshLayerSymbols.snapshotCachedImage);
+    keepValid(g_meshLayerSymbols.freezeCachedImage);
     keepValid(g_meshLayerSymbols.createVisual);
     keepValid(g_meshLayerSymbols.addInstruction);
     keepValid(g_meshLayerSymbols.updateRenderData);
@@ -3617,6 +3655,76 @@ static bool IsNativeVisualPointerValid(void* visual)
     return IsDwmImageAddress(*static_cast<void**>(visual), sizeof(void*));
 }
 
+static void ProbeCompleteWindowImage(void* compositor, void* root, HWND hwnd)
+{
+    auto& api = g_meshLayerSymbols;
+    if (!api.HasWindowSourceProbe() ||
+        !IsDwmImageAddress(api.cachedImageVtable, 3 * sizeof(void*)))
+    {
+        Wh_Log(L"4x4 window image probe unavailable: HWND=%p "
+               L"(checkerboard remains active)", hwnd);
+        return;
+    }
+
+    void* rootProxy = ReadPointerMember(root, g_visualProxyOffset);
+    RECT bounds = {};
+    if (!IsVisualProxyPointerValid(rootProxy) || !GetWindowRect(hwnd, &bounds))
+    {
+        Wh_Log(L"4x4 window image probe skipped: HWND=%p rootProxy=%p "
+               L"(checkerboard remains active)", hwnd, rootProxy);
+        return;
+    }
+    LONG width = bounds.right - bounds.left;
+    LONG height = bounds.bottom - bounds.top;
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384)
+    {
+        Wh_Log(L"4x4 window image probe skipped: HWND=%p invalidSize=%ldx%ld",
+               hwnd, width, height);
+        return;
+    }
+
+    const MeshSourceRectF sourceRect = {0.0f, 0.0f,
+                                        static_cast<float>(width),
+                                        static_cast<float>(height)};
+    const MeshSourceSizeD sourceSize = {static_cast<double>(width),
+                                        static_cast<double>(height)};
+    const RECT snapshotRect = {0, 0, width, height};
+    void* image = nullptr;
+    const wchar_t* stage = L"CreateCachedImage";
+    ULONGLONG started = GetTickCount64();
+    long result = api.createCachedImage(compositor, &image);
+    if (result >= 0 && !image) result = E_UNEXPECTED;
+    if (result >= 0)
+    {
+        stage = L"VerifyImageType";
+        if (!IsReadableMemory(image, sizeof(void*)) ||
+            *static_cast<void**>(image) != api.cachedImageVtable)
+            result = E_NOINTERFACE;
+    }
+    if (result >= 0)
+    {
+        stage = L"BindCompleteWindowRoot";
+        result = api.updateCachedImage(image, sourceRect, sourceSize,
+                                       nullptr, nullptr, rootProxy, 0);
+    }
+    if (result >= 0)
+    {
+        stage = L"Snapshot";
+        result = api.snapshotCachedImage(image, snapshotRect);
+    }
+    if (result >= 0)
+    {
+        stage = L"Freeze";
+        result = api.freezeCachedImage(image);
+    }
+    Wh_Log(L"4x4 window image probe: HWND=%p Stage=%s result=0x%08X "
+           L"Root=%p RootProxy=%p CachedImage=%p size=%ldx%ld elapsedMs=%llu "
+           L"source=CompleteWindowRoot rendered=no affine=unchanged",
+           hwnd, stage, static_cast<unsigned int>(result), root, rootProxy,
+           image, width, height, GetTickCount64() - started);
+    if (image) g_cBaseObjectRelease(image);
+}
+
 static void ReleaseMeshLayerResources(MeshLayerState& state)
 {
     void* resources[] = {state.renderVisual, state.instruction, state.groupProxy,
@@ -3805,6 +3913,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             ReadPointerMember(collection, sizeof(void*)) != root)
             break;
 
+        ProbeCompleteWindowImage(compositor, root, hwnd);
         stage = L"RetainHost";
         if (g_cBaseObjectAddRef)
         {
