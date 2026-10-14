@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.239
+// @version         0.240
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -418,13 +418,16 @@ struct DiagnosticMesh
 static DiagnosticMesh BuildDiagnosticMesh()
 {
     DiagnosticMesh mesh = {};
-    // An undeformed 240x160 rectangle, deliberately independent of window DPI.
+    // Bounded, deliberately asymmetric bend to prove non-affine mesh rendering.
+    constexpr float rowShiftX[4] = {0.0f, 48.0f, -16.0f, 0.0f};
+    constexpr float columnShiftY[4] = {0.0f, -12.0f, 12.0f, 0.0f};
     for (unsigned int y = 0; y < 4; y++)
     {
         for (unsigned int x = 0; x < 4; x++)
         {
             unsigned int i = y * 4 + x;
-            mesh.positions[i] = {32.0f + x * 80.0f, 80.0f + y * (160.0f / 3.0f), 0.0f};
+            mesh.positions[i] = {32.0f + x * 80.0f + rowShiftX[y],
+                                 80.0f + y * (160.0f / 3.0f) + columnShiftY[x], 0.0f};
             mesh.uv[i] = {x * (64.0 / 3.0), y * (64.0 / 3.0)};
         }
     }
@@ -3645,7 +3648,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         g_meshLayerActive.store(true, std::memory_order_release);
         Wh_Log(L"4x4 diagnostic attached: Slot=%d HWND=%p Root=%p Collection=%p "
                L"Visual=%p BitmapSource=%p abi=MilPoint2D-double "
-               L"source=Checkerboard shape=identity size=240x160 uv=pixels "
+               L"source=Checkerboard shape=static-wave size=240x160 uv=pixels "
                L"vertices=16 indices=54 placement=append durationMs=5000 affine=unchanged",
                slotIndex, hwnd, root, collection, pending.renderVisual, pending.bitmapSource);
         RequestDwmScenePass();
