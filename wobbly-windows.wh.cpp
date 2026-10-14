@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.238
+// @version         0.239
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -492,6 +492,18 @@ static bool DecodeMeshHostLayout(const BYTE* code, size_t length,
     layout.parentOffset = parent;
     layout.collectionOffset = collection;
     return true;
+}
+
+// On the verified 23H2 InsertRelative path, a null reference with the first
+// boolean set inserts at index zero. Clearing it appends after existing children.
+static bool HasVerifiedMeshAppendPath(const BYTE* code, size_t length)
+{
+    constexpr BYTE appendPath[] = {
+        0x45,0x84,0xE4,0x0F,0x85,0x17,0x03,0x00,0x00,
+        0x41,0x83,0xFF,0xFF,0x75,0x03,0x44,0x8B,0xFD
+    };
+    return code && length >= 0xA9 + sizeof(appendPath) &&
+           std::memcmp(code + 0xA9, appendPath, sizeof(appendPath)) == 0;
 }
 
 static HRESULT CreateDiagnosticBitmap(IWICBitmap** bitmap)
@@ -2879,8 +2891,9 @@ static void InitializeMeshLayerDiagnostic()
     // The owner link at collection+8 is verified from this InsertRelative body.
     const auto* insert = reinterpret_cast<const BYTE*>(symbols.insertRelative);
     constexpr BYTE ownerLoad[] = {0x48, 0x8B, 0x59, 0x08};
-    layoutReady = layoutReady && IsReadableMemory(insert, 41) &&
+    layoutReady = layoutReady && IsReadableMemory(insert, 0xBB) &&
                   std::memcmp(insert + 37, ownerLoad, sizeof(ownerLoad)) == 0 &&
+                  HasVerifiedMeshAppendPath(insert, 0xBB) &&
                   IsDwmImageAddress(symbols.collectionVtable, sizeof(void*));
     const auto* release = reinterpret_cast<const BYTE*>(g_cBaseObjectRelease);
     g_meshRefCountOffset = IsReadableMemory(release, 17)
@@ -3619,7 +3632,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         insertionAttempted = true;
         // Native collection handles ownership, the connection bit and the virtual
         // structure proxy. No guessed sibling reference or manual SetParent.
-        result = api.insertRelative(collection, pending.renderVisual, nullptr, true, false);
+        result = api.insertRelative(collection, pending.renderVisual, nullptr, false, false);
         if (result < 0) break;
         stage = L"VerifyParent";
         if (ReadPointerMember(pending.renderVisual, g_meshHostLayout.parentOffset) != root)
@@ -3633,7 +3646,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         Wh_Log(L"4x4 diagnostic attached: Slot=%d HWND=%p Root=%p Collection=%p "
                L"Visual=%p BitmapSource=%p abi=MilPoint2D-double "
                L"source=Checkerboard shape=identity size=240x160 uv=pixels "
-               L"vertices=16 indices=54 durationMs=5000 affine=unchanged",
+               L"vertices=16 indices=54 placement=append durationMs=5000 affine=unchanged",
                slotIndex, hwnd, root, collection, pending.renderVisual, pending.bitmapSource);
         RequestDwmScenePass();
         return;
