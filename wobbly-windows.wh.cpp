@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.247
+// @version         0.248
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -318,6 +318,16 @@ bool g_lastDraggedWindowZoomed = false;
 bool g_finalizingMoveSize = false;
 std::atomic_bool g_realDragging = false;
 std::atomic<HWND> g_realDraggedWindow = nullptr;
+std::atomic<ULONGLONG> g_nextDragTraceAt = 0;
+std::atomic<ULONGLONG> g_nextMatrixTraceAt = 0;
+
+static bool ShouldEmitTimedTrace(std::atomic<ULONGLONG>& nextAt)
+{
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG expected = nextAt.load(std::memory_order_relaxed);
+    return now >= expected && nextAt.compare_exchange_strong(
+                                  expected, now + 1000, std::memory_order_relaxed);
+}
 using OnPositionChange_t = void(__cdecl*)(void* pThis, void* pWindowData, bool unknown);
 OnPositionChange_t g_onPositionChangeOriginal = nullptr;
 using FindWindowDataByHwnd_t = void*(__cdecl*)(void* pThis, HWND hwnd);
@@ -789,6 +799,7 @@ MeshHostLayout g_meshHostLayout;
 size_t g_meshRefCountOffset = SIZE_MAX;
 bool g_meshSiblingPathVerified = false;
 std::atomic_bool g_meshLayerBackendAvailable = false;
+static constexpr bool ENABLE_MESH_LAYER_VISUAL_TEST = false;
 
 struct MeshLayerState
 {
@@ -3115,7 +3126,9 @@ static void InitializeMeshLayerDiagnostic()
                : (symbols.updateD2D && !symbols.updateMil ? L"D2D_POINT_2F-float"
                                                           : L"unavailable-or-ambiguous"),
            layoutReady ? L"verified-23H2" : L"unverified",
-           ready ? L"enabled" : L"disabled-affine-fallback", g_meshRefCountOffset);
+           !ENABLE_MESH_LAYER_VISUAL_TEST ? L"disabled-for-drag-isolation"
+               : (ready ? L"enabled" : L"disabled-affine-fallback"),
+           g_meshRefCountOffset);
 }
 
 static bool InitializeDwmHooks()
@@ -4349,7 +4362,8 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             transitionBindResult =
                 g_cVisualProxySetTransform(transitionVisualProxy, matrixTransformProxy);
         }
-        if (rendererMode == RendererMode::MeshLayer && topLevelVisualProxy &&
+        if (ENABLE_MESH_LAYER_VISUAL_TEST &&
+            rendererMode == RendererMode::MeshLayer && topLevelVisualProxy &&
             ((topLevelBindingAttempted && topLevelBindResult >= 0) ||
              (!topLevelBindingAttempted && previouslyTopLevelAttached)))
         {
@@ -6379,6 +6393,8 @@ static void HandleMoveSizeStart(HWND hwnd)
     g_monitorTransitionRebaseUntil = 0;
     g_hasLastMousePosition = true;
     g_realDragging = true;
+    g_nextDragTraceAt.store(0, std::memory_order_relaxed);
+    g_nextMatrixTraceAt.store(0, std::memory_order_relaxed);
     g_realResizing = operationTypeKnown && operationResizing;
     g_moveTypeKnown = operationTypeKnown;
     g_dragResizeWobbleEnabled = activeSettings.resizeWobbleEnabled;
@@ -6388,6 +6404,11 @@ static void HandleMoveSizeStart(HWND hwnd)
         RetireAnimationSlot(slotIndex);
         return;
     }
+    Wh_Log(L"DRAG TRACE START: HWND=%p Slot=%d Renderer=%s size=%dx%d "
+           L"resizing=%d typeKnown=%d",
+           hwnd, slotIndex,
+           activeSettings.rendererMode == RendererMode::MeshLayer ? L"mesh-layer" : L"affine",
+           width, height, g_realResizing, g_moveTypeKnown);
     RequestDwmScenePass();
 }
 
@@ -6597,6 +6618,16 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
     MilMatrix3x2D matrix = {m11, m12, m21, m22, translationX, translationY};
     long updateResult = UpdateMatrixTransformProxy(snapshot.matrixTransformProxy, matrix);
     finishUpdate(updateResult, false);
+    if (g_realDragging.load(std::memory_order_relaxed) &&
+        snapshot.hwnd == g_realDraggedWindow.load(std::memory_order_relaxed) &&
+        ShouldEmitTimedTrace(g_nextMatrixTraceAt))
+    {
+        Wh_Log(L"DRAG TRACE MATRIX: HWND=%p revision=%llu result=0x%08X "
+               L"m11=%.4f m12=%.4f m21=%.4f m22=%.4f dx=%.2f dy=%.2f",
+               snapshot.hwnd, snapshot.meshRevision,
+               static_cast<unsigned int>(updateResult), matrix.m11, matrix.m12,
+               matrix.m21, matrix.m22, matrix.dx, matrix.dy);
+    }
 }
 
 static void RestorePendingAnimationIdentities()
@@ -7133,6 +7164,10 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         slot.meshIdentityPending = false;
         slot.meshRevision++;
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
+        if (ShouldEmitTimedTrace(g_nextDragTraceAt))
+            Wh_Log(L"DRAG TRACE LOCATION: HWND=%p Slot=%d transformAttached=0 "
+                   L"delta=(%.1f,%.1f) resizing=%d",
+                   hwnd, slotIndex, windowDeltaX, windowDeltaY, g_realResizing);
         g_lastDraggedWindowRect = rect;
         g_lastDraggedWindowZoomed = IsZoomed(hwnd) != FALSE;
         g_lastMousePosition = mousePosition;
@@ -7252,6 +7287,11 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     slot.meshIdentityPending = false;
     slot.meshRevision++;
     ReleaseSRWLockExclusive(&g_animationSlotsLock);
+    if (ShouldEmitTimedTrace(g_nextDragTraceAt))
+        Wh_Log(L"DRAG TRACE LOCATION: HWND=%p Slot=%d transformAttached=1 "
+               L"delta=(%.1f,%.1f) resizing=%d rebase=%d",
+               hwnd, slotIndex, windowDeltaX, windowDeltaY,
+               g_realResizing, rebaseMonitorTransition);
     g_lastDraggedWindowRect = rect;
     g_lastDraggedWindowZoomed = windowZoomed;
     g_lastMousePosition = mousePosition;
