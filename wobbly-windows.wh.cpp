@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.249
+// @version         0.250
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -92,7 +92,7 @@ the combined mod is not offered under GPLv2.
 
 - Renderer: "affine"
   $name: Renderer
-  $description: Experimental diagnostic on validated 23H2 layouts. Shows one colored checkerboard for up to 5 seconds on the first normal drag after loading. Affine wobble stays enabled; this is not live window bending.
+  $description: Experimental five-second window-image inset test on validated 23H2 layouts. Affine wobble stays enabled; this is not yet live window bending.
   $options:
   - "affine": "Affine (stable)"
   - "mesh-layer": "True 4x4 mesh layer (experimental)"
@@ -821,9 +821,12 @@ struct MeshLayerState
     ULONGLONG lastGeometryUpdate = 0;
     ULONGLONG lastWindowSnapshot = 0;
     ULONGLONG slowestWindowSnapshot = 0;
+    ULONGLONG lastVisualPublish = 0;
+    ULONGLONG slowestVisualPublish = 0;
     ULONGLONG lastMeshRevision = ULLONG_MAX;
     unsigned int geometryUpdates = 0;
     unsigned int windowSnapshots = 0;
+    unsigned int visualPublishes = 0;
     double peakBendPx = 0.0;
     bool bendLogged = false;
     bool detachFailureLogged = false;
@@ -3852,15 +3855,18 @@ static bool DetachMeshLayer(const wchar_t* reason)
     unsigned int geometryUpdates = state.geometryUpdates;
     unsigned int windowSnapshots = state.windowSnapshots;
     ULONGLONG slowestWindowSnapshot = state.slowestWindowSnapshot;
+    unsigned int visualPublishes = state.visualPublishes;
+    ULONGLONG slowestVisualPublish = state.slowestVisualPublish;
     double peakBendPx = state.peakBendPx;
     bool liveFlat = state.liveFlat;
     ReleaseMeshLayerResources(state);
     g_meshLayerActive.store(false, std::memory_order_release);
     Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s mode=%s geometryUpdates=%u "
-           L"peakBendPx=%.2f windowSnapshots=%u slowestSnapshotMs=%llu",
+           L"peakBendPx=%.2f windowSnapshots=%u slowestSnapshotMs=%llu "
+           L"visualPublishes=%u slowestPublishMs=%llu",
            hwnd, reason, liveFlat ? L"live-inset" : L"checkerboard",
            geometryUpdates, peakBendPx, windowSnapshots,
-           slowestWindowSnapshot);
+           slowestWindowSnapshot, visualPublishes, slowestVisualPublish);
     return true;
 }
 
@@ -3908,8 +3914,31 @@ static void RefreshCompleteWindowImage(MeshLayerState& state, ULONGLONG now)
     if (++state.windowSnapshots == 2)
         Wh_Log(L"4x4 live window source snapshot requests accepted: "
                L"HWND=%p targetFps=30 "
-               L"rendered=%s frozen=no", state.hwnd,
+               L"rendered=%s frameAdvancement=unverified", state.hwnd,
                state.liveFlat ? L"live-inset-test" : L"no");
+    if (!state.liveFlat ||
+        GetTickCount64() - state.lastVisualPublish < 100)
+        return;
+
+    // Snapshot succeeds without proving that an attached draw instruction
+    // invalidates. Republish this test visual at most 10 times per second.
+    ULONGLONG publishStarted = GetTickCount64();
+    result = g_meshLayerSymbols.updateRenderData(state.renderVisual);
+    elapsed = GetTickCount64() - publishStarted;
+    if (result < 0 || elapsed > 16)
+    {
+        Wh_Log(L"4x4 live inset republish stopped: HWND=%p result=0x%08X "
+               L"publishMs=%llu publishes=%u",
+               state.hwnd, static_cast<unsigned int>(result), elapsed,
+               state.visualPublishes);
+        state.liveSourceFailed = true;
+        return;
+    }
+    state.lastVisualPublish = GetTickCount64();
+    state.slowestVisualPublish = std::max(state.slowestVisualPublish, elapsed);
+    if (++state.visualPublishes == 1)
+        Wh_Log(L"4x4 live inset republish requests accepted: HWND=%p "
+               L"targetFps=10 frameAdvancement=unverified", state.hwnd);
 }
 
 static void MaintainMeshLayer()
@@ -4157,13 +4186,14 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                 liveVisualProxy, pending.liveVisualTransformProxy);
             if (result < 0) break;
             pending.attachedAt = GetTickCount64();
+            pending.lastVisualPublish = pending.attachedAt;
             pending.expiresAt = pending.attachedAt + 5000;
             g_meshLayerState = pending;
             g_meshLayerActive.store(true, std::memory_order_release);
             Wh_Log(L"4x4 live window-image inset test attached: Slot=%d HWND=%p "
                    L"Root=%p SiblingCollection=%p Visual=%p CachedImage=%p "
                    L"Transform=%p size=%ldx%ld scale=0.22 "
-                   L"snapshotCap=30fps durationMs=5000 mesh=no "
+                   L"snapshotCap=30fps republishCap=10fps durationMs=5000 mesh=no "
                    L"affine=original-unchanged",
                    slotIndex, hwnd, root, siblingCollection, pending.renderVisual,
                    pending.liveWindowImage, pending.liveVisualTransformProxy,
