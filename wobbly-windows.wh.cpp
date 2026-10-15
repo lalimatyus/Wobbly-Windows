@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.250
+// @version         0.251
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -92,7 +92,7 @@ the combined mod is not offered under GPLv2.
 
 - Renderer: "affine"
   $name: Renderer
-  $description: Experimental five-second window-image inset test on validated 23H2 layouts. Affine wobble stays enabled; this is not yet live window bending.
+  $description: Experimental five-second live-source inset test on validated 23H2 layouts. Affine wobble stays enabled; this is not yet window bending.
   $options:
   - "affine": "Affine (stable)"
   - "mesh-layer": "True 4x4 mesh layer (experimental)"
@@ -779,8 +779,7 @@ struct MeshLayerSymbols
     bool HasImagePipeline() const { return createBitmap && setBitmap; }
     bool HasWindowSourceProbe() const
     {
-        return createCachedImage && updateCachedImage && snapshotCachedImage &&
-               cachedImageVtable;
+        return createCachedImage && updateCachedImage && cachedImageVtable;
     }
     bool HasLiveFlatImagePipeline() const
     {
@@ -805,6 +804,7 @@ struct MeshLayerState
 {
     void* bitmapSource = nullptr;
     void* liveWindowImage = nullptr;
+    void* sourceVisualProxy = nullptr; // Borrowed from retained hostVisual.
     RECT liveWindowRect = {};
     void* meshProxy = nullptr;
     void* groupProxy = nullptr;
@@ -819,14 +819,8 @@ struct MeshLayerState
     ULONGLONG expiresAt = 0;
     ULONGLONG attachedAt = 0;
     ULONGLONG lastGeometryUpdate = 0;
-    ULONGLONG lastWindowSnapshot = 0;
-    ULONGLONG slowestWindowSnapshot = 0;
-    ULONGLONG lastVisualPublish = 0;
-    ULONGLONG slowestVisualPublish = 0;
     ULONGLONG lastMeshRevision = ULLONG_MAX;
     unsigned int geometryUpdates = 0;
-    unsigned int windowSnapshots = 0;
-    unsigned int visualPublishes = 0;
     double peakBendPx = 0.0;
     bool bendLogged = false;
     bool detachFailureLogged = false;
@@ -3765,11 +3759,9 @@ static void ProbeCompleteWindowImage(void* compositor, void* root,
                                         static_cast<float>(height)};
     const MeshSourceSizeD sourceSize = {static_cast<double>(width),
                                         static_cast<double>(height)};
-    const RECT snapshotRect = {0, 0, width, height};
     void* image = nullptr;
     const wchar_t* stage = L"CreateCachedImage";
     ULONGLONG started = GetTickCount64();
-    ULONGLONG snapshotTime = 0;
     long result = api.createCachedImage(compositor, &image);
     if (result >= 0 && !image) result = E_UNEXPECTED;
     if (result >= 0)
@@ -3787,27 +3779,13 @@ static void ProbeCompleteWindowImage(void* compositor, void* root,
     }
     if (result >= 0)
     {
-        stage = L"Snapshot";
-        ULONGLONG snapshotStarted = GetTickCount64();
-        result = api.snapshotCachedImage(image, snapshotRect);
-        snapshotTime = GetTickCount64() - snapshotStarted;
-    }
-    if (result >= 0 && snapshotTime <= 16)
-    {
         state.liveWindowImage = image;
-        state.liveWindowRect = snapshotRect;
-        state.lastWindowSnapshot = GetTickCount64();
-        state.slowestWindowSnapshot = snapshotTime;
-        state.windowSnapshots = 1;
-    }
-    else if (result >= 0)
-    {
-        stage = L"SnapshotTooSlow";
-        result = E_ABORT;
+        state.sourceVisualProxy = rootProxy;
+        state.liveWindowRect = {0, 0, width, height};
     }
     Wh_Log(L"4x4 window image probe: HWND=%p Stage=%s result=0x%08X "
            L"Root=%p RootProxy=%p CachedImage=%p size=%ldx%ld elapsedMs=%llu "
-           L"source=CompleteWindowRoot snapshotCap=30fps frozen=no rendered=no "
+           L"source=CompleteWindowRoot snapshot=none liveBinding=unverified rendered=no "
            L"affine=unchanged",
            state.hwnd, stage, static_cast<unsigned int>(result), root,
            rootProxy, image, width, height, GetTickCount64() - started);
@@ -3853,26 +3831,20 @@ static bool DetachMeshLayer(const wchar_t* reason)
     }
     HWND hwnd = state.hwnd;
     unsigned int geometryUpdates = state.geometryUpdates;
-    unsigned int windowSnapshots = state.windowSnapshots;
-    ULONGLONG slowestWindowSnapshot = state.slowestWindowSnapshot;
-    unsigned int visualPublishes = state.visualPublishes;
-    ULONGLONG slowestVisualPublish = state.slowestVisualPublish;
     double peakBendPx = state.peakBendPx;
     bool liveFlat = state.liveFlat;
     ReleaseMeshLayerResources(state);
     g_meshLayerActive.store(false, std::memory_order_release);
-    Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s mode=%s geometryUpdates=%u "
-           L"peakBendPx=%.2f windowSnapshots=%u slowestSnapshotMs=%llu "
-           L"visualPublishes=%u slowestPublishMs=%llu",
+    Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s mode=%s "
+           L"geometryUpdates=%u peakBendPx=%.2f snapshot=none",
            hwnd, reason, liveFlat ? L"live-inset" : L"checkerboard",
-           geometryUpdates, peakBendPx, windowSnapshots,
-           slowestWindowSnapshot, visualPublishes, slowestVisualPublish);
+           geometryUpdates, peakBendPx);
     return true;
 }
 
-static void RefreshCompleteWindowImage(MeshLayerState& state, ULONGLONG now)
+static void ValidateCompleteWindowImage(MeshLayerState& state)
 {
-    if (!state.liveWindowImage || now - state.lastWindowSnapshot < 33)
+    if (!state.liveWindowImage)
         return;
 
     RECT bounds = {};
@@ -3880,65 +3852,20 @@ static void RefreshCompleteWindowImage(MeshLayerState& state, ULONGLONG now)
         bounds.right - bounds.left != state.liveWindowRect.right ||
         bounds.bottom - bounds.top != state.liveWindowRect.bottom)
     {
-        Wh_Log(L"4x4 live window source stopped: HWND=%p window-size-changed",
+        Wh_Log(L"4x4 live window source stopped: HWND=%p size-changed-or-closed",
                state.hwnd);
-        if (state.liveFlat) state.liveSourceFailed = true;
-        else
-        {
-            g_cBaseObjectRelease(state.liveWindowImage);
-            state.liveWindowImage = nullptr;
-        }
-        return;
-    }
-
-    ULONGLONG started = GetTickCount64();
-    long result = g_meshLayerSymbols.snapshotCachedImage(
-        state.liveWindowImage, state.liveWindowRect);
-    ULONGLONG elapsed = GetTickCount64() - started;
-    if (result < 0 || elapsed > 16)
-    {
-        Wh_Log(L"4x4 live window source stopped: HWND=%p result=0x%08X "
-               L"snapshotMs=%llu frames=%u",
-               state.hwnd, static_cast<unsigned int>(result), elapsed,
-               state.windowSnapshots);
-        if (state.liveFlat) state.liveSourceFailed = true;
-        else
-        {
-            g_cBaseObjectRelease(state.liveWindowImage);
-            state.liveWindowImage = nullptr;
-        }
-        return;
-    }
-    state.lastWindowSnapshot = GetTickCount64();
-    state.slowestWindowSnapshot = std::max(state.slowestWindowSnapshot, elapsed);
-    if (++state.windowSnapshots == 2)
-        Wh_Log(L"4x4 live window source snapshot requests accepted: "
-               L"HWND=%p targetFps=30 "
-               L"rendered=%s frameAdvancement=unverified", state.hwnd,
-               state.liveFlat ? L"live-inset-test" : L"no");
-    if (!state.liveFlat ||
-        GetTickCount64() - state.lastVisualPublish < 100)
-        return;
-
-    // Snapshot succeeds without proving that an attached draw instruction
-    // invalidates. Republish this test visual at most 10 times per second.
-    ULONGLONG publishStarted = GetTickCount64();
-    result = g_meshLayerSymbols.updateRenderData(state.renderVisual);
-    elapsed = GetTickCount64() - publishStarted;
-    if (result < 0 || elapsed > 16)
-    {
-        Wh_Log(L"4x4 live inset republish stopped: HWND=%p result=0x%08X "
-               L"publishMs=%llu publishes=%u",
-               state.hwnd, static_cast<unsigned int>(result), elapsed,
-               state.visualPublishes);
         state.liveSourceFailed = true;
         return;
     }
-    state.lastVisualPublish = GetTickCount64();
-    state.slowestVisualPublish = std::max(state.slowestVisualPublish, elapsed);
-    if (++state.visualPublishes == 1)
-        Wh_Log(L"4x4 live inset republish requests accepted: HWND=%p "
-               L"targetFps=10 frameAdvancement=unverified", state.hwnd);
+    if (state.liveFlat &&
+        (!IsVisualProxyPointerValid(state.sourceVisualProxy) ||
+         ReadPointerMember(state.hostVisual, g_visualProxyOffset) !=
+             state.sourceVisualProxy))
+    {
+        Wh_Log(L"4x4 live window source stopped: HWND=%p root-proxy-changed",
+               state.hwnd);
+        state.liveSourceFailed = true;
+    }
 }
 
 static void MaintainMeshLayer()
@@ -3985,7 +3912,7 @@ static void MaintainMeshLayer()
         DetachMeshLayer(expired ? L"five-second-test-ended" : L"slot-ended-or-unload");
         return;
     }
-    RefreshCompleteWindowImage(g_meshLayerState, now);
+    ValidateCompleteWindowImage(g_meshLayerState);
     if (g_meshLayerState.liveSourceFailed)
     {
         DetachMeshLayer(L"live-source-stopped");
@@ -4186,14 +4113,13 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                 liveVisualProxy, pending.liveVisualTransformProxy);
             if (result < 0) break;
             pending.attachedAt = GetTickCount64();
-            pending.lastVisualPublish = pending.attachedAt;
             pending.expiresAt = pending.attachedAt + 5000;
             g_meshLayerState = pending;
             g_meshLayerActive.store(true, std::memory_order_release);
             Wh_Log(L"4x4 live window-image inset test attached: Slot=%d HWND=%p "
                    L"Root=%p SiblingCollection=%p Visual=%p CachedImage=%p "
                    L"Transform=%p size=%ldx%ld scale=0.22 "
-                   L"snapshotCap=30fps republishCap=10fps durationMs=5000 mesh=no "
+                   L"snapshot=none durationMs=5000 mesh=no "
                    L"affine=original-unchanged",
                    slotIndex, hwnd, root, siblingCollection, pending.renderVisual,
                    pending.liveWindowImage, pending.liveVisualTransformProxy,
