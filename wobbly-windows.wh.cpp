@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.246
+// @version         0.247
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1187,7 +1187,7 @@ static void FinalizeRetiringSlots();
 static void EnsurePendingMatrixTransformProxies();
 static void MaintainMeshLayer();
 static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
-                               void* topLevelWindow);
+                               void* topLevelWindow, void* affineTransform);
 static bool HasAnyAnimationSlots();
 static int GetPointIndex(int x, int y);
 static bool ResetMatrixTransformProxy(void* matrixTransformProxy);
@@ -4002,7 +4002,7 @@ static void MaintainMeshLayer()
 }
 
 static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
-                               void* topLevelWindow)
+                               void* topLevelWindow, void* affineTransform)
 {
     if (!IsOnDwmSceneThread() || g_unloading.load(std::memory_order_acquire) ||
         !g_meshLayerBackendAvailable.load(std::memory_order_acquire) ||
@@ -4014,6 +4014,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
     const auto& slot = g_animationSlots[slotIndex];
     bool eligible = slot.active && !slot.retiring && slot.dragging &&
                     slot.generation == generation && slot.hwnd == hwnd &&
+                    slot.matrixTransformProxy == affineTransform &&
                     !slot.mesh.resizing && !slot.windowStateThrob;
     ReleaseSRWLockShared(&g_animationSlotsLock);
     if (!eligible) return;
@@ -4064,7 +4065,8 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                 break;
         }
         pending.hostVisual = root;
-        void* siblingCollection = pending.liveWindowImage &&
+        void* siblingCollection = pending.liveWindowImage && affineTransform &&
+                                   g_cVisualProxySetTransform &&
                                    api.HasLiveFlatImagePipeline()
                                        ? FindVerifiedMeshSiblingCollection(root)
                                        : nullptr;
@@ -4097,6 +4099,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                                       g_meshHostLayout.parentOffset) != nullptr;
                 break;
             }
+            pending.liveFlat = true;
             stage = L"VerifyLiveSibling";
             if (ReadPointerMember(pending.renderVisual,
                                   g_meshHostLayout.parentOffset) !=
@@ -4105,7 +4108,16 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                 result = E_UNEXPECTED;
                 break;
             }
-            pending.liveFlat = true;
+            stage = L"BindLiveAffineTransform";
+            void* liveVisualProxy =
+                ReadPointerMember(pending.renderVisual, g_visualProxyOffset);
+            if (!IsVisualProxyPointerValid(liveVisualProxy))
+            {
+                result = E_NOINTERFACE;
+                break;
+            }
+            result = g_cVisualProxySetTransform(liveVisualProxy, affineTransform);
+            if (result < 0) break;
             pending.attachedAt = GetTickCount64();
             pending.expiresAt = pending.attachedAt + 5000;
             g_meshLayerState = pending;
@@ -4113,7 +4125,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             Wh_Log(L"4x4 live flat window-image test attached: Slot=%d HWND=%p "
                    L"Root=%p SiblingCollection=%p Visual=%p CachedImage=%p "
                    L"size=%ldx%ld snapshotCap=30fps durationMs=5000 "
-                   L"mesh=no affine=unchanged",
+                   L"mesh=no affine=shared-with-original",
                    slotIndex, hwnd, root, siblingCollection, pending.renderVisual,
                    pending.liveWindowImage, pending.liveWindowRect.right,
                    pending.liveWindowRect.bottom);
@@ -4121,8 +4133,10 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             return;
         }
         Wh_Log(L"4x4 live flat window-image test unavailable: HWND=%p "
-               L"siblingCollection=%p drawBitmap=%p (checkerboard fallback)",
-               hwnd, siblingCollection, api.createBitmapInstruction);
+               L"siblingCollection=%p drawBitmap=%p affineTransform=%p "
+               L"setTransform=%p (checkerboard fallback)",
+               hwnd, siblingCollection, api.createBitmapInstruction,
+               affineTransform, g_cVisualProxySetTransform);
         stage = L"CreateWicBitmap";
         result = CreateDiagnosticBitmap(&pending.bitmap);
         if (!requireObject(pending.bitmap)) break;
@@ -4335,9 +4349,12 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             transitionBindResult =
                 g_cVisualProxySetTransform(transitionVisualProxy, matrixTransformProxy);
         }
-        if (rendererMode == RendererMode::MeshLayer && topLevelVisualProxy)
+        if (rendererMode == RendererMode::MeshLayer && topLevelVisualProxy &&
+            ((topLevelBindingAttempted && topLevelBindResult >= 0) ||
+             (!topLevelBindingAttempted && previouslyTopLevelAttached)))
         {
-            TryAttachMeshLayer(i, generation, hwnd, topLevelWindow);
+            TryAttachMeshLayer(i, generation, hwnd, topLevelWindow,
+                               matrixTransformProxy);
         }
         bool logBinding = false;
         bool logBindingFailure = false;
