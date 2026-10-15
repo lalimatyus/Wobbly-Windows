@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.248
+// @version         0.249
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -799,7 +799,7 @@ MeshHostLayout g_meshHostLayout;
 size_t g_meshRefCountOffset = SIZE_MAX;
 bool g_meshSiblingPathVerified = false;
 std::atomic_bool g_meshLayerBackendAvailable = false;
-static constexpr bool ENABLE_MESH_LAYER_VISUAL_TEST = false;
+static constexpr bool ENABLE_MESH_LAYER_VISUAL_TEST = true;
 
 struct MeshLayerState
 {
@@ -810,6 +810,7 @@ struct MeshLayerState
     void* groupProxy = nullptr;
     void* instruction = nullptr;
     void* renderVisual = nullptr;
+    void* liveVisualTransformProxy = nullptr;
     void* hostVisual = nullptr; // Owned reference, released only after detach.
     IWICBitmap* bitmap = nullptr;
     HWND hwnd = nullptr;
@@ -3115,7 +3116,7 @@ static void InitializeMeshLayerDiagnostic()
     g_meshLayerBackendAvailable.store(ready, std::memory_order_release);
     Wh_Log(L"4x4 diagnostic prerequisites: geometry=%s bitmap=%s visual=%s "
            L"windowSourceProbe=%s liveFlat=%s abi=%s hostLayout=%s attach=%s "
-           L"source=LiveFlatPreferred/CheckerboardFallback oneShot=1 refOffset=0x%zx",
+           L"source=LiveInsetPreferred/CheckerboardFallback oneShot=1 refOffset=0x%zx",
            symbols.HasGeometryPipeline() ? L"available" : L"unavailable",
            symbols.HasImagePipeline() ? L"available" : L"unavailable",
            symbols.HasVisualPipeline() ? L"available" : L"unavailable",
@@ -3812,7 +3813,8 @@ static void ProbeCompleteWindowImage(void* compositor, void* root,
 
 static void ReleaseMeshLayerResources(MeshLayerState& state)
 {
-    void* resources[] = {state.renderVisual, state.instruction, state.groupProxy,
+    void* resources[] = {state.renderVisual, state.liveVisualTransformProxy,
+                         state.instruction, state.groupProxy,
                          state.meshProxy, state.bitmapSource,
                          state.liveWindowImage};
     for (void* resource : resources)
@@ -3856,7 +3858,7 @@ static bool DetachMeshLayer(const wchar_t* reason)
     g_meshLayerActive.store(false, std::memory_order_release);
     Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s mode=%s geometryUpdates=%u "
            L"peakBendPx=%.2f windowSnapshots=%u slowestSnapshotMs=%llu",
-           hwnd, reason, liveFlat ? L"live-flat" : L"checkerboard",
+           hwnd, reason, liveFlat ? L"live-inset" : L"checkerboard",
            geometryUpdates, peakBendPx, windowSnapshots,
            slowestWindowSnapshot);
     return true;
@@ -3907,7 +3909,7 @@ static void RefreshCompleteWindowImage(MeshLayerState& state, ULONGLONG now)
         Wh_Log(L"4x4 live window source snapshot requests accepted: "
                L"HWND=%p targetFps=30 "
                L"rendered=%s frozen=no", state.hwnd,
-               state.liveFlat ? L"live-flat-test" : L"no");
+               state.liveFlat ? L"live-inset-test" : L"no");
 }
 
 static void MaintainMeshLayer()
@@ -4080,6 +4082,8 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         pending.hostVisual = root;
         void* siblingCollection = pending.liveWindowImage && affineTransform &&
                                    g_cVisualProxySetTransform &&
+                                   g_createMatrixTransformProxy &&
+                                   HasMatrixTransformUpdate() &&
                                    api.HasLiveFlatImagePipeline()
                                        ? FindVerifiedMeshSiblingCollection(root)
                                        : nullptr;
@@ -4088,6 +4092,23 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             // A flat, live duplicate is the source test. It is a sibling of the
             // captured root, so later snapshots never include this visual.
             collection = siblingCollection;
+            stage = L"CreateIndependentLiveTransform";
+            result = g_createMatrixTransformProxy(compositor,
+                                                   &pending.liveVisualTransformProxy);
+            if (!requireObject(pending.liveVisualTransformProxy)) break;
+            if (!IsDwmObjectPointerValid(pending.liveVisualTransformProxy,
+                                         g_matrixTransformProxyVtable))
+            {
+                result = E_NOINTERFACE;
+                break;
+            }
+            stage = L"PositionLiveInset";
+            MilMatrix3x2D insetMatrix = {0.22, 0.0, 0.0, 0.22,
+                                         pending.liveWindowRect.right * 0.75,
+                                         pending.liveWindowRect.bottom * 0.75};
+            result = UpdateMatrixTransformProxy(pending.liveVisualTransformProxy,
+                                                insetMatrix);
+            if (result < 0) break;
             stage = L"CreateLiveVisual";
             result = api.createVisual(&pending.renderVisual);
             if (!requireObject(pending.renderVisual)) break;
@@ -4116,12 +4137,15 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             stage = L"VerifyLiveSibling";
             if (ReadPointerMember(pending.renderVisual,
                                   g_meshHostLayout.parentOffset) !=
-                ReadPointerMember(root, g_meshHostLayout.parentOffset))
+                    ReadPointerMember(root, g_meshHostLayout.parentOffset) ||
+                FindVerifiedMeshSiblingCollection(root) != siblingCollection ||
+                FindVerifiedMeshSiblingCollection(pending.renderVisual) !=
+                    siblingCollection)
             {
                 result = E_UNEXPECTED;
                 break;
             }
-            stage = L"BindLiveAffineTransform";
+            stage = L"BindIndependentLiveTransform";
             void* liveVisualProxy =
                 ReadPointerMember(pending.renderVisual, g_visualProxyOffset);
             if (!IsVisualProxyPointerValid(liveVisualProxy))
@@ -4129,27 +4153,31 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                 result = E_NOINTERFACE;
                 break;
             }
-            result = g_cVisualProxySetTransform(liveVisualProxy, affineTransform);
+            result = g_cVisualProxySetTransform(
+                liveVisualProxy, pending.liveVisualTransformProxy);
             if (result < 0) break;
             pending.attachedAt = GetTickCount64();
             pending.expiresAt = pending.attachedAt + 5000;
             g_meshLayerState = pending;
             g_meshLayerActive.store(true, std::memory_order_release);
-            Wh_Log(L"4x4 live flat window-image test attached: Slot=%d HWND=%p "
+            Wh_Log(L"4x4 live window-image inset test attached: Slot=%d HWND=%p "
                    L"Root=%p SiblingCollection=%p Visual=%p CachedImage=%p "
-                   L"size=%ldx%ld snapshotCap=30fps durationMs=5000 "
-                   L"mesh=no affine=shared-with-original",
+                   L"Transform=%p size=%ldx%ld scale=0.22 "
+                   L"snapshotCap=30fps durationMs=5000 mesh=no "
+                   L"affine=original-unchanged",
                    slotIndex, hwnd, root, siblingCollection, pending.renderVisual,
-                   pending.liveWindowImage, pending.liveWindowRect.right,
+                   pending.liveWindowImage, pending.liveVisualTransformProxy,
+                   pending.liveWindowRect.right,
                    pending.liveWindowRect.bottom);
             RequestDwmScenePass();
             return;
         }
         Wh_Log(L"4x4 live flat window-image test unavailable: HWND=%p "
                L"siblingCollection=%p drawBitmap=%p affineTransform=%p "
-               L"setTransform=%p (checkerboard fallback)",
+               L"setTransform=%p createTransform=%p (checkerboard fallback)",
                hwnd, siblingCollection, api.createBitmapInstruction,
-               affineTransform, g_cVisualProxySetTransform);
+               affineTransform, g_cVisualProxySetTransform,
+               g_createMatrixTransformProxy);
         stage = L"CreateWicBitmap";
         result = CreateDiagnosticBitmap(&pending.bitmap);
         if (!requireObject(pending.bitmap)) break;
