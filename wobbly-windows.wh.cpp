@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.245
+// @version         0.246
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -651,6 +651,20 @@ static bool HasVerifiedMeshAppendPath(const BYTE* code, size_t length)
            std::memcmp(code + 0xA9, appendPath, sizeof(appendPath)) == 0;
 }
 
+// The verified 23H2 path locates a non-null reference in the collection and
+// inserts after it when the first boolean is set. A sibling keeps the captured
+// root separate from the live-image test visual, avoiding snapshot feedback.
+static bool HasVerifiedMeshSiblingPath(const BYTE* code, size_t length)
+{
+    constexpr BYTE referenceCompare[] = {0x49,0x3B,0xC8,0x0F,0x84,0xB6,0x01,0x00,0x00};
+    constexpr BYTE referenceIndex[] = {0x44,0x8B,0xF8};
+    constexpr BYTE afterReference[] = {0x43,0x8D,0x1C,0x27};
+    return code && length >= 0x247 &&
+           std::memcmp(code + 0x85, referenceCompare, sizeof(referenceCompare)) == 0 &&
+           std::memcmp(code + 0x244, referenceIndex, sizeof(referenceIndex)) == 0 &&
+           std::memcmp(code + 0xFC, afterReference, sizeof(afterReference)) == 0;
+}
+
 static HRESULT CreateDiagnosticBitmap(IWICBitmap** bitmap)
 {
     if (!bitmap)
@@ -716,6 +730,7 @@ using CCachedVisualImageUpdate_t = long(__cdecl*)(
 using CCachedVisualImageSnapshot_t = long(__cdecl*)(void*, const RECT&);
 using CGeometry2dGroupProxyUpdate_t = long(__cdecl*)(void*, void*);
 using CDrawMesh2DInstructionCreate_t = long(__cdecl*)(void*, void*, void**);
+using CDrawBitmapInstructionCreate_t = long(__cdecl*)(void*, void**);
 using CRenderDataVisualCreate_t = long(__cdecl*)(void**);
 using CRenderDataVisualAddInstruction_t = long(__cdecl*)(void*, void*);
 using CRenderDataVisualUpdateRenderData_t = long(__cdecl*)(void*);
@@ -731,6 +746,7 @@ struct MeshLayerSymbols
     CCompositorCreateProxy_t createGroup = nullptr;
     CGeometry2dGroupProxyUpdate_t updateGroup = nullptr;
     CDrawMesh2DInstructionCreate_t createInstruction = nullptr;
+    CDrawBitmapInstructionCreate_t createBitmapInstruction = nullptr;
     CCompositorCreateProxy_t createBitmap = nullptr;
     CBitmapSourceSetBitmap_t setBitmap = nullptr;
     CCompositorCreateProxy_t createCachedImage = nullptr;
@@ -756,6 +772,11 @@ struct MeshLayerSymbols
         return createCachedImage && updateCachedImage && snapshotCachedImage &&
                cachedImageVtable;
     }
+    bool HasLiveFlatImagePipeline() const
+    {
+        return HasWindowSourceProbe() && createBitmapInstruction && createVisual &&
+               addInstruction && updateRenderData;
+    }
     bool HasVisualPipeline() const
     {
         return createVisual && addInstruction && updateRenderData &&
@@ -766,6 +787,7 @@ struct MeshLayerSymbols
 MeshLayerSymbols g_meshLayerSymbols;
 MeshHostLayout g_meshHostLayout;
 size_t g_meshRefCountOffset = SIZE_MAX;
+bool g_meshSiblingPathVerified = false;
 std::atomic_bool g_meshLayerBackendAvailable = false;
 
 struct MeshLayerState
@@ -793,6 +815,8 @@ struct MeshLayerState
     double peakBendPx = 0.0;
     bool bendLogged = false;
     bool detachFailureLogged = false;
+    bool liveFlat = false;
+    bool liveSourceFailed = false;
 };
 
 MeshLayerState g_meshLayerState;
@@ -3067,6 +3091,9 @@ static void InitializeMeshLayerDiagnostic()
                   std::memcmp(insert + 37, ownerLoad, sizeof(ownerLoad)) == 0 &&
                   HasVerifiedMeshAppendPath(insert, 0xBB) &&
                   IsDwmImageAddress(symbols.collectionVtable, sizeof(void*));
+    g_meshSiblingPathVerified = layoutReady &&
+                                IsReadableMemory(insert, 0x247) &&
+                                HasVerifiedMeshSiblingPath(insert, 0x247);
     const auto* release = reinterpret_cast<const BYTE*>(g_cBaseObjectRelease);
     g_meshRefCountOffset = IsReadableMemory(release, 17)
                               ? DecodeMeshRefCountOffset(release, 17) : SIZE_MAX;
@@ -3076,12 +3103,14 @@ static void InitializeMeshLayerDiagnostic()
                  g_cBaseObjectRelease;
     g_meshLayerBackendAvailable.store(ready, std::memory_order_release);
     Wh_Log(L"4x4 diagnostic prerequisites: geometry=%s bitmap=%s visual=%s "
-           L"windowSourceProbe=%s abi=%s hostLayout=%s attach=%s "
-           L"source=Checkerboard oneShot=1 refOffset=0x%zx",
+           L"windowSourceProbe=%s liveFlat=%s abi=%s hostLayout=%s attach=%s "
+           L"source=LiveFlatPreferred/CheckerboardFallback oneShot=1 refOffset=0x%zx",
            symbols.HasGeometryPipeline() ? L"available" : L"unavailable",
            symbols.HasImagePipeline() ? L"available" : L"unavailable",
            symbols.HasVisualPipeline() ? L"available" : L"unavailable",
            symbols.HasWindowSourceProbe() ? L"available" : L"unavailable",
+           symbols.HasLiveFlatImagePipeline() && g_meshSiblingPathVerified
+               ? L"available" : L"unavailable",
            symbols.updateMil && !symbols.updateD2D ? L"MilPoint2D-double"
                : (symbols.updateD2D && !symbols.updateMil ? L"D2D_POINT_2F-float"
                                                           : L"unavailable-or-ambiguous"),
@@ -3217,6 +3246,9 @@ static bool InitializeDwmHooks()
            L"class CGeometry2dGroupProxy *,class CBitmapSourceProxy *,"
            L"class CDrawMesh2DInstruction * *)"},
          &g_meshLayerSymbols.createInstruction, nullptr, true},
+        {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
+           L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
+         &g_meshLayerSymbols.createBitmapInstruction, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateBitmapSourceProxy("
            L"class CBitmapSourceProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
@@ -3385,6 +3417,7 @@ static bool InitializeDwmHooks()
     keepValid(g_meshLayerSymbols.createGroup);
     keepValid(g_meshLayerSymbols.updateGroup);
     keepValid(g_meshLayerSymbols.createInstruction);
+    keepValid(g_meshLayerSymbols.createBitmapInstruction);
     keepValid(g_meshLayerSymbols.createBitmap);
     keepValid(g_meshLayerSymbols.setBitmap);
     keepValid(g_meshLayerSymbols.createCachedImage);
@@ -3655,6 +3688,31 @@ static bool IsNativeVisualPointerValid(void* visual)
     return IsDwmImageAddress(*static_cast<void**>(visual), sizeof(void*));
 }
 
+static void* FindVerifiedMeshSiblingCollection(void* root)
+{
+    if (!g_meshSiblingPathVerified || !IsNativeVisualPointerValid(root))
+        return nullptr;
+    void* parent = ReadPointerMember(root, g_meshHostLayout.parentOffset);
+    if (!IsNativeVisualPointerValid(parent))
+        return nullptr;
+    auto* collection = static_cast<BYTE*>(parent) + g_meshHostLayout.collectionOffset;
+    if (!IsReadableMemory(collection, 0x2C) ||
+        *reinterpret_cast<void**>(collection) != g_meshLayerSymbols.collectionVtable ||
+        ReadPointerMember(collection, sizeof(void*)) != parent)
+        return nullptr;
+    unsigned int count = 0;
+    std::memcpy(&count, collection + 0x28, sizeof(count));
+    if (count == 0 || count > 256)
+        return nullptr;
+    void* entries = ReadPointerMember(collection, 0x10);
+    if (!IsReadableMemory(entries, count * sizeof(void*)))
+        return nullptr;
+    unsigned int matches = 0;
+    for (unsigned int i = 0; i < count; ++i)
+        matches += static_cast<void**>(entries)[i] == root;
+    return matches == 1 ? collection : nullptr;
+}
+
 static void ProbeCompleteWindowImage(void* compositor, void* root,
                                      MeshLayerState& state)
 {
@@ -3780,11 +3838,13 @@ static bool DetachMeshLayer(const wchar_t* reason)
     unsigned int windowSnapshots = state.windowSnapshots;
     ULONGLONG slowestWindowSnapshot = state.slowestWindowSnapshot;
     double peakBendPx = state.peakBendPx;
+    bool liveFlat = state.liveFlat;
     ReleaseMeshLayerResources(state);
     g_meshLayerActive.store(false, std::memory_order_release);
-    Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s geometryUpdates=%u "
+    Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s mode=%s geometryUpdates=%u "
            L"peakBendPx=%.2f windowSnapshots=%u slowestSnapshotMs=%llu",
-           hwnd, reason, geometryUpdates, peakBendPx, windowSnapshots,
+           hwnd, reason, liveFlat ? L"live-flat" : L"checkerboard",
+           geometryUpdates, peakBendPx, windowSnapshots,
            slowestWindowSnapshot);
     return true;
 }
@@ -3801,8 +3861,12 @@ static void RefreshCompleteWindowImage(MeshLayerState& state, ULONGLONG now)
     {
         Wh_Log(L"4x4 live window source stopped: HWND=%p window-size-changed",
                state.hwnd);
-        g_cBaseObjectRelease(state.liveWindowImage);
-        state.liveWindowImage = nullptr;
+        if (state.liveFlat) state.liveSourceFailed = true;
+        else
+        {
+            g_cBaseObjectRelease(state.liveWindowImage);
+            state.liveWindowImage = nullptr;
+        }
         return;
     }
 
@@ -3813,11 +3877,15 @@ static void RefreshCompleteWindowImage(MeshLayerState& state, ULONGLONG now)
     if (result < 0 || elapsed > 16)
     {
         Wh_Log(L"4x4 live window source stopped: HWND=%p result=0x%08X "
-               L"snapshotMs=%llu frames=%u (affine and checkerboard unchanged)",
+               L"snapshotMs=%llu frames=%u",
                state.hwnd, static_cast<unsigned int>(result), elapsed,
                state.windowSnapshots);
-        g_cBaseObjectRelease(state.liveWindowImage);
-        state.liveWindowImage = nullptr;
+        if (state.liveFlat) state.liveSourceFailed = true;
+        else
+        {
+            g_cBaseObjectRelease(state.liveWindowImage);
+            state.liveWindowImage = nullptr;
+        }
         return;
     }
     state.lastWindowSnapshot = GetTickCount64();
@@ -3825,7 +3893,8 @@ static void RefreshCompleteWindowImage(MeshLayerState& state, ULONGLONG now)
     if (++state.windowSnapshots == 2)
         Wh_Log(L"4x4 live window source snapshot requests accepted: "
                L"HWND=%p targetFps=30 "
-               L"rendered=no frozen=no", state.hwnd);
+               L"rendered=%s frozen=no", state.hwnd,
+               state.liveFlat ? L"live-flat-test" : L"no");
 }
 
 static void MaintainMeshLayer()
@@ -3873,6 +3942,13 @@ static void MaintainMeshLayer()
         return;
     }
     RefreshCompleteWindowImage(g_meshLayerState, now);
+    if (g_meshLayerState.liveSourceFailed)
+    {
+        DetachMeshLayer(L"live-source-stopped");
+        return;
+    }
+    if (g_meshLayerState.liveFlat)
+        return;
     if (meshRevision == g_meshLayerState.lastMeshRevision ||
         now - g_meshLayerState.lastGeometryUpdate < 16)
         return;
@@ -3988,6 +4064,65 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                 break;
         }
         pending.hostVisual = root;
+        void* siblingCollection = pending.liveWindowImage &&
+                                   api.HasLiveFlatImagePipeline()
+                                       ? FindVerifiedMeshSiblingCollection(root)
+                                       : nullptr;
+        if (siblingCollection)
+        {
+            // A flat, live duplicate is the source test. It is a sibling of the
+            // captured root, so later snapshots never include this visual.
+            collection = siblingCollection;
+            stage = L"CreateLiveVisual";
+            result = api.createVisual(&pending.renderVisual);
+            if (!requireObject(pending.renderVisual)) break;
+            stage = L"CreateLiveBitmapInstruction";
+            result = api.createBitmapInstruction(pending.liveWindowImage,
+                                                 &pending.instruction);
+            if (!requireObject(pending.instruction)) break;
+            stage = L"AddLiveInstruction";
+            result = api.addInstruction(pending.renderVisual, pending.instruction);
+            if (result < 0) break;
+            stage = L"PublishLiveRenderData";
+            result = api.updateRenderData(pending.renderVisual);
+            if (result < 0) break;
+            stage = L"InsertLiveSibling";
+            insertionAttempted = true;
+            result = api.insertRelative(siblingCollection, pending.renderVisual,
+                                        root, true, false);
+            if (result < 0)
+            {
+                insertionAttempted =
+                    ReadPointerMember(pending.renderVisual,
+                                      g_meshHostLayout.parentOffset) != nullptr;
+                break;
+            }
+            stage = L"VerifyLiveSibling";
+            if (ReadPointerMember(pending.renderVisual,
+                                  g_meshHostLayout.parentOffset) !=
+                ReadPointerMember(root, g_meshHostLayout.parentOffset))
+            {
+                result = E_UNEXPECTED;
+                break;
+            }
+            pending.liveFlat = true;
+            pending.attachedAt = GetTickCount64();
+            pending.expiresAt = pending.attachedAt + 5000;
+            g_meshLayerState = pending;
+            g_meshLayerActive.store(true, std::memory_order_release);
+            Wh_Log(L"4x4 live flat window-image test attached: Slot=%d HWND=%p "
+                   L"Root=%p SiblingCollection=%p Visual=%p CachedImage=%p "
+                   L"size=%ldx%ld snapshotCap=30fps durationMs=5000 "
+                   L"mesh=no affine=unchanged",
+                   slotIndex, hwnd, root, siblingCollection, pending.renderVisual,
+                   pending.liveWindowImage, pending.liveWindowRect.right,
+                   pending.liveWindowRect.bottom);
+            RequestDwmScenePass();
+            return;
+        }
+        Wh_Log(L"4x4 live flat window-image test unavailable: HWND=%p "
+               L"siblingCollection=%p drawBitmap=%p (checkerboard fallback)",
+               hwnd, siblingCollection, api.createBitmapInstruction);
         stage = L"CreateWicBitmap";
         result = CreateDiagnosticBitmap(&pending.bitmap);
         if (!requireObject(pending.bitmap)) break;
