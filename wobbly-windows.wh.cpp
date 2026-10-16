@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.253
+// @version         0.254
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -766,7 +766,7 @@ static bool HasVerifiedMeshSiblingPath(const BYTE* code, size_t length)
            std::memcmp(code + 0xFC, afterReference, sizeof(afterReference)) == 0;
 }
 
-static HRESULT CreateDiagnosticBitmap(IWICBitmap** bitmap)
+static HRESULT CreateDiagnosticBitmap(IWICBitmap** bitmap, unsigned int phase = 0)
 {
     if (!bitmap)
         return E_POINTER;
@@ -783,8 +783,8 @@ static HRESULT CreateDiagnosticBitmap(IWICBitmap** bitmap)
         for (unsigned int x = 0; x < 64; x++)
         {
             bool edge = x < 2 || y < 2 || x >= 62 || y >= 62;
-            pixels[y * 64 + x] = edge ? 0xFFFFFF00u
-                                     : (((x / 8) ^ (y / 8)) & 1)
+            pixels[y * 64 + x] = edge ? (phase & 1 ? 0xFF00FF00u : 0xFFFFFF00u)
+                                     : ((((x / 8) ^ (y / 8)) + phase) & 1)
                                            ? 0xFFFF00FFu : 0xFF00FFFFu;
         }
     }
@@ -895,6 +895,9 @@ size_t g_meshRefCountOffset = SIZE_MAX;
 bool g_meshSiblingPathVerified = false;
 std::atomic_bool g_meshLayerBackendAvailable = false;
 static constexpr bool ENABLE_MESH_LAYER_VISUAL_TEST = true;
+// Temporary source-refresh canary. Only the diagnostic inset changes;
+// the dragged window keeps the proven affine renderer.
+bool g_meshUseAnimatedWicCanary = true; // Scene thread only.
 
 struct MeshLayerState
 {
@@ -909,14 +912,17 @@ struct MeshLayerState
     void* liveVisualTransformProxy = nullptr;
     void* hostVisual = nullptr; // Owned reference, released only after detach.
     IWICBitmap* bitmap = nullptr;
+    IWICBitmap* alternateBitmap = nullptr;
     HWND hwnd = nullptr;
     int slotIndex = -1;
     ULONGLONG generation = 0;
     ULONGLONG expiresAt = 0;
     ULONGLONG attachedAt = 0;
     ULONGLONG lastGeometryUpdate = 0;
+    ULONGLONG lastBitmapUpdate = 0;
     ULONGLONG lastMeshRevision = ULLONG_MAX;
     unsigned int geometryUpdates = 0;
+    unsigned int bitmapUpdates = 0;
     double peakBendPx = 0.0;
     bool bendLogged = false;
     bool detachFailureLogged = false;
@@ -3933,6 +3939,7 @@ static void ReleaseMeshLayerResources(MeshLayerState& state)
     for (void* resource : resources)
         if (resource) g_cBaseObjectRelease(resource);
     if (state.bitmap) state.bitmap->Release();
+    if (state.alternateBitmap) state.alternateBitmap->Release();
     if (state.hostVisual) g_cBaseObjectRelease(state.hostVisual);
     state = {};
 }
@@ -3963,14 +3970,15 @@ static bool DetachMeshLayer(const wchar_t* reason)
     }
     HWND hwnd = state.hwnd;
     unsigned int geometryUpdates = state.geometryUpdates;
+    unsigned int bitmapUpdates = state.bitmapUpdates;
     double peakBendPx = state.peakBendPx;
     bool liveFlat = state.liveFlat;
     ReleaseMeshLayerResources(state);
     g_meshLayerActive.store(false, std::memory_order_release);
     Wh_Log(L"4x4 diagnostic detached: HWND=%p reason=%s mode=%s "
-           L"geometryUpdates=%u peakBendPx=%.2f snapshot=none",
+           L"geometryUpdates=%u bitmapUpdates=%u peakBendPx=%.2f snapshot=none",
            hwnd, reason, liveFlat ? L"live-inset" : L"checkerboard",
-           geometryUpdates, peakBendPx);
+           geometryUpdates, bitmapUpdates, peakBendPx);
     return true;
 }
 
@@ -4052,6 +4060,29 @@ static void MaintainMeshLayer()
     }
     if (g_meshLayerState.liveFlat)
         return;
+    if (g_meshLayerState.bitmapSource &&
+        now - g_meshLayerState.lastBitmapUpdate >= 500)
+    {
+        IWICBitmap* nextBitmap = (g_meshLayerState.bitmapUpdates & 1)
+                                     ? g_meshLayerState.bitmap
+                                     : g_meshLayerState.alternateBitmap;
+        HRESULT bitmapResult = nextBitmap
+                                   ? g_meshLayerSymbols.setBitmap(
+                                         g_meshLayerState.bitmapSource, nextBitmap)
+                                   : E_UNEXPECTED;
+        if (FAILED(bitmapResult))
+        {
+            Wh_Log(L"4x4 diagnostic bitmap refresh failed: HWND=%p result=0x%08X",
+                   g_meshLayerState.hwnd, static_cast<unsigned int>(bitmapResult));
+            g_meshLayerBackendAvailable.store(false, std::memory_order_release);
+            DetachMeshLayer(L"bitmap-refresh-failed");
+            return;
+        }
+        g_meshLayerState.lastBitmapUpdate = now;
+        if (++g_meshLayerState.bitmapUpdates == 1)
+            Wh_Log(L"4x4 WIC bitmap refresh submitted: HWND=%p intervalMs=500 "
+                   L"(visual result still needs checking)", g_meshLayerState.hwnd);
+    }
     if (meshRevision == g_meshLayerState.lastMeshRevision ||
         now - g_meshLayerState.lastGeometryUpdate < 16)
         return;
@@ -4152,7 +4183,8 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             ReadPointerMember(collection, sizeof(void*)) != root)
             break;
 
-        ProbeCompleteWindowImage(compositor, root, pending);
+        if (!g_meshUseAnimatedWicCanary)
+            ProbeCompleteWindowImage(compositor, root, pending);
         stage = L"RetainHost";
         if (g_cBaseObjectAddRef)
         {
@@ -4175,7 +4207,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                                    api.HasLiveFlatImagePipeline()
                                        ? FindVerifiedMeshSiblingCollection(root)
                                        : nullptr;
-        if (siblingCollection)
+        if (siblingCollection && !g_meshUseAnimatedWicCanary)
         {
             // A flat, live duplicate is the source test. It is a sibling of the
             // captured root, so later snapshots never include this visual.
@@ -4260,15 +4292,18 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             RequestDwmScenePass();
             return;
         }
-        Wh_Log(L"4x4 live flat window-image test unavailable: HWND=%p "
+        Wh_Log(L"4x4 animated WIC source test selected: HWND=%p "
                L"siblingCollection=%p drawBitmap=%p affineTransform=%p "
-               L"setTransform=%p createTransform=%p (checkerboard fallback)",
+               L"setTransform=%p createTransform=%p",
                hwnd, siblingCollection, api.createBitmapInstruction,
                affineTransform, g_cVisualProxySetTransform,
                g_createMatrixTransformProxy);
         stage = L"CreateWicBitmap";
         result = CreateDiagnosticBitmap(&pending.bitmap);
         if (!requireObject(pending.bitmap)) break;
+        stage = L"CreateAlternateWicBitmap";
+        result = CreateDiagnosticBitmap(&pending.alternateBitmap, 1);
+        if (!requireObject(pending.alternateBitmap)) break;
         stage = L"CreateBitmapSource";
         result = api.createBitmap(compositor, &pending.bitmapSource);
         if (!requireObject(pending.bitmapSource)) break;
@@ -4315,6 +4350,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
         }
         pending.attachedAt = GetTickCount64();
         pending.lastGeometryUpdate = pending.attachedAt;
+        pending.lastBitmapUpdate = pending.attachedAt;
         pending.expiresAt = pending.attachedAt + 5000;
         g_meshLayerState = pending;
         g_meshLayerActive.store(true, std::memory_order_release);
@@ -4322,7 +4358,8 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                L"Root=%p Collection=%p "
                L"Visual=%p BitmapSource=%p abi=MilPoint2D-double "
                L"source=Checkerboard shape=physics-residual size=240x160 uv=pixels "
-               L"vertices=%u indices=%u placement=append durationMs=5000 affine=unchanged",
+               L"vertices=%u indices=%u placement=append durationMs=5000 "
+               L"bitmapRefreshMs=500 affine=unchanged",
                slotIndex, hwnd, root, collection, pending.renderVisual,
                pending.bitmapSource, DIAGNOSTIC_MESH_VERTICES, DIAGNOSTIC_MESH_INDICES);
         RequestDwmScenePass();
