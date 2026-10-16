@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.251
+// @version         0.252
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -757,6 +757,10 @@ struct MeshLayerSymbols
     CGeometry2dGroupProxyUpdate_t updateGroup = nullptr;
     CDrawMesh2DInstructionCreate_t createInstruction = nullptr;
     CDrawBitmapInstructionCreate_t createBitmapInstruction = nullptr;
+    // Read-only bridge probes. Never call these until their complete ABI and
+    // object inheritance have been verified on the running DWM build.
+    void* createImageBrushProbe = nullptr;
+    void* createDrawGeometryProbe = nullptr;
     CCompositorCreateProxy_t createBitmap = nullptr;
     CBitmapSourceSetBitmap_t setBitmap = nullptr;
     CCompositorCreateProxy_t createCachedImage = nullptr;
@@ -3127,6 +3131,11 @@ static void InitializeMeshLayerDiagnostic()
            !ENABLE_MESH_LAYER_VISUAL_TEST ? L"disabled-for-drag-isolation"
                : (ready ? L"enabled" : L"disabled-affine-fallback"),
            g_meshRefCountOffset);
+    Wh_Log(L"4x4 live-image bridge probe: imageBrushCreate=%s "
+           L"drawGeometryCreate=%s (symbols only; ABI/inheritance unverified; "
+           L"no bridge calls)",
+           symbols.createImageBrushProbe ? L"available" : L"unavailable",
+           symbols.createDrawGeometryProbe ? L"available" : L"unavailable");
 }
 
 static bool InitializeDwmHooks()
@@ -3260,6 +3269,14 @@ static bool InitializeDwmHooks()
         {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
            L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
          &g_meshLayerSymbols.createBitmapInstruction, nullptr, true},
+        {{L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CImageLegacyMilBrushProxy>("
+           L"class CImageLegacyMilBrushProxy * *)"},
+         &g_meshLayerSymbols.createImageBrushProbe, nullptr, true},
+        {{L"public: static long __cdecl CDrawGeometryInstruction::Create("
+           L"class CBaseLegacyMilBrushProxy *,class CBaseGeometryProxy *,"
+           L"class CDrawGeometryInstruction * *)"},
+         &g_meshLayerSymbols.createDrawGeometryProbe, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateBitmapSourceProxy("
            L"class CBitmapSourceProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
@@ -3429,6 +3446,8 @@ static bool InitializeDwmHooks()
     keepValid(g_meshLayerSymbols.updateGroup);
     keepValid(g_meshLayerSymbols.createInstruction);
     keepValid(g_meshLayerSymbols.createBitmapInstruction);
+    keepValid(g_meshLayerSymbols.createImageBrushProbe);
+    keepValid(g_meshLayerSymbols.createDrawGeometryProbe);
     keepValid(g_meshLayerSymbols.createBitmap);
     keepValid(g_meshLayerSymbols.setBitmap);
     keepValid(g_meshLayerSymbols.createCachedImage);
