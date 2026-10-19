@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.255
+// @version         0.256
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3958,34 +3958,53 @@ static void ProbeCompleteWindowImage(void* compositor, void* root,
     if (result < 0 && image) g_cBaseObjectRelease(image);
 }
 
-static void RunOneShotVisualCaptureProbe(void* compositor, void* root, HWND hwnd)
+static void RunOneShotVisualCaptureProbe(void* compositor, void* root,
+                                         void* topLevelWindow, HWND hwnd)
 {
     if (!g_meshCaptureProbeEnabled.load(std::memory_order_acquire)) return;
     auto& api = g_meshLayerSymbols;
     const uintptr_t imageBase = reinterpret_cast<uintptr_t>(g_dwmModuleLayout.imageBegin);
     const uintptr_t create = reinterpret_cast<uintptr_t>(api.createCaptureProxy);
     const uintptr_t sync = reinterpret_cast<uintptr_t>(api.syncCaptureBits);
+    const uintptr_t canvasGetter =
+        reinterpret_cast<uintptr_t>(g_getCanvasRootVisualProxy);
     // These RVAs are from the locally verified 22621.6199 image. Do not guess
     // this private ABI on another DWM build, even if its symbol names match.
     if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
         !IsDwmFunctionPointerValid(reinterpret_cast<void*>(create)) ||
         !IsDwmFunctionPointerValid(reinterpret_cast<void*>(sync)) ||
+        !IsDwmFunctionPointerValid(reinterpret_cast<void*>(canvasGetter)) ||
         create - imageBase != 0xAD608 || sync - imageBase != 0xC6074 ||
+        canvasGetter - imageBase != 0xE5BAC ||
+        g_canvasVisualOwnerOffset != 0x120 || g_visualProxyOffset != 0x10 ||
         !g_cBaseObjectRelease)
     {
         Wh_Log(L"4x4 capture probe skipped: unsupported DWM build or symbols "
-               L"(timestamp=0x%08X size=0x%X create=%p sync=%p)",
+               L"(timestamp=0x%08X size=0x%X create=%p sync=%p canvas=%p)",
                g_dwmModuleLayout.timeDateStamp, g_dwmModuleLayout.sizeOfImage,
-               api.createCaptureProxy, api.syncCaptureBits);
+               api.createCaptureProxy, api.syncCaptureBits,
+               g_getCanvasRootVisualProxy);
         return;
     }
     void* rootProxy = ReadPointerMember(root, g_visualProxyOffset);
-    if (!IsVisualProxyPointerValid(rootProxy))
+    void* canvasOwner = ReadPointerMember(topLevelWindow,
+                                          g_canvasVisualOwnerOffset);
+    void* canvasProxy = IsReadableMemory(canvasOwner, 0x18)
+                            ? g_getCanvasRootVisualProxy(topLevelWindow)
+                            : nullptr;
+    if (!IsVisualProxyPointerValid(rootProxy) ||
+        !IsVisualProxyPointerValid(canvasProxy) ||
+        ReadPointerMember(canvasOwner, g_visualProxyOffset) != canvasProxy)
     {
-        Wh_Log(L"4x4 capture probe skipped: no verified root proxy HWND=%p", hwnd);
+        Wh_Log(L"4x4 capture probe skipped: unverified visual HWND=%p "
+               L"completeRootProxy=%p canvasProxy=%p canvasOwner=%p",
+               hwnd, rootProxy, canvasProxy, canvasOwner);
         return;
     }
+    Wh_Log(L"4x4 capture probe source: HWND=%p completeRootProxy=%p "
+           L"canvasProxy=%p same=%d (Windows CaptureWindow path uses canvas)",
+           hwnd, rootProxy, canvasProxy, rootProxy == canvasProxy);
 
     void* captureProxy = nullptr;
     const ULONGLONG started = GetTickCount64();
@@ -4006,7 +4025,7 @@ static void RunOneShotVisualCaptureProbe(void* compositor, void* root, HWND hwnd
 
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     void* bits = nullptr;
-    result = api.syncCaptureBits(captureProxy, rootProxy, 1.0f,
+    result = api.syncCaptureBits(captureProxy, canvasProxy, 1.0f,
                                  0, 0, 64, 64, 0, &format, &bits);
     MEMORY_BASIC_INFORMATION memory = {};
     const SIZE_T queried = bits ? VirtualQuery(bits, &memory, sizeof(memory)) : 0;
@@ -4295,7 +4314,7 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                 break;
         }
         pending.hostVisual = root;
-        RunOneShotVisualCaptureProbe(compositor, root, hwnd);
+        RunOneShotVisualCaptureProbe(compositor, root, topLevelWindow, hwnd);
         void* siblingCollection = pending.liveWindowImage && affineTransform &&
                                    g_cVisualProxySetTransform &&
                                    g_createMatrixTransformProxy &&
