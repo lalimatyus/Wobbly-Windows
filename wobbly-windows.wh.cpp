@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.260
+// @version         0.261
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -619,100 +619,6 @@ static long UploadDiagnosticMesh(void* proxy, const DiagnosticMesh& mesh,
                DIAGNOSTIC_MESH_VERTICES, mesh.indices, DIAGNOSTIC_MESH_INDICES);
 }
 
-enum class RttiBaseProbe
-{
-    Unavailable,
-    ZeroOffsetBase,
-    NonzeroOrVirtualBase,
-    NotBase,
-};
-
-// Read only MSVC x64 RTTI. Every pointer and RVA must stay in the loaded
-// module; an unknown layout fails closed and never enables a renderer.
-static RttiBaseProbe ProbeRttiBase(const BYTE* image, size_t imageSize,
-                                  const void* vtable, const char* className,
-                                  const char* baseName)
-{
-    if (!image || imageSize < 1024 || !vtable || !className || !baseName)
-        return RttiBaseProbe::Unavailable;
-    uintptr_t begin = reinterpret_cast<uintptr_t>(image);
-    uintptr_t table = reinterpret_cast<uintptr_t>(vtable);
-    if (begin > UINTPTR_MAX - imageSize || table < begin + sizeof(void*) ||
-        table - begin > imageSize - sizeof(void*))
-        return RttiBaseProbe::Unavailable;
-    auto readAddress = [&](uintptr_t address, void* out, size_t length)
-    {
-        if (address < begin || length > imageSize ||
-            address - begin > imageSize - length ||
-            !IsReadableMemory(reinterpret_cast<const void*>(address), length))
-            return false;
-        std::memcpy(out, reinterpret_cast<const void*>(address), length);
-        return true;
-    };
-    auto readRva = [&](int64_t rva, void* out, size_t length)
-    {
-        return rva > 0 && static_cast<size_t>(rva) <= imageSize &&
-               readAddress(begin + static_cast<size_t>(rva), out, length);
-    };
-    uintptr_t colAddress = 0;
-    if (!readAddress(table - sizeof(void*), &colAddress, sizeof(colAddress)))
-        return RttiBaseProbe::Unavailable;
-    struct CompleteObjectLocator
-    {
-        uint32_t signature, offset, cdOffset;
-        int32_t typeRva, hierarchyRva, selfRva;
-    } col = {};
-    if (!readAddress(colAddress, &col, sizeof(col)) || col.signature != 1 ||
-        col.offset != 0 || col.selfRva <= 0 ||
-        colAddress - begin != static_cast<uint32_t>(col.selfRva))
-        return RttiBaseProbe::Unavailable;
-    const size_t classLength = std::strlen(className) + 1;
-    const size_t baseLength = std::strlen(baseName) + 1;
-    char name[64] = {};
-    if (classLength > sizeof(name) || baseLength > sizeof(name))
-        return RttiBaseProbe::Unavailable;
-    if (col.typeRva <= 0 ||
-        !readRva(col.typeRva + 2 * sizeof(void*), name, classLength) ||
-        std::memcmp(name, className, classLength) != 0)
-        return RttiBaseProbe::Unavailable;
-    struct ClassHierarchy
-    {
-        uint32_t signature, attributes, count;
-        int32_t arrayRva;
-    } hierarchy = {};
-    if (!readRva(col.hierarchyRva, &hierarchy, sizeof(hierarchy)) ||
-        hierarchy.count < 2 || hierarchy.count > 64 ||
-        hierarchy.arrayRva <= 0)
-        return RttiBaseProbe::Unavailable;
-    for (uint32_t i = 0; i < hierarchy.count; ++i)
-    {
-        int32_t descriptorRva = 0;
-        if (!readRva(hierarchy.arrayRva + i * sizeof(int32_t),
-                     &descriptorRva, sizeof(descriptorRva)))
-            return RttiBaseProbe::Unavailable;
-        struct BaseDescriptor
-        {
-            int32_t typeRva;
-            uint32_t containedBases;
-            int32_t memberOffset, vbtableOffset, vbaseOffset;
-            uint32_t attributes;
-            int32_t hierarchyRva;
-        } descriptor = {};
-        if (!readRva(descriptorRva, &descriptor, sizeof(descriptor)))
-            return RttiBaseProbe::Unavailable;
-        char baseType[64] = {};
-        if (descriptor.typeRva <= 0 ||
-            !readRva(descriptor.typeRva + 2 * sizeof(void*),
-                     baseType, baseLength))
-            return RttiBaseProbe::Unavailable;
-        if (std::memcmp(baseType, baseName, baseLength) == 0)
-            return descriptor.memberOffset == 0 && descriptor.vbtableOffset == -1
-                       ? RttiBaseProbe::ZeroOffsetBase
-                       : RttiBaseProbe::NonzeroOrVirtualBase;
-    }
-    return RttiBaseProbe::NotBase;
-}
-
 struct MeshHostLayout
 {
     size_t parentOffset = SIZE_MAX;
@@ -863,9 +769,6 @@ struct MeshLayerSymbols
     // object inheritance have been verified on the running DWM build.
     void* createImageBrushProbe = nullptr;
     void* createDrawGeometryProbe = nullptr;
-    void* geometryGroupVtableProbe = nullptr;
-    void* meshVtableProbe = nullptr;
-    void* imageBrushVtableProbe = nullptr;
     CCompositorCreateProxy_t createBitmap = nullptr;
     CBitmapSourceSetBitmap_t setBitmap = nullptr;
     CCompositorCreateProxy_t createCachedImage = nullptr;
@@ -3206,37 +3109,6 @@ static void LogVisualCaptureAbi();
 static void InitializeMeshLayerDiagnostic()
 {
     auto& symbols = g_meshLayerSymbols;
-    constexpr char groupName[] = ".?AVCGeometry2dGroupProxy@@";
-    constexpr char meshName[] = ".?AVCMeshGeometry2dProxy@@";
-    constexpr char brushName[] = ".?AVCImageLegacyMilBrushProxy@@";
-    constexpr char cachedName[] = ".?AVCCachedVisualImageProxy@@";
-    constexpr char geometryBaseName[] = ".?AVCBaseGeometryProxy@@";
-    constexpr char brushBaseName[] = ".?AVCBaseLegacyMilBrushProxy@@";
-    constexpr char imageBaseName[] = ".?AVCBaseImageProxy@@";
-    auto probe = [&](const void* vtable, const char* derived, const char* base)
-    {
-        return ProbeRttiBase(
-            g_dwmModuleLayout.imageBegin, g_dwmModuleLayout.sizeOfImage,
-            vtable, derived, base);
-    };
-    auto status = [](RttiBaseProbe value)
-    {
-        switch (value)
-        {
-        case RttiBaseProbe::ZeroOffsetBase: return L"zero-offset";
-        case RttiBaseProbe::NonzeroOrVirtualBase: return L"nonzero-or-virtual";
-        case RttiBaseProbe::NotBase: return L"not-a-base";
-        default: return L"unavailable";
-        }
-    };
-    RttiBaseProbe geometryBase = probe(
-        symbols.geometryGroupVtableProbe, groupName, geometryBaseName);
-    RttiBaseProbe meshBase = probe(
-        symbols.meshVtableProbe, meshName, geometryBaseName);
-    RttiBaseProbe brushBase = probe(
-        symbols.imageBrushVtableProbe, brushName, brushBaseName);
-    RttiBaseProbe cachedBase = probe(
-        symbols.cachedImageVtable, cachedName, imageBaseName);
     const void* remove = reinterpret_cast<void*>(symbols.removeFromParent);
     bool layoutReady = IsDwmFunctionPointerValid(remove) &&
                        IsReadableMemory(remove, 24) &&
@@ -3279,16 +3151,13 @@ static void InitializeMeshLayerDiagnostic()
            !ENABLE_MESH_LAYER_VISUAL_TEST ? L"disabled-for-drag-isolation"
                : (ready ? L"enabled" : L"disabled-affine-fallback"),
            g_meshRefCountOffset);
-    Wh_Log(L"4x4 live-image bridge probe: imageBrushCreate=%s "
-           L"drawGeometryCreate=%s groupBaseGeometry=%s "
-           L"(read-only RTTI; no bridge calls)",
+    // This udwm build has no MSVC complete-object locators before these
+    // vtables, so their base-class conversions cannot be validated by RTTI.
+    Wh_Log(L"4x4 live-image bridge candidates: imageBrushCreate=%s "
+           L"drawGeometryCreate=%s inheritance=unverified "
+           L"(no bridge calls)",
            symbols.createImageBrushProbe ? L"available" : L"unavailable",
-           symbols.createDrawGeometryProbe ? L"available" : L"unavailable",
-           status(geometryBase));
-    Wh_Log(L"4x4 live-image bridge RTTI: meshBaseGeometry=%s "
-           L"imageBrushBaseBrush=%s cachedImageBaseImage=%s "
-           L"(read-only; no bridge calls)",
-           status(meshBase), status(brushBase), status(cachedBase));
+           symbols.createDrawGeometryProbe ? L"available" : L"unavailable");
     Wh_Log(L"4x4 read-only capture ABI probe: setting=%s sync=%s "
            L"(exact 23H2 build only; no capture or rendering)",
            g_meshCaptureProbeEnabled.load(std::memory_order_acquire)
@@ -3436,12 +3305,6 @@ static bool InitializeDwmHooks()
            L"class CBaseLegacyMilBrushProxy *,class CBaseGeometryProxy *,"
            L"class CDrawGeometryInstruction * *)"},
          &g_meshLayerSymbols.createDrawGeometryProbe, nullptr, true},
-        {{L"const CGeometry2dGroupProxy::`vftable'"},
-         &g_meshLayerSymbols.geometryGroupVtableProbe, nullptr, true},
-        {{L"const CMeshGeometry2dProxy::`vftable'"},
-         &g_meshLayerSymbols.meshVtableProbe, nullptr, true},
-        {{L"const CImageLegacyMilBrushProxy::`vftable'"},
-         &g_meshLayerSymbols.imageBrushVtableProbe, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateBitmapSourceProxy("
            L"class CBitmapSourceProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
