@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.258
+// @version         0.259
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -99,7 +99,7 @@ the combined mod is not offered under GPLv2.
 
 - EnableCaptureProbe: false
   $name: Read-only visual capture ABI probe (23H2 only)
-  $description: Logs the private DWM capture function's instructions once when the mod loads. Does not capture pixels or change rendering.
+  $description: Logs the capture wrapper at load and its virtual dispatch target on the first drag. Does not capture pixels or change rendering.
 
 - AdvancedMode:
   - enable: false
@@ -4000,6 +4000,73 @@ static void LogVisualCaptureAbi()
     }
 }
 
+static void ProbeCaptureVirtualDispatch(void* compositor, HWND hwnd)
+{
+    if (!g_meshCaptureProbeEnabled.load(std::memory_order_acquire) ||
+        g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
+        g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
+        !IsOnDwmSceneThread() || !g_meshLayerSymbols.createCaptureProxy ||
+        !g_cBaseObjectRelease)
+        return;
+
+    void* proxy = nullptr;
+    long result = g_meshLayerSymbols.createCaptureProxy(compositor, &proxy);
+    if (result < 0 || !proxy || !IsReadableMemory(proxy, sizeof(void*)))
+    {
+        Wh_Log(L"4x4 capture dispatch probe: HWND=%p create=0x%08X proxy=%p",
+               hwnd, static_cast<unsigned int>(result), proxy);
+        return;
+    }
+
+    void* resource = ReadPointerMember(proxy, 0x10);
+    void* interfaceObject = ReadPointerMember(resource, 0x10);
+    void* vtable = ReadPointerMember(interfaceObject, 0);
+    void* method = ReadPointerMember(vtable, 0x118);
+    HMODULE module = nullptr;
+    wchar_t modulePath[MAX_PATH] = L"unmapped";
+    if (method && GetModuleHandleExW(
+                      GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                      reinterpret_cast<LPCWSTR>(method), &module))
+        GetModuleFileNameW(module, modulePath, ARRAYSIZE(modulePath));
+    MEMORY_BASIC_INFORMATION mbi = {};
+    bool executable = method &&
+                      VirtualQuery(method, &mbi, sizeof(mbi)) &&
+                      mbi.State == MEM_COMMIT &&
+                      !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                      ((mbi.Protect & 0xFF) == PAGE_EXECUTE_READ ||
+                       (mbi.Protect & 0xFF) == PAGE_EXECUTE_READWRITE ||
+                       (mbi.Protect & 0xFF) == PAGE_EXECUTE_WRITECOPY);
+    Wh_Log(L"4x4 capture dispatch probe: HWND=%p create=0x%08X "
+           L"proxy=%p resource=%p interface=%p vtable=%p method=%p "
+           L"module=%s RVA=0x%zx executable=%d (no capture call)",
+           hwnd, static_cast<unsigned int>(result), proxy, resource,
+           interfaceObject, vtable, method, modulePath,
+           module ? reinterpret_cast<uintptr_t>(method) -
+                        reinterpret_cast<uintptr_t>(module) : 0,
+           executable);
+    if (executable)
+    {
+        BYTE* instruction = static_cast<BYTE*>(method);
+        size_t bytesRead = 0;
+        for (unsigned int index = 0; index < 64 && bytesRead < 384; index++)
+        {
+            WH_DISASM_RESULT decoded = {};
+            if (!IsReadableMemory(instruction, 16) ||
+                !Wh_Disasm(instruction, &decoded) || decoded.length == 0 ||
+                bytesRead + decoded.length > 384)
+                break;
+            Wh_Log(L"4x4 capture dispatch[%u] +0x%zx: %S",
+                   index, bytesRead, decoded.text);
+            bytesRead += decoded.length;
+            instruction += decoded.length;
+            std::string_view text = decoded.text;
+            if (text == "ret" || text.starts_with("jmp ")) break;
+        }
+    }
+    g_cBaseObjectRelease(proxy);
+}
+
 static void ReleaseMeshLayerResources(MeshLayerState& state)
 {
     void* resources[] = {state.renderVisual, state.liveVisualTransformProxy,
@@ -4252,6 +4319,8 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
             *static_cast<void**>(collection) != api.collectionVtable ||
             ReadPointerMember(collection, sizeof(void*)) != root)
             break;
+
+        ProbeCaptureVirtualDispatch(compositor, hwnd);
 
         if (!g_meshUseAnimatedWicCanary)
             ProbeCompleteWindowImage(compositor, root, pending);
