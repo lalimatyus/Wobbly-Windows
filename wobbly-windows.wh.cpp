@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.257
+// @version         0.258
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -98,8 +98,8 @@ the combined mod is not offered under GPLv2.
   - "mesh-layer": "True 4x4 mesh layer (experimental)"
 
 - EnableCaptureProbe: false
-  $name: One-shot visual capture probe (23H2 only)
-  $description: Experimental 64x64 DWM readback on the first mesh-layer drag. Never used for rendering; may briefly stall or crash DWM. Leave disabled for normal use.
+  $name: Read-only visual capture ABI probe (23H2 only)
+  $description: Logs the private DWM capture function's instructions once when the mod loads. Does not capture pixels or change rendering.
 
 - AdvancedMode:
   - enable: false
@@ -909,7 +909,7 @@ static constexpr bool ENABLE_MESH_LAYER_VISUAL_TEST = true;
 // the dragged window keeps the proven affine renderer.
 bool g_meshUseAnimatedWicCanary = true; // Scene thread only.
 std::atomic_bool g_meshCaptureProbeEnabled = false;
-void* g_meshCaptureProbeReturnedBits = nullptr; // Ownership unknown; never free blindly.
+std::atomic_bool g_meshCaptureProbeLogged = false;
 
 struct MeshLayerState
 {
@@ -3196,6 +3196,8 @@ static void* FindDwmCompositor()
     return g_dwmCompositor.load(std::memory_order_acquire);
 }
 
+static void LogVisualCaptureAbi();
+
 static void InitializeMeshLayerDiagnostic()
 {
     auto& symbols = g_meshLayerSymbols;
@@ -3265,12 +3267,12 @@ static void InitializeMeshLayerDiagnostic()
            symbols.createImageBrushProbe ? L"available" : L"unavailable",
            symbols.createDrawGeometryProbe ? L"available" : L"unavailable",
            geometryBaseStatus);
-    Wh_Log(L"4x4 one-shot capture probe: setting=%s create=%s sync=%s "
-           L"(exact 23H2 build only; no rendering)",
+    Wh_Log(L"4x4 read-only capture ABI probe: setting=%s sync=%s "
+           L"(exact 23H2 build only; no capture or rendering)",
            g_meshCaptureProbeEnabled.load(std::memory_order_acquire)
                ? L"enabled" : L"disabled",
-           symbols.createCaptureProxy ? L"available" : L"unavailable",
            symbols.syncCaptureBits ? L"available" : L"unavailable");
+    LogVisualCaptureAbi();
 }
 
 static bool InitializeDwmHooks()
@@ -3958,90 +3960,44 @@ static void ProbeCompleteWindowImage(void* compositor, void* root,
     if (result < 0 && image) g_cBaseObjectRelease(image);
 }
 
-static void RunOneShotVisualCaptureProbe(void* compositor, void* root,
-                                         void* topLevelWindow, HWND hwnd)
+static void LogVisualCaptureAbi()
 {
-    if (!g_meshCaptureProbeEnabled.load(std::memory_order_acquire)) return;
-    auto& api = g_meshLayerSymbols;
+    if (!g_meshCaptureProbeEnabled.load(std::memory_order_acquire) ||
+        g_meshCaptureProbeLogged.exchange(true, std::memory_order_acq_rel))
+        return;
+    void* function = reinterpret_cast<void*>(g_meshLayerSymbols.syncCaptureBits);
     const uintptr_t imageBase = reinterpret_cast<uintptr_t>(g_dwmModuleLayout.imageBegin);
-    const uintptr_t create = reinterpret_cast<uintptr_t>(api.createCaptureProxy);
-    const uintptr_t sync = reinterpret_cast<uintptr_t>(api.syncCaptureBits);
-    const uintptr_t canvasGetter =
-        reinterpret_cast<uintptr_t>(g_getCanvasRootVisualProxy);
-    // These RVAs are from the locally verified 22621.6199 image. Do not guess
-    // this private ABI on another DWM build, even if its symbol names match.
+    const uintptr_t sync = reinterpret_cast<uintptr_t>(function);
     if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
-        !IsDwmFunctionPointerValid(reinterpret_cast<void*>(create)) ||
-        !IsDwmFunctionPointerValid(reinterpret_cast<void*>(sync)) ||
-        !IsDwmFunctionPointerValid(reinterpret_cast<void*>(canvasGetter)) ||
-        create - imageBase != 0xAD608 || sync - imageBase != 0xC6074 ||
-        canvasGetter - imageBase != 0xE5BAC ||
-        g_canvasVisualOwnerOffset != 0x120 || g_visualProxyOffset != 0x10 ||
-        !g_cBaseObjectRelease)
+        !IsDwmFunctionPointerValid(function) || sync - imageBase != 0xC6074)
     {
-        Wh_Log(L"4x4 capture probe skipped: unsupported DWM build or symbols "
-               L"(timestamp=0x%08X size=0x%X create=%p sync=%p canvas=%p)",
+        Wh_Log(L"4x4 capture ABI probe skipped: unsupported DWM build or symbol "
+               L"(timestamp=0x%08X size=0x%X sync=%p)",
                g_dwmModuleLayout.timeDateStamp, g_dwmModuleLayout.sizeOfImage,
-               api.createCaptureProxy, api.syncCaptureBits,
-               g_getCanvasRootVisualProxy);
+               function);
         return;
     }
-    void* rootProxy = ReadPointerMember(root, g_visualProxyOffset);
-    void* canvasOwner = ReadPointerMember(topLevelWindow,
-                                          g_canvasVisualOwnerOffset);
-    void* canvasProxy = IsReadableMemory(canvasOwner, 0x18)
-                            ? g_getCanvasRootVisualProxy(topLevelWindow)
-                            : nullptr;
-    if (!IsVisualProxyPointerValid(rootProxy) ||
-        !IsVisualProxyPointerValid(canvasProxy) ||
-        ReadPointerMember(canvasOwner, g_visualProxyOffset) != canvasProxy)
+    Wh_Log(L"4x4 capture ABI probe: function=%p RVA=0x%zx "
+           L"(read-only disassembly; no capture call)",
+           function, sync - imageBase);
+    BYTE* instruction = static_cast<BYTE*>(function);
+    size_t bytesRead = 0;
+    for (unsigned int index = 0; index < 100 && bytesRead < 512; index++)
     {
-        Wh_Log(L"4x4 capture probe skipped: unverified visual HWND=%p "
-               L"completeRootProxy=%p canvasProxy=%p canvasOwner=%p",
-               hwnd, rootProxy, canvasProxy, canvasOwner);
-        return;
+        WH_DISASM_RESULT decoded = {};
+        if (!IsDwmExecutableAddress(instruction) ||
+            !Wh_Disasm(instruction, &decoded) || decoded.length == 0 ||
+            bytesRead + decoded.length > 512)
+        {
+            Wh_Log(L"4x4 capture ABI probe stopped at +0x%zx", bytesRead);
+            break;
+        }
+        Wh_Log(L"4x4 capture ABI[%u] +0x%zx: %S", index, bytesRead, decoded.text);
+        bytesRead += decoded.length;
+        instruction += decoded.length;
+        if (std::string_view(decoded.text) == "ret") break;
     }
-    Wh_Log(L"4x4 capture probe source: HWND=%p completeRootProxy=%p "
-           L"canvasProxy=%p same=%d (Windows CaptureWindow path uses canvas)",
-           hwnd, rootProxy, canvasProxy, rootProxy == canvasProxy);
-
-    void* captureProxy = nullptr;
-    const ULONGLONG started = GetTickCount64();
-    long result = api.createCaptureProxy(compositor, &captureProxy);
-    const bool verifiedProxy = captureProxy &&
-        IsReadableMemory(captureProxy, sizeof(void*)) &&
-        IsDwmImageAddress(*static_cast<void**>(captureProxy), 3 * sizeof(void*));
-    if (result < 0 || !verifiedProxy)
-    {
-        Wh_Log(L"4x4 capture probe: stage=create result=0x%08X proxy=%p "
-               L"elapsedMs=%llu (no readback)",
-               static_cast<unsigned int>(result), captureProxy,
-               GetTickCount64() - started);
-        if (verifiedProxy) g_cBaseObjectRelease(captureProxy);
-        // An unverified object must not be passed to a private Release call.
-        return;
-    }
-
-    DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    void* bits = nullptr;
-    result = api.syncCaptureBits(captureProxy, canvasProxy, 1.0f,
-                                 0, 0, 64, 64, 0, &format, &bits);
-    MEMORY_BASIC_INFORMATION memory = {};
-    const SIZE_T queried = bits ? VirtualQuery(bits, &memory, sizeof(memory)) : 0;
-    // The private API does not establish buffer ownership. Retain at most this
-    // one diagnostic result per module load; never guess an allocator or read
-    // pixels. This is deliberately not a production capture path.
-    g_meshCaptureProbeReturnedBits = bits;
-    Wh_Log(L"4x4 capture probe: stage=sync result=0x%08X HWND=%p "
-           L"format=%u bits=%p memoryType=0x%X virtualRegionBytes=%zu "
-           L"elapsedMs=%llu pixelsRead=no bufferFreed=no "
-           L"rendering=unchanged",
-           static_cast<unsigned int>(result), hwnd,
-           static_cast<unsigned int>(format), bits,
-           queried ? memory.Type : 0, queried ? memory.RegionSize : 0,
-           GetTickCount64() - started);
-    g_cBaseObjectRelease(captureProxy);
 }
 
 static void ReleaseMeshLayerResources(MeshLayerState& state)
@@ -4314,7 +4270,6 @@ static void TryAttachMeshLayer(int slotIndex, ULONGLONG generation, HWND hwnd,
                 break;
         }
         pending.hostVisual = root;
-        RunOneShotVisualCaptureProbe(compositor, root, topLevelWindow, hwnd);
         void* siblingCollection = pending.liveWindowImage && affineTransform &&
                                    g_cVisualProxySetTransform &&
                                    g_createMatrixTransformProxy &&
