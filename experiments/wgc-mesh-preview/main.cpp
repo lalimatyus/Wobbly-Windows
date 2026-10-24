@@ -162,13 +162,16 @@ private:
         DWORD style = overlayTest_ ? WS_POPUP : WS_OVERLAPPEDWINDOW;
         DWORD exStyle = overlayTest_ ?
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-            WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP : 0;
+            WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP : 0;
         window_ = CreateWindowExW(exStyle, windowClass.lpszClassName,
                                   L"Wobbly GPU mesh preview", style,
                                   CW_USEDEFAULT, CW_USEDEFAULT,
                                   overlayTest_ ? 1 : 1050, overlayTest_ ? 1 : 750,
                                   nullptr, nullptr, windowClass.hInstance, this);
         if (!window_) winrt::throw_last_error();
+        if (overlayTest_ &&
+            !SetLayeredWindowAttributes(window_, 0, 255, LWA_ALPHA))
+            winrt::throw_last_error();
 
         UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
         D3D_FEATURE_LEVEL level;
@@ -249,11 +252,27 @@ private:
             overlayVisible_ = false;
             return false;
         }
-        RECT source{};
-        if (FAILED(DwmGetWindowAttribute(target_, DWMWA_EXTENDED_FRAME_BOUNDS,
-                                         &source, sizeof(source))) &&
-            !GetWindowRect(target_, &source))
+        RECT windowBounds{};
+        if (!GetWindowRect(target_, &windowBounds))
             return false;
+        if (!haveFrameInsets_) {
+            RECT visibleBounds{};
+            if (SUCCEEDED(DwmGetWindowAttribute(target_,
+                    DWMWA_EXTENDED_FRAME_BOUNDS,
+                    &visibleBounds, sizeof(visibleBounds))) &&
+                visibleBounds.right > visibleBounds.left &&
+                visibleBounds.bottom > visibleBounds.top) {
+                frameInsets_ = {visibleBounds.left - windowBounds.left,
+                                visibleBounds.top - windowBounds.top,
+                                visibleBounds.right - windowBounds.right,
+                                visibleBounds.bottom - windowBounds.bottom};
+            }
+            haveFrameInsets_ = true;
+        }
+        RECT source{windowBounds.left + frameInsets_.left,
+                    windowBounds.top + frameInsets_.top,
+                    windowBounds.right + frameInsets_.right,
+                    windowBounds.bottom + frameInsets_.bottom};
         const int width = source.right - source.left;
         const int height = source.bottom - source.top;
         if (width < 1 || height < 1 || width > 16000 || height > 16000)
@@ -265,11 +284,15 @@ private:
                      source.left - (canvasWidth - width) / 2 + canvasWidth,
                      source.top - (canvasHeight - height) / 2 + canvasHeight};
         if (!EqualRect(&desired, &overlayBounds_)) {
+            if (!SetWindowPos(window_, HWND_TOPMOST, desired.left, desired.top,
+                              canvasWidth, canvasHeight,
+                              SWP_NOACTIVATE | SWP_NOOWNERZORDER))
+                return false;
             overlayBounds_ = desired;
-            SetWindowPos(window_, HWND_TOPMOST, desired.left, desired.top,
-                         canvasWidth, canvasHeight,
-                         SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            ++overlayMoves_;
         }
+        targetWindowBounds_ = windowBounds;
+        sourceBounds_ = source;
         if (!overlayVisible_) {
             ShowWindow(window_, SW_SHOWNOACTIVATE);
             overlayVisible_ = true;
@@ -606,6 +629,15 @@ private:
                 physicsMode_ ? (bridgeActive_ ? L"active" : L"waiting") : L"demo");
             if (!overlayTest_) SetWindowTextW(window_, title);
             std::wprintf(L"%ls\n", title);
+            if (overlayTest_) {
+                std::wprintf(L"Overlay tracking: window=(%ld,%ld) source=(%ld,%ld) "
+                             L"overlay=(%ld,%ld) moves=%llu\n",
+                             targetWindowBounds_.left, targetWindowBounds_.top,
+                             sourceBounds_.left, sourceBounds_.top,
+                             overlayBounds_.left, overlayBounds_.top,
+                             overlayMoves_);
+                overlayMoves_ = 0;
+            }
             capturedFrames_ = renderedFrames_ = 0;
             lastStats_ = now;
         }
@@ -617,6 +649,11 @@ private:
     bool overlayTest_ = false;
     bool overlayVisible_ = false;
     RECT overlayBounds_{};
+    RECT targetWindowBounds_{};
+    RECT sourceBounds_{};
+    RECT frameInsets_{};
+    bool haveFrameInsets_ = false;
+    unsigned long long overlayMoves_ = 0;
     bool bridgeActive_ = false;
     HANDLE bridgeHandle_ = nullptr;
     const mesh_bridge::Data* bridge_ = nullptr;
