@@ -2,12 +2,14 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.267
+// @version         0.268
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
+// @include         windhawk.exe
 // @architecture    amd64
-// @compilerOptions -lwevtapi -lole32 -lwindowscodecs -ladvapi32 -ld3d11 -ldxgi -lwindowsapp -luser32
+// @architecture    x86
+// @compilerOptions -lwevtapi -lole32 -lwindowscodecs -ladvapi32 -ld3d11 -ldxgi -lwindowsapp -luser32 -lshell32
 // @license         GPL-3.0-only
 // ==/WindhawkMod==
 
@@ -110,9 +112,9 @@ the combined mod is not offered under GPLv2.
   $name: External GPU mesh preview (experimental)
   $description: Publishes 4x4 physics points to a separate local preview program. Automatically enabled by the External GPU renderer option.
 
-- EnableInProcessGpuProbe: false
-  $name: In-process GPU capture probe (experimental)
-  $description: Tests whether DWM can capture one moving window through Windows Graphics Capture. Logs three seconds of frames without changing the image. Keep this off for normal use.
+- EnableGpuCompanionProbe: false
+  $name: Windhawk GPU companion probe (experimental)
+  $description: Tests three seconds of window capture in a separate user-session Windhawk process. Does not change the image. Keep this off for normal use.
 
 - AdvancedMode:
   - enable: false
@@ -138,6 +140,7 @@ the combined mod is not offered under GPLv2.
 
 
 #include <windows.h>
+#include <shellapi.h>
 #include <winevt.h>
 #include <wincodec.h>
 #include <sddl.h>
@@ -1376,13 +1379,12 @@ static void PublishMeshBridgeSnapshot()
     }
 }
 
-std::atomic_bool g_inProcessGpuProbeEnabled = false;
+std::atomic_bool g_gpuCompanionProbeEnabled = false;
 HANDLE g_inProcessGpuProbeStop = nullptr;
 HANDLE g_inProcessGpuProbeThread = nullptr;
 
-static HWND FindInProcessGpuProbeTarget()
+static HWND FindGpuCompanionProbeTarget(const MeshBridgeData* bridge)
 {
-    const auto* bridge = g_meshBridge.load(std::memory_order_acquire);
     if (!bridge || bridge->magic != 0x48535757 || bridge->version != 1 ||
         bridge->size != sizeof(MeshBridgeData))
         return nullptr;
@@ -1418,6 +1420,35 @@ static HWND FindInProcessGpuProbeTarget()
 
 static DWORD WINAPI InProcessGpuProbeThreadProc(void*)
 {
+    struct BridgeView
+    {
+        HANDLE handle = nullptr;
+        const MeshBridgeData* data = nullptr;
+        DWORD lastError = 0;
+        ~BridgeView()
+        {
+            if (data) UnmapViewOfFile(data);
+            if (handle) CloseHandle(handle);
+        }
+        void Open()
+        {
+            if (data) return;
+            handle = OpenFileMappingW(FILE_MAP_READ, FALSE, MESH_BRIDGE_NAME);
+            if (!handle)
+            {
+                lastError = GetLastError();
+                return;
+            }
+            data = static_cast<const MeshBridgeData*>(
+                MapViewOfFile(handle, FILE_MAP_READ, 0, 0, sizeof(MeshBridgeData)));
+            if (!data)
+            {
+                lastError = GetLastError();
+                CloseHandle(handle);
+                handle = nullptr;
+            }
+        }
+    } bridge;
     using namespace winrt::Windows::Graphics::Capture;
     Direct3D11CaptureFramePool pool{nullptr};
     GraphicsCaptureSession session{nullptr};
@@ -1432,23 +1463,24 @@ static DWORD WINAPI InProcessGpuProbeThreadProc(void*)
         using namespace winrt::Windows::Graphics::DirectX;
         using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
         stage = L"Support";
-        try
-        {
-            Wh_Log(L"In-process GPU probe: support query=%d",
-                   GraphicsCaptureSession::IsSupported() ? 1 : 0);
-        }
-        catch (const winrt::hresult_error& error)
-        {
-            Wh_Log(L"In-process GPU probe: support query failed HRESULT=0x%08X; "
-                   L"trying direct window capture",
-                   static_cast<unsigned int>(error.code()));
-        }
-        Wh_Log(L"In-process GPU probe: waiting for first moving window");
+        Wh_Log(L"GPU companion probe: support query=%d",
+               GraphicsCaptureSession::IsSupported() ? 1 : 0);
+        Wh_Log(L"GPU companion probe: waiting for first moving window");
         HWND hwnd = nullptr;
-        while (WaitForSingleObject(g_inProcessGpuProbeStop, 16) == WAIT_TIMEOUT)
+        ULONGLONG waitingSince = GetTickCount64();
+        bool mappingWarningLogged = false;
+        while (WaitForSingleObject(g_inProcessGpuProbeStop, 50) == WAIT_TIMEOUT)
         {
-            hwnd = FindInProcessGpuProbeTarget();
+            bridge.Open();
+            hwnd = FindGpuCompanionProbeTarget(bridge.data);
             if (hwnd) break;
+            if (!bridge.data && !mappingWarningLogged &&
+                GetTickCount64() - waitingSince > 2000)
+            {
+                Wh_Log(L"GPU companion probe: waiting for DWM physics bridge error=%u",
+                       bridge.lastError);
+                mappingWarningLogged = true;
+            }
         }
         if (!hwnd || WaitForSingleObject(g_inProcessGpuProbeStop, 0) == WAIT_OBJECT_0)
             return 0;
@@ -1460,7 +1492,7 @@ static DWORD WINAPI InProcessGpuProbeThreadProc(void*)
         winrt::check_hresult(interop->CreateForWindow(
             hwnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item)));
         auto size = item.Size();
-        Wh_Log(L"In-process GPU probe: window item created HWND=%p size=%dx%d",
+        Wh_Log(L"GPU companion probe: window item created HWND=%p size=%dx%d",
                hwnd, size.Width, size.Height);
 
         stage = L"D3DDevice";
@@ -1483,7 +1515,7 @@ static DWORD WINAPI InProcessGpuProbeThreadProc(void*)
         session = pool.CreateCaptureSession(item);
         session.IsCursorCaptureEnabled(false);
         session.StartCapture();
-        Wh_Log(L"In-process GPU probe: capture started HWND=%p size=%dx%d",
+        Wh_Log(L"GPU companion probe: capture started HWND=%p size=%dx%d",
                hwnd, size.Width, size.Height);
 
         unsigned int frames = 0;
@@ -1509,18 +1541,18 @@ static DWORD WINAPI InProcessGpuProbeThreadProc(void*)
         session = nullptr;
         pool.Close();
         pool = nullptr;
-        Wh_Log(L"In-process GPU probe: completed HWND=%p frames=%u durationMs=%llu",
+        Wh_Log(L"GPU companion probe: completed HWND=%p frames=%u durationMs=%llu",
                hwnd, frames, GetTickCount64() - started);
     }
     catch (const winrt::hresult_error& error)
     {
-        Wh_Log(L"In-process GPU probe: failed stage=%s HRESULT=0x%08X %s",
+        Wh_Log(L"GPU companion probe: failed stage=%s HRESULT=0x%08X %s",
                stage, static_cast<unsigned int>(error.code()),
                error.message().c_str());
     }
     catch (...)
     {
-        Wh_Log(L"In-process GPU probe: unexpected failure stage=%s", stage);
+        Wh_Log(L"GPU companion probe: unexpected failure stage=%s", stage);
     }
     try
     {
@@ -1528,6 +1560,8 @@ static DWORD WINAPI InProcessGpuProbeThreadProc(void*)
         if (pool) pool.Close();
     }
     catch (...) {}
+    // Keep the dedicated tool process alive until Windhawk unloads the mod.
+    WaitForSingleObject(g_inProcessGpuProbeStop, INFINITE);
     return 0;
 }
 
@@ -1549,7 +1583,7 @@ static void StopInProcessGpuProbe()
 
 static void UpdateInProcessGpuProbe()
 {
-    if (!g_inProcessGpuProbeEnabled.load(std::memory_order_acquire))
+    if (!g_gpuCompanionProbeEnabled.load(std::memory_order_acquire))
     {
         StopInProcessGpuProbe();
         return;
@@ -1561,14 +1595,14 @@ static void UpdateInProcessGpuProbe()
     g_inProcessGpuProbeStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_inProcessGpuProbeStop)
     {
-        Wh_Log(L"In-process GPU probe: failed to create stop event");
+        Wh_Log(L"GPU companion probe: failed to create stop event");
         return;
     }
     g_inProcessGpuProbeThread = CreateThread(
         nullptr, 0, InProcessGpuProbeThreadProc, nullptr, 0, nullptr);
     if (!g_inProcessGpuProbeThread)
     {
-        Wh_Log(L"In-process GPU probe: failed to create worker thread");
+        Wh_Log(L"GPU companion probe: failed to create worker thread");
         StopInProcessGpuProbe();
     }
 }
@@ -9046,13 +9080,13 @@ static void LoadSettings()
     g_meshCaptureProbeEnabled.store(
         Wh_GetIntSetting(L"EnableCaptureProbe") != 0,
         std::memory_order_release);
-    g_inProcessGpuProbeEnabled.store(
-        Wh_GetIntSetting(L"EnableInProcessGpuProbe") != 0,
+    g_gpuCompanionProbeEnabled.store(
+        Wh_GetIntSetting(L"EnableGpuCompanionProbe") != 0,
         std::memory_order_release);
     g_meshBridgeEnabled.store(
         Wh_GetIntSetting(L"EnableExternalMeshBridge") != 0 ||
             settings.rendererMode == RendererMode::ExternalGpu ||
-            g_inProcessGpuProbeEnabled.load(std::memory_order_relaxed),
+            g_gpuCompanionProbeEnabled.load(std::memory_order_relaxed),
         std::memory_order_release);
     bool advancedMode = Wh_GetIntSetting(L"AdvancedMode.enable") != 0;
     settings.resizeWobbleEnabled = Wh_GetIntSetting(L"EnableResizeWobble") != 0;
@@ -9115,10 +9149,150 @@ static bool HasRecentDwmCrashLoop()
     return success && count >= ARRAYSIZE(warnings);
 }
 
+enum class HostProcess { Dwm, GpuToolLauncher, GpuToolChild };
+HostProcess g_hostProcess = HostProcess::Dwm;
+HANDLE g_gpuToolMutex = nullptr;
+HANDLE g_gpuToolProcess = nullptr;
+
+static bool IsCurrentGpuToolChild(bool* isAnyToolChild)
+{
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return false;
+    bool current = false;
+    *isAnyToolChild = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (!_wcsicmp(argv[i], L"-service") ||
+            !_wcsicmp(argv[i], L"-service-start") ||
+            !_wcsicmp(argv[i], L"-service-stop"))
+        {
+            *isAnyToolChild = true;
+            break;
+        }
+        if (!_wcsicmp(argv[i], L"-tool-mod"))
+        {
+            *isAnyToolChild = true;
+            current = i + 1 < argc && !_wcsicmp(argv[i + 1], WH_MOD_ID);
+            break;
+        }
+    }
+    LocalFree(argv);
+    return current;
+}
+
+static void WINAPI GpuToolEntryPointHook()
+{
+    ExitThread(0);
+}
+
+static bool HookGpuToolEntryPoint()
+{
+    auto* base = reinterpret_cast<BYTE*>(GetModuleHandleW(nullptr));
+    if (!base) return false;
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        !nt->OptionalHeader.AddressOfEntryPoint)
+        return false;
+    return Wh_SetFunctionHook(base + nt->OptionalHeader.AddressOfEntryPoint,
+                              reinterpret_cast<void*>(GpuToolEntryPointHook),
+                              nullptr);
+}
+
+static void StartGpuToolProcess()
+{
+    if (Wh_GetIntSetting(L"EnableGpuCompanionProbe") == 0) return;
+    if (g_gpuToolProcess)
+    {
+        if (WaitForSingleObject(g_gpuToolProcess, 0) == WAIT_TIMEOUT) return;
+        CloseHandle(g_gpuToolProcess);
+        g_gpuToolProcess = nullptr;
+    }
+    wchar_t path[MAX_PATH] = {};
+    DWORD length = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+    if (!length || length >= ARRAYSIZE(path))
+    {
+        Wh_Log(L"GPU companion launcher: cannot find host executable");
+        return;
+    }
+    std::wstring command = L"\"";
+    command += path;
+    command += L"\" -tool-mod \"";
+    command += WH_MOD_ID;
+    command += L"\"";
+    HMODULE kernel = GetModuleHandleW(L"kernelbase.dll");
+    if (!kernel) kernel = GetModuleHandleW(L"kernel32.dll");
+    using CreateProcessInternalW_t = BOOL (WINAPI*)(
+        HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
+        LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR,
+        LPSTARTUPINFOW, LPPROCESS_INFORMATION, PHANDLE);
+    auto createProcess = kernel ? reinterpret_cast<CreateProcessInternalW_t>(
+        GetProcAddress(kernel, "CreateProcessInternalW")) : nullptr;
+    if (!createProcess)
+    {
+        Wh_Log(L"GPU companion launcher: CreateProcessInternalW unavailable");
+        return;
+    }
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_FORCEOFFFEEDBACK;
+    PROCESS_INFORMATION process = {};
+    if (!createProcess(nullptr, path, command.data(), nullptr, nullptr,
+                       FALSE, NORMAL_PRIORITY_CLASS, nullptr, nullptr,
+                       &startup, &process, nullptr))
+    {
+        Wh_Log(L"GPU companion launcher: process creation failed error=%u",
+               GetLastError());
+        return;
+    }
+    Wh_Log(L"GPU companion launcher: started PID=%u", process.dwProcessId);
+    CloseHandle(process.hThread);
+    g_gpuToolProcess = process.hProcess;
+}
+
 }  // namespace
 
 BOOL Wh_ModInit()
 {
+    wchar_t processPath[MAX_PATH] = {};
+    DWORD processPathLength = GetModuleFileNameW(
+        nullptr, processPath, ARRAYSIZE(processPath));
+    if (!processPathLength || processPathLength >= ARRAYSIZE(processPath))
+        return FALSE;
+    const wchar_t* processName = wcsrchr(processPath, L'\\');
+    processName = processName ? processName + 1 : processPath;
+    if (!_wcsicmp(processName, L"windhawk.exe"))
+    {
+        DWORD sessionId = 0;
+        if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) ||
+            sessionId == 0)
+            return FALSE;
+        bool anyToolChild = false;
+        bool thisToolChild = IsCurrentGpuToolChild(&anyToolChild);
+        if (anyToolChild && !thisToolChild) return FALSE;
+        g_hostProcess = thisToolChild ? HostProcess::GpuToolChild
+                                     : HostProcess::GpuToolLauncher;
+        if (!thisToolChild) return TRUE;
+        g_gpuToolMutex = CreateMutexW(
+            nullptr, TRUE, L"Local\\Windhawk.WobblyWindows.GpuTool.v1");
+        if (!g_gpuToolMutex || GetLastError() == ERROR_ALREADY_EXISTS)
+        {
+            Wh_Log(L"GPU companion: another instance is running");
+            ExitProcess(1);
+        }
+        if (!HookGpuToolEntryPoint())
+        {
+            Wh_Log(L"GPU companion: host entry point hook failed");
+            CloseHandle(g_gpuToolMutex);
+            g_gpuToolMutex = nullptr;
+            return FALSE;
+        }
+        Wh_Log(L"GPU companion: dedicated process initialized");
+        return TRUE;
+    }
+    if (_wcsicmp(processName, L"dwm.exe")) return FALSE;
     if (HasRecentDwmCrashLoop())
     {
         Wh_Log(L"Refusing to load: repeated recent Dwminit warnings; "
@@ -9190,28 +9364,78 @@ BOOL Wh_ModInit()
 
 void Wh_ModAfterInit()
 {
+    if (g_hostProcess == HostProcess::GpuToolLauncher)
+    {
+        StartGpuToolProcess();
+        return;
+    }
+    if (g_hostProcess == HostProcess::GpuToolChild)
+    {
+        g_gpuCompanionProbeEnabled.store(
+            Wh_GetIntSetting(L"EnableGpuCompanionProbe") != 0,
+            std::memory_order_release);
+        UpdateInProcessGpuProbe();
+        return;
+    }
     // Windhawk activates detours after Wh_ModInit returns. Queue the first
     // scene pass only now so already-open windows cannot miss the wake.
     QueueExistingWindowBackfill();
-    UpdateInProcessGpuProbe();
 }
 
 void Wh_ModSettingsChanged()
 {
+    if (g_hostProcess == HostProcess::GpuToolLauncher)
+    {
+        StartGpuToolProcess();
+        return;
+    }
+    if (g_hostProcess == HostProcess::GpuToolChild)
+    {
+        g_gpuCompanionProbeEnabled.store(
+            Wh_GetIntSetting(L"EnableGpuCompanionProbe") != 0,
+            std::memory_order_release);
+        UpdateInProcessGpuProbe();
+        if (!g_gpuCompanionProbeEnabled.load(std::memory_order_acquire))
+            ExitProcess(0);
+        return;
+    }
     Wh_Log(L"Settings changed");
     LoadSettings();
     InitializeMeshBridge();
-    UpdateInProcessGpuProbe();
 }
 
 void Wh_ModBeforeUninit()
 {
+    if (g_hostProcess == HostProcess::GpuToolLauncher)
+    {
+        if (g_gpuToolProcess)
+        {
+            CloseHandle(g_gpuToolProcess);
+            g_gpuToolProcess = nullptr;
+        }
+        return;
+    }
+    if (g_hostProcess == HostProcess::GpuToolChild)
+    {
+        StopInProcessGpuProbe();
+        return;
+    }
     g_unloading.store(true, std::memory_order_release);
     Wh_Log(L"Preparing to unload");
     // Restore scene resources before Windhawk removes the hooks.
-    StopInProcessGpuProbe();
     StopWindowEventThread();
     CloseMeshBridge();
     UninitializeDpiSupport();
+}
+
+void Wh_ModUninit()
+{
+    if (g_hostProcess != HostProcess::GpuToolChild) return;
+    if (g_gpuToolMutex)
+    {
+        CloseHandle(g_gpuToolMutex);
+        g_gpuToolMutex = nullptr;
+    }
+    ExitProcess(0);
 }
 

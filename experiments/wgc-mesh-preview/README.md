@@ -67,17 +67,22 @@ This is still a two-process experiment. The original affine image remains
 behind each curved layer.
 Do not treat this mode as a finished replacement renderer.
 
-## In-process capture feasibility test
+## Windhawk GPU companion capture test
 
-Wobbly Windows 0.267 adds an optional **In-process GPU capture probe**. Leave
-**Renderer** on **Affine (stable)**, close the external preview, enable the
-probe, and move one normal window. The mod tries a three-second live capture
-inside dwm.exe and logs either `In-process GPU probe: completed` with a frame
-count or `In-process GPU probe: failed` with a stage and error code. The probe
-continues past an error from the preliminary support query. It does not
-draw or hide anything. Switch it off after the test. This establishes whether
-the working external capture path can be brought into the mod before moving
-its GPU renderer and changing the original window's visibility.
+The 0.267 in-DWM capture probe failed at `CaptureItem` with `0x80070424` on
+Windows 11 23H2. Wobbly Windows 0.268 instead tries the same capture from a
+dedicated user-session `windhawk.exe` process. This follows Windhawk's
+documented tool-mod process model. It keeps all capture calls out of DWM.
+
+Leave **Renderer** on **Affine (stable)**, close the external preview, enable
+**Windhawk GPU companion probe (experimental)**, and move one normal window.
+Look for `GPU companion launcher: started` and `GPU companion: dedicated
+process initialized`, then a separate Windhawk log showing `GPU companion
+probe: completed` with a frame count. A `failed` line gives the stage and
+HRESULT. The probe captures for three seconds, does not draw or hide anything,
+and keeps the released 0.115 affine behavior. Disable the setting after the
+test. It is a feasibility step before moving the working GPU renderer into
+the companion and safely replacing the original window image.
 
 The default sinusoidal demo is separate from the physics modes. Windows may
 show its normal capture border on the source.
