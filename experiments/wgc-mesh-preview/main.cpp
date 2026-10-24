@@ -276,6 +276,7 @@ private:
             PostMessageW(window, kFrameMessage, 0, 0);
         });
         session_ = pool_.CreateCaptureSession(item_);
+        session_.IsCursorCaptureEnabled(false);
         session_.StartCapture();
     }
 
