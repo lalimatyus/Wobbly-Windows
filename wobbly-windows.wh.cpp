@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.262
+// @version         0.263
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -37,6 +37,10 @@ initialize instead of using unverified addresses.
 * Enable custom physics to change each parameter independently, instead of a preset
 * Fluid wobble animations for dragging, snapping and even resizing windows
 * Uses a 4x4 spring simulation fitted to a smooth whole-window transform
+
+The experimental **External GPU mesh overlay** renderer requires the
+`experiments/wgc-mesh-preview/run-integrated.cmd` companion program from this
+repository. It still shows the original affine image behind the curved layer.
 
 ## Known Issues
 
@@ -92,10 +96,11 @@ the combined mod is not offered under GPLv2.
 
 - Renderer: "affine"
   $name: Renderer
-  $description: Experimental five-second live-source inset test on validated 23H2 layouts. Affine wobble stays enabled; this is not yet window bending.
+  $description: The external GPU option requires the separate experimental helper. Affine wobble remains underneath until original-window replacement is verified.
   $options:
   - "affine": "Affine (stable)"
   - "mesh-layer": "True 4x4 mesh layer (experimental)"
+  - "external-gpu": "External GPU mesh overlay (experimental)"
 
 - EnableCaptureProbe: false
   $name: Read-only visual capture ABI probe (23H2 only)
@@ -103,7 +108,7 @@ the combined mod is not offered under GPLv2.
 
 - EnableExternalMeshBridge: false
   $name: External GPU mesh preview (experimental)
-  $description: Publishes 4x4 physics points to a separate local preview program. The normal affine window effect remains active.
+  $description: Publishes 4x4 physics points to a separate local preview program. Automatically enabled by the External GPU renderer option.
 
 - AdvancedMode:
   - enable: false
@@ -165,6 +170,7 @@ enum class RendererMode : unsigned char
 {
     Affine,
     MeshLayer,
+    ExternalGpu,
 };
 
 struct WobblySettings
@@ -6777,7 +6783,8 @@ static void HandleMoveSizeStart(HWND hwnd)
     Wh_Log(L"DRAG TRACE START: HWND=%p Slot=%d Renderer=%s size=%dx%d "
            L"resizing=%d typeKnown=%d",
            hwnd, slotIndex,
-           activeSettings.rendererMode == RendererMode::MeshLayer ? L"mesh-layer" : L"affine",
+           activeSettings.rendererMode == RendererMode::MeshLayer ? L"mesh-layer" :
+           activeSettings.rendererMode == RendererMode::ExternalGpu ? L"external-gpu" : L"affine",
            width, height, g_realResizing, g_moveTypeKnown);
     RequestDwmScenePass();
 }
@@ -8812,14 +8819,18 @@ static void LoadSettings()
     }
     WobblySettings settings = PHYSICS_PRESETS[wobbliness];
     auto rendererSetting = WindhawkUtils::StringSetting::make(L"Renderer");
-    settings.rendererMode = std::wstring_view(rendererSetting.get()) == L"mesh-layer"
+    std::wstring_view rendererValue(rendererSetting.get());
+    settings.rendererMode = rendererValue == L"mesh-layer"
                                 ? RendererMode::MeshLayer
-                                : RendererMode::Affine;
+                                : rendererValue == L"external-gpu"
+                                      ? RendererMode::ExternalGpu
+                                      : RendererMode::Affine;
     g_meshCaptureProbeEnabled.store(
         Wh_GetIntSetting(L"EnableCaptureProbe") != 0,
         std::memory_order_release);
     g_meshBridgeEnabled.store(
-        Wh_GetIntSetting(L"EnableExternalMeshBridge") != 0,
+        Wh_GetIntSetting(L"EnableExternalMeshBridge") != 0 ||
+            settings.rendererMode == RendererMode::ExternalGpu,
         std::memory_order_release);
     bool advancedMode = Wh_GetIntSetting(L"AdvancedMode.enable") != 0;
     settings.resizeWobbleEnabled = Wh_GetIntSetting(L"EnableResizeWobble") != 0;
@@ -8850,7 +8861,8 @@ static void LoadSettings()
            L"Drag=%.2f, "
            L"MoveFactor=%.2f",
            wobbliness, advancedMode,
-           settings.rendererMode == RendererMode::MeshLayer ? L"mesh-layer" : L"affine",
+           settings.rendererMode == RendererMode::MeshLayer ? L"mesh-layer" :
+           settings.rendererMode == RendererMode::ExternalGpu ? L"external-gpu" : L"affine",
            settings.resizeWobbleEnabled,
            settings.windowStateWobbleEnabled, settings.stiffness, settings.drag,
            settings.moveFactor);
