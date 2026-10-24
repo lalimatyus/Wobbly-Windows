@@ -240,7 +240,7 @@ private:
         CreateRenderTarget();
     }
 
-    bool UpdateOverlayBounds() {
+    bool UpdateOverlayBounds(double physicsX = 0.0, double physicsY = 0.0) {
         if (!IsWindow(target_)) {
             DestroyWindow(window_);
             return false;
@@ -283,6 +283,9 @@ private:
                      source.top - (canvasHeight - height) / 2,
                      source.left - (canvasWidth - width) / 2 + canvasWidth,
                      source.top - (canvasHeight - height) / 2 + canvasHeight};
+        const LONG shiftX = static_cast<LONG>(std::lround(physicsX));
+        const LONG shiftY = static_cast<LONG>(std::lround(physicsY));
+        OffsetRect(&desired, shiftX, shiftY);
         if (!EqualRect(&desired, &overlayBounds_)) {
             if (!SetWindowPos(window_, HWND_TOPMOST, desired.left, desired.top,
                               canvasWidth, canvasHeight,
@@ -293,6 +296,8 @@ private:
         }
         targetWindowBounds_ = windowBounds;
         sourceBounds_ = source;
+        overlayPhysicsX_ = physicsX;
+        overlayPhysicsY_ = physicsY;
         if (!overlayVisible_) {
             ShowWindow(window_, SW_SHOWNOACTIVATE);
             overlayVisible_ = true;
@@ -525,7 +530,8 @@ private:
         return false;
     }
 
-    bool MakePhysicsBend(Bend& bend) {
+    bool MakePhysicsBend(Bend& bend, double& translationX,
+                         double& translationY) {
         mesh_bridge::Payload snapshot{};
         if (!ReadPhysics(snapshot)) return false;
         if (!std::isfinite(snapshot.width) || !std::isfinite(snapshot.height) ||
@@ -544,6 +550,12 @@ private:
         }
         baseX /= 16; baseY /= 16;
         centerX /= 16; centerY /= 16;
+        translationX = centerX - baseX;
+        translationY = centerY - baseY;
+        if (!std::isfinite(translationX) || !std::isfinite(translationY))
+            return false;
+        translationX = std::clamp(translationX, -4096.0, 4096.0);
+        translationY = std::clamp(translationY, -4096.0, 4096.0);
         double denomX = 0, denomY = 0, xx = 0, xy = 0, yx = 0, yy = 0;
         for (auto const& point : snapshot.points) {
             double bx = point.baseX - baseX;
@@ -577,20 +589,24 @@ private:
 
     void Render() {
         if (!capturedView_ || !renderTarget_) return;
-        if (overlayTest_ && !UpdateOverlayBounds()) return;
-        RECT rect{};
-        GetClientRect(window_, &rect);
-        if (rect.right <= 0 || rect.bottom <= 0) return;
         auto now = std::chrono::steady_clock::now();
         float t = std::chrono::duration<float>(now - started_).count();
         Bend bend{};
+        double translationX = 0.0, translationY = 0.0;
         bend.options[3] = overlayTest_ ? (8.0f / 9.0f) : 1.0f;
         if (physicsMode_) {
-            bridgeActive_ = MakePhysicsBend(bend);
+            bridgeActive_ = MakePhysicsBend(bend, translationX, translationY);
         } else {
             bend.options[0] = 0.16f * std::sin(t * 2.0f);
             bend.options[1] = 0.12f * std::sin(t * 1.6f + 0.7f);
         }
+        if (overlayTest_ && !UpdateOverlayBounds(
+                bridgeActive_ ? translationX : 0.0,
+                bridgeActive_ ? translationY : 0.0))
+            return;
+        RECT rect{};
+        GetClientRect(window_, &rect);
+        if (rect.right <= 0 || rect.bottom <= 0) return;
         context_->UpdateSubresource(bendBuffer_.Get(), 0, nullptr, &bend, 0, 0);
         D3D11_VIEWPORT viewport{0, 0, static_cast<float>(rect.right),
                                 static_cast<float>(rect.bottom), 0, 1};
@@ -631,9 +647,10 @@ private:
             std::wprintf(L"%ls\n", title);
             if (overlayTest_) {
                 std::wprintf(L"Overlay tracking: window=(%ld,%ld) source=(%ld,%ld) "
-                             L"overlay=(%ld,%ld) moves=%llu\n",
+                             L"physics=(%.1f,%.1f) overlay=(%ld,%ld) moves=%llu\n",
                              targetWindowBounds_.left, targetWindowBounds_.top,
                              sourceBounds_.left, sourceBounds_.top,
+                             overlayPhysicsX_, overlayPhysicsY_,
                              overlayBounds_.left, overlayBounds_.top,
                              overlayMoves_);
                 overlayMoves_ = 0;
@@ -654,6 +671,7 @@ private:
     RECT frameInsets_{};
     bool haveFrameInsets_ = false;
     unsigned long long overlayMoves_ = 0;
+    double overlayPhysicsX_ = 0.0, overlayPhysicsY_ = 0.0;
     bool bridgeActive_ = false;
     HANDLE bridgeHandle_ = nullptr;
     const mesh_bridge::Data* bridge_ = nullptr;

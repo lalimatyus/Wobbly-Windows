@@ -41,8 +41,10 @@ Keep the mod on **Affine (stable)** with **External GPU mesh preview
 (experimental)** enabled. Run `run-overlay-test.cmd`, activate a normal window
 within the five-second countdown, then drag it immediately. The separate GPU
 program draws a transparent, click-through layer above that window only while
-it receives active physics. The layer follows the visible window bounds and
-disappears automatically after five seconds. It does not hide the real window,
+it receives active physics. The layer follows the visible window bounds plus
+the mesh's average physical displacement, so its motion can lag behind the
+pointer along with the original wobble. It disappears automatically after five
+seconds. It does not hide the real window,
 so seeing the original behind the bent image is expected. Test with a simple
 window first. The console prints the captured texture and overlay sizes, plus
 the source window and overlay positions once per second.
