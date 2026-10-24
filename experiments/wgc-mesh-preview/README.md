@@ -67,5 +67,16 @@ This is still a two-process experiment. The original affine image remains
 behind each curved layer.
 Do not treat this mode as a finished replacement renderer.
 
+## In-process capture feasibility test
+
+Wobbly Windows 0.266 adds an optional **In-process GPU capture probe**. Leave
+**Renderer** on **Affine (stable)**, close the external preview, enable the
+probe, and move one normal window. The mod tries a three-second live capture
+inside dwm.exe and logs either `In-process GPU probe: completed` with a frame
+count or `In-process GPU probe: failed` with an error code. The probe does not
+draw or hide anything. Switch it off after the test. This establishes whether
+the working external capture path can be brought into the mod before moving
+its GPU renderer and changing the original window's visibility.
+
 The default sinusoidal demo is separate from the physics modes. Windows may
 show its normal capture border on the source.

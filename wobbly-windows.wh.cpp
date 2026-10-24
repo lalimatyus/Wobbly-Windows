@@ -2,12 +2,12 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.264
+// @version         0.266
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
 // @architecture    amd64
-// @compilerOptions -lwevtapi -lole32 -lwindowscodecs -ladvapi32
+// @compilerOptions -lwevtapi -lole32 -lwindowscodecs -ladvapi32 -ld3d11 -ldxgi -lwindowsapp -luser32
 // @license         GPL-3.0-only
 // ==/WindhawkMod==
 
@@ -110,6 +110,10 @@ the combined mod is not offered under GPLv2.
   $name: External GPU mesh preview (experimental)
   $description: Publishes 4x4 physics points to a separate local preview program. Automatically enabled by the External GPU renderer option.
 
+- EnableInProcessGpuProbe: false
+  $name: In-process GPU capture probe (experimental)
+  $description: Tests whether DWM can capture one moving window through Windows Graphics Capture. Logs three seconds of frames without changing the image. Keep this off for normal use.
+
 - AdvancedMode:
   - enable: false
     $name: Enable
@@ -138,6 +142,13 @@ the combined mod is not offered under GPLv2.
 #include <wincodec.h>
 #include <sddl.h>
 #include <dxgiformat.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <wrl/client.h>
+#include <windows.graphics.capture.interop.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
@@ -152,6 +163,16 @@ the combined mod is not offered under GPLv2.
 #include <vector>
 
 #include <windhawk_utils.h>
+
+// The Windhawk SDK omits this Windows SDK interop header.
+extern "C" HRESULT WINAPI CreateDirect3D11DeviceFromDXGIDevice(
+    IDXGIDevice* dxgiDevice, IInspectable** graphicsDevice);
+struct IDirect3DDxgiInterfaceAccess : IUnknown
+{
+    virtual HRESULT STDMETHODCALLTYPE GetInterface(REFIID iid, void** result) = 0;
+};
+__CRT_UUID_DECL(IDirect3DDxgiInterfaceAccess, 0xA9B3D012, 0x3DF2, 0x4EE3,
+                0xB8, 0xD1, 0x86, 0x95, 0xF4, 0x57, 0xD3, 0xC1)
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -1352,6 +1373,194 @@ static void PublishMeshBridgeSnapshot()
         slot.payload = snapshots[i];
         MemoryBarrier();
         InterlockedIncrement(&slot.sequence);
+    }
+}
+
+std::atomic_bool g_inProcessGpuProbeEnabled = false;
+HANDLE g_inProcessGpuProbeStop = nullptr;
+HANDLE g_inProcessGpuProbeThread = nullptr;
+
+static HWND FindInProcessGpuProbeTarget()
+{
+    const auto* bridge = g_meshBridge.load(std::memory_order_acquire);
+    if (!bridge || bridge->magic != 0x48535757 || bridge->version != 1 ||
+        bridge->size != sizeof(MeshBridgeData))
+        return nullptr;
+
+    for (const auto& slot : bridge->slots)
+    {
+        MeshBridgePayload payload = {};
+        for (int attempt = 0; attempt < 3; ++attempt)
+        {
+            LONG before = slot.sequence;
+            if (before & 1) continue;
+            MemoryBarrier();
+            payload = slot.payload;
+            MemoryBarrier();
+            if (before == slot.sequence && !(before & 1)) break;
+            payload = {};
+        }
+        ULONGLONG now = GetTickCount64();
+        if (!payload.active || !payload.hwnd || payload.timestamp > now ||
+            now - payload.timestamp > 500)
+            continue;
+        HWND hwnd = reinterpret_cast<HWND>(static_cast<UINT_PTR>(payload.hwnd));
+        DWORD cloaked = 0;
+        constexpr DWORD dwmwaCloaked = 14;
+        if (IsWindow(hwnd) && IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
+            (!g_dwmGetWindowAttribute ||
+             FAILED(g_dwmGetWindowAttribute(hwnd, dwmwaCloaked, &cloaked,
+                                            sizeof(cloaked))) || !cloaked))
+            return hwnd;
+    }
+    return nullptr;
+}
+
+static DWORD WINAPI InProcessGpuProbeThreadProc(void*)
+{
+    using namespace winrt::Windows::Graphics::Capture;
+    Direct3D11CaptureFramePool pool{nullptr};
+    GraphicsCaptureSession session{nullptr};
+    const wchar_t* stage = L"Apartment";
+    try
+    {
+        struct Apartment
+        {
+            Apartment() { winrt::init_apartment(winrt::apartment_type::multi_threaded); }
+            ~Apartment() { winrt::uninit_apartment(); }
+        } apartment;
+        using namespace winrt::Windows::Graphics::DirectX;
+        using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
+        stage = L"Support";
+        if (!GraphicsCaptureSession::IsSupported())
+        {
+            Wh_Log(L"In-process GPU probe: Windows Graphics Capture unavailable");
+            return 0;
+        }
+        Wh_Log(L"In-process GPU probe: waiting for first moving window");
+        HWND hwnd = nullptr;
+        while (WaitForSingleObject(g_inProcessGpuProbeStop, 16) == WAIT_TIMEOUT)
+        {
+            hwnd = FindInProcessGpuProbeTarget();
+            if (hwnd) break;
+        }
+        if (!hwnd || WaitForSingleObject(g_inProcessGpuProbeStop, 0) == WAIT_OBJECT_0)
+            return 0;
+
+        stage = L"D3DDevice";
+        Microsoft::WRL::ComPtr<ID3D11Device> device;
+        D3D_FEATURE_LEVEL featureLevel;
+        winrt::check_hresult(D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+            &device, &featureLevel, nullptr));
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgi;
+        winrt::check_hresult(device.As(&dxgi));
+        winrt::com_ptr<::IInspectable> inspectable;
+        winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(
+            dxgi.Get(), inspectable.put()));
+        IDirect3DDevice captureDevice = inspectable.as<IDirect3DDevice>();
+        stage = L"CaptureItem";
+        auto interop = winrt::get_activation_factory<GraphicsCaptureItem,
+                                                    IGraphicsCaptureItemInterop>();
+        GraphicsCaptureItem item{nullptr};
+        winrt::check_hresult(interop->CreateForWindow(
+            hwnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item)));
+        auto size = item.Size();
+        stage = L"FramePool";
+        pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            captureDevice, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+        stage = L"CaptureSession";
+        session = pool.CreateCaptureSession(item);
+        session.IsCursorCaptureEnabled(false);
+        session.StartCapture();
+        Wh_Log(L"In-process GPU probe: capture started HWND=%p size=%dx%d",
+               hwnd, size.Width, size.Height);
+
+        unsigned int frames = 0;
+        ULONGLONG started = GetTickCount64();
+        stage = L"ReceiveFrames";
+        while (GetTickCount64() - started < 3000 && IsWindow(hwnd) &&
+               WaitForSingleObject(g_inProcessGpuProbeStop, 8) == WAIT_TIMEOUT)
+        {
+            while (GetTickCount64() - started < 3000 &&
+                   WaitForSingleObject(g_inProcessGpuProbeStop, 0) == WAIT_TIMEOUT)
+            {
+                auto frame = pool.TryGetNextFrame();
+                if (!frame) break;
+                auto access = frame.Surface().as<IDirect3DDxgiInterfaceAccess>();
+                Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+                winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(&texture)));
+                ++frames;
+                frame.Close();
+            }
+        }
+        stage = L"CloseCapture";
+        session.Close();
+        session = nullptr;
+        pool.Close();
+        pool = nullptr;
+        Wh_Log(L"In-process GPU probe: completed HWND=%p frames=%u durationMs=%llu",
+               hwnd, frames, GetTickCount64() - started);
+    }
+    catch (const winrt::hresult_error& error)
+    {
+        Wh_Log(L"In-process GPU probe: failed stage=%s HRESULT=0x%08X %s",
+               stage, static_cast<unsigned int>(error.code()),
+               error.message().c_str());
+    }
+    catch (...)
+    {
+        Wh_Log(L"In-process GPU probe: unexpected failure stage=%s", stage);
+    }
+    try
+    {
+        if (session) session.Close();
+        if (pool) pool.Close();
+    }
+    catch (...) {}
+    return 0;
+}
+
+static void StopInProcessGpuProbe()
+{
+    if (g_inProcessGpuProbeStop) SetEvent(g_inProcessGpuProbeStop);
+    if (g_inProcessGpuProbeThread)
+    {
+        WaitForSingleObject(g_inProcessGpuProbeThread, INFINITE);
+        CloseHandle(g_inProcessGpuProbeThread);
+        g_inProcessGpuProbeThread = nullptr;
+    }
+    if (g_inProcessGpuProbeStop)
+    {
+        CloseHandle(g_inProcessGpuProbeStop);
+        g_inProcessGpuProbeStop = nullptr;
+    }
+}
+
+static void UpdateInProcessGpuProbe()
+{
+    if (!g_inProcessGpuProbeEnabled.load(std::memory_order_acquire))
+    {
+        StopInProcessGpuProbe();
+        return;
+    }
+    if (g_inProcessGpuProbeThread &&
+        WaitForSingleObject(g_inProcessGpuProbeThread, 0) == WAIT_TIMEOUT)
+        return;
+    StopInProcessGpuProbe();
+    g_inProcessGpuProbeStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_inProcessGpuProbeStop)
+    {
+        Wh_Log(L"In-process GPU probe: failed to create stop event");
+        return;
+    }
+    g_inProcessGpuProbeThread = CreateThread(
+        nullptr, 0, InProcessGpuProbeThreadProc, nullptr, 0, nullptr);
+    if (!g_inProcessGpuProbeThread)
+    {
+        Wh_Log(L"In-process GPU probe: failed to create worker thread");
+        StopInProcessGpuProbe();
     }
 }
 
@@ -8828,9 +9037,13 @@ static void LoadSettings()
     g_meshCaptureProbeEnabled.store(
         Wh_GetIntSetting(L"EnableCaptureProbe") != 0,
         std::memory_order_release);
+    g_inProcessGpuProbeEnabled.store(
+        Wh_GetIntSetting(L"EnableInProcessGpuProbe") != 0,
+        std::memory_order_release);
     g_meshBridgeEnabled.store(
         Wh_GetIntSetting(L"EnableExternalMeshBridge") != 0 ||
-            settings.rendererMode == RendererMode::ExternalGpu,
+            settings.rendererMode == RendererMode::ExternalGpu ||
+            g_inProcessGpuProbeEnabled.load(std::memory_order_relaxed),
         std::memory_order_release);
     bool advancedMode = Wh_GetIntSetting(L"AdvancedMode.enable") != 0;
     settings.resizeWobbleEnabled = Wh_GetIntSetting(L"EnableResizeWobble") != 0;
@@ -8971,6 +9184,7 @@ void Wh_ModAfterInit()
     // Windhawk activates detours after Wh_ModInit returns. Queue the first
     // scene pass only now so already-open windows cannot miss the wake.
     QueueExistingWindowBackfill();
+    UpdateInProcessGpuProbe();
 }
 
 void Wh_ModSettingsChanged()
@@ -8978,6 +9192,7 @@ void Wh_ModSettingsChanged()
     Wh_Log(L"Settings changed");
     LoadSettings();
     InitializeMeshBridge();
+    UpdateInProcessGpuProbe();
 }
 
 void Wh_ModBeforeUninit()
@@ -8985,6 +9200,7 @@ void Wh_ModBeforeUninit()
     g_unloading.store(true, std::memory_order_release);
     Wh_Log(L"Preparing to unload");
     // Restore scene resources before Windhawk removes the hooks.
+    StopInProcessGpuProbe();
     StopWindowEventThread();
     CloseMeshBridge();
     UninitializeDpiSupport();
