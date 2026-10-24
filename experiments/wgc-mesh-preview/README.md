@@ -1,7 +1,7 @@
 # Isolated live-window GPU mesh preview
 
 This is a standalone feasibility test. It does not inject into DWM, change the
-Windhawk mod, hide the original window, or attach an overlay to it.
+Windhawk mod, or hide the original window.
 
 Build from this directory with `build.cmd`, then run `wgc-mesh-preview.exe`.
 Within five seconds, activate a normal window. A separate preview will capture
@@ -35,7 +35,20 @@ rendering stay outside dwm.exe.
 console open: if opening the shared mapping fails, the Windows error appears
 there. Close the preview window to stop the test.
 
-The sinusoidal bend deliberately makes the mesh shape obvious; it is not yet
-connected to Wobbly Windows physics. The experiment tests whether public GPU
-capture and mesh rendering are technically sound and fast enough before any
-integration work. Windows may show its normal capture border on the source.
+## Five-second overlay alignment test
+
+Keep the mod on **Affine (stable)** with **External GPU mesh preview
+(experimental)** enabled. Run `run-overlay-test.cmd`, activate a normal window
+within the five-second countdown, then drag it immediately. The separate GPU
+program draws a transparent, click-through layer above that window only while
+it receives active physics. The layer follows the visible window bounds and
+disappears automatically after five seconds. It does not hide the real window,
+so seeing the original behind the bent image is expected. Test with a simple
+window first. The console prints the captured texture and overlay sizes.
+
+If the image is offset, shows a duplicate while idle, blocks clicks, or remains
+on screen after the timer, report that before proceeding. Do not use this mode
+as the normal renderer yet; it only checks positioning and transparency.
+
+The default sinusoidal demo is separate from the physics modes. Windows may
+show its normal capture border on the source.

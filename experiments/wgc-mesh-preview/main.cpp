@@ -3,6 +3,8 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dcomp.h>
+#include <dwmapi.h>
 #include <wrl/client.h>
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
@@ -51,7 +53,7 @@ Pixel VSMain(Vertex input) {
     } else {
         p += options.xy * envelope;
     }
-    output.position = float4(p, 0.0, 1.0);
+    output.position = float4(p * options.w, 0.0, 1.0);
     output.uv = input.uv;
     return output;
 }
@@ -73,8 +75,8 @@ struct Bend {
 
 class Preview {
 public:
-    explicit Preview(HWND target, bool physicsMode = false)
-        : target_(target), physicsMode_(physicsMode) {
+    explicit Preview(HWND target, bool physicsMode = false, bool overlayTest = false)
+        : target_(target), physicsMode_(physicsMode), overlayTest_(overlayTest) {
         CreateWindowAndDevice();
         if (target_) StartCapture();
         else CreateTestTexture();
@@ -122,12 +124,22 @@ private:
                 BeginPaint(window, &paint);
                 self->Render();
                 EndPaint(window, &paint);
-                if (self->capturedView_ && !IsIconic(window))
+                if (!self->overlayTest_ && self->capturedView_ && !IsIconic(window))
                     InvalidateRect(window, nullptr, FALSE);
                 return 0;
             }
             case WM_ERASEBKGND:
                 return 1;
+            case WM_NCHITTEST:
+                if (self->overlayTest_) return HTTRANSPARENT;
+                break;
+            case WM_TIMER:
+                if (self->overlayTest_) {
+                    if (wparam == 2) DestroyWindow(window);
+                    else if (wparam == 1) InvalidateRect(window, nullptr, FALSE);
+                    return 0;
+                }
+                break;
             case WM_SIZE:
                 if (self->swapChain_ && LOWORD(lparam) && HIWORD(lparam))
                     self->Resize(LOWORD(lparam), HIWORD(lparam));
@@ -147,9 +159,14 @@ private:
         windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         windowClass.lpszClassName = L"WobblyWgcMeshPreview";
         if (!RegisterClassW(&windowClass)) winrt::throw_last_error();
-        window_ = CreateWindowExW(0, windowClass.lpszClassName,
-                                  L"Wobbly GPU mesh preview", WS_OVERLAPPEDWINDOW,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 1050, 750,
+        DWORD style = overlayTest_ ? WS_POPUP : WS_OVERLAPPEDWINDOW;
+        DWORD exStyle = overlayTest_ ?
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+            WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP : 0;
+        window_ = CreateWindowExW(exStyle, windowClass.lpszClassName,
+                                  L"Wobbly GPU mesh preview", style,
+                                  CW_USEDEFAULT, CW_USEDEFAULT,
+                                  overlayTest_ ? 1 : 1050, overlayTest_ ? 1 : 750,
                                   nullptr, nullptr, windowClass.hInstance, this);
         if (!window_) winrt::throw_last_error();
 
@@ -171,18 +188,38 @@ private:
         ComPtr<IDXGIFactory2> factory;
         winrt::check_hresult(adapter->GetParent(IID_PPV_ARGS(&factory)));
         DXGI_SWAP_CHAIN_DESC1 description{};
-        description.Width = 1050;
-        description.Height = 750;
+        description.Width = overlayTest_ ? 1 : 1050;
+        description.Height = overlayTest_ ? 1 : 750;
         description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         description.SampleDesc.Count = 1;
         description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         description.BufferCount = 2;
         description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        winrt::check_hresult(factory->CreateSwapChainForHwnd(
-            device_.Get(), window_, &description, nullptr, nullptr, &swapChain_));
+        if (overlayTest_) {
+            description.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+            winrt::check_hresult(factory->CreateSwapChainForComposition(
+                device_.Get(), &description, nullptr, &swapChain_));
+            winrt::check_hresult(DCompositionCreateDevice(
+                dxgi.Get(), IID_PPV_ARGS(&compositionDevice_)));
+            winrt::check_hresult(compositionDevice_->CreateTargetForHwnd(
+                window_, TRUE, &compositionTarget_));
+            winrt::check_hresult(compositionDevice_->CreateVisual(&compositionVisual_));
+            winrt::check_hresult(compositionVisual_->SetContent(swapChain_.Get()));
+            winrt::check_hresult(compositionTarget_->SetRoot(compositionVisual_.Get()));
+            winrt::check_hresult(compositionDevice_->Commit());
+        } else {
+            winrt::check_hresult(factory->CreateSwapChainForHwnd(
+                device_.Get(), window_, &description, nullptr, nullptr, &swapChain_));
+        }
         CreateRenderTarget();
         CreatePipeline();
-        ShowWindow(window_, SW_SHOW);
+        if (overlayTest_) {
+            UpdateOverlayBounds();
+            SetTimer(window_, 1, 16, nullptr);
+            SetTimer(window_, 2, 5000, nullptr);
+        } else {
+            ShowWindow(window_, SW_SHOW);
+        }
     }
 
     void CreateRenderTarget() {
@@ -198,6 +235,49 @@ private:
         winrt::check_hresult(swapChain_->ResizeBuffers(0, width, height,
                                                          DXGI_FORMAT_UNKNOWN, 0));
         CreateRenderTarget();
+    }
+
+    bool UpdateOverlayBounds() {
+        if (!IsWindow(target_)) {
+            DestroyWindow(window_);
+            return false;
+        }
+        DWORD cloaked = 0;
+        DwmGetWindowAttribute(target_, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+        if (!IsWindowVisible(target_) || IsIconic(target_) || cloaked) {
+            if (overlayVisible_) ShowWindow(window_, SW_HIDE);
+            overlayVisible_ = false;
+            return false;
+        }
+        RECT source{};
+        if (FAILED(DwmGetWindowAttribute(target_, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                         &source, sizeof(source))) &&
+            !GetWindowRect(target_, &source))
+            return false;
+        const int width = source.right - source.left;
+        const int height = source.bottom - source.top;
+        if (width < 1 || height < 1 || width > 16000 || height > 16000)
+            return false;
+        const int canvasWidth = width * 5 / 4;
+        const int canvasHeight = height * 5 / 4;
+        RECT desired{source.left - (canvasWidth - width) / 2,
+                     source.top - (canvasHeight - height) / 2,
+                     source.left - (canvasWidth - width) / 2 + canvasWidth,
+                     source.top - (canvasHeight - height) / 2 + canvasHeight};
+        if (!EqualRect(&desired, &overlayBounds_)) {
+            overlayBounds_ = desired;
+            SetWindowPos(window_, HWND_TOPMOST, desired.left, desired.top,
+                         canvasWidth, canvasHeight,
+                         SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        }
+        if (!overlayVisible_) {
+            ShowWindow(window_, SW_SHOWNOACTIVATE);
+            overlayVisible_ = true;
+            std::wprintf(L"Overlay aligned: source=%dx%d canvas=%dx%d capture=%ux%u\n",
+                width, height, canvasWidth, canvasHeight,
+                textureWidth_, textureHeight_);
+        }
+        return true;
     }
 
     void CreatePipeline() {
@@ -349,6 +429,9 @@ private:
                                                                &capturedTexture_));
                 winrt::check_hresult(device_->CreateShaderResourceView(
                     capturedTexture_.Get(), nullptr, &capturedView_));
+                if (overlayTest_)
+                    std::wprintf(L"Captured window texture: %ux%u\n",
+                                 textureWidth_, textureHeight_);
             }
             context_->CopyResource(capturedTexture_.Get(), source.Get());
             ++capturedFrames_;
@@ -471,12 +554,14 @@ private:
 
     void Render() {
         if (!capturedView_ || !renderTarget_) return;
+        if (overlayTest_ && !UpdateOverlayBounds()) return;
         RECT rect{};
         GetClientRect(window_, &rect);
         if (rect.right <= 0 || rect.bottom <= 0) return;
         auto now = std::chrono::steady_clock::now();
         float t = std::chrono::duration<float>(now - started_).count();
         Bend bend{};
+        bend.options[3] = overlayTest_ ? (8.0f / 9.0f) : 1.0f;
         if (physicsMode_) {
             bridgeActive_ = MakePhysicsBend(bend);
         } else {
@@ -487,7 +572,10 @@ private:
         D3D11_VIEWPORT viewport{0, 0, static_cast<float>(rect.right),
                                 static_cast<float>(rect.bottom), 0, 1};
         context_->RSSetViewports(1, &viewport);
-        const float clear[] = {0.06f, 0.07f, 0.09f, 1};
+        const float clear[] = {overlayTest_ ? 0.0f : 0.06f,
+                               overlayTest_ ? 0.0f : 0.07f,
+                               overlayTest_ ? 0.0f : 0.09f,
+                               overlayTest_ ? 0.0f : 1.0f};
         context_->ClearRenderTargetView(renderTarget_.Get(), clear);
         ID3D11RenderTargetView* target = renderTarget_.Get();
         context_->OMSetRenderTargets(1, &target, nullptr);
@@ -506,7 +594,8 @@ private:
         context_->PSSetShaderResources(0, 1, &image);
         ID3D11SamplerState* sampler = sampler_.Get();
         context_->PSSetSamplers(0, 1, &sampler);
-        context_->DrawIndexed(indexCount_, 0, 0);
+        if (!overlayTest_ || bridgeActive_)
+            context_->DrawIndexed(indexCount_, 0, 0);
         swapChain_->Present(1, 0);
         ++renderedFrames_;
         if (now - lastStats_ >= std::chrono::seconds(1)) {
@@ -515,7 +604,7 @@ private:
                 L"Wobbly GPU preview | capture %llu fps | render %llu fps | %ux%u | physics %ls",
                 capturedFrames_, renderedFrames_, textureWidth_, textureHeight_,
                 physicsMode_ ? (bridgeActive_ ? L"active" : L"waiting") : L"demo");
-            SetWindowTextW(window_, title);
+            if (!overlayTest_) SetWindowTextW(window_, title);
             std::wprintf(L"%ls\n", title);
             capturedFrames_ = renderedFrames_ = 0;
             lastStats_ = now;
@@ -525,6 +614,9 @@ private:
     HWND target_ = nullptr;
     HWND window_ = nullptr;
     bool physicsMode_ = false;
+    bool overlayTest_ = false;
+    bool overlayVisible_ = false;
+    RECT overlayBounds_{};
     bool bridgeActive_ = false;
     HANDLE bridgeHandle_ = nullptr;
     const mesh_bridge::Data* bridge_ = nullptr;
@@ -533,6 +625,9 @@ private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGISwapChain1> swapChain_;
+    ComPtr<IDCompositionDevice> compositionDevice_;
+    ComPtr<IDCompositionTarget> compositionTarget_;
+    ComPtr<IDCompositionVisual> compositionVisual_;
     ComPtr<ID3D11RenderTargetView> renderTarget_;
     ComPtr<ID3D11VertexShader> vertexShader_;
     ComPtr<ID3D11PixelShader> pixelShader_;
@@ -557,6 +652,7 @@ private:
 
 int wmain(int argc, wchar_t** argv) {
     try {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
         if (argc > 1 && std::wcscmp(argv[1], L"--self-test") == 0) {
             ComPtr<ID3D11Device> device;
@@ -588,7 +684,9 @@ int wmain(int argc, wchar_t** argv) {
             preview.Run();
             return 0;
         }
-        bool physicsMode = argc > 1 && std::wcscmp(argv[1], L"--physics") == 0;
+        bool overlayTest = argc > 1 && std::wcscmp(argv[1], L"--overlay-test") == 0;
+        bool physicsMode = overlayTest ||
+            (argc > 1 && std::wcscmp(argv[1], L"--physics") == 0);
         std::wprintf(L"Activate a normal window to capture within five seconds.\n");
         for (int seconds = 5; seconds > 0; --seconds) {
             std::wprintf(L"%d...\n", seconds);
@@ -601,7 +699,7 @@ int wmain(int argc, wchar_t** argv) {
         GetWindowTextW(target, title, std::size(title));
         std::wprintf(L"Capturing HWND=%p (%ls). Close the preview to stop.\n",
                      target, title);
-        Preview preview(target, physicsMode);
+        Preview preview(target, physicsMode, overlayTest);
         preview.Run();
         return 0;
     } catch (winrt::hresult_error const& error) {
