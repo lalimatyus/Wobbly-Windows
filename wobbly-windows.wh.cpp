@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.266
+// @version         0.267
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -1432,10 +1432,16 @@ static DWORD WINAPI InProcessGpuProbeThreadProc(void*)
         using namespace winrt::Windows::Graphics::DirectX;
         using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
         stage = L"Support";
-        if (!GraphicsCaptureSession::IsSupported())
+        try
         {
-            Wh_Log(L"In-process GPU probe: Windows Graphics Capture unavailable");
-            return 0;
+            Wh_Log(L"In-process GPU probe: support query=%d",
+                   GraphicsCaptureSession::IsSupported() ? 1 : 0);
+        }
+        catch (const winrt::hresult_error& error)
+        {
+            Wh_Log(L"In-process GPU probe: support query failed HRESULT=0x%08X; "
+                   L"trying direct window capture",
+                   static_cast<unsigned int>(error.code()));
         }
         Wh_Log(L"In-process GPU probe: waiting for first moving window");
         HWND hwnd = nullptr;
@@ -1446,6 +1452,16 @@ static DWORD WINAPI InProcessGpuProbeThreadProc(void*)
         }
         if (!hwnd || WaitForSingleObject(g_inProcessGpuProbeStop, 0) == WAIT_OBJECT_0)
             return 0;
+
+        stage = L"CaptureItem";
+        auto interop = winrt::get_activation_factory<GraphicsCaptureItem,
+                                                    IGraphicsCaptureItemInterop>();
+        GraphicsCaptureItem item{nullptr};
+        winrt::check_hresult(interop->CreateForWindow(
+            hwnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item)));
+        auto size = item.Size();
+        Wh_Log(L"In-process GPU probe: window item created HWND=%p size=%dx%d",
+               hwnd, size.Width, size.Height);
 
         stage = L"D3DDevice";
         Microsoft::WRL::ComPtr<ID3D11Device> device;
@@ -1460,13 +1476,6 @@ static DWORD WINAPI InProcessGpuProbeThreadProc(void*)
         winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(
             dxgi.Get(), inspectable.put()));
         IDirect3DDevice captureDevice = inspectable.as<IDirect3DDevice>();
-        stage = L"CaptureItem";
-        auto interop = winrt::get_activation_factory<GraphicsCaptureItem,
-                                                    IGraphicsCaptureItemInterop>();
-        GraphicsCaptureItem item{nullptr};
-        winrt::check_hresult(interop->CreateForWindow(
-            hwnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item)));
-        auto size = item.Size();
         stage = L"FramePool";
         pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             captureDevice, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
