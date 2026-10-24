@@ -55,16 +55,16 @@ as the normal renderer yet; it only checks positioning and transparency.
 
 ## Continuous mod integration test
 
-In Wobbly Windows 0.263, select **External GPU mesh overlay (experimental)**
+In Wobbly Windows 0.264, select **External GPU mesh overlay (experimental)**
 under **Renderer**. This enables the physics bridge automatically and keeps
 the affine effect as a fallback. Run `run-integrated.cmd` once. The GPU helper
-then finds active mesh slots without a countdown and follows the foreground
-window when several windows are animating. It releases the capture after the
-slot becomes inactive and waits for the next window. Closing the helper's
+then finds active mesh slots without a countdown. Each active window gets its
+own capture and overlay, including while a previous window is settling. The
+helper releases a capture when its slot becomes inactive. Closing the helper's
 console ends the test; the affine mod keeps working.
 
-This is still a two-process experiment, and only one window is shown in the GPU
-overlay at a time. The original affine image remains behind the curved layer.
+This is still a two-process experiment. The original affine image remains
+behind each curved layer.
 Do not treat this mode as a finished replacement renderer.
 
 The default sinusoidal demo is separate from the physics modes. Windows may

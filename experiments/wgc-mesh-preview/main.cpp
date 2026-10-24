@@ -18,8 +18,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -73,23 +75,52 @@ struct Bend {
     float controls[16][4];
 };
 
+bool ReadSlot(const mesh_bridge::Slot& slot, mesh_bridge::Payload& payload) {
+    bool consistent = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        LONG before = slot.sequence;
+        if (before & 1) continue;
+        MemoryBarrier();
+        payload = slot.payload;
+        MemoryBarrier();
+        LONG after = slot.sequence;
+        if (before == after && !(after & 1)) {
+            consistent = true;
+            break;
+        }
+    }
+    if (!consistent || !payload.active || !payload.hwnd) return false;
+    ULONGLONG now = GetTickCount64();
+    return payload.timestamp <= now && now - payload.timestamp <= 500;
+}
+
 class Preview {
 public:
     explicit Preview(HWND target, bool physicsMode = false,
-                     bool overlayTest = false, bool followBridge = false)
+                     bool overlayTest = false, bool managed = false)
         : target_(target), physicsMode_(physicsMode),
-          overlayTest_(overlayTest), followBridge_(followBridge) {
-        CreateWindowAndDevice();
-        if (target_) StartCapture();
-        else if (!overlayTest_) CreateTestTexture();
-        InvalidateRect(window_, nullptr, FALSE);
+          overlayTest_(overlayTest), managed_(managed) {
+        try {
+            CreateWindowAndDevice();
+            if (target_) StartCapture();
+            else if (!overlayTest_) CreateTestTexture();
+            InvalidateRect(window_, nullptr, FALSE);
+        } catch (...) {
+            StopCapture();
+            if (window_ && IsWindow(window_)) DestroyWindow(window_);
+            throw;
+        }
     }
 
     ~Preview() {
         StopCapture();
+        if (window_ && IsWindow(window_)) DestroyWindow(window_);
         if (bridge_) UnmapViewOfFile(bridge_);
         if (bridgeHandle_) CloseHandle(bridgeHandle_);
     }
+
+    HWND window() const { return window_; }
+    bool failed() const { return failed_; }
 
     void Run() {
         MSG msg;
@@ -116,16 +147,30 @@ private:
                 catch (winrt::hresult_error const& error) {
                     std::fwprintf(stderr, L"Capture error: 0x%08X %ls\n",
                                   static_cast<unsigned>(error.code()), error.message().c_str());
-                    if (self->followBridge_) self->SuspendFailedCapture();
+                    if (self->managed_) {
+                        self->failed_ = true;
+                        self->StopCapture();
+                    }
                     else DestroyWindow(window);
                 }
                 return 0;
             case WM_PAINT: {
                 PAINTSTRUCT paint;
                 BeginPaint(window, &paint);
-                self->Render();
+                bool destroyAfterPaint = false;
+                try { self->Render(); }
+                catch (winrt::hresult_error const& error) {
+                    std::fwprintf(stderr, L"Render error: 0x%08X %ls\n",
+                                  static_cast<unsigned>(error.code()), error.message().c_str());
+                    if (self->managed_) {
+                        self->failed_ = true;
+                        self->StopCapture();
+                    } else destroyAfterPaint = true;
+                }
                 EndPaint(window, &paint);
-                if (!self->overlayTest_ && self->capturedView_ && !IsIconic(window))
+                if (destroyAfterPaint) DestroyWindow(window);
+                if (!destroyAfterPaint && !self->overlayTest_ &&
+                    self->capturedView_ && !IsIconic(window))
                     InvalidateRect(window, nullptr, FALSE);
                 return 0;
             }
@@ -138,7 +183,6 @@ private:
                 if (self->overlayTest_) {
                     if (wparam == 2) DestroyWindow(window);
                     else if (wparam == 1) {
-                        if (self->followBridge_) self->PollBridgeTarget();
                         InvalidateRect(window, nullptr, FALSE);
                     }
                     return 0;
@@ -149,8 +193,11 @@ private:
                     self->Resize(LOWORD(lparam), HIWORD(lparam));
                 return 0;
             case WM_DESTROY:
-                PostQuitMessage(0);
+                if (!self->managed_) PostQuitMessage(0);
                 return 0;
+            case WM_NCDESTROY:
+                SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+                break;
             }
         }
         return DefWindowProcW(window, message, wparam, lparam);
@@ -162,7 +209,9 @@ private:
         windowClass.hInstance = GetModuleHandleW(nullptr);
         windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         windowClass.lpszClassName = L"WobblyWgcMeshPreview";
-        if (!RegisterClassW(&windowClass)) winrt::throw_last_error();
+        if (!RegisterClassW(&windowClass) &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            winrt::throw_last_error();
         DWORD style = overlayTest_ ? WS_POPUP : WS_OVERLAPPEDWINDOW;
         DWORD exStyle = overlayTest_ ?
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
@@ -223,7 +272,7 @@ private:
         if (overlayTest_) {
             if (target_) UpdateOverlayBounds();
             SetTimer(window_, 1, 16, nullptr);
-            if (!followBridge_) SetTimer(window_, 2, 5000, nullptr);
+            if (!managed_) SetTimer(window_, 2, 5000, nullptr);
         } else {
             ShowWindow(window_, SW_SHOW);
         }
@@ -246,7 +295,7 @@ private:
 
     bool UpdateOverlayBounds(double physicsX = 0.0, double physicsY = 0.0) {
         if (!target_ || !IsWindow(target_)) {
-            if (followBridge_) {
+            if (managed_) {
                 if (overlayVisible_) ShowWindow(window_, SW_HIDE);
                 overlayVisible_ = false;
             } else {
@@ -296,9 +345,9 @@ private:
         const LONG shiftY = static_cast<LONG>(std::lround(physicsY));
         OffsetRect(&desired, shiftX, shiftY);
         if (!EqualRect(&desired, &overlayBounds_)) {
-            if (!SetWindowPos(window_, HWND_TOPMOST, desired.left, desired.top,
+            if (!SetWindowPos(window_, nullptr, desired.left, desired.top,
                               canvasWidth, canvasHeight,
-                              SWP_NOACTIVATE | SWP_NOOWNERZORDER))
+                              SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER))
                 return false;
             overlayBounds_ = desired;
             ++overlayMoves_;
@@ -439,35 +488,6 @@ private:
         overlayVisible_ = false;
     }
 
-    void SuspendFailedCapture() {
-        failedTarget_ = target_;
-        failedUntil_ = GetTickCount64() + 2000;
-        StopCapture();
-        target_ = nullptr;
-    }
-
-    void PollBridgeTarget() {
-        ULONGLONG now = GetTickCount64();
-        HWND selected = FindActiveTarget();
-        if (selected) lastTargetActive_ = now;
-        if (selected && selected != target_) {
-            StopCapture();
-            target_ = selected;
-            try {
-                StartCapture();
-                std::wprintf(L"Following HWND=%p\n", target_);
-            } catch (winrt::hresult_error const& error) {
-                std::fwprintf(stderr, L"Capture start failed for HWND=%p: 0x%08X %ls\n",
-                    target_, static_cast<unsigned>(error.code()), error.message().c_str());
-                SuspendFailedCapture();
-            }
-        } else if (!selected && target_ && now - lastTargetActive_ > 600) {
-            StopCapture();
-            target_ = nullptr;
-            std::wprintf(L"Waiting for an active window\n");
-        }
-    }
-
     void CreateTestTexture() {
         constexpr UINT size = 256;
         std::vector<uint32_t> pixels(size * size);
@@ -562,48 +582,6 @@ private:
         return bridge_ && bridge_->magic == mesh_bridge::magic &&
             bridge_->version == mesh_bridge::version &&
             bridge_->size == sizeof(mesh_bridge::Data);
-    }
-
-    static bool ReadSlot(const mesh_bridge::Slot& slot,
-                         mesh_bridge::Payload& payload) {
-        bool consistent = false;
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            LONG before = slot.sequence;
-            if (before & 1) continue;
-            MemoryBarrier();
-            payload = slot.payload;
-            MemoryBarrier();
-            LONG after = slot.sequence;
-            if (before == after && !(after & 1)) {
-                consistent = true;
-                break;
-            }
-        }
-        if (!consistent || !payload.active || !payload.hwnd) return false;
-        ULONGLONG now = GetTickCount64();
-        return payload.timestamp <= now && now - payload.timestamp <= 500;
-    }
-
-    HWND FindActiveTarget() {
-        if (!BridgeReady()) return nullptr;
-        HWND foreground = GetForegroundWindow();
-        HWND current = nullptr, first = nullptr;
-        for (auto const& slot : bridge_->slots) {
-            mesh_bridge::Payload copy{};
-            if (!ReadSlot(slot, copy)) continue;
-            HWND candidate = reinterpret_cast<HWND>(static_cast<UINT_PTR>(copy.hwnd));
-            if (!IsWindow(candidate)) continue;
-            DWORD cloaked = 0;
-            DwmGetWindowAttribute(candidate, DWMWA_CLOAKED,
-                                  &cloaked, sizeof(cloaked));
-            if (!IsWindowVisible(candidate) || IsIconic(candidate) || cloaked ||
-                (candidate == failedTarget_ && GetTickCount64() < failedUntil_))
-                continue;
-            if (candidate == foreground) return candidate;
-            if (candidate == target_) current = candidate;
-            if (!first) first = candidate;
-        }
-        return current ? current : first;
     }
 
     bool ReadPhysics(mesh_bridge::Payload& payload) {
@@ -734,8 +712,9 @@ private:
             if (!overlayTest_) SetWindowTextW(window_, title);
             std::wprintf(L"%ls\n", title);
             if (overlayTest_) {
-                std::wprintf(L"Overlay tracking: window=(%ld,%ld) source=(%ld,%ld) "
+                std::wprintf(L"Overlay tracking: HWND=%p window=(%ld,%ld) source=(%ld,%ld) "
                              L"physics=(%.1f,%.1f) overlay=(%ld,%ld) moves=%llu\n",
+                             target_,
                              targetWindowBounds_.left, targetWindowBounds_.top,
                              sourceBounds_.left, sourceBounds_.top,
                              overlayPhysicsX_, overlayPhysicsY_,
@@ -752,11 +731,9 @@ private:
     HWND window_ = nullptr;
     bool physicsMode_ = false;
     bool overlayTest_ = false;
-    bool followBridge_ = false;
+    bool managed_ = false;
+    bool failed_ = false;
     bool overlayVisible_ = false;
-    HWND failedTarget_ = nullptr;
-    ULONGLONG failedUntil_ = 0;
-    ULONGLONG lastTargetActive_ = 0;
     RECT overlayBounds_{};
     RECT targetWindowBounds_{};
     RECT sourceBounds_{};
@@ -795,6 +772,118 @@ private:
     std::chrono::steady_clock::time_point lastStats_ = started_;
     unsigned long long capturedFrames_ = 0, renderedFrames_ = 0;
 };
+
+class BridgeScanner {
+public:
+    ~BridgeScanner() {
+        if (data_) UnmapViewOfFile(data_);
+        if (mapping_) CloseHandle(mapping_);
+    }
+
+    std::vector<HWND> ActiveWindows() {
+        if (!data_) {
+            ULONGLONG now = GetTickCount64();
+            if (now - lastOpenAttempt_ < 1000) return {};
+            lastOpenAttempt_ = now;
+            mapping_ = OpenFileMappingW(FILE_MAP_READ, FALSE, mesh_bridge::name);
+            if (!mapping_) return {};
+            data_ = static_cast<const mesh_bridge::Data*>(MapViewOfFile(
+                mapping_, FILE_MAP_READ, 0, 0, sizeof(mesh_bridge::Data)));
+            if (!data_) {
+                CloseHandle(mapping_);
+                mapping_ = nullptr;
+                return {};
+            }
+        }
+        if (data_->magic != mesh_bridge::magic ||
+            data_->version != mesh_bridge::version ||
+            data_->size != sizeof(mesh_bridge::Data)) return {};
+        std::vector<HWND> windows;
+        windows.reserve(mesh_bridge::slot_count);
+        for (auto const& slot : data_->slots) {
+            mesh_bridge::Payload payload{};
+            if (!ReadSlot(slot, payload)) continue;
+            HWND hwnd = reinterpret_cast<HWND>(static_cast<UINT_PTR>(payload.hwnd));
+            if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd)) continue;
+            DWORD cloaked = 0;
+            DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+            if (!cloaked && std::find(windows.begin(), windows.end(), hwnd) == windows.end())
+                windows.push_back(hwnd);
+        }
+        return windows;
+    }
+
+private:
+    HANDLE mapping_ = nullptr;
+    const mesh_bridge::Data* data_ = nullptr;
+    ULONGLONG lastOpenAttempt_ = 0;
+};
+
+struct ActiveView {
+    std::unique_ptr<Preview> preview;
+    ULONGLONG lastSeen;
+};
+
+int RunIntegrated() {
+    BridgeScanner scanner;
+    std::unordered_map<HWND, ActiveView> views;
+    std::unordered_map<HWND, ULONGLONG> retryAfter;
+    HWND lastRaised = nullptr;
+    ULONGLONG lastScan = 0;
+    std::wprintf(L"Following up to %u active Wobbly Windows mesh slots. "
+                 L"Close this console to stop.\n", mesh_bridge::slot_count);
+    for (;;) {
+        DWORD wait = MsgWaitForMultipleObjectsEx(
+            0, nullptr, 16, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (wait == WAIT_FAILED) winrt::throw_last_error();
+        MSG msg{};
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) return 0;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        ULONGLONG now = GetTickCount64();
+        if (now - lastScan < 16) continue;
+        lastScan = now;
+        auto active = scanner.ActiveWindows();
+        for (HWND hwnd : active) {
+            auto existing = views.find(hwnd);
+            if (existing != views.end()) {
+                existing->second.lastSeen = now;
+                continue;
+            }
+            if (now < retryAfter[hwnd]) continue;
+            try {
+                auto preview = std::make_unique<Preview>(hwnd, true, true, true);
+                views.emplace(hwnd, ActiveView{std::move(preview), now});
+                retryAfter.erase(hwnd);
+                std::wprintf(L"Following HWND=%p (active views=%zu)\n",
+                             hwnd, views.size());
+            } catch (winrt::hresult_error const& error) {
+                retryAfter[hwnd] = now + 2000;
+                std::fwprintf(stderr, L"Capture start failed for HWND=%p: 0x%08X %ls\n",
+                              hwnd, static_cast<unsigned>(error.code()),
+                              error.message().c_str());
+            }
+        }
+        for (auto it = views.begin(); it != views.end();) {
+            if (it->second.preview->failed() || !IsWindow(it->first) ||
+                now - it->second.lastSeen > 750) {
+                std::wprintf(L"Stopped following HWND=%p\n", it->first);
+                if (it->second.preview->failed()) retryAfter[it->first] = now + 2000;
+                it = views.erase(it);
+            } else ++it;
+        }
+        HWND foreground = GetForegroundWindow();
+        auto front = views.find(foreground);
+        if (front != views.end() && lastRaised != foreground) {
+            SetWindowPos(front->second.preview->window(), HWND_TOPMOST,
+                         0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            lastRaised = foreground;
+        } else if (front == views.end()) lastRaised = nullptr;
+    }
+}
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -832,13 +921,7 @@ int wmain(int argc, wchar_t** argv) {
             return 0;
         }
         bool followBridge = argc > 1 && std::wcscmp(argv[1], L"--follow-bridge") == 0;
-        if (followBridge) {
-            std::wprintf(L"Following active Wobbly Windows mesh slots. "
-                         L"Close this console to stop.\n");
-            Preview preview(nullptr, true, true, true);
-            preview.Run();
-            return 0;
-        }
+        if (followBridge) return RunIntegrated();
         bool overlayTest = argc > 1 && std::wcscmp(argv[1], L"--overlay-test") == 0;
         bool physicsMode = overlayTest ||
             (argc > 1 && std::wcscmp(argv[1], L"--physics") == 0);
