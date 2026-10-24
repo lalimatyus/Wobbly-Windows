@@ -2,12 +2,12 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.261
+// @version         0.262
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
 // @architecture    amd64
-// @compilerOptions -lwevtapi -lole32 -lwindowscodecs
+// @compilerOptions -lwevtapi -lole32 -lwindowscodecs -ladvapi32
 // @license         GPL-3.0-only
 // ==/WindhawkMod==
 
@@ -101,6 +101,10 @@ the combined mod is not offered under GPLv2.
   $name: Read-only visual capture ABI probe (23H2 only)
   $description: Logs the capture wrapper at load and its virtual dispatch target on the first drag. Does not capture pixels or change rendering.
 
+- EnableExternalMeshBridge: false
+  $name: External GPU mesh preview (experimental)
+  $description: Publishes 4x4 physics points to a separate local preview program. The normal affine window effect remains active.
+
 - AdvancedMode:
   - enable: false
     $name: Enable
@@ -127,6 +131,7 @@ the combined mod is not offered under GPLv2.
 #include <windows.h>
 #include <winevt.h>
 #include <wincodec.h>
+#include <sddl.h>
 #include <dxgiformat.h>
 #include <algorithm>
 #include <atomic>
@@ -1159,6 +1164,190 @@ thread_local bool g_insideWobblyScenePass = false;
 WindowAnimationSlot g_animationSlots[MAX_ANIMATION_SLOTS] = {};
 SRWLOCK g_animationSlotsLock = SRWLOCK_INIT;
 CONDITION_VARIABLE g_animationSlotsCondition = CONDITION_VARIABLE_INIT;
+
+// Optional diagnostic IPC. DWM only writes 4x4 physics data; the separate
+// preview owns window capture and GPU rendering. No capture API runs in DWM.
+static constexpr wchar_t MESH_BRIDGE_NAME[] =
+    L"Local\\Windhawk.WobblyWindows.MeshBridge.v1";
+static constexpr DWORD MESH_BRIDGE_MAGIC = 0x48535757; // "WWSH"
+struct MeshBridgePoint
+{
+    float baseX, baseY, x, y;
+};
+struct MeshBridgePayload
+{
+    DWORD active, reserved;
+    ULONGLONG hwnd, generation, timestamp;
+    float width, height;
+    MeshBridgePoint points[16];
+};
+struct MeshBridgeSlot
+{
+    volatile LONG sequence;
+    LONG reserved;
+    MeshBridgePayload payload;
+};
+struct MeshBridgeData
+{
+    DWORD magic, version, size, ownerPid;
+    MeshBridgeSlot slots[MAX_ANIMATION_SLOTS];
+};
+static_assert(sizeof(MeshBridgePoint) == 16);
+static_assert(sizeof(MeshBridgePayload) == 296);
+static_assert(sizeof(MeshBridgeSlot) == 304);
+static_assert(offsetof(MeshBridgeData, slots) == 16);
+
+HANDLE g_meshBridgeHandle = nullptr;
+std::atomic<MeshBridgeData*> g_meshBridge = nullptr;
+std::atomic_bool g_meshBridgeEnabled = false;
+
+static void InitializeMeshBridge()
+{
+    if (!g_meshBridgeEnabled.load(std::memory_order_acquire) ||
+        g_meshBridge.load(std::memory_order_acquire))
+        return;
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+    {
+        Wh_Log(L"External mesh bridge unavailable: OpenProcessToken error=%u",
+               GetLastError());
+        return;
+    }
+    DWORD userBytes = 0;
+    GetTokenInformation(token, TokenUser, nullptr, 0, &userBytes);
+    std::vector<BYTE> userBuffer(userBytes);
+    bool gotUser = userBytes >= sizeof(TOKEN_USER) &&
+                   GetTokenInformation(token, TokenUser, userBuffer.data(),
+                                       userBytes, &userBytes);
+    CloseHandle(token);
+    LPWSTR ownerSid = nullptr;
+    if (!gotUser || !ConvertSidToStringSidW(
+            reinterpret_cast<TOKEN_USER*>(userBuffer.data())->User.Sid,
+            &ownerSid))
+    {
+        Wh_Log(L"External mesh bridge unavailable: token SID error=%u",
+               GetLastError());
+        return;
+    }
+    // The compositor's account can write. Other authenticated processes in
+    // this session can read the physics snapshot but cannot modify it.
+    std::wstring sddl = L"D:(A;;GR;;;AU)(A;;GA;;;";
+    sddl += ownerSid;
+    sddl += L")";
+    LocalFree(ownerSid);
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr))
+    {
+        Wh_Log(L"External mesh bridge unavailable: security descriptor error=%u",
+               GetLastError());
+        return;
+    }
+    SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
+    HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &security,
+        PAGE_READWRITE, 0, sizeof(MeshBridgeData), MESH_BRIDGE_NAME);
+    LocalFree(descriptor);
+    if (!mapping)
+    {
+        Wh_Log(L"External mesh bridge unavailable: CreateFileMapping error=%u",
+               GetLastError());
+        return;
+    }
+    auto* bridge = static_cast<MeshBridgeData*>(
+        MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+                      sizeof(MeshBridgeData)));
+    if (!bridge)
+    {
+        Wh_Log(L"External mesh bridge unavailable: MapViewOfFile error=%u",
+               GetLastError());
+        CloseHandle(mapping);
+        return;
+    }
+    bridge->magic = 0;
+    MemoryBarrier();
+    for (auto& slot : bridge->slots)
+    {
+        if (slot.sequence & 1) InterlockedIncrement(&slot.sequence);
+        InterlockedIncrement(&slot.sequence);
+        slot.payload = {};
+        InterlockedIncrement(&slot.sequence);
+    }
+    bridge->version = 1;
+    bridge->size = sizeof(MeshBridgeData);
+    bridge->ownerPid = GetCurrentProcessId();
+    MemoryBarrier();
+    bridge->magic = MESH_BRIDGE_MAGIC;
+    g_meshBridgeHandle = mapping;
+    g_meshBridge.store(bridge, std::memory_order_release);
+    Wh_Log(L"External mesh bridge ready: version=1 slots=%d name=%s",
+           MAX_ANIMATION_SLOTS, MESH_BRIDGE_NAME);
+}
+
+static void CloseMeshBridge()
+{
+    auto* bridge = g_meshBridge.exchange(nullptr, std::memory_order_acq_rel);
+    if (bridge)
+    {
+        bridge->magic = 0;
+        UnmapViewOfFile(bridge);
+    }
+    if (g_meshBridgeHandle)
+    {
+        CloseHandle(g_meshBridgeHandle);
+        g_meshBridgeHandle = nullptr;
+    }
+}
+
+static void PublishMeshBridgeSnapshot()
+{
+    if (!g_meshBridgeEnabled.load(std::memory_order_acquire))
+        return;
+    auto* bridge = g_meshBridge.load(std::memory_order_acquire);
+    if (!bridge) return;
+    MeshBridgePayload snapshots[MAX_ANIMATION_SLOTS] = {};
+    ULONGLONG timestamp = GetTickCount64();
+    AcquireSRWLockShared(&g_animationSlotsLock);
+    for (int i = 0; i < MAX_ANIMATION_SLOTS; ++i)
+    {
+        const auto& slot = g_animationSlots[i];
+        auto& payload = snapshots[i];
+        if (!slot.active || !slot.hwnd || !slot.mesh.active ||
+            slot.mesh.resizing || slot.windowStateThrob ||
+            !std::isfinite(slot.mesh.width) ||
+            !std::isfinite(slot.mesh.height) ||
+            slot.mesh.width < 1.0 || slot.mesh.height < 1.0)
+            continue;
+        payload.hwnd = reinterpret_cast<UINT_PTR>(slot.hwnd);
+        payload.generation = slot.generation;
+        payload.timestamp = timestamp;
+        payload.width = static_cast<float>(slot.mesh.width);
+        payload.height = static_cast<float>(slot.mesh.height);
+        bool valid = std::isfinite(payload.width) &&
+                     std::isfinite(payload.height);
+        for (int p = 0; p < 16 && valid; ++p)
+        {
+            const auto& point = slot.mesh.points[p];
+            payload.points[p] = {
+                static_cast<float>(point.basePosition.x),
+                static_cast<float>(point.basePosition.y),
+                static_cast<float>(point.position.x),
+                static_cast<float>(point.position.y)};
+            const auto& out = payload.points[p];
+            valid = std::isfinite(out.baseX) && std::isfinite(out.baseY) &&
+                    std::isfinite(out.x) && std::isfinite(out.y);
+        }
+        payload.active = valid;
+    }
+    ReleaseSRWLockShared(&g_animationSlotsLock);
+    for (int i = 0; i < MAX_ANIMATION_SLOTS; ++i)
+    {
+        auto& slot = bridge->slots[i];
+        InterlockedIncrement(&slot.sequence);
+        slot.payload = snapshots[i];
+        MemoryBarrier();
+        InterlockedIncrement(&slot.sequence);
+    }
+}
 
 static void ReleaseAnimationSlotPinLocked(WindowAnimationSlot& slot)
 {
@@ -6908,6 +7097,7 @@ static void UpdateAnimationFrame()
     FinalizeRetiringSlots();
     if (!HasAnyAnimationSlots())
     {
+        PublishMeshBridgeSnapshot();
         StopAnimationClockIfIdle();
         return;
     }
@@ -7041,6 +7231,7 @@ static void UpdateAnimationFrame()
         }
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
     }
+    PublishMeshBridgeSnapshot();
     int slotsToRetire[MAX_ANIMATION_SLOTS] = {};
     int retireCount = 0;
     for (int i = 0; i < MAX_ANIMATION_SLOTS; i++)
@@ -8627,6 +8818,9 @@ static void LoadSettings()
     g_meshCaptureProbeEnabled.store(
         Wh_GetIntSetting(L"EnableCaptureProbe") != 0,
         std::memory_order_release);
+    g_meshBridgeEnabled.store(
+        Wh_GetIntSetting(L"EnableExternalMeshBridge") != 0,
+        std::memory_order_release);
     bool advancedMode = Wh_GetIntSetting(L"AdvancedMode.enable") != 0;
     settings.resizeWobbleEnabled = Wh_GetIntSetting(L"EnableResizeWobble") != 0;
     settings.windowStateWobbleEnabled =
@@ -8740,10 +8934,12 @@ BOOL Wh_ModInit()
     Wh_Log(L"Initializing version " WH_MOD_VERSION);
     InitializeDpiSupport();
     LoadSettings();
+    InitializeMeshBridge();
     if (!InitializeDwmHooks())
     {
         Wh_Log(L"Failed to initialize DWM hooks");
         UninitializeDpiSupport();
+        CloseMeshBridge();
         return FALSE;
     }
     if (!StartWindowEventThread())
@@ -8751,6 +8947,7 @@ BOOL Wh_ModInit()
         Wh_Log(L"Failed to initialize event thread");
         StopWindowEventThread();
         UninitializeDpiSupport();
+        CloseMeshBridge();
         return FALSE;
     }
     Wh_Log(L"Initialized successfully");
@@ -8768,6 +8965,7 @@ void Wh_ModSettingsChanged()
 {
     Wh_Log(L"Settings changed");
     LoadSettings();
+    InitializeMeshBridge();
 }
 
 void Wh_ModBeforeUninit()
@@ -8776,6 +8974,7 @@ void Wh_ModBeforeUninit()
     Wh_Log(L"Preparing to unload");
     // Restore scene resources before Windhawk removes the hooks.
     StopWindowEventThread();
+    CloseMeshBridge();
     UninitializeDpiSupport();
 }
 

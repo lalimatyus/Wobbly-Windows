@@ -9,7 +9,9 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+#include "mesh_bridge.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -27,14 +29,28 @@ namespace {
 constexpr UINT kFrameMessage = WM_APP + 1;
 constexpr UINT kGrid = 20;
 constexpr char kShaders[] = R"(
-cbuffer Bend : register(b0) { float2 amount; float2 padding; };
+cbuffer Bend : register(b0) { float4 options; float4 controls[16]; };
 struct Vertex { float2 position : POSITION; float2 uv : TEXCOORD0; };
 struct Pixel { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
 Pixel VSMain(Vertex input) {
     Pixel output;
     float2 p = input.position;
     float envelope = (1.0 - p.x * p.x) * (1.0 - p.y * p.y);
-    p += amount * envelope;
+    if (options.z > 0.5) {
+        float u = input.uv.x;
+        float v = input.uv.y;
+        float4 bx = float4(pow(1-u, 3), 3*u*pow(1-u, 2),
+                           3*u*u*(1-u), u*u*u);
+        float4 by = float4(pow(1-v, 3), 3*v*pow(1-v, 2),
+                           3*v*v*(1-v), v*v*v);
+        float2 displacement = 0;
+        [unroll] for (int y = 0; y < 4; ++y)
+            [unroll] for (int x = 0; x < 4; ++x)
+                displacement += controls[y * 4 + x].xy * bx[x] * by[y];
+        p += displacement;
+    } else {
+        p += options.xy * envelope;
+    }
     output.position = float4(p, 0.0, 1.0);
     output.uv = input.uv;
     return output;
@@ -51,12 +67,14 @@ struct Vertex {
 };
 
 struct Bend {
-    float x, y, pad1, pad2;
+    float options[4];
+    float controls[16][4];
 };
 
 class Preview {
 public:
-    explicit Preview(HWND target) : target_(target) {
+    explicit Preview(HWND target, bool physicsMode = false)
+        : target_(target), physicsMode_(physicsMode) {
         CreateWindowAndDevice();
         if (target_) StartCapture();
         else CreateTestTexture();
@@ -67,6 +85,8 @@ public:
         if (pool_) pool_.FrameArrived(frameToken_);
         if (session_) session_.Close();
         if (pool_) pool_.Close();
+        if (bridge_) UnmapViewOfFile(bridge_);
+        if (bridgeHandle_) CloseHandle(bridgeHandle_);
     }
 
     void Run() {
@@ -344,6 +364,111 @@ private:
         InvalidateRect(window_, nullptr, FALSE);
     }
 
+    void TryOpenBridge() {
+        if (bridge_ || GetTickCount64() - lastBridgeOpenAttempt_ < 1000) return;
+        lastBridgeOpenAttempt_ = GetTickCount64();
+        HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, mesh_bridge::name);
+        if (!mapping) {
+            DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != lastBridgeOpenError_)
+                std::fwprintf(stderr, L"Mesh bridge open failed: %u\n", error);
+            lastBridgeOpenError_ = error;
+            return;
+        }
+        lastBridgeOpenError_ = ERROR_SUCCESS;
+        auto* data = static_cast<const mesh_bridge::Data*>(
+            MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(mesh_bridge::Data)));
+        if (!data) {
+            CloseHandle(mapping);
+            return;
+        }
+        bridgeHandle_ = mapping;
+        bridge_ = data;
+    }
+
+    bool ReadPhysics(mesh_bridge::Payload& payload) {
+        TryOpenBridge();
+        if (!bridge_ || bridge_->magic != mesh_bridge::magic ||
+            bridge_->version != mesh_bridge::version ||
+            bridge_->size != sizeof(mesh_bridge::Data))
+            return false;
+        for (auto const& slot : bridge_->slots) {
+            mesh_bridge::Payload copy{};
+            bool consistent = false;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                LONG before = slot.sequence;
+                if (before & 1) continue;
+                MemoryBarrier();
+                copy = slot.payload;
+                MemoryBarrier();
+                LONG after = slot.sequence;
+                if (before == after && !(after & 1)) {
+                    consistent = true;
+                    break;
+                }
+            }
+            if (!consistent || !copy.active ||
+                copy.hwnd != reinterpret_cast<UINT_PTR>(target_))
+                continue;
+            ULONGLONG now = GetTickCount64();
+            if (copy.timestamp > now || now - copy.timestamp > 500)
+                continue;
+            payload = copy;
+            return true;
+        }
+        return false;
+    }
+
+    bool MakePhysicsBend(Bend& bend) {
+        mesh_bridge::Payload snapshot{};
+        if (!ReadPhysics(snapshot)) return false;
+        if (!std::isfinite(snapshot.width) || !std::isfinite(snapshot.height) ||
+            snapshot.width < 1 || snapshot.height < 1 ||
+            snapshot.width > 20000 || snapshot.height > 20000)
+            return false;
+        double baseX = 0, baseY = 0, centerX = 0, centerY = 0;
+        for (auto const& point : snapshot.points) {
+            if (!std::isfinite(point.baseX) || !std::isfinite(point.baseY) ||
+                !std::isfinite(point.x) || !std::isfinite(point.y))
+                return false;
+            baseX += point.baseX;
+            baseY += point.baseY;
+            centerX += point.x;
+            centerY += point.y;
+        }
+        baseX /= 16; baseY /= 16;
+        centerX /= 16; centerY /= 16;
+        double denomX = 0, denomY = 0, xx = 0, xy = 0, yx = 0, yy = 0;
+        for (auto const& point : snapshot.points) {
+            double bx = point.baseX - baseX;
+            double by = point.baseY - baseY;
+            double px = point.x - centerX;
+            double py = point.y - centerY;
+            denomX += bx * bx;
+            denomY += by * by;
+            xx += bx * px;
+            xy += bx * py;
+            yx += by * px;
+            yy += by * py;
+        }
+        if (denomX < 1 || denomY < 1) return false;
+        double m11 = xx / denomX, m12 = xy / denomX;
+        double m21 = yx / denomY, m22 = yy / denomY;
+        for (int i = 0; i < 16; ++i) {
+            auto const& point = snapshot.points[i];
+            double bx = point.baseX - baseX;
+            double by = point.baseY - baseY;
+            double dx = (point.x - centerX) - m11 * bx - m21 * by;
+            double dy = (point.y - centerY) - m12 * bx - m22 * by;
+            bend.controls[i][0] = static_cast<float>(
+                std::clamp(1.8 * dx / snapshot.width, -0.25, 0.25));
+            bend.controls[i][1] = static_cast<float>(
+                std::clamp(-1.8 * dy / snapshot.height, -0.25, 0.25));
+        }
+        bend.options[2] = 1;
+        return true;
+    }
+
     void Render() {
         if (!capturedView_ || !renderTarget_) return;
         RECT rect{};
@@ -351,8 +476,13 @@ private:
         if (rect.right <= 0 || rect.bottom <= 0) return;
         auto now = std::chrono::steady_clock::now();
         float t = std::chrono::duration<float>(now - started_).count();
-        Bend bend{0.16f * std::sin(t * 2.0f),
-                  0.12f * std::sin(t * 1.6f + 0.7f), 0, 0};
+        Bend bend{};
+        if (physicsMode_) {
+            bridgeActive_ = MakePhysicsBend(bend);
+        } else {
+            bend.options[0] = 0.16f * std::sin(t * 2.0f);
+            bend.options[1] = 0.12f * std::sin(t * 1.6f + 0.7f);
+        }
         context_->UpdateSubresource(bendBuffer_.Get(), 0, nullptr, &bend, 0, 0);
         D3D11_VIEWPORT viewport{0, 0, static_cast<float>(rect.right),
                                 static_cast<float>(rect.bottom), 0, 1};
@@ -380,10 +510,11 @@ private:
         swapChain_->Present(1, 0);
         ++renderedFrames_;
         if (now - lastStats_ >= std::chrono::seconds(1)) {
-            wchar_t title[160];
+            wchar_t title[200];
             std::swprintf(title, std::size(title),
-                L"Wobbly GPU preview | capture %llu fps | render %llu fps | %ux%u",
-                capturedFrames_, renderedFrames_, textureWidth_, textureHeight_);
+                L"Wobbly GPU preview | capture %llu fps | render %llu fps | %ux%u | physics %ls",
+                capturedFrames_, renderedFrames_, textureWidth_, textureHeight_,
+                physicsMode_ ? (bridgeActive_ ? L"active" : L"waiting") : L"demo");
             SetWindowTextW(window_, title);
             std::wprintf(L"%ls\n", title);
             capturedFrames_ = renderedFrames_ = 0;
@@ -393,6 +524,12 @@ private:
 
     HWND target_ = nullptr;
     HWND window_ = nullptr;
+    bool physicsMode_ = false;
+    bool bridgeActive_ = false;
+    HANDLE bridgeHandle_ = nullptr;
+    const mesh_bridge::Data* bridge_ = nullptr;
+    ULONGLONG lastBridgeOpenAttempt_ = 0;
+    DWORD lastBridgeOpenError_ = ERROR_SUCCESS;
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGISwapChain1> swapChain_;
@@ -451,6 +588,7 @@ int wmain(int argc, wchar_t** argv) {
             preview.Run();
             return 0;
         }
+        bool physicsMode = argc > 1 && std::wcscmp(argv[1], L"--physics") == 0;
         std::wprintf(L"Activate a normal window to capture within five seconds.\n");
         for (int seconds = 5; seconds > 0; --seconds) {
             std::wprintf(L"%d...\n", seconds);
@@ -463,7 +601,7 @@ int wmain(int argc, wchar_t** argv) {
         GetWindowTextW(target, title, std::size(title));
         std::wprintf(L"Capturing HWND=%p (%ls). Close the preview to stop.\n",
                      target, title);
-        Preview preview(target);
+        Preview preview(target, physicsMode);
         preview.Run();
         return 0;
     } catch (winrt::hresult_error const& error) {
