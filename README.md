@@ -1,4 +1,4 @@
-> [!WARNING]
+> [!CAUTION]
 > ## This repo has test/experimental releases. If you want to download the stable release download it directly from Windhawk.
 
 
