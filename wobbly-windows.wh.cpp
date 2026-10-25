@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.269
+// @version         0.270
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -7665,9 +7665,63 @@ bool ReadSlot(const mesh_bridge::Slot& slot, mesh_bridge::Payload& payload) {
     return payload.timestamp <= now && now - payload.timestamp <= 500;
 }
 
+struct GpuRuntime {
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    ComPtr<IDXGIDevice> dxgi;
+    ComPtr<IDXGIFactory2> factory;
+    ComPtr<IDCompositionDevice> compositionDevice;
+    ComPtr<ID3DBlob> vertexBlob, pixelBlob;
+    IDirect3DDevice captureDevice{nullptr};
+    winrt::com_ptr<IGraphicsCaptureItemInterop> captureInterop;
+
+    GpuRuntime() {
+        constexpr UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        D3D_FEATURE_LEVEL level;
+        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
+            nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
+            &device, &level, &context);
+        if (FAILED(hr)) {
+            Wh_Log(L"GPU mesh renderer: hardware D3D11 unavailable, using WARP");
+            winrt::check_hresult(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP,
+                nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
+                &device, &level, &context));
+        }
+        winrt::check_hresult(device.As(&dxgi));
+        ComPtr<IDXGIAdapter> adapter;
+        winrt::check_hresult(dxgi->GetAdapter(&adapter));
+        winrt::check_hresult(adapter->GetParent(IID_PPV_ARGS(&factory)));
+        winrt::check_hresult(DCompositionCreateDevice(
+            dxgi.Get(), IID_PPV_ARGS(&compositionDevice)));
+
+        auto compile = [&](const char* entry, const char* profile,
+                           ID3DBlob** output) {
+            ComPtr<ID3DBlob> errors;
+            HRESULT result = D3DCompile(kShaders, sizeof(kShaders) - 1, nullptr,
+                nullptr, nullptr, entry, profile, 0, 0, output, &errors);
+            if (FAILED(result) && errors)
+                Wh_Log(L"GPU mesh shader compile failed: %S",
+                       static_cast<const char*>(errors->GetBufferPointer()));
+            winrt::check_hresult(result);
+        };
+        compile("VSMain", "vs_4_0", &vertexBlob);
+        compile("PSMain", "ps_4_0", &pixelBlob);
+
+        winrt::com_ptr<::IInspectable> inspectable;
+        winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(
+            dxgi.Get(), inspectable.put()));
+        captureDevice = inspectable.as<IDirect3DDevice>();
+        captureInterop = winrt::get_activation_factory<GraphicsCaptureItem,
+            IGraphicsCaptureItemInterop>();
+        Wh_Log(L"GPU mesh renderer: GPU and capture resources ready");
+    }
+};
+
 class Preview {
 public:
-    explicit Preview(HWND target) : target_(target) {
+    Preview(HWND target, GpuRuntime& runtime)
+        : target_(target), runtime_(runtime), device_(runtime.device),
+          context_(runtime.context), compositionDevice_(runtime.compositionDevice) {
         try {
             CreateWindowAndDevice();
             StartCapture();
@@ -7773,23 +7827,6 @@ private:
         if (!SetLayeredWindowAttributes(window_, 0, 255, LWA_ALPHA))
             winrt::throw_last_error();
 
-        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-        D3D_FEATURE_LEVEL level;
-        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
-                                       nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
-                                       &device_, &level, &context_);
-        if (FAILED(hr)) {
-            Wh_Log(L"GPU mesh renderer: hardware D3D11 unavailable, using WARP");
-            winrt::check_hresult(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP,
-                nullptr, flags, nullptr, 0, D3D11_SDK_VERSION, &device_, &level, &context_));
-        }
-
-        ComPtr<IDXGIDevice> dxgi;
-        winrt::check_hresult(device_.As(&dxgi));
-        ComPtr<IDXGIAdapter> adapter;
-        winrt::check_hresult(dxgi->GetAdapter(&adapter));
-        ComPtr<IDXGIFactory2> factory;
-        winrt::check_hresult(adapter->GetParent(IID_PPV_ARGS(&factory)));
         DXGI_SWAP_CHAIN_DESC1 description{};
         description.Width = 1;
         description.Height = 1;
@@ -7799,10 +7836,8 @@ private:
         description.BufferCount = 2;
         description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         description.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-        winrt::check_hresult(factory->CreateSwapChainForComposition(
+        winrt::check_hresult(runtime_.factory->CreateSwapChainForComposition(
             device_.Get(), &description, nullptr, &swapChain_));
-        winrt::check_hresult(DCompositionCreateDevice(
-            dxgi.Get(), IID_PPV_ARGS(&compositionDevice_)));
         winrt::check_hresult(compositionDevice_->CreateTargetForHwnd(
             window_, TRUE, &compositionTarget_));
         winrt::check_hresult(compositionDevice_->CreateVisual(&compositionVisual_));
@@ -7895,30 +7930,19 @@ private:
     }
 
     void CreatePipeline() {
-        ComPtr<ID3DBlob> vertexBlob, pixelBlob, errors;
-        auto compile = [&](const char* entry, const char* profile, ID3DBlob** output) {
-            HRESULT hr = D3DCompile(kShaders, sizeof(kShaders) - 1, nullptr,
-                                    nullptr, nullptr, entry, profile, 0, 0,
-                                    output, &errors);
-            if (FAILED(hr)) {
-                if (errors) Wh_Log(L"GPU mesh shader compile failed: %S",
-                                   static_cast<const char*>(errors->GetBufferPointer()));
-                winrt::check_hresult(hr);
-            }
-            errors.Reset();
-        };
-        compile("VSMain", "vs_4_0", &vertexBlob);
-        compile("PSMain", "ps_4_0", &pixelBlob);
-        winrt::check_hresult(device_->CreateVertexShader(vertexBlob->GetBufferPointer(),
-            vertexBlob->GetBufferSize(), nullptr, &vertexShader_));
-        winrt::check_hresult(device_->CreatePixelShader(pixelBlob->GetBufferPointer(),
-            pixelBlob->GetBufferSize(), nullptr, &pixelShader_));
+        winrt::check_hresult(device_->CreateVertexShader(
+            runtime_.vertexBlob->GetBufferPointer(),
+            runtime_.vertexBlob->GetBufferSize(), nullptr, &vertexShader_));
+        winrt::check_hresult(device_->CreatePixelShader(
+            runtime_.pixelBlob->GetBufferPointer(),
+            runtime_.pixelBlob->GetBufferSize(), nullptr, &pixelShader_));
         const D3D11_INPUT_ELEMENT_DESC layout[] = {
             {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
             {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
         };
         winrt::check_hresult(device_->CreateInputLayout(layout, 2,
-            vertexBlob->GetBufferPointer(), vertexBlob->GetBufferSize(), &inputLayout_));
+            runtime_.vertexBlob->GetBufferPointer(),
+            runtime_.vertexBlob->GetBufferSize(), &inputLayout_));
 
         std::vector<Vertex> vertices;
         std::vector<uint16_t> indices;
@@ -7972,16 +7996,9 @@ private:
     }
 
     void StartCapture() {
-        auto interop = winrt::get_activation_factory<GraphicsCaptureItem,
-                                                     IGraphicsCaptureItemInterop>();
-        winrt::check_hresult(interop->CreateForWindow(
+        winrt::check_hresult(runtime_.captureInterop->CreateForWindow(
             target_, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item_)));
-        ComPtr<IDXGIDevice> dxgi;
-        winrt::check_hresult(device_.As(&dxgi));
-        winrt::com_ptr<::IInspectable> inspectable;
-        winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(
-            dxgi.Get(), inspectable.put()));
-        captureDevice_ = inspectable.as<IDirect3DDevice>();
+        captureDevice_ = runtime_.captureDevice;
         frameSize_ = item_.Size();
         pool_ = Direct3D11CaptureFramePool::CreateFreeThreaded(
             captureDevice_, DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -8199,6 +8216,7 @@ private:
     }
 
     HWND target_ = nullptr;
+    GpuRuntime& runtime_;
     HWND window_ = nullptr;
     bool failed_ = false;
     bool overlayVisible_ = false;
@@ -8287,6 +8305,7 @@ struct ActiveView {
 };
 
 int RunIntegrated(HANDLE stopEvent) {
+    GpuRuntime runtime;
     BridgeScanner scanner;
     std::unordered_map<HWND, ActiveView> views;
     std::unordered_map<HWND, ULONGLONG> retryAfter;
@@ -8315,11 +8334,12 @@ int RunIntegrated(HANDLE stopEvent) {
             }
             if (now < retryAfter[hwnd]) continue;
             try {
-                auto preview = std::make_unique<Preview>(hwnd);
+                ULONGLONG setupStarted = GetTickCount64();
+                auto preview = std::make_unique<Preview>(hwnd, runtime);
                 views.emplace(hwnd, ActiveView{std::move(preview), now});
                 retryAfter.erase(hwnd);
-                Wh_Log(L"GPU mesh following HWND=%p activeViews=%zu",
-                       hwnd, views.size());
+                Wh_Log(L"GPU mesh following HWND=%p activeViews=%zu setup=%llums",
+                       hwnd, views.size(), GetTickCount64() - setupStarted);
             } catch (winrt::hresult_error const& error) {
                 retryAfter[hwnd] = now + 2000;
                 Wh_Log(L"GPU mesh capture start failed HWND=%p HRESULT=0x%08X %s",
