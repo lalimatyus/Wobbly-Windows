@@ -27,6 +27,12 @@ initialize instead of using unverified addresses.
 * Fluid wobble animations for dragging, snapping and even resizing windows
 * Uses a 4x4 spring simulation fitted to a smooth whole-window transform
 
+The experimental **GPU mesh overlay** renders the live window image on a curved
+20×20 mesh in a separate Windhawk companion process. Select it under
+**Renderer** to try it. The original affine image remains visible behind the
+curved layer, and Windows may show a colored capture border. Use **Affine** for
+normal use while the overlay is being developed.
+
 ## Known Issues
 
 * ARM64 isn't supported yet.
