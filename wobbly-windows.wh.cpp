@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.270
+// @version         0.271
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -7743,6 +7743,31 @@ public:
     HWND window() const { return window_; }
     bool failed() const { return failed_; }
 
+    void SuspendCapture() {
+        if (suspended_) return;
+        KillTimer(window_, 1);
+        if (session_) session_.Close();
+        session_ = nullptr;
+        suspended_ = true;
+        if (overlayVisible_) ShowWindow(window_, SW_HIDE);
+        overlayVisible_ = false;
+        Wh_Log(L"GPU mesh capture paused: HWND=%p", target_);
+    }
+
+    void ResumeCapture() {
+        if (!suspended_) return;
+        if (!IsWindow(target_) || !pool_ || !item_)
+            winrt::throw_hresult(E_INVALIDARG);
+        while (auto frame = pool_.TryGetNextFrame()) frame.Close();
+        session_ = pool_.CreateCaptureSession(item_);
+        session_.IsCursorCaptureEnabled(false);
+        session_.StartCapture();
+        suspended_ = false;
+        renderedLogged_ = false;
+        SetTimer(window_, 1, 16, nullptr);
+        Wh_Log(L"GPU mesh capture resumed: HWND=%p", target_);
+    }
+
 private:
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
                                        LPARAM lparam) {
@@ -8037,6 +8062,10 @@ private:
 
     void ReceiveFrames() {
         if (!pool_) return;
+        if (suspended_) {
+            while (auto frame = pool_.TryGetNextFrame()) frame.Close();
+            return;
+        }
         bool resize = false;
         while (auto frame = pool_.TryGetNextFrame()) {
             auto size = frame.ContentSize();
@@ -8172,7 +8201,7 @@ private:
     }
 
     void Render() {
-        if (!capturedView_ || !renderTarget_) return;
+        if (suspended_ || !capturedView_ || !renderTarget_) return;
         Bend bend{};
         double translationX = 0.0, translationY = 0.0;
         bend.options[3] = 8.0f / 9.0f;
@@ -8219,6 +8248,7 @@ private:
     GpuRuntime& runtime_;
     HWND window_ = nullptr;
     bool failed_ = false;
+    bool suspended_ = false;
     bool overlayVisible_ = false;
     RECT overlayBounds_{};
     RECT frameInsets_{};
@@ -8309,6 +8339,10 @@ int RunIntegrated(HANDLE stopEvent) {
     BridgeScanner scanner;
     std::unordered_map<HWND, ActiveView> views;
     std::unordered_map<HWND, ULONGLONG> retryAfter;
+    std::unique_ptr<Preview> cached;
+    HWND cachedHwnd = nullptr;
+    DWORD cachedPid = 0, cachedThread = 0;
+    ULONGLONG cachedSince = 0;
     HWND lastRaised = nullptr;
     ULONGLONG lastScan = 0;
     for (;;) {
@@ -8325,6 +8359,8 @@ int RunIntegrated(HANDLE stopEvent) {
         ULONGLONG now = GetTickCount64();
         if (now - lastScan < 16) continue;
         lastScan = now;
+        if (cached && (now - cachedSince > 10000 || !IsWindow(cachedHwnd)))
+            cached.reset();
         auto active = scanner.ActiveWindows();
         for (HWND hwnd : active) {
             auto existing = views.find(hwnd);
@@ -8335,11 +8371,26 @@ int RunIntegrated(HANDLE stopEvent) {
             if (now < retryAfter[hwnd]) continue;
             try {
                 ULONGLONG setupStarted = GetTickCount64();
-                auto preview = std::make_unique<Preview>(hwnd, runtime);
+                std::unique_ptr<Preview> preview;
+                bool reused = false;
+                DWORD pid = 0;
+                DWORD thread = GetWindowThreadProcessId(hwnd, &pid);
+                if (cached && cachedHwnd == hwnd && cachedPid == pid &&
+                    cachedThread == thread) {
+                    preview = std::move(cached);
+                    try {
+                        preview->ResumeCapture();
+                        reused = true;
+                    } catch (...) {
+                        Wh_Log(L"GPU mesh cached capture failed: HWND=%p; rebuilding", hwnd);
+                        preview.reset();
+                    }
+                }
+                if (!preview) preview = std::make_unique<Preview>(hwnd, runtime);
                 views.emplace(hwnd, ActiveView{std::move(preview), now});
                 retryAfter.erase(hwnd);
-                Wh_Log(L"GPU mesh following HWND=%p activeViews=%zu setup=%llums",
-                       hwnd, views.size(), GetTickCount64() - setupStarted);
+                Wh_Log(L"GPU mesh following HWND=%p activeViews=%zu reused=%d setup=%llums",
+                       hwnd, views.size(), reused, GetTickCount64() - setupStarted);
             } catch (winrt::hresult_error const& error) {
                 retryAfter[hwnd] = now + 2000;
                 Wh_Log(L"GPU mesh capture start failed HWND=%p HRESULT=0x%08X %s",
@@ -8351,12 +8402,25 @@ int RunIntegrated(HANDLE stopEvent) {
             }
         }
         for (auto it = views.begin(); it != views.end();) {
-            if (it->second.preview->failed() || !IsWindow(it->first) ||
-                now - it->second.lastSeen > 750) {
-                Wh_Log(L"GPU mesh stopped following HWND=%p", it->first);
+            if (it->second.preview->failed() || !IsWindow(it->first)) {
                 if (it->second.preview->failed()) retryAfter[it->first] = now + 2000;
                 it = views.erase(it);
-            } else ++it;
+            } else if (now - it->second.lastSeen > 750) {
+                HWND hwnd = it->first;
+                try {
+                    it->second.preview->SuspendCapture();
+                    cachedThread = GetWindowThreadProcessId(hwnd, &cachedPid);
+                    cachedHwnd = hwnd;
+                    cachedSince = now;
+                    cached = std::move(it->second.preview);
+                    Wh_Log(L"GPU mesh stopped following HWND=%p; resources cached", hwnd);
+                } catch (...) {
+                    Wh_Log(L"GPU mesh capture pause failed: HWND=%p", hwnd);
+                }
+                it = views.erase(it);
+            } else {
+                ++it;
+            }
         }
         HWND foreground = GetForegroundWindow();
         auto front = views.find(foreground);
