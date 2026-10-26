@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.277
+// @version         0.278
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -497,12 +497,18 @@ std::atomic_bool g_nativeTileStopRequested = false;
 struct NativeTileState
 {
     void* root = nullptr;         // Owned reference while the sibling is attached.
+    void* collection = nullptr;
     void* image = nullptr;
     void* instruction = nullptr;
     void* visual = nullptr;
     void* transform = nullptr;
     void* sourceProxy = nullptr;  // Compared only while root is retained.
     HWND hwnd = nullptr;
+    int slotIndex = -1;
+    ULONGLONG generation = 0;
+    ULONGLONG lastMeshRevision = ULLONG_MAX;
+    unsigned int transformUpdates = 0;
+    bool motionLogged = false;
     int width = 0;
     int height = 0;
     ULONGLONG expiresAt = 0;
@@ -3791,7 +3797,8 @@ static bool DetachNativeTileProbe(const wchar_t* reason)
         RequestDwmScenePass();
         return false;
     }
-    Wh_Log(L"NATIVE TILE DETACHED: HWND=%p reason=%s", state.hwnd, reason);
+    Wh_Log(L"NATIVE TILE DETACHED: HWND=%p reason=%s updates=%u motion=%d",
+           state.hwnd, reason, state.transformUpdates, state.motionLogged);
     ReleaseNativeTileState(state);
     g_nativeTileActive.store(false, std::memory_order_release);
     g_nativeTileStopRequested.store(false, std::memory_order_release);
@@ -3807,6 +3814,7 @@ static void MaintainNativeTileProbe()
     RECT bounds = {};
     bool sourceValid = state.root &&
         g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy &&
+        FindNativeTileSiblingCollection(state.root) == state.collection &&
         GetWindowRect(state.hwnd, &bounds) &&
         bounds.right - bounds.left == state.width &&
         bounds.bottom - bounds.top == state.height;
@@ -3819,10 +3827,103 @@ static void MaintainNativeTileProbe()
                                    ? L"unload" :
                                (g_nativeTileStopRequested.load(std::memory_order_acquire)
                                    ? L"stop-requested" : L"five-second-test-ended")));
+        return;
+    }
+
+    bool slotValid = false;
+    bool physicsActive = false;
+    ULONGLONG revision = 0;
+    double meshWidth = 0.0;
+    double meshHeight = 0.0;
+    Vec2 corners[3] = {};
+    AcquireSRWLockShared(&g_animationSlotsLock);
+    if (state.slotIndex >= 0 && state.slotIndex < MAX_ANIMATION_SLOTS)
+    {
+        const WindowAnimationSlot& slot = g_animationSlots[state.slotIndex];
+        slotValid = slot.active && !slot.retiring &&
+                    slot.generation == state.generation &&
+                    slot.hwnd == state.hwnd && !slot.mesh.resizing &&
+                    !slot.windowStateThrob &&
+                    slot.settings.rendererMode == RendererMode::Affine;
+        if (slotValid)
+        {
+            revision = slot.meshRevision;
+            meshWidth = slot.mesh.width;
+            meshHeight = slot.mesh.height;
+            physicsActive = slot.mesh.active;
+            if (physicsActive)
+            {
+                corners[0] = slot.mesh.points[0].position;
+                corners[1] = slot.mesh.points[1].position;
+                corners[2] = slot.mesh.points[GRID_WIDTH].position;
+            }
+        }
+    }
+    ReleaseSRWLockShared(&g_animationSlotsLock);
+    if (!slotValid || meshWidth <= 0.0 || meshHeight <= 0.0)
+    {
+        DetachNativeTileProbe(L"slot-ended-or-transition");
+        return;
+    }
+    if (revision == state.lastMeshRevision)
+        return;
+    if (!physicsActive)
+    {
+        corners[0] = {0.0, 0.0};
+        corners[1] = {meshWidth / 3.0, 0.0};
+        corners[2] = {0.0, meshHeight / 3.0};
+    }
+    const double scaleX = state.width / meshWidth;
+    const double scaleY = state.height / meshHeight;
+    const double tileWidth = std::max(1, state.width / 3);
+    const double tileHeight = std::max(1, state.height / 3);
+    const double x0 = corners[0].x * scaleX;
+    const double y0 = corners[0].y * scaleY;
+    const MilMatrix3x2D matrix = {
+        (corners[1].x * scaleX - x0) / tileWidth,
+        (corners[1].y * scaleY - y0) / tileWidth,
+        (corners[2].x * scaleX - x0) / tileHeight,
+        (corners[2].y * scaleY - y0) / tileHeight,
+        state.width * 0.55 + x0, y0};
+    if (!std::isfinite(matrix.m11) || !std::isfinite(matrix.m12) ||
+        !std::isfinite(matrix.m21) || !std::isfinite(matrix.m22) ||
+        !std::isfinite(matrix.dx) || !std::isfinite(matrix.dy) ||
+        matrix.m11 < 0.2 || matrix.m11 > 2.0 ||
+        matrix.m22 < 0.2 || matrix.m22 > 2.0 ||
+        std::abs(matrix.m12) > 1.0 || std::abs(matrix.m21) > 1.0 ||
+        std::abs(x0) > state.width || std::abs(y0) > state.height)
+    {
+        Wh_Log(L"NATIVE TILE invalid physics: HWND=%p revision=%llu",
+               state.hwnd, revision);
+        DetachNativeTileProbe(L"invalid-physics");
+        return;
+    }
+    long result = UpdateMatrixTransformProxy(state.transform, matrix);
+    if (result < 0)
+    {
+        Wh_Log(L"NATIVE TILE transform failed: HWND=%p result=0x%08X",
+               state.hwnd, static_cast<unsigned>(result));
+        DetachNativeTileProbe(L"transform-failed");
+        return;
+    }
+    state.lastMeshRevision = revision;
+    state.transformUpdates++;
+    if (!state.motionLogged &&
+        (std::hypot(x0, y0) > 2.0 ||
+         std::abs(matrix.m11 - 1.0) > 0.02 ||
+         std::abs(matrix.m22 - 1.0) > 0.02 ||
+         std::abs(matrix.m12) > 0.02 || std::abs(matrix.m21) > 0.02))
+    {
+        state.motionLogged = true;
+        Wh_Log(L"NATIVE TILE MOTION: HWND=%p revision=%llu "
+               L"m11=%.4f m12=%.4f m21=%.4f m22=%.4f dx=%.2f dy=%.2f",
+               state.hwnd, revision, matrix.m11, matrix.m12, matrix.m21,
+               matrix.m22, matrix.dx, matrix.dy);
     }
 }
 
-static bool TryAttachNativeTileProbe(HWND hwnd, void* topLevelWindow,
+static bool TryAttachNativeTileProbe(int slotIndex, ULONGLONG generation,
+                                     HWND hwnd, void* topLevelWindow,
                                      void* sourceProxy, void* compositor,
                                      void*& image, int width, int height)
 {
@@ -3852,7 +3953,10 @@ static bool TryAttachNativeTileProbe(HWND hwnd, void* topLevelWindow,
     }
     NativeTileState pending = {};
     pending.root = root;
+    pending.collection = collection;
     pending.hwnd = hwnd;
+    pending.slotIndex = slotIndex;
+    pending.generation = generation;
     pending.sourceProxy = sourceProxy;
     pending.width = width;
     pending.height = height;
@@ -3922,9 +4026,9 @@ static bool TryAttachNativeTileProbe(HWND hwnd, void* topLevelWindow,
         pending.expiresAt = GetTickCount64() + 5000;
         g_nativeTileState = pending;
         g_nativeTileActive.store(true, std::memory_order_release);
-        Wh_Log(L"NATIVE TILE ATTACHED: HWND=%p root=%p visual=%p "
+        Wh_Log(L"NATIVE TILE ATTACHED: Slot=%d HWND=%p root=%p visual=%p "
                L"sourceRect=%ldx%ld durationMs=5000 affine=unchanged "
-               L"snapshot=none", hwnd, root, pending.visual,
+               L"snapshot=none", slotIndex, hwnd, root, pending.visual,
                tile.right, tile.bottom);
         RequestDwmScenePass();
         return true;
@@ -3947,7 +4051,8 @@ static bool TryAttachNativeTileProbe(HWND hwnd, void* topLevelWindow,
     return false;
 }
 
-static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
+static void RunNativeSourceProbe(int slotIndex, ULONGLONG generation,
+                                 HWND hwnd, void* topLevelWindow,
                                  void* sourceVisualProxy)
 {
     if (!IsOnDwmSceneThread() || !IsVisualProxyPointerValid(sourceVisualProxy) ||
@@ -4059,8 +4164,9 @@ static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
         // factory may return S_OK for a wrong pointer type and fail later when
         // rendering, so never pass the cached image to that instruction.
         RunDetachedNativeGeometryProbe(hwnd, compositor);
-        TryAttachNativeTileProbe(hwnd, topLevelWindow, sourceVisualProxy,
-                                 compositor, image, width, height);
+        TryAttachNativeTileProbe(slotIndex, generation, hwnd, topLevelWindow,
+                                 sourceVisualProxy, compositor, image, width,
+                                 height);
     }
     if (bitmapInstruction && drawBitmapResult >= 0 &&
         IsReadableMemory(bitmapInstruction, sizeof(void*)) &&
@@ -4185,7 +4291,8 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         if (topLevelVisualProxy &&
             !g_nativeProbeAttempted.load(std::memory_order_acquire))
         {
-            RunNativeSourceProbe(hwnd, topLevelWindow, topLevelVisualProxy);
+            RunNativeSourceProbe(i, generation, hwnd, topLevelWindow,
+                                 topLevelVisualProxy);
         }
         bool topLevelBindingAttempted =
             topLevelVisualProxy &&
