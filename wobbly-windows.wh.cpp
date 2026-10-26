@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.283
+// @version         0.284
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -471,6 +471,12 @@ using NativeProbeUpdateImageBrush_t = long(__cdecl*)(
 using NativeProbeCreateRectangle_t = long(__cdecl*)(const RECT*, void**);
 using NativeProbeCreateGeometryInstruction_t = long(__cdecl*)(
     void*, void*, void**);
+using NativeRectCreateVisual_t = long(__cdecl*)(void**);
+using NativeRectAddInstruction_t = long(__cdecl*)(void*, void*);
+using NativeRectUpdateRenderData_t = long(__cdecl*)(void*);
+using NativeRectInsertRelative_t = long(__cdecl*)(
+    void*, void*, void*, bool, bool);
+using NativeRectRemoveFromParent_t = long(__cdecl*)(void*);
 using NativeProbeCreateMesh_t = long(__cdecl*)(void*, void**);
 using NativeProbeUpdateMesh_t = long(__cdecl*)(
     void*, int, const NativeProbePoint3F*, const NativeProbePoint2D*,
@@ -488,6 +494,32 @@ NativeProbeCreateImageBrush_t g_nativeProbeCreateImageBrush = nullptr;
 NativeProbeUpdateImageBrush_t g_nativeProbeUpdateImageBrush = nullptr;
 NativeProbeCreateRectangle_t g_nativeProbeCreateRectangle = nullptr;
 NativeProbeCreateGeometryInstruction_t g_nativeProbeCreateGeometryInstruction = nullptr;
+NativeRectCreateVisual_t g_nativeRectCreateVisual = nullptr;
+NativeRectAddInstruction_t g_nativeRectAddInstruction = nullptr;
+NativeRectUpdateRenderData_t g_nativeRectUpdateRenderData = nullptr;
+NativeRectInsertRelative_t g_nativeRectInsertRelative = nullptr;
+NativeRectRemoveFromParent_t g_nativeRectRemoveFromParent = nullptr;
+void* g_nativeRectCollectionRemove = nullptr;
+void* g_nativeRectCollectionVtable = nullptr;
+std::atomic_bool g_nativeRectActive = false;
+std::atomic_bool g_nativeRectStopRequested = false;
+struct NativeRectState
+{
+    void* root = nullptr;
+    void* image = nullptr;
+    void* brush = nullptr;
+    void* rectangle = nullptr;
+    void* instruction = nullptr;
+    void* visual = nullptr;
+    void* transform = nullptr;
+    void* sourceProxy = nullptr;
+    HWND hwnd = nullptr;
+    int width = 0;
+    int height = 0;
+    ULONGLONG expiresAt = 0;
+    bool detachFailureLogged = false;
+};
+NativeRectState g_nativeRectState; // DWM scene thread only.
 NativeProbeCreateMesh_t g_nativeProbeCreateMesh = nullptr;
 NativeProbeUpdateMesh_t g_nativeProbeUpdateMesh = nullptr;
 NativeProbeCreateMesh_t g_nativeProbeCreateGroup = nullptr;
@@ -3084,6 +3116,23 @@ static bool InitializeDwmHooks()
            L"class CBaseLegacyMilBrushProxy *,class CBaseGeometryProxy *,"
            L"class CDrawGeometryInstruction * *)"},
          &g_nativeProbeCreateGeometryInstruction, nullptr, true},
+        {{L"public: static long __cdecl CRenderDataVisual::Create("
+           L"class CRenderDataVisual * *)"},
+         &g_nativeRectCreateVisual, nullptr, true},
+        {{L"public: long __cdecl CRenderDataVisual::AddInstruction("
+           L"class CRenderDataInstruction *)"},
+         &g_nativeRectAddInstruction, nullptr, true},
+        {{L"public: virtual long __cdecl CRenderDataVisual::UpdateRenderData(void)"},
+         &g_nativeRectUpdateRenderData, nullptr, true},
+        {{L"public: long __cdecl VisualCollection::InsertRelative("
+           L"class CVisual *,class CVisual *,bool,bool)"},
+         &g_nativeRectInsertRelative, nullptr, true},
+        {{L"public: long __cdecl VisualCollection::Remove(class CVisual *)"},
+         &g_nativeRectCollectionRemove, nullptr, true},
+        {{L"public: long __cdecl CVisual::RemoveSelfFromParent(void)"},
+         &g_nativeRectRemoveFromParent, nullptr, true},
+        {{L"const VisualCollection::`vftable'"},
+         &g_nativeRectCollectionVtable, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateMeshGeometry2dProxy("
            L"class CMeshGeometry2dProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
@@ -3250,6 +3299,16 @@ static bool InitializeDwmHooks()
     keepValid(g_nativeProbeUpdateImageBrush);
     keepValid(g_nativeProbeCreateRectangle);
     keepValid(g_nativeProbeCreateGeometryInstruction);
+    keepValid(g_nativeRectCreateVisual);
+    keepValid(g_nativeRectAddInstruction);
+    keepValid(g_nativeRectUpdateRenderData);
+    keepValid(g_nativeRectInsertRelative);
+    keepValid(g_nativeRectRemoveFromParent);
+    keepValid(g_nativeRectCollectionRemove);
+    if (!IsDwmImageAddress(g_nativeRectCollectionVtable, sizeof(void*)))
+    {
+        g_nativeRectCollectionVtable = nullptr;
+    }
     keepValid(g_nativeProbeCreateMesh);
     keepValid(g_nativeProbeUpdateMesh);
     keepValid(g_nativeProbeCreateGroup);
@@ -3663,8 +3722,302 @@ static void ProbeNativeMeshHost(HWND hwnd, void* topLevelWindow,
            sourceMatches, independentSiblingHost);
 }
 
-static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* compositor,
-                                              void* image, int width, int height)
+static bool NativeRectAbiVerified()
+{
+    if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
+        g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
+        !g_nativeProbeCreateGeometryInstruction || !g_nativeRectCreateVisual ||
+        !g_nativeRectAddInstruction || !g_nativeRectUpdateRenderData ||
+        !g_nativeRectInsertRelative || !g_nativeRectRemoveFromParent ||
+        !g_nativeRectCollectionRemove || !g_nativeRectCollectionVtable ||
+        !g_nativeProbeGetVisualParent || !g_nativeProbeGetVisualProxy ||
+        !g_createMatrixTransformProxy || !g_cVisualProxySetTransform ||
+        !HasMatrixTransformUpdate() || !g_cBaseObjectRelease)
+    {
+        return false;
+    }
+    const auto* remove = reinterpret_cast<const BYTE*>(g_nativeRectRemoveFromParent);
+    const auto* insert = reinterpret_cast<const BYTE*>(g_nativeRectInsertRelative);
+    const auto* release = reinterpret_cast<const BYTE*>(g_cBaseObjectRelease);
+    constexpr BYTE removePrefix[] = {0x48,0x8B,0xD1,0x48,0x8B,0x49,0x18,
+                                      0x48,0x85,0xC9,0x74,0x09,0x48,0x83,0xC1,0x20};
+    constexpr BYTE siblingCompare[] = {0x49,0x3B,0xC8,0x0F,0x84,0xB6,0x01,0x00,0x00};
+    constexpr BYTE siblingIndex[] = {0x44,0x8B,0xF8};
+    constexpr BYTE afterReference[] = {0x43,0x8D,0x1C,0x27};
+    constexpr BYTE ownerLoad[] = {0x48,0x8B,0x59,0x08};
+    constexpr BYTE releasePrefix[] = {0x40,0x53,0x48,0x83,0xEC,0x20,
+                                      0x83,0xCB,0xFF,0xF0,0x0F,0xC1,0x59,0x08};
+    constexpr BYTE releaseSuffix[] = {0x83,0xEB,0x01};
+    if (!IsReadableMemory(remove, 24) || !IsReadableMemory(insert, 0x247) ||
+        !IsReadableMemory(release, 17) ||
+        std::memcmp(remove, removePrefix, sizeof(removePrefix)) ||
+        remove[16] != 0xE9 || remove[21] != 0x33 ||
+        remove[22] != 0xC0 || remove[23] != 0xC3 ||
+        std::memcmp(insert + 0x85, siblingCompare, sizeof(siblingCompare)) ||
+        std::memcmp(insert + 0x244, siblingIndex, sizeof(siblingIndex)) ||
+        std::memcmp(insert + 0xFC, afterReference, sizeof(afterReference)) ||
+        std::memcmp(insert + 37, ownerLoad, sizeof(ownerLoad)) ||
+        std::memcmp(release, releasePrefix, sizeof(releasePrefix)) ||
+        std::memcmp(release + 14, releaseSuffix, sizeof(releaseSuffix)))
+    {
+        return false;
+    }
+    int32_t jump = 0;
+    std::memcpy(&jump, remove + 17, sizeof(jump));
+    return reinterpret_cast<uintptr_t>(remove) + 21 + jump ==
+           reinterpret_cast<uintptr_t>(g_nativeRectCollectionRemove);
+}
+
+static void* FindNativeRectSiblingCollection(void* root)
+{
+    if (!root || !IsReadableMemory(root, sizeof(void*)) ||
+        !IsDwmImageAddress(*reinterpret_cast<void**>(root), sizeof(void*)))
+    {
+        return nullptr;
+    }
+    void* parent = ReadPointerMember(root, 0x18);
+    if (!parent || parent != g_nativeProbeGetVisualParent(root) ||
+        !IsReadableMemory(parent, sizeof(void*)) ||
+        !IsDwmImageAddress(*reinterpret_cast<void**>(parent), sizeof(void*)))
+    {
+        return nullptr;
+    }
+    auto* collection = static_cast<BYTE*>(parent) + 0x20;
+    if (!IsReadableMemory(collection, 0x2C) ||
+        *reinterpret_cast<void**>(collection) != g_nativeRectCollectionVtable ||
+        ReadPointerMember(collection, 8) != parent)
+    {
+        return nullptr;
+    }
+    unsigned int count = 0;
+    std::memcpy(&count, collection + 0x28, sizeof(count));
+    if (!count || count > 256)
+        return nullptr;
+    void* entries = ReadPointerMember(collection, 0x10);
+    if (!IsReadableMemory(entries, count * sizeof(void*)))
+        return nullptr;
+    unsigned int matches = 0;
+    for (unsigned int i = 0; i < count; ++i)
+        matches += static_cast<void**>(entries)[i] == root;
+    return matches == 1 ? collection : nullptr;
+}
+
+static bool RetainNativeRectRoot(void* root)
+{
+    auto* count = reinterpret_cast<volatile LONG*>(static_cast<BYTE*>(root) + 8);
+    if (!IsWritableMemory(const_cast<LONG*>(count), sizeof(LONG)))
+        return false;
+    LONG current = InterlockedCompareExchange(count, 0, 0);
+    for (unsigned int i = 0; i < 8 && current > 0 && current < 0x100000; ++i)
+    {
+        LONG previous = InterlockedCompareExchange(count, current + 1, current);
+        if (previous == current) return true;
+        current = previous;
+    }
+    return false;
+}
+
+static void ReleaseNativeRectState(NativeRectState& state)
+{
+    if (state.visual) g_cBaseObjectRelease(state.visual);
+    if (state.transform) g_cBaseObjectRelease(state.transform);
+    if (state.instruction) g_cBaseObjectRelease(state.instruction);
+    if (state.rectangle) g_cBaseObjectRelease(state.rectangle);
+    if (state.brush) g_cBaseObjectRelease(state.brush);
+    if (state.image) g_cBaseObjectRelease(state.image);
+    if (state.root) g_cBaseObjectRelease(state.root);
+    state = {};
+}
+
+static bool DetachNativeRectProbe(const wchar_t* reason)
+{
+    auto& state = g_nativeRectState;
+    if (!state.visual)
+    {
+        g_nativeRectActive.store(false, std::memory_order_release);
+        return true;
+    }
+    void* parent = ReadPointerMember(state.visual, 0x18);
+    long result = parent ? g_nativeRectRemoveFromParent(state.visual) : S_OK;
+    parent = ReadPointerMember(state.visual, 0x18);
+    if (result < 0 || parent)
+    {
+        if (!state.detachFailureLogged)
+        {
+            Wh_Log(L"NATIVE RECTANGLE DETACH DEFERRED: HWND=%p reason=%s "
+                   L"result=0x%08X parent=%p", state.hwnd, reason,
+                   static_cast<unsigned>(result), parent);
+            state.detachFailureLogged = true;
+        }
+        RequestDwmScenePass();
+        return false;
+    }
+    Wh_Log(L"NATIVE RECTANGLE DETACHED: HWND=%p reason=%s", state.hwnd, reason);
+    ReleaseNativeRectState(state);
+    g_nativeRectActive.store(false, std::memory_order_release);
+    g_nativeRectStopRequested.store(false, std::memory_order_release);
+    return true;
+}
+
+static void MaintainNativeRectProbe()
+{
+    if (!IsOnDwmSceneThread() ||
+        !g_nativeRectActive.load(std::memory_order_acquire))
+        return;
+    auto& state = g_nativeRectState;
+    RECT bounds = {};
+    bool sourceValid = state.root &&
+        g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy &&
+        GetWindowRect(state.hwnd, &bounds) &&
+        bounds.right - bounds.left == state.width &&
+        bounds.bottom - bounds.top == state.height;
+    if (g_unloading.load(std::memory_order_acquire) ||
+        g_nativeRectStopRequested.load(std::memory_order_acquire) ||
+        GetTickCount64() >= state.expiresAt || !sourceValid)
+    {
+        DetachNativeRectProbe(!sourceValid ? L"source-changed" :
+                              (g_unloading.load(std::memory_order_acquire)
+                                   ? L"unload" :
+                               (g_nativeRectStopRequested.load(std::memory_order_acquire)
+                                   ? L"stop-requested" : L"five-second-test-ended")));
+    }
+}
+
+static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
+                                     void* sourceProxy, void* compositor,
+                                     void*& image, void*& brush,
+                                     void*& rectangle, void*& instruction,
+                                     int width, int height)
+{
+    AcquireSRWLockShared(&g_settingsLock);
+    bool affineSelected = g_settings.rendererMode == RendererMode::Affine;
+    ReleaseSRWLockShared(&g_settingsLock);
+    if (!affineSelected || !NativeRectAbiVerified() ||
+        !g_topLevelWindowGetRootVisual ||
+        g_nativeRectActive.load(std::memory_order_acquire) ||
+        g_unloading.load(std::memory_order_acquire))
+    {
+        Wh_Log(L"NATIVE RECTANGLE SKIPPED: HWND=%p affine=%d abi=%d",
+               hwnd, affineSelected, NativeRectAbiVerified());
+        return false;
+    }
+    g_nativeRectStopRequested.store(false, std::memory_order_release);
+    void* root = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
+    if (!root || !IsReadableMemory(root, sizeof(void*)) ||
+        !IsDwmImageAddress(*reinterpret_cast<void**>(root), sizeof(void*)) ||
+        g_nativeProbeGetVisualProxy(root) != sourceProxy)
+        return false;
+    void* collection = FindNativeRectSiblingCollection(root);
+    if (!collection || !RetainNativeRectRoot(root))
+    {
+        Wh_Log(L"NATIVE RECTANGLE SKIPPED: HWND=%p sibling=%p",
+               hwnd, collection);
+        return false;
+    }
+
+    NativeRectState pending = {};
+    pending.root = root;
+    pending.hwnd = hwnd;
+    pending.sourceProxy = sourceProxy;
+    pending.width = width;
+    pending.height = height;
+    const wchar_t* stage = L"CreateVisual";
+    Wh_Log(L"NATIVE RECTANGLE ATTACH STAGE: %s HWND=%p", stage, hwnd);
+    long result = g_nativeRectCreateVisual(&pending.visual);
+    if (result >= 0 && !pending.visual) result = E_UNEXPECTED;
+    if (result >= 0)
+    {
+        stage = L"AddInstruction";
+        Wh_Log(L"NATIVE RECTANGLE ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeRectAddInstruction(pending.visual, instruction);
+    }
+    if (result >= 0)
+    {
+        stage = L"PublishRenderData";
+        Wh_Log(L"NATIVE RECTANGLE ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeRectUpdateRenderData(pending.visual);
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateTransform";
+        Wh_Log(L"NATIVE RECTANGLE ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_createMatrixTransformProxy(compositor, &pending.transform);
+        if (result >= 0 && !pending.transform) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"PositionRectangle";
+        const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0,
+                                     static_cast<double>(width) * 0.55, 0.0};
+        Wh_Log(L"NATIVE RECTANGLE ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        result = UpdateMatrixTransformProxy(pending.transform, matrix);
+    }
+    if (result >= 0)
+    {
+        stage = L"InsertSibling";
+        Wh_Log(L"NATIVE RECTANGLE ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeRectInsertRelative(collection, pending.visual,
+                                            root, true, false);
+    }
+    bool inserted = pending.visual && ReadPointerMember(pending.visual, 0x18);
+    if (result >= 0 && inserted)
+    {
+        stage = L"VerifySibling";
+        if (ReadPointerMember(pending.visual, 0x18) !=
+                ReadPointerMember(root, 0x18) ||
+            FindNativeRectSiblingCollection(root) != collection)
+            result = E_UNEXPECTED;
+    }
+    if (result >= 0 && inserted)
+    {
+        stage = L"BindTransform";
+        Wh_Log(L"NATIVE RECTANGLE ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        void* visualProxy = g_nativeProbeGetVisualProxy(pending.visual);
+        result = IsVisualProxyPointerValid(visualProxy)
+                     ? g_cVisualProxySetTransform(visualProxy, pending.transform)
+                     : E_NOINTERFACE;
+    }
+    if (result >= 0 && inserted)
+    {
+        pending.image = image;
+        pending.brush = brush;
+        pending.rectangle = rectangle;
+        pending.instruction = instruction;
+        image = brush = rectangle = instruction = nullptr;
+        pending.expiresAt = GetTickCount64() + 5000;
+        g_nativeRectState = pending;
+        g_nativeRectActive.store(true, std::memory_order_release);
+        Wh_Log(L"NATIVE RECTANGLE ATTACHED: HWND=%p root=%p visual=%p "
+               L"durationMs=5000 affine=unchanged snapshot=none",
+               hwnd, root, pending.visual);
+        RequestDwmScenePass();
+        return true;
+    }
+    Wh_Log(L"NATIVE RECTANGLE FAILED: HWND=%p stage=%s result=0x%08X "
+           L"inserted=%d", hwnd, stage, static_cast<unsigned>(result),
+           inserted);
+    if (inserted)
+    {
+        pending.image = image;
+        pending.brush = brush;
+        pending.rectangle = rectangle;
+        pending.instruction = instruction;
+        image = brush = rectangle = instruction = nullptr;
+        pending.expiresAt = GetTickCount64();
+        g_nativeRectState = pending;
+        g_nativeRectActive.store(true, std::memory_order_release);
+        DetachNativeRectProbe(L"failed-attach");
+    }
+    else
+    {
+        ReleaseNativeRectState(pending);
+    }
+    return false;
+}
+
+static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
+                                              void* sourceProxy, void* compositor,
+                                              void*& image, int width, int height)
 {
     if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
@@ -3732,12 +4085,18 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* compositor,
         if (result >= 0 && !exactInstruction) result = E_UNEXPECTED;
     }
     Wh_Log(L"NATIVE RECTANGLE PROBE: HWND=%p stage=%s result=0x%08X "
-           L"brushType=%d rectangleType=%d instructionType=%d attached=0",
+           L"brushType=%d rectangleType=%d instructionType=%d",
            hwnd, stage, static_cast<unsigned>(result), exactType,
            exactRectangle, exactInstruction);
-    if (exactInstruction) g_cBaseObjectRelease(instruction);
-    if (exactRectangle) g_cBaseObjectRelease(rectangle);
-    if (exactType) g_cBaseObjectRelease(brush);
+    if (result >= 0 && exactType && exactRectangle && exactInstruction)
+    {
+        TryAttachNativeRectProbe(hwnd, topLevelWindow, sourceProxy, compositor,
+                                 image, brush, rectangle, instruction,
+                                 width, height);
+    }
+    if (exactInstruction && instruction) g_cBaseObjectRelease(instruction);
+    if (exactRectangle && rectangle) g_cBaseObjectRelease(rectangle);
+    if (exactType && brush) g_cBaseObjectRelease(brush);
 }
 
 static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
@@ -3852,8 +4211,9 @@ static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
         // factory may return S_OK for a wrong pointer type and fail later when
         // rendering, so never pass the cached image to that instruction.
         RunDetachedNativeGeometryProbe(hwnd, compositor);
-        RunDetachedNativeImageBrushProbe(hwnd, compositor, image,
-                                         width, height);
+        RunDetachedNativeImageBrushProbe(hwnd, topLevelWindow,
+                                         sourceVisualProxy, compositor,
+                                         image, width, height);
     }
     if (bitmapInstruction && drawBitmapResult >= 0 &&
         IsReadableMemory(bitmapInstruction, sizeof(void*)) &&
@@ -4151,6 +4511,7 @@ static void SubmitPendingWobblySceneWork()
     g_sceneWakeScheduled.store(false, std::memory_order_release);
     g_sceneWakePostTimestamp.store(0, std::memory_order_release);
     g_scenePassCounter.fetch_add(1, std::memory_order_release);
+    MaintainNativeRectProbe();
     // Restore retiring/quiet windows before discovery, creation or normal rendering.
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
@@ -4179,7 +4540,8 @@ static void SubmitPendingWobblySceneWork()
 
 static bool HasPendingWobblySceneWork()
 {
-    return g_sceneRequestedSerial.load(std::memory_order_acquire) >
+    return g_nativeRectActive.load(std::memory_order_acquire) ||
+           g_sceneRequestedSerial.load(std::memory_order_acquire) >
                g_sceneSubmittedSerial.load(std::memory_order_acquire) ||
            g_existingWindowBackfillIndex.load(std::memory_order_acquire) <
                g_existingWindowBackfillCount.load(std::memory_order_acquire) ||
@@ -6281,6 +6643,8 @@ static void StopAllAnimations()
     int slotsToRetire[MAX_ANIMATION_SLOTS] = {};
     bool sceneCleanupNeeded = false;
     int retireCount = CollectActiveAnimationSlots(slotsToRetire, &sceneCleanupNeeded);
+    sceneCleanupNeeded |= g_nativeRectActive.load(std::memory_order_acquire);
+    g_nativeRectStopRequested.store(true, std::memory_order_release);
     for (int i = 0; i < retireCount; i++)
     {
         RetireAnimationSlot(slotsToRetire[i]);
@@ -6314,7 +6678,8 @@ static void StopAllAnimations()
         // Wakes carry only an instance token, not pointers; keep their counter
         // intact for late acknowledgments, but don't mistake them for resources.
         bool wakePending = g_sceneWakeOutstanding.load(std::memory_order_acquire) != 0;
-        if (!hookUsers && !retainedProxies)
+        bool rectActive = g_nativeRectActive.load(std::memory_order_acquire);
+        if (!hookUsers && !retainedProxies && !rectActive)
         {
             break;
         }
@@ -6329,7 +6694,7 @@ static void StopAllAnimations()
             break;
         }
         ULONGLONG lastWakePost = g_sceneWakePostTimestamp.load(std::memory_order_acquire);
-        if (retainedProxies &&
+        if ((retainedProxies || rectActive) &&
             (!wakePending || !lastWakePost || now - lastWakePost >= 50))
         {
             PostPendingDwmSceneWake(true);
@@ -6342,6 +6707,8 @@ static void StopAllAnimations()
         // Off-scene private calls are unsafe. Drop bookkeeping and intentionally
         // retain any unresolved DWM proxies instead of blocking unload forever.
         AbandonAnimationSlotsAfterSceneStall(L"cleanup timeout");
+        if (g_nativeRectActive.load(std::memory_order_acquire))
+            Wh_Log(L"NATIVE RECTANGLE cleanup timed out; retaining DWM resources");
     }
     DisarmAnimationClock();
     ResetDragInputState();
@@ -9258,6 +9625,8 @@ BOOL Wh_ModInit()
     }
     g_unloading.store(false, std::memory_order_release);
     g_nativeProbeAttempted.store(false, std::memory_order_release);
+    g_nativeRectActive.store(false, std::memory_order_release);
+    g_nativeRectStopRequested.store(false, std::memory_order_release);
     g_dwmSceneWakeMessage =
         RegisterWindowMessageW(L"Windhawk.WobblyWindows.DwmSceneWake");
     if (g_dwmSceneWakeMessage == 0)
