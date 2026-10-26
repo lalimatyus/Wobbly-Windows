@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.272
+// @version         0.273
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -447,6 +447,14 @@ struct NativeProbeSizeF
 {
     float width, height;
 };
+struct NativeProbePoint3F
+{
+    float x, y, z;
+};
+struct NativeProbePoint2D
+{
+    double x, y;
+};
 using NativeProbeCreateImage_t = long(__cdecl*)(void*, void**);
 using NativeProbeUpdateImageD_t = long(__cdecl*)(
     void*, const NativeProbeRectF&, const NativeProbeSizeD&, const void*,
@@ -455,10 +463,21 @@ using NativeProbeUpdateImageF_t = long(__cdecl*)(
     void*, const NativeProbeRectF&, const NativeProbeSizeF&, const void*,
     const void*, void*, int);
 using NativeProbeCreateBitmapInstruction_t = long(__cdecl*)(void*, void**);
+using NativeProbeCreateMesh_t = long(__cdecl*)(void*, void**);
+using NativeProbeUpdateMesh_t = long(__cdecl*)(
+    void*, int, const NativeProbePoint3F*, const NativeProbePoint2D*,
+    unsigned int, const unsigned int*, unsigned int);
+using NativeProbeUpdateGroup_t = long(__cdecl*)(void*, void*);
+using NativeProbeCreateMeshInstruction_t = long(__cdecl*)(void*, void*, void**);
 NativeProbeCreateImage_t g_nativeProbeCreateImage = nullptr;
 NativeProbeUpdateImageD_t g_nativeProbeUpdateImageD = nullptr;
 NativeProbeUpdateImageF_t g_nativeProbeUpdateImageF = nullptr;
 NativeProbeCreateBitmapInstruction_t g_nativeProbeCreateBitmapInstruction = nullptr;
+NativeProbeCreateMesh_t g_nativeProbeCreateMesh = nullptr;
+NativeProbeUpdateMesh_t g_nativeProbeUpdateMesh = nullptr;
+NativeProbeCreateMesh_t g_nativeProbeCreateGroup = nullptr;
+NativeProbeUpdateGroup_t g_nativeProbeUpdateGroup = nullptr;
+NativeProbeCreateMeshInstruction_t g_nativeProbeCreateMeshInstruction = nullptr;
 void* g_nativeProbeImageVtableSymbol = nullptr;
 void* g_nativeProbeBitmapVtableSymbol = nullptr;
 std::atomic<void*> g_nativeProbeImageVtable = nullptr;
@@ -3019,6 +3038,27 @@ static bool InitializeDwmHooks()
         {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
            L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
          &g_nativeProbeCreateBitmapInstruction, nullptr, true},
+        {{L"public: long __cdecl CCompositor::CreateMeshGeometry2dProxy("
+           L"class CMeshGeometry2dProxy * *)",
+          L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CMeshGeometry2dProxy>(class CMeshGeometry2dProxy * *)"},
+         &g_nativeProbeCreateMesh, nullptr, true},
+        {{L"public: long __cdecl CMeshGeometry2dProxy::Update("
+           L"int,struct MilPoint3F const *,struct MilPoint2D const *,"
+           L"unsigned int,unsigned int const *,unsigned int)"},
+         &g_nativeProbeUpdateMesh, nullptr, true},
+        {{L"public: long __cdecl CCompositor::CreateGeometry2dGroupProxy("
+           L"class CGeometry2dGroupProxy * *)",
+          L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CGeometry2dGroupProxy>(class CGeometry2dGroupProxy * *)"},
+         &g_nativeProbeCreateGroup, nullptr, true},
+        {{L"public: long __cdecl CGeometry2dGroupProxy::Update("
+           L"class CMeshGeometry2dProxy const *)"},
+         &g_nativeProbeUpdateGroup, nullptr, true},
+        {{L"public: static long __cdecl CDrawMesh2DInstruction::Create("
+           L"class CGeometry2dGroupProxy *,class CBitmapSourceProxy *,"
+           L"class CDrawMesh2DInstruction * *)"},
+         &g_nativeProbeCreateMeshInstruction, nullptr, true},
         {{L"const CCachedVisualImageProxy::`vftable'"},
          &g_nativeProbeImageVtableSymbol, nullptr, true},
         {{L"const CBitmapSourceProxy::`vftable'"},
@@ -3146,6 +3186,11 @@ static bool InitializeDwmHooks()
     keepValid(g_nativeProbeUpdateImageD);
     keepValid(g_nativeProbeUpdateImageF);
     keepValid(g_nativeProbeCreateBitmapInstruction);
+    keepValid(g_nativeProbeCreateMesh);
+    keepValid(g_nativeProbeUpdateMesh);
+    keepValid(g_nativeProbeCreateGroup);
+    keepValid(g_nativeProbeUpdateGroup);
+    keepValid(g_nativeProbeCreateMeshInstruction);
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
@@ -3193,6 +3238,13 @@ static bool InitializeDwmHooks()
            g_nativeProbeCreateBitmapInstruction != nullptr,
            g_nativeProbeImageVtable.load(std::memory_order_acquire),
            g_nativeProbeBitmapVtable.load(std::memory_order_acquire));
+    Wh_Log(L"NATIVE MESH BRIDGE: mesh=%d update=%d group=%d "
+           L"groupUpdate=%d instruction=%d",
+           g_nativeProbeCreateMesh != nullptr,
+           g_nativeProbeUpdateMesh != nullptr,
+           g_nativeProbeCreateGroup != nullptr,
+           g_nativeProbeUpdateGroup != nullptr,
+           g_nativeProbeCreateMeshInstruction != nullptr);
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
@@ -3401,6 +3453,107 @@ static bool InitializeDwmHooks()
     return true;
 }
 
+static void RunDetachedNativeMeshProbe(HWND hwnd, void* compositor, void* image)
+{
+    // This ABI is verified only for the exact 23H2 uDWM image used here.
+    if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
+        g_dwmModuleLayout.sizeOfImage != 0x16A000)
+    {
+        Wh_Log(L"NATIVE MESH BRIDGE: skipped HWND=%p (unverified uDWM ABI)", hwnd);
+        return;
+    }
+    if (!g_nativeProbeCreateMesh || !g_nativeProbeUpdateMesh ||
+        !g_nativeProbeCreateGroup || !g_nativeProbeUpdateGroup ||
+        !g_nativeProbeCreateMeshInstruction || !g_cBaseObjectRelease)
+    {
+        Wh_Log(L"NATIVE MESH BRIDGE: skipped HWND=%p (missing symbols)", hwnd);
+        return;
+    }
+
+    NativeProbePoint3F positions[16] = {};
+    NativeProbePoint2D coordinates[16] = {};
+    unsigned int indices[54] = {};
+    for (int y = 0; y < 4; ++y)
+    {
+        for (int x = 0; x < 4; ++x)
+        {
+            int index = y * 4 + x;
+            float u = static_cast<float>(x) / 3.0f;
+            float v = static_cast<float>(y) / 3.0f;
+            positions[index] = {u, v, 0.0f};
+            coordinates[index] = {static_cast<double>(u), static_cast<double>(v)};
+        }
+    }
+    unsigned int count = 0;
+    for (unsigned int y = 0; y < 3; ++y)
+    {
+        for (unsigned int x = 0; x < 3; ++x)
+        {
+            unsigned int a = y * 4 + x;
+            unsigned int b = a + 1;
+            unsigned int c = a + 4;
+            unsigned int d = c + 1;
+            indices[count++] = a;
+            indices[count++] = c;
+            indices[count++] = b;
+            indices[count++] = b;
+            indices[count++] = c;
+            indices[count++] = d;
+        }
+    }
+
+    void* mesh = nullptr;
+    void* group = nullptr;
+    void* instruction = nullptr;
+    const wchar_t* stage = L"CreateMesh";
+    long result = g_nativeProbeCreateMesh(compositor, &mesh);
+    if (result >= 0 && mesh)
+    {
+        stage = L"UpdateMesh";
+        result = g_nativeProbeUpdateMesh(mesh, 0, positions, coordinates,
+                                         16, indices, count);
+    }
+    else if (result >= 0)
+    {
+        result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateGroup";
+        result = g_nativeProbeCreateGroup(compositor, &group);
+        if (result >= 0 && !group) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"UpdateGroup";
+        result = g_nativeProbeUpdateGroup(group, mesh);
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateInstruction";
+        result = g_nativeProbeCreateMeshInstruction(group, image,
+                                                     &instruction);
+        if (result >= 0 && !instruction) result = E_UNEXPECTED;
+    }
+    Wh_Log(L"NATIVE MESH BRIDGE: HWND=%p stage=%s result=0x%08X "
+           L"mesh=%p group=%p instruction=%p vertices=16 indices=%u "
+           L"attached=0",
+           hwnd, stage, static_cast<unsigned int>(result), mesh, group,
+           instruction, count);
+
+    auto release = [](void* object)
+    {
+        if (object && IsReadableMemory(object, sizeof(void*)) &&
+            IsDwmImageAddress(*reinterpret_cast<void**>(object), sizeof(void*)))
+        {
+            g_cBaseObjectRelease(object);
+        }
+    };
+    release(instruction);
+    release(group);
+    release(mesh);
+}
+
 static void RunNativeSourceProbe(HWND hwnd, void* sourceVisualProxy)
 {
     if (!IsOnDwmSceneThread() || !IsVisualProxyPointerValid(sourceVisualProxy) ||
@@ -3503,6 +3656,11 @@ static void RunNativeSourceProbe(HWND hwnd, void* sourceVisualProxy)
            knownImageLayout, resourceReadable, imageResourceId,
            instructionKeepsImage,
            g_nativeProbeBitmapVtable.load(std::memory_order_acquire));
+    if (resourceReadable && imageResourceId && drawBitmapResult >= 0 &&
+        instructionKeepsImage)
+    {
+        RunDetachedNativeMeshProbe(hwnd, compositor, image);
+    }
     if (bitmapInstruction && drawBitmapResult >= 0 &&
         IsReadableMemory(bitmapInstruction, sizeof(void*)) &&
         IsDwmImageAddress(*reinterpret_cast<void**>(bitmapInstruction),
