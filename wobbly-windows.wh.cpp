@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.286
+// @version         0.287
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -520,7 +520,7 @@ struct NativeRectState
     int width = 0;
     int height = 0;
     ULONGLONG expiresAt = 0;
-    bool triangle = false;
+    bool regionGeometry = false;
     bool detachFailureLogged = false;
 };
 NativeRectState g_nativeRectState; // DWM scene thread only.
@@ -3394,7 +3394,7 @@ static bool InitializeDwmHooks()
            g_nativeProbeRectangleVtable.load(std::memory_order_acquire),
            g_nativeProbeGeometryInstructionVtable.load(
                std::memory_order_acquire));
-    Wh_Log(L"NATIVE TRIANGLE PROBE: region=%d regionVtable=%p attached=0",
+    Wh_Log(L"NATIVE REGION RECT PROBE: region=%d regionVtable=%p attached=0",
            g_nativeProbeCreateRegion != nullptr,
            g_nativeProbeRegionVtable.load(std::memory_order_acquire));
     Wh_Log(L"NATIVE MESH BRIDGE: mesh=%d update=%d group=%d "
@@ -3871,7 +3871,7 @@ static bool DetachNativeRectProbe(const wchar_t* reason)
         return false;
     }
     Wh_Log(L"NATIVE SHAPE DETACHED: HWND=%p geometry=%s reason=%s",
-           state.hwnd, state.triangle ? L"triangle" : L"rectangle", reason);
+           state.hwnd, state.regionGeometry ? L"region-rectangle" : L"rectangle", reason);
     ReleaseNativeRectState(state);
     g_nativeRectActive.store(false, std::memory_order_release);
     g_nativeRectStopRequested.store(false, std::memory_order_release);
@@ -3907,7 +3907,7 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
                                      void*& image, void*& brush,
                                      void*& rectangle, void*& instruction,
                                      HRGN& region, int width, int height,
-                                     bool triangleSelected)
+                                     bool regionSelected)
 {
     AcquireSRWLockShared(&g_settingsLock);
     bool affineSelected = g_settings.rendererMode == RendererMode::Affine;
@@ -3941,7 +3941,7 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
     pending.sourceProxy = sourceProxy;
     pending.width = width;
     pending.height = height;
-    pending.triangle = triangleSelected;
+    pending.regionGeometry = regionSelected;
     const wchar_t* stage = L"CreateVisual";
     Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
     long result = g_nativeRectCreateVisual(&pending.visual);
@@ -4012,14 +4012,14 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
         g_nativeRectActive.store(true, std::memory_order_release);
         Wh_Log(L"NATIVE SHAPE ATTACHED: HWND=%p geometry=%s root=%p "
                L"visual=%p durationMs=5000 affine=unchanged snapshot=none",
-               hwnd, triangleSelected ? L"triangle" : L"rectangle",
+               hwnd, regionSelected ? L"region-rectangle" : L"rectangle",
                root, pending.visual);
         RequestDwmScenePass();
         return true;
     }
     Wh_Log(L"NATIVE SHAPE FAILED: HWND=%p geometry=%s stage=%s "
            L"result=0x%08X inserted=%d", hwnd,
-           triangleSelected ? L"triangle" : L"rectangle", stage,
+           regionSelected ? L"region-rectangle" : L"rectangle", stage,
            static_cast<unsigned>(result), inserted);
     if (inserted)
     {
@@ -4042,11 +4042,11 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
     return false;
 }
 
-static bool CreateNativeTriangleInstruction(HWND hwnd, void* brush,
-                                             int width, int height,
-                                             void*& geometryOut,
-                                             void*& instructionOut,
-                                             HRGN& regionOut)
+static bool CreateNativeRegionRectangleInstruction(HWND hwnd, void* brush,
+                                                    int width, int height,
+                                                    void*& geometryOut,
+                                                    void*& instructionOut,
+                                                    HRGN& regionOut)
 {
     geometryOut = nullptr;
     instructionOut = nullptr;
@@ -4062,24 +4062,33 @@ static bool CreateNativeTriangleInstruction(HWND hwnd, void* brush,
             std::memory_order_acquire) ||
         width < 32 || height < 32)
     {
-        Wh_Log(L"NATIVE TRIANGLE PROBE: skipped HWND=%p", hwnd);
+        Wh_Log(L"NATIVE REGION RECT PROBE: skipped HWND=%p", hwnd);
         return false;
     }
 
-    const POINT points[3] = {{0, 0}, {std::min(width, 160), 0},
-                             {0, std::min(height, 100)}};
-    Wh_Log(L"NATIVE TRIANGLE STAGE: CreatePolygonRgn HWND=%p", hwnd);
-    HRGN region = CreatePolygonRgn(points, 3, WINDING);
+    const int rectWidth = std::min(width, 160);
+    const int rectHeight = std::min(height, 100);
+    Wh_Log(L"NATIVE REGION RECT STAGE: CreateRectRgn HWND=%p", hwnd);
+    HRGN region = CreateRectRgn(0, 0, rectWidth, rectHeight);
     void* geometry = nullptr;
     void* instruction = nullptr;
     bool geometryType = false;
     bool instructionType = false;
     long result = region ? S_OK : HRESULT_FROM_WIN32(GetLastError());
-    const wchar_t* stage = L"CreatePolygonRgn";
+    const wchar_t* stage = L"CreateRectRgn";
+    RECT regionBox = {};
+    int regionKind = region ? GetRgnBox(region, &regionBox) : ERROR;
+    DWORD regionBytes = region ? GetRegionData(region, 0, nullptr) : 0;
+    Wh_Log(L"NATIVE REGION RECT INPUT: HWND=%p kind=%d box=%ld,%ld-%ld,%ld "
+           L"dataBytes=%lu", hwnd, regionKind, regionBox.left,
+           regionBox.top, regionBox.right, regionBox.bottom, regionBytes);
+    if (result >= 0 && (regionKind == ERROR || regionBox.right <= regionBox.left ||
+                        regionBox.bottom <= regionBox.top || !regionBytes))
+        result = E_INVALIDARG;
     if (result >= 0)
     {
         stage = L"CreateGeometryFromHRGN";
-        Wh_Log(L"NATIVE TRIANGLE STAGE: %s HWND=%p", stage, hwnd);
+        Wh_Log(L"NATIVE REGION RECT STAGE: %s HWND=%p", stage, hwnd);
         result = g_nativeProbeCreateRegion(region, &geometry);
         geometryType = geometry && IsReadableMemory(geometry, sizeof(void*)) &&
             *reinterpret_cast<void**>(geometry) ==
@@ -4089,7 +4098,7 @@ static bool CreateNativeTriangleInstruction(HWND hwnd, void* brush,
     if (result >= 0)
     {
         stage = L"CreateInstruction";
-        Wh_Log(L"NATIVE TRIANGLE STAGE: %s HWND=%p", stage, hwnd);
+        Wh_Log(L"NATIVE REGION RECT STAGE: %s HWND=%p", stage, hwnd);
         result = g_nativeProbeCreateGeometryInstruction(
             brush, geometry, &instruction);
         instructionType = instruction &&
@@ -4099,7 +4108,7 @@ static bool CreateNativeTriangleInstruction(HWND hwnd, void* brush,
                     std::memory_order_acquire);
         if (result >= 0 && !instructionType) result = E_UNEXPECTED;
     }
-    Wh_Log(L"NATIVE TRIANGLE PROBE: HWND=%p stage=%s result=0x%08X "
+    Wh_Log(L"NATIVE REGION RECT PROBE: HWND=%p stage=%s result=0x%08X "
            L"geometryType=%d instructionType=%d",
            hwnd, stage, static_cast<unsigned>(result), geometryType,
            instructionType);
@@ -4165,7 +4174,7 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
     const wchar_t* stage = L"UpdateBrush";
     if (result >= 0)
     {
-        // Keep the proven rectangle as a fallback if the triangle factory fails.
+        // Keep the proven rectangle as a fallback if the region-rectangle factory fails.
         const RECT rect = {0, 0, std::min(width, 160), std::min(height, 100)};
         stage = L"CreateRectangle";
         Wh_Log(L"NATIVE RECTANGLE STAGE: %s HWND=%p", stage, hwnd);
@@ -4194,24 +4203,24 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
            exactRectangle, exactInstruction);
     if (result >= 0 && exactType && exactRectangle && exactInstruction)
     {
-        void* triangleGeometry = nullptr;
-        void* triangleInstruction = nullptr;
-        HRGN triangleRegion = nullptr;
-        bool triangleSelected = CreateNativeTriangleInstruction(
+        void* regionGeometry = nullptr;
+        void* regionInstruction = nullptr;
+        HRGN regionHandle = nullptr;
+        bool regionSelected = CreateNativeRegionRectangleInstruction(
             hwnd, brush, width, height,
-            triangleGeometry, triangleInstruction, triangleRegion);
-        if (triangleSelected)
+            regionGeometry, regionInstruction, regionHandle);
+        if (regionSelected)
         {
             g_cBaseObjectRelease(instruction);
             g_cBaseObjectRelease(rectangle);
-            rectangle = triangleGeometry;
-            instruction = triangleInstruction;
+            rectangle = regionGeometry;
+            instruction = regionInstruction;
         }
         TryAttachNativeRectProbe(hwnd, topLevelWindow, sourceProxy, compositor,
                                  image, brush, rectangle, instruction,
-                                 triangleRegion, width, height,
-                                 triangleSelected);
-        if (triangleRegion) DeleteObject(triangleRegion);
+                                 regionHandle, width, height,
+                                 regionSelected);
+        if (regionHandle) DeleteObject(regionHandle);
     }
     if (exactInstruction && instruction) g_cBaseObjectRelease(instruction);
     if (exactRectangle && rectangle) g_cBaseObjectRelease(rectangle);
