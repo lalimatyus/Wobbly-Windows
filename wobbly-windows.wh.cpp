@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.282
+// @version         0.283
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -468,6 +468,9 @@ using NativeProbeUpdateImageBrush_t = long(__cdecl*)(
     void*, double, const NativeProbeRectF&, const NativeProbeRectF&,
     const void*, int, int, const void*, const void*, int, int, int, int,
     const void*);
+using NativeProbeCreateRectangle_t = long(__cdecl*)(const RECT*, void**);
+using NativeProbeCreateGeometryInstruction_t = long(__cdecl*)(
+    void*, void*, void**);
 using NativeProbeCreateMesh_t = long(__cdecl*)(void*, void**);
 using NativeProbeUpdateMesh_t = long(__cdecl*)(
     void*, int, const NativeProbePoint3F*, const NativeProbePoint2D*,
@@ -483,6 +486,8 @@ NativeProbeUpdateImageF_t g_nativeProbeUpdateImageF = nullptr;
 NativeProbeCreateBitmapInstruction_t g_nativeProbeCreateBitmapInstruction = nullptr;
 NativeProbeCreateImageBrush_t g_nativeProbeCreateImageBrush = nullptr;
 NativeProbeUpdateImageBrush_t g_nativeProbeUpdateImageBrush = nullptr;
+NativeProbeCreateRectangle_t g_nativeProbeCreateRectangle = nullptr;
+NativeProbeCreateGeometryInstruction_t g_nativeProbeCreateGeometryInstruction = nullptr;
 NativeProbeCreateMesh_t g_nativeProbeCreateMesh = nullptr;
 NativeProbeUpdateMesh_t g_nativeProbeUpdateMesh = nullptr;
 NativeProbeCreateMesh_t g_nativeProbeCreateGroup = nullptr;
@@ -493,9 +498,13 @@ NativeProbeGetVisual_t g_nativeProbeGetVisualProxy = nullptr;
 void* g_nativeProbeImageVtableSymbol = nullptr;
 void* g_nativeProbeBitmapVtableSymbol = nullptr;
 void* g_nativeProbeImageBrushVtableSymbol = nullptr;
+void* g_nativeProbeRectangleVtableSymbol = nullptr;
+void* g_nativeProbeGeometryInstructionVtableSymbol = nullptr;
 std::atomic<void*> g_nativeProbeImageVtable = nullptr;
 std::atomic<void*> g_nativeProbeBitmapVtable = nullptr;
 std::atomic<void*> g_nativeProbeImageBrushVtable = nullptr;
+std::atomic<void*> g_nativeProbeRectangleVtable = nullptr;
+std::atomic<void*> g_nativeProbeGeometryInstructionVtable = nullptr;
 std::atomic_bool g_nativeProbeAttempted = false;
 
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
@@ -3068,6 +3077,13 @@ static bool InitializeDwmHooks()
            L"enum MilVerticalAlignment::Enum,"
            L"class CBaseImageProxy const *)"},
          &g_nativeProbeUpdateImageBrush, nullptr, true},
+        {{L"public: static long __cdecl ResourceHelper::CreateRectangleGeometry("
+           L"struct tagRECT const *,class CRectangleGeometryProxy * *)"},
+         &g_nativeProbeCreateRectangle, nullptr, true},
+        {{L"public: static long __cdecl CDrawGeometryInstruction::Create("
+           L"class CBaseLegacyMilBrushProxy *,class CBaseGeometryProxy *,"
+           L"class CDrawGeometryInstruction * *)"},
+         &g_nativeProbeCreateGeometryInstruction, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateMeshGeometry2dProxy("
            L"class CMeshGeometry2dProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
@@ -3103,6 +3119,10 @@ static bool InitializeDwmHooks()
          &g_nativeProbeBitmapVtableSymbol, nullptr, true},
         {{L"const CImageLegacyMilBrushProxy::`vftable'"},
          &g_nativeProbeImageBrushVtableSymbol, nullptr, true},
+        {{L"const CRectangleGeometryProxy::`vftable'"},
+         &g_nativeProbeRectangleVtableSymbol, nullptr, true},
+        {{L"const CDrawGeometryInstruction::`vftable'"},
+         &g_nativeProbeGeometryInstructionVtableSymbol, nullptr, true},
 
         {{L"private: static class CDesktopManager * "
            L"CDesktopManager::s_pDesktopManagerInstance"},
@@ -3228,6 +3248,8 @@ static bool InitializeDwmHooks()
     keepValid(g_nativeProbeCreateBitmapInstruction);
     keepValid(g_nativeProbeCreateImageBrush);
     keepValid(g_nativeProbeUpdateImageBrush);
+    keepValid(g_nativeProbeCreateRectangle);
+    keepValid(g_nativeProbeCreateGeometryInstruction);
     keepValid(g_nativeProbeCreateMesh);
     keepValid(g_nativeProbeUpdateMesh);
     keepValid(g_nativeProbeCreateGroup);
@@ -3276,6 +3298,10 @@ static bool InitializeDwmHooks()
     cacheVtableSymbol(g_nativeProbeBitmapVtableSymbol, g_nativeProbeBitmapVtable);
     cacheVtableSymbol(g_nativeProbeImageBrushVtableSymbol,
                       g_nativeProbeImageBrushVtable);
+    cacheVtableSymbol(g_nativeProbeRectangleVtableSymbol,
+                      g_nativeProbeRectangleVtable);
+    cacheVtableSymbol(g_nativeProbeGeometryInstructionVtableSymbol,
+                      g_nativeProbeGeometryInstructionVtable);
     Wh_Log(L"NATIVE SOURCE PROBE: create=%d update=%s drawBitmap=%d "
            L"imageVtable=%p bitmapVtable=%p",
            g_nativeProbeCreateImage != nullptr,
@@ -3288,6 +3314,13 @@ static bool InitializeDwmHooks()
            L"attached=0", g_nativeProbeCreateImageBrush != nullptr,
            g_nativeProbeUpdateImageBrush != nullptr,
            g_nativeProbeImageBrushVtable.load(std::memory_order_acquire));
+    Wh_Log(L"NATIVE RECTANGLE PROBE: geometry=%d instruction=%d "
+           L"geometryVtable=%p instructionVtable=%p attached=0",
+           g_nativeProbeCreateRectangle != nullptr,
+           g_nativeProbeCreateGeometryInstruction != nullptr,
+           g_nativeProbeRectangleVtable.load(std::memory_order_acquire),
+           g_nativeProbeGeometryInstructionVtable.load(
+               std::memory_order_acquire));
     Wh_Log(L"NATIVE MESH BRIDGE: mesh=%d update=%d group=%d "
            L"groupUpdate=%d meshFactory=%d directCachedImageSource=0 "
            L"getParent=%d getProxy=%d",
@@ -3636,8 +3669,13 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* compositor,
     if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
         !g_nativeProbeCreateImageBrush || !g_nativeProbeUpdateImageBrush ||
+        !g_nativeProbeCreateRectangle ||
+        !g_nativeProbeCreateGeometryInstruction ||
         !g_cBaseObjectRelease ||
-        !g_nativeProbeImageBrushVtable.load(std::memory_order_acquire))
+        !g_nativeProbeImageBrushVtable.load(std::memory_order_acquire) ||
+        !g_nativeProbeRectangleVtable.load(std::memory_order_acquire) ||
+        !g_nativeProbeGeometryInstructionVtable.load(
+            std::memory_order_acquire))
     {
         Wh_Log(L"NATIVE IMAGE BRUSH PROBE: skipped HWND=%p "
                L"(unverified ABI or missing symbol)", hwnd);
@@ -3645,6 +3683,8 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* compositor,
     }
 
     void* brush = nullptr;
+    void* rectangle = nullptr;
+    void* instruction = nullptr;
     Wh_Log(L"NATIVE IMAGE BRUSH STAGE: Create HWND=%p", hwnd);
     long result = g_nativeProbeCreateImageBrush(compositor, &brush);
     bool exactType = brush && IsReadableMemory(brush, sizeof(void*)) &&
@@ -3662,9 +3702,41 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* compositor,
             brush, 1.0, viewport, viewbox, nullptr,
             1, 0, nullptr, nullptr, 1, 0, 0, 0, image);
     }
-    Wh_Log(L"NATIVE IMAGE BRUSH PROBE: HWND=%p result=0x%08X "
-           L"exactType=%d attached=0", hwnd,
-           static_cast<unsigned>(result), exactType);
+    bool exactRectangle = false;
+    bool exactInstruction = false;
+    const wchar_t* stage = L"UpdateBrush";
+    if (result >= 0)
+    {
+        // A small, separate drawing primitive. It does not clip or alter the
+        // source visual and is not inserted into the DWM scene in this build.
+        const RECT rect = {0, 0, std::min(width, 160), std::min(height, 100)};
+        stage = L"CreateRectangle";
+        Wh_Log(L"NATIVE RECTANGLE STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeProbeCreateRectangle(&rect, &rectangle);
+        exactRectangle = rectangle && IsReadableMemory(rectangle, sizeof(void*)) &&
+            *reinterpret_cast<void**>(rectangle) ==
+                g_nativeProbeRectangleVtable.load(std::memory_order_acquire);
+        if (result >= 0 && !exactRectangle) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateInstruction";
+        Wh_Log(L"NATIVE RECTANGLE STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeProbeCreateGeometryInstruction(
+            brush, rectangle, &instruction);
+        exactInstruction = instruction &&
+            IsReadableMemory(instruction, sizeof(void*)) &&
+            *reinterpret_cast<void**>(instruction) ==
+                g_nativeProbeGeometryInstructionVtable.load(
+                    std::memory_order_acquire);
+        if (result >= 0 && !exactInstruction) result = E_UNEXPECTED;
+    }
+    Wh_Log(L"NATIVE RECTANGLE PROBE: HWND=%p stage=%s result=0x%08X "
+           L"brushType=%d rectangleType=%d instructionType=%d attached=0",
+           hwnd, stage, static_cast<unsigned>(result), exactType,
+           exactRectangle, exactInstruction);
+    if (exactInstruction) g_cBaseObjectRelease(instruction);
+    if (exactRectangle) g_cBaseObjectRelease(rectangle);
     if (exactType) g_cBaseObjectRelease(brush);
 }
 
