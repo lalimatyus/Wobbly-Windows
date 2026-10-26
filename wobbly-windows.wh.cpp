@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.278
+// @version         0.279
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -494,19 +494,26 @@ void* g_nativeTileCollectionRemove = nullptr;
 void* g_nativeTileCollectionVtable = nullptr;
 std::atomic_bool g_nativeTileActive = false;
 std::atomic_bool g_nativeTileStopRequested = false;
+static constexpr int NATIVE_TILE_ROWS = 3;
+struct NativeTilePart
+{
+    void* instruction = nullptr;
+    void* visual = nullptr;
+    void* transform = nullptr;
+    RECT source = {};
+};
 struct NativeTileState
 {
     void* root = nullptr;         // Owned reference while the sibling is attached.
     void* collection = nullptr;
     void* image = nullptr;
-    void* instruction = nullptr;
-    void* visual = nullptr;
-    void* transform = nullptr;
+    NativeTilePart parts[NATIVE_TILE_ROWS] = {};
     void* sourceProxy = nullptr;  // Compared only while root is retained.
     HWND hwnd = nullptr;
     int slotIndex = -1;
     ULONGLONG generation = 0;
     ULONGLONG lastMeshRevision = ULLONG_MAX;
+    ULONGLONG lastTransformAt = 0;
     unsigned int transformUpdates = 0;
     bool motionLogged = false;
     int width = 0;
@@ -3766,9 +3773,12 @@ static bool RetainNativeTileRoot(void* root)
 
 static void ReleaseNativeTileState(NativeTileState& state)
 {
-    if (state.visual) g_cBaseObjectRelease(state.visual);
-    if (state.transform) g_cBaseObjectRelease(state.transform);
-    if (state.instruction) g_cBaseObjectRelease(state.instruction);
+    for (NativeTilePart& part : state.parts)
+    {
+        if (part.visual) g_cBaseObjectRelease(part.visual);
+        if (part.transform) g_cBaseObjectRelease(part.transform);
+        if (part.instruction) g_cBaseObjectRelease(part.instruction);
+    }
     if (state.image) g_cBaseObjectRelease(state.image);
     if (state.root) g_cBaseObjectRelease(state.root);
     state = {};
@@ -3777,15 +3787,22 @@ static void ReleaseNativeTileState(NativeTileState& state)
 static bool DetachNativeTileProbe(const wchar_t* reason)
 {
     auto& state = g_nativeTileState;
-    if (!state.visual)
+    long result = S_OK;
+    void* parent = nullptr;
+    for (int i = NATIVE_TILE_ROWS - 1; i >= 0; --i)
     {
-        g_nativeTileActive.store(false, std::memory_order_release);
-        return true;
+        NativeTilePart& part = state.parts[i];
+        if (!part.visual) continue;
+        void* currentParent = ReadPointerMember(part.visual, 0x18);
+        if (currentParent)
+        {
+            long currentResult = g_nativeTileRemoveFromParent(part.visual);
+            if (currentResult < 0) result = currentResult;
+            currentParent = ReadPointerMember(part.visual, 0x18);
+        }
+        if (currentParent) parent = currentParent;
     }
-    void* parent = ReadPointerMember(state.visual, 0x18);
-    long result = parent ? g_nativeTileRemoveFromParent(state.visual) : S_OK;
-    parent = ReadPointerMember(state.visual, 0x18);
-    if (result < 0 || parent)
+    if (parent)
     {
         if (!state.detachFailureLogged)
         {
@@ -3835,7 +3852,7 @@ static void MaintainNativeTileProbe()
     ULONGLONG revision = 0;
     double meshWidth = 0.0;
     double meshHeight = 0.0;
-    Vec2 corners[3] = {};
+    Vec2 control[GRID_HEIGHT][2] = {};
     AcquireSRWLockShared(&g_animationSlotsLock);
     if (state.slotIndex >= 0 && state.slotIndex < MAX_ANIMATION_SLOTS)
     {
@@ -3853,9 +3870,11 @@ static void MaintainNativeTileProbe()
             physicsActive = slot.mesh.active;
             if (physicsActive)
             {
-                corners[0] = slot.mesh.points[0].position;
-                corners[1] = slot.mesh.points[1].position;
-                corners[2] = slot.mesh.points[GRID_WIDTH].position;
+                for (int y = 0; y < GRID_HEIGHT; ++y)
+                {
+                    control[y][0] = slot.mesh.points[y * GRID_WIDTH].position;
+                    control[y][1] = slot.mesh.points[y * GRID_WIDTH + 1].position;
+                }
             }
         }
     }
@@ -3867,58 +3886,77 @@ static void MaintainNativeTileProbe()
     }
     if (revision == state.lastMeshRevision)
         return;
+    ULONGLONG now = GetTickCount64();
+    if (state.lastTransformAt && now - state.lastTransformAt < 7)
+        return;
     if (!physicsActive)
     {
-        corners[0] = {0.0, 0.0};
-        corners[1] = {meshWidth / 3.0, 0.0};
-        corners[2] = {0.0, meshHeight / 3.0};
+        for (int y = 0; y < GRID_HEIGHT; ++y)
+        {
+            control[y][0] = {0.0, meshHeight * y / 3.0};
+            control[y][1] = {meshWidth / 3.0, meshHeight * y / 3.0};
+        }
     }
     const double scaleX = state.width / meshWidth;
     const double scaleY = state.height / meshHeight;
-    const double tileWidth = std::max(1, state.width / 3);
-    const double tileHeight = std::max(1, state.height / 3);
-    const double x0 = corners[0].x * scaleX;
-    const double y0 = corners[0].y * scaleY;
-    const MilMatrix3x2D matrix = {
-        (corners[1].x * scaleX - x0) / tileWidth,
-        (corners[1].y * scaleY - y0) / tileWidth,
-        (corners[2].x * scaleX - x0) / tileHeight,
-        (corners[2].y * scaleY - y0) / tileHeight,
-        state.width * 0.55 + x0, y0};
-    if (!std::isfinite(matrix.m11) || !std::isfinite(matrix.m12) ||
-        !std::isfinite(matrix.m21) || !std::isfinite(matrix.m22) ||
-        !std::isfinite(matrix.dx) || !std::isfinite(matrix.dy) ||
-        matrix.m11 < 0.2 || matrix.m11 > 2.0 ||
-        matrix.m22 < 0.2 || matrix.m22 > 2.0 ||
-        std::abs(matrix.m12) > 1.0 || std::abs(matrix.m21) > 1.0 ||
-        std::abs(x0) > state.width || std::abs(y0) > state.height)
+    double peakDisplacement = 0.0;
+    double peakShear = 0.0;
+    for (int row = 0; row < NATIVE_TILE_ROWS; ++row)
     {
-        Wh_Log(L"NATIVE TILE invalid physics: HWND=%p revision=%llu",
-               state.hwnd, revision);
-        DetachNativeTileProbe(L"invalid-physics");
-        return;
-    }
-    long result = UpdateMatrixTransformProxy(state.transform, matrix);
-    if (result < 0)
-    {
-        Wh_Log(L"NATIVE TILE transform failed: HWND=%p result=0x%08X",
-               state.hwnd, static_cast<unsigned>(result));
-        DetachNativeTileProbe(L"transform-failed");
-        return;
+        const NativeTilePart& part = state.parts[row];
+        const double tileWidth = part.source.right - part.source.left;
+        const double tileHeight = part.source.bottom - part.source.top;
+        const double x0 = control[row][0].x * scaleX;
+        const double y0 = control[row][0].y * scaleY;
+        const double x1 = control[row][1].x * scaleX;
+        const double y1 = control[row][1].y * scaleY;
+        const double x2 = control[row + 1][0].x * scaleX;
+        const double y2 = control[row + 1][0].y * scaleY;
+        const double m11 = (x1 - x0) / tileWidth;
+        const double m12 = (y1 - y0) / tileWidth;
+        const double m21 = (x2 - x0) / tileHeight;
+        const double m22 = (y2 - y0) / tileHeight;
+        const MilMatrix3x2D matrix = {
+            m11, m12, m21, m22,
+            state.width * 0.55 + x0 - m11 * part.source.left -
+                m21 * part.source.top,
+            y0 - m12 * part.source.left - m22 * part.source.top};
+        if (!std::isfinite(matrix.m11) || !std::isfinite(matrix.m12) ||
+            !std::isfinite(matrix.m21) || !std::isfinite(matrix.m22) ||
+            !std::isfinite(matrix.dx) || !std::isfinite(matrix.dy) ||
+            matrix.m11 < 0.2 || matrix.m11 > 2.0 ||
+            matrix.m22 < 0.2 || matrix.m22 > 2.0 ||
+            std::abs(matrix.m12) > 1.0 || std::abs(matrix.m21) > 1.0 ||
+            std::abs(x0) > state.width || std::abs(y0) > state.height * 2.0)
+        {
+            Wh_Log(L"NATIVE TILE invalid physics: HWND=%p row=%d revision=%llu",
+                   state.hwnd, row, revision);
+            DetachNativeTileProbe(L"invalid-physics");
+            return;
+        }
+        long result = UpdateMatrixTransformProxy(part.transform, matrix);
+        if (result < 0)
+        {
+            Wh_Log(L"NATIVE TILE transform failed: HWND=%p row=%d result=0x%08X",
+                   state.hwnd, row, static_cast<unsigned>(result));
+            DetachNativeTileProbe(L"transform-failed");
+            return;
+        }
+        peakDisplacement = std::max(peakDisplacement,
+                                    std::hypot(x0, y0 - part.source.top));
+        peakShear = std::max(peakShear,
+                             std::max(std::abs(m12), std::abs(m21)));
     }
     state.lastMeshRevision = revision;
+    state.lastTransformAt = now;
     state.transformUpdates++;
-    if (!state.motionLogged &&
-        (std::hypot(x0, y0) > 2.0 ||
-         std::abs(matrix.m11 - 1.0) > 0.02 ||
-         std::abs(matrix.m22 - 1.0) > 0.02 ||
-         std::abs(matrix.m12) > 0.02 || std::abs(matrix.m21) > 0.02))
+    if (!state.motionLogged && (peakDisplacement > 2.0 || peakShear > 0.02))
     {
         state.motionLogged = true;
-        Wh_Log(L"NATIVE TILE MOTION: HWND=%p revision=%llu "
-               L"m11=%.4f m12=%.4f m21=%.4f m22=%.4f dx=%.2f dy=%.2f",
-               state.hwnd, revision, matrix.m11, matrix.m12, matrix.m21,
-               matrix.m22, matrix.dx, matrix.dy);
+        Wh_Log(L"NATIVE TILE MOTION: HWND=%p revision=%llu rows=%d "
+               L"peakDisplacement=%.2f peakShear=%.4f",
+               state.hwnd, revision, NATIVE_TILE_ROWS,
+               peakDisplacement, peakShear);
     }
 }
 
@@ -3960,82 +3998,86 @@ static bool TryAttachNativeTileProbe(int slotIndex, ULONGLONG generation,
     pending.sourceProxy = sourceProxy;
     pending.width = width;
     pending.height = height;
-    const RECT tile = {0, 0, std::max(1, width / 3), std::max(1, height / 3)};
-    const POINT origin = {0, 0};
+    if (width < 3 || height < 3)
+    {
+        ReleaseNativeTileState(pending);
+        return false;
+    }
     const wchar_t* stage = L"CreateTileInstruction";
-    long result = g_nativeTileCreateInstruction(image, tile, origin, 1.0f,
-                                                &pending.instruction);
-    if (result >= 0 && !pending.instruction) result = E_UNEXPECTED;
-    if (result >= 0)
+    long result = S_OK;
+    int failedRow = -1;
+    for (int row = 0; row < NATIVE_TILE_ROWS; ++row)
     {
+        NativeTilePart& part = pending.parts[row];
+        part.source = {0, height * row / NATIVE_TILE_ROWS,
+                       width / 3, height * (row + 1) / NATIVE_TILE_ROWS};
+        const POINT origin = {0, part.source.top};
+        failedRow = row;
+        stage = L"CreateTileInstruction";
+        result = g_nativeTileCreateInstruction(image, part.source, origin,
+                                                1.0f, &part.instruction);
+        if (result >= 0 && !part.instruction) result = E_UNEXPECTED;
+        if (result < 0) break;
         stage = L"CreateVisual";
-        result = g_nativeTileCreateVisual(&pending.visual);
-        if (result >= 0 && !pending.visual) result = E_UNEXPECTED;
-    }
-    if (result >= 0)
-    {
+        result = g_nativeTileCreateVisual(&part.visual);
+        if (result >= 0 && !part.visual) result = E_UNEXPECTED;
+        if (result < 0) break;
         stage = L"AddInstruction";
-        result = g_nativeTileAddInstruction(pending.visual,
-                                            pending.instruction);
-    }
-    if (result >= 0)
-    {
+        result = g_nativeTileAddInstruction(part.visual, part.instruction);
+        if (result < 0) break;
         stage = L"PublishRenderData";
-        result = g_nativeTileUpdateRenderData(pending.visual);
-    }
-    if (result >= 0)
-    {
+        result = g_nativeTileUpdateRenderData(part.visual);
+        if (result < 0) break;
         stage = L"CreateTransform";
-        result = g_createMatrixTransformProxy(compositor, &pending.transform);
-        if (result >= 0 && !pending.transform) result = E_UNEXPECTED;
-    }
-    if (result >= 0)
-    {
+        result = g_createMatrixTransformProxy(compositor, &part.transform);
+        if (result >= 0 && !part.transform) result = E_UNEXPECTED;
+        if (result < 0) break;
         stage = L"PositionTile";
         const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0,
                                      static_cast<double>(width) * 0.55, 0.0};
-        result = UpdateMatrixTransformProxy(pending.transform, matrix);
-    }
-    if (result >= 0)
-    {
+        result = UpdateMatrixTransformProxy(part.transform, matrix);
+        if (result < 0) break;
         stage = L"InsertSibling";
-        result = g_nativeTileInsertRelative(collection, pending.visual,
-                                            root, true, false);
-    }
-    bool inserted = pending.visual && ReadPointerMember(pending.visual, 0x18);
-    if (result >= 0 && inserted)
-    {
+        void* reference = row ? pending.parts[row - 1].visual : root;
+        result = g_nativeTileInsertRelative(collection, part.visual,
+                                            reference, true, false);
+        if (result < 0) break;
         stage = L"VerifySibling";
-        if (ReadPointerMember(pending.visual, 0x18) !=
+        if (ReadPointerMember(part.visual, 0x18) !=
                 ReadPointerMember(root, 0x18) ||
             FindNativeTileSiblingCollection(root) != collection)
+        {
             result = E_UNEXPECTED;
-    }
-    if (result >= 0 && inserted)
-    {
+            break;
+        }
         stage = L"BindTransform";
-        void* visualProxy = g_nativeProbeGetVisualProxy(pending.visual);
+        void* visualProxy = g_nativeProbeGetVisualProxy(part.visual);
         result = IsVisualProxyPointerValid(visualProxy)
-                     ? g_cVisualProxySetTransform(visualProxy, pending.transform)
+                     ? g_cVisualProxySetTransform(visualProxy, part.transform)
                      : E_NOINTERFACE;
+        if (result < 0) break;
     }
-    if (result >= 0 && inserted)
+    if (result >= 0)
     {
         pending.image = image;
         image = nullptr;
         pending.expiresAt = GetTickCount64() + 5000;
         g_nativeTileState = pending;
         g_nativeTileActive.store(true, std::memory_order_release);
-        Wh_Log(L"NATIVE TILE ATTACHED: Slot=%d HWND=%p root=%p visual=%p "
-               L"sourceRect=%ldx%ld durationMs=5000 affine=unchanged "
-               L"snapshot=none", slotIndex, hwnd, root, pending.visual,
-               tile.right, tile.bottom);
+        Wh_Log(L"NATIVE TILE STRIP ATTACHED: Slot=%d HWND=%p root=%p "
+               L"parts=%d stripWidth=%d height=%d durationMs=5000 "
+               L"affine=unchanged snapshot=none", slotIndex, hwnd, root,
+               NATIVE_TILE_ROWS, width / 3, height);
         RequestDwmScenePass();
         return true;
     }
-    Wh_Log(L"NATIVE TILE FAILED: HWND=%p stage=%s result=0x%08X "
-           L"inserted=%d", hwnd, stage, static_cast<unsigned>(result), inserted);
-    if (inserted)
+    bool anyInserted = false;
+    for (const NativeTilePart& part : pending.parts)
+        anyInserted |= part.visual && ReadPointerMember(part.visual, 0x18);
+    Wh_Log(L"NATIVE TILE FAILED: HWND=%p row=%d stage=%s result=0x%08X "
+           L"inserted=%d", hwnd, failedRow, stage,
+           static_cast<unsigned>(result), anyInserted);
+    if (anyInserted)
     {
         pending.image = image;
         image = nullptr;
