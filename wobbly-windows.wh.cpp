@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.274
+// @version         0.275
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -469,6 +469,7 @@ using NativeProbeUpdateMesh_t = long(__cdecl*)(
     unsigned int, const unsigned int*, unsigned int);
 using NativeProbeUpdateGroup_t = long(__cdecl*)(void*, void*);
 using NativeProbeCreateMeshInstruction_t = long(__cdecl*)(void*, void*, void**);
+using NativeProbeGetVisual_t = void*(__cdecl*)(void*);
 NativeProbeCreateImage_t g_nativeProbeCreateImage = nullptr;
 NativeProbeUpdateImageD_t g_nativeProbeUpdateImageD = nullptr;
 NativeProbeUpdateImageF_t g_nativeProbeUpdateImageF = nullptr;
@@ -478,6 +479,8 @@ NativeProbeUpdateMesh_t g_nativeProbeUpdateMesh = nullptr;
 NativeProbeCreateMesh_t g_nativeProbeCreateGroup = nullptr;
 NativeProbeUpdateGroup_t g_nativeProbeUpdateGroup = nullptr;
 NativeProbeCreateMeshInstruction_t g_nativeProbeCreateMeshInstruction = nullptr;
+NativeProbeGetVisual_t g_nativeProbeGetVisualParent = nullptr;
+NativeProbeGetVisual_t g_nativeProbeGetVisualProxy = nullptr;
 void* g_nativeProbeImageVtableSymbol = nullptr;
 void* g_nativeProbeBitmapVtableSymbol = nullptr;
 std::atomic<void*> g_nativeProbeImageVtable = nullptr;
@@ -3059,6 +3062,14 @@ static bool InitializeDwmHooks()
            L"class CGeometry2dGroupProxy *,class CBitmapSourceProxy *,"
            L"class CDrawMesh2DInstruction * *)"},
          &g_nativeProbeCreateMeshInstruction, nullptr, true},
+        {{L"public: virtual class CVisual * __cdecl "
+           L"CVisual::GetTransformParent(void)const",
+          L"public: virtual class CVisual * __cdecl "
+           L"CVisual::GetTransformParent(void)const "},
+         &g_nativeProbeGetVisualParent, nullptr, true},
+        {{L"public: virtual class CVisualProxy * __cdecl "
+           L"CVisual::GetVisualProxyForStructure(void)"},
+         &g_nativeProbeGetVisualProxy, nullptr, true},
         {{L"const CCachedVisualImageProxy::`vftable'"},
          &g_nativeProbeImageVtableSymbol, nullptr, true},
         {{L"const CBitmapSourceProxy::`vftable'"},
@@ -3191,6 +3202,8 @@ static bool InitializeDwmHooks()
     keepValid(g_nativeProbeCreateGroup);
     keepValid(g_nativeProbeUpdateGroup);
     keepValid(g_nativeProbeCreateMeshInstruction);
+    keepValid(g_nativeProbeGetVisualParent);
+    keepValid(g_nativeProbeGetVisualProxy);
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
@@ -3239,12 +3252,14 @@ static bool InitializeDwmHooks()
            g_nativeProbeImageVtable.load(std::memory_order_acquire),
            g_nativeProbeBitmapVtable.load(std::memory_order_acquire));
     Wh_Log(L"NATIVE MESH BRIDGE: mesh=%d update=%d group=%d "
-           L"groupUpdate=%d instruction=%d",
+           L"groupUpdate=%d instruction=%d getParent=%d getProxy=%d",
            g_nativeProbeCreateMesh != nullptr,
            g_nativeProbeUpdateMesh != nullptr,
            g_nativeProbeCreateGroup != nullptr,
            g_nativeProbeUpdateGroup != nullptr,
-           g_nativeProbeCreateMeshInstruction != nullptr);
+           g_nativeProbeCreateMeshInstruction != nullptr,
+           g_nativeProbeGetVisualParent != nullptr,
+           g_nativeProbeGetVisualProxy != nullptr);
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
@@ -3554,7 +3569,41 @@ static void RunDetachedNativeMeshProbe(HWND hwnd, void* compositor, void* image)
     release(mesh);
 }
 
-static void RunNativeSourceProbe(HWND hwnd, void* sourceVisualProxy)
+static void ProbeNativeMeshHost(HWND hwnd, void* topLevelWindow,
+                                void* sourceVisualProxy)
+{
+    if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
+        g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
+        !g_topLevelWindowGetRootVisual || !g_nativeProbeGetVisualParent ||
+        !g_nativeProbeGetVisualProxy)
+    {
+        Wh_Log(L"NATIVE MESH HOST: skipped HWND=%p (unverified ABI or symbols)",
+               hwnd);
+        return;
+    }
+    void* root = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
+    bool validRoot = root && IsReadableMemory(root, sizeof(void*)) &&
+        IsDwmImageAddress(*reinterpret_cast<void**>(root), sizeof(void*));
+    void* parent = validRoot ? g_nativeProbeGetVisualParent(root) : nullptr;
+    bool validParent = parent && parent != root &&
+        IsReadableMemory(parent, sizeof(void*)) &&
+        IsDwmImageAddress(*reinterpret_cast<void**>(parent), sizeof(void*));
+    void* rootProxy = validRoot ? g_nativeProbeGetVisualProxy(root) : nullptr;
+    void* parentProxy = validParent ? g_nativeProbeGetVisualProxy(parent) : nullptr;
+    bool sourceMatches = rootProxy == sourceVisualProxy &&
+        IsVisualProxyPointerValid(rootProxy);
+    bool independentSiblingHost = sourceMatches && validParent &&
+        IsVisualProxyPointerValid(parentProxy) &&
+        parentProxy != sourceVisualProxy;
+    Wh_Log(L"NATIVE MESH HOST: HWND=%p root=%p parent=%p rootProxy=%p "
+           L"sourceProxy=%p parentProxy=%p sourceMatches=%d "
+           L"independentSiblingHost=%d attached=0",
+           hwnd, root, parent, rootProxy, sourceVisualProxy, parentProxy,
+           sourceMatches, independentSiblingHost);
+}
+
+static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
+                                 void* sourceVisualProxy)
 {
     if (!IsOnDwmSceneThread() || !IsVisualProxyPointerValid(sourceVisualProxy) ||
         g_nativeProbeAttempted.load(std::memory_order_acquire))
@@ -3588,6 +3637,7 @@ static void RunNativeSourceProbe(HWND hwnd, void* sourceVisualProxy)
     {
         return;
     }
+    ProbeNativeMeshHost(hwnd, topLevelWindow, sourceVisualProxy);
 
     void* image = nullptr;
     void* bitmapInstruction = nullptr;
@@ -3784,7 +3834,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         if (topLevelVisualProxy &&
             !g_nativeProbeAttempted.load(std::memory_order_acquire))
         {
-            RunNativeSourceProbe(hwnd, topLevelVisualProxy);
+            RunNativeSourceProbe(hwnd, topLevelWindow, topLevelVisualProxy);
         }
         bool topLevelBindingAttempted =
             topLevelVisualProxy &&
