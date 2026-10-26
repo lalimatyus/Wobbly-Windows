@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.273
+// @version         0.274
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -8104,6 +8104,12 @@ public:
         if (!suspended_) return;
         if (!IsWindow(target_) || !pool_ || !item_)
             winrt::throw_hresult(E_INVALIDARG);
+        HMONITOR current = MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST);
+        if (captureMonitor_ && current != captureMonitor_) {
+            Wh_Log(L"GPU mesh cached capture monitor changed: HWND=%p from=%p to=%p",
+                   target_, captureMonitor_, current);
+            winrt::throw_hresult(E_FAIL);
+        }
         while (auto frame = pool_.TryGetNextFrame()) frame.Close();
         session_ = pool_.CreateCaptureSession(item_);
         session_.IsCursorCaptureEnabled(false);
@@ -8380,8 +8386,46 @@ private:
         session_ = pool_.CreateCaptureSession(item_);
         session_.IsCursorCaptureEnabled(false);
         session_.StartCapture();
-        Wh_Log(L"GPU mesh capture started: HWND=%p size=%dx%d",
-               target_, frameSize_.Width, frameSize_.Height);
+        captureMonitor_ = MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST);
+        pendingMonitor_ = nullptr;
+        Wh_Log(L"GPU mesh capture started: HWND=%p size=%dx%d monitor=%p dpi=%u",
+               target_, frameSize_.Width, frameSize_.Height,
+               captureMonitor_, GetDpiForWindow(target_));
+    }
+
+    void RefreshCaptureAfterMonitorChange() {
+        if (!IsWindow(target_)) return;
+        HMONITOR current = MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST);
+        if (!current || !captureMonitor_ || current == captureMonitor_) {
+            pendingMonitor_ = nullptr;
+            return;
+        }
+        ULONGLONG now = GetTickCount64();
+        if (current != pendingMonitor_) {
+            pendingMonitor_ = current;
+            pendingMonitorSince_ = now;
+            Wh_Log(L"GPU mesh monitor transition: HWND=%p from=%p to=%p",
+                   target_, captureMonitor_, current);
+            return;
+        }
+        ULONGLONG stableSince = std::max(pendingMonitorSince_,
+                                         lastFrameSizeChangeAt_);
+        if (now - stableSince < 250) return;
+
+        HMONITOR previous = captureMonitor_;
+        if (pool_) pool_.FrameArrived(frameToken_);
+        if (session_) session_.Close();
+        if (pool_) pool_.Close();
+        session_ = nullptr;
+        pool_ = nullptr;
+        item_ = nullptr;
+        captureDevice_ = nullptr;
+        haveFrameInsets_ = false;
+        StartCapture();
+        renderedLogged_ = false;
+        Wh_Log(L"GPU mesh capture refreshed for monitor: HWND=%p from=%p to=%p "
+               L"wait=%llums",
+               target_, previous, captureMonitor_, now - pendingMonitorSince_);
     }
 
     void StopCapture() noexcept {
@@ -8402,6 +8446,10 @@ private:
         textureWidth_ = textureHeight_ = 0;
         haveFrameInsets_ = false;
         overlayBounds_ = {};
+        captureMonitor_ = nullptr;
+        pendingMonitor_ = nullptr;
+        pendingMonitorSince_ = 0;
+        lastFrameSizeChangeAt_ = 0;
         if (overlayVisible_) ShowWindow(window_, SW_HIDE);
         overlayVisible_ = false;
     }
@@ -8423,6 +8471,7 @@ private:
             source->GetDesc(&desc);
             if (!capturedTexture_ || desc.Width != textureWidth_ ||
                 desc.Height != textureHeight_) {
+                lastFrameSizeChangeAt_ = GetTickCount64();
                 textureWidth_ = desc.Width;
                 textureHeight_ = desc.Height;
                 desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -8440,6 +8489,7 @@ private:
             frame.Close();
             if (size.Width > 0 && size.Height > 0 &&
                 (size.Width != frameSize_.Width || size.Height != frameSize_.Height)) {
+                lastFrameSizeChangeAt_ = GetTickCount64();
                 frameSize_ = size;
                 resize = true;
             }
@@ -8547,7 +8597,9 @@ private:
     }
 
     void Render() {
-        if (suspended_ || !capturedView_ || !renderTarget_) return;
+        if (suspended_ || !renderTarget_) return;
+        RefreshCaptureAfterMonitorChange();
+        if (!capturedView_) return;
         Bend bend{};
         double translationX = 0.0, translationY = 0.0;
         bend.options[3] = 8.0f / 9.0f;
@@ -8601,6 +8653,10 @@ private:
     bool haveFrameInsets_ = false;
     bool bridgeActive_ = false;
     bool renderedLogged_ = false;
+    HMONITOR captureMonitor_ = nullptr;
+    HMONITOR pendingMonitor_ = nullptr;
+    ULONGLONG pendingMonitorSince_ = 0;
+    ULONGLONG lastFrameSizeChangeAt_ = 0;
     HANDLE bridgeHandle_ = nullptr;
     const mesh_bridge::Data* bridge_ = nullptr;
     ULONGLONG lastBridgeOpenAttempt_ = 0;
