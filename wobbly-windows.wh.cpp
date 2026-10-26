@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.276
+// @version         0.277
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -463,6 +463,14 @@ using NativeProbeUpdateImageF_t = long(__cdecl*)(
     void*, const NativeProbeRectF&, const NativeProbeSizeF&, const void*,
     const void*, void*, int);
 using NativeProbeCreateBitmapInstruction_t = long(__cdecl*)(void*, void**);
+using NativeTileCreateInstruction_t = long(__cdecl*)(
+    void*, const RECT&, const POINT&, float, void**);
+using NativeTileCreateVisual_t = long(__cdecl*)(void**);
+using NativeTileAddInstruction_t = long(__cdecl*)(void*, void*);
+using NativeTileUpdateRenderData_t = long(__cdecl*)(void*);
+using NativeTileInsertRelative_t = long(__cdecl*)(
+    void*, void*, void*, bool, bool);
+using NativeTileRemoveFromParent_t = long(__cdecl*)(void*);
 using NativeProbeCreateMesh_t = long(__cdecl*)(void*, void**);
 using NativeProbeUpdateMesh_t = long(__cdecl*)(
     void*, int, const NativeProbePoint3F*, const NativeProbePoint2D*,
@@ -476,6 +484,31 @@ NativeProbeCreateImage_t g_nativeProbeCreateImage = nullptr;
 NativeProbeUpdateImageD_t g_nativeProbeUpdateImageD = nullptr;
 NativeProbeUpdateImageF_t g_nativeProbeUpdateImageF = nullptr;
 NativeProbeCreateBitmapInstruction_t g_nativeProbeCreateBitmapInstruction = nullptr;
+NativeTileCreateInstruction_t g_nativeTileCreateInstruction = nullptr;
+NativeTileCreateVisual_t g_nativeTileCreateVisual = nullptr;
+NativeTileAddInstruction_t g_nativeTileAddInstruction = nullptr;
+NativeTileUpdateRenderData_t g_nativeTileUpdateRenderData = nullptr;
+NativeTileInsertRelative_t g_nativeTileInsertRelative = nullptr;
+NativeTileRemoveFromParent_t g_nativeTileRemoveFromParent = nullptr;
+void* g_nativeTileCollectionRemove = nullptr;
+void* g_nativeTileCollectionVtable = nullptr;
+std::atomic_bool g_nativeTileActive = false;
+std::atomic_bool g_nativeTileStopRequested = false;
+struct NativeTileState
+{
+    void* root = nullptr;         // Owned reference while the sibling is attached.
+    void* image = nullptr;
+    void* instruction = nullptr;
+    void* visual = nullptr;
+    void* transform = nullptr;
+    void* sourceProxy = nullptr;  // Compared only while root is retained.
+    HWND hwnd = nullptr;
+    int width = 0;
+    int height = 0;
+    ULONGLONG expiresAt = 0;
+    bool detachFailureLogged = false;
+};
+NativeTileState g_nativeTileState; // DWM scene thread only.
 NativeProbeCreateMesh_t g_nativeProbeCreateMesh = nullptr;
 NativeProbeUpdateMesh_t g_nativeProbeUpdateMesh = nullptr;
 NativeProbeCreateMesh_t g_nativeProbeCreateGroup = nullptr;
@@ -3043,6 +3076,28 @@ static bool InitializeDwmHooks()
         {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
            L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
          &g_nativeProbeCreateBitmapInstruction, nullptr, true},
+        {{L"public: static long __cdecl CDrawTileImageInstruction::Create("
+           L"class CBaseImageProxy *,struct tagRECT const &,"
+           L"struct tagPOINT const &,float,"
+           L"class CDrawTileImageInstruction * *)"},
+         &g_nativeTileCreateInstruction, nullptr, true},
+        {{L"public: static long __cdecl CRenderDataVisual::Create("
+           L"class CRenderDataVisual * *)"},
+         &g_nativeTileCreateVisual, nullptr, true},
+        {{L"public: long __cdecl CRenderDataVisual::AddInstruction("
+           L"class CRenderDataInstruction *)"},
+         &g_nativeTileAddInstruction, nullptr, true},
+        {{L"public: virtual long __cdecl CRenderDataVisual::UpdateRenderData(void)"},
+         &g_nativeTileUpdateRenderData, nullptr, true},
+        {{L"public: long __cdecl VisualCollection::InsertRelative("
+           L"class CVisual *,class CVisual *,bool,bool)"},
+         &g_nativeTileInsertRelative, nullptr, true},
+        {{L"public: long __cdecl VisualCollection::Remove(class CVisual *)"},
+         &g_nativeTileCollectionRemove, nullptr, true},
+        {{L"public: long __cdecl CVisual::RemoveSelfFromParent(void)"},
+         &g_nativeTileRemoveFromParent, nullptr, true},
+        {{L"const VisualCollection::`vftable'"},
+         &g_nativeTileCollectionVtable, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateMeshGeometry2dProxy("
            L"class CMeshGeometry2dProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
@@ -3199,6 +3254,17 @@ static bool InitializeDwmHooks()
     keepValid(g_nativeProbeUpdateImageD);
     keepValid(g_nativeProbeUpdateImageF);
     keepValid(g_nativeProbeCreateBitmapInstruction);
+    keepValid(g_nativeTileCreateInstruction);
+    keepValid(g_nativeTileCreateVisual);
+    keepValid(g_nativeTileAddInstruction);
+    keepValid(g_nativeTileUpdateRenderData);
+    keepValid(g_nativeTileInsertRelative);
+    keepValid(g_nativeTileRemoveFromParent);
+    keepValid(g_nativeTileCollectionRemove);
+    if (!IsDwmImageAddress(g_nativeTileCollectionVtable, sizeof(void*)))
+    {
+        g_nativeTileCollectionVtable = nullptr;
+    }
     keepValid(g_nativeProbeCreateMesh);
     keepValid(g_nativeProbeUpdateMesh);
     keepValid(g_nativeProbeCreateGroup);
@@ -3595,6 +3661,292 @@ static void ProbeNativeMeshHost(HWND hwnd, void* topLevelWindow,
            sourceMatches, independentSiblingHost);
 }
 
+// Exact 22621.6199 path only. A live image can be drawn by a tile instruction
+// without pretending that it is the bitmap-source type required by DrawMesh2D.
+static bool NativeTileAbiVerified()
+{
+    if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
+        g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
+        !g_nativeTileCreateInstruction || !g_nativeTileCreateVisual ||
+        !g_nativeTileAddInstruction || !g_nativeTileUpdateRenderData ||
+        !g_nativeTileInsertRelative || !g_nativeTileRemoveFromParent ||
+        !g_nativeTileCollectionRemove || !g_nativeTileCollectionVtable ||
+        !g_nativeProbeGetVisualParent || !g_nativeProbeGetVisualProxy ||
+        !g_createMatrixTransformProxy || !g_cVisualProxySetTransform ||
+        !HasMatrixTransformUpdate() || !g_cBaseObjectRelease)
+    {
+        return false;
+    }
+    const auto* remove = reinterpret_cast<const BYTE*>(g_nativeTileRemoveFromParent);
+    const auto* insert = reinterpret_cast<const BYTE*>(g_nativeTileInsertRelative);
+    const auto* release = reinterpret_cast<const BYTE*>(g_cBaseObjectRelease);
+    constexpr BYTE removePrefix[] = {0x48,0x8B,0xD1,0x48,0x8B,0x49,0x18,
+                                      0x48,0x85,0xC9,0x74,0x09,0x48,0x83,0xC1,0x20};
+    constexpr BYTE siblingCompare[] = {0x49,0x3B,0xC8,0x0F,0x84,0xB6,0x01,0x00,0x00};
+    constexpr BYTE siblingIndex[] = {0x44,0x8B,0xF8};
+    constexpr BYTE afterReference[] = {0x43,0x8D,0x1C,0x27};
+    constexpr BYTE ownerLoad[] = {0x48,0x8B,0x59,0x08};
+    constexpr BYTE releasePrefix[] = {0x40,0x53,0x48,0x83,0xEC,0x20,
+                                      0x83,0xCB,0xFF,0xF0,0x0F,0xC1,0x59,0x08};
+    constexpr BYTE releaseSuffix[] = {0x83,0xEB,0x01};
+    if (!IsReadableMemory(remove, 24) || !IsReadableMemory(insert, 0x247) ||
+        !IsReadableMemory(release, 17) ||
+        std::memcmp(remove, removePrefix, sizeof(removePrefix)) ||
+        remove[16] != 0xE9 || remove[21] != 0x33 ||
+        remove[22] != 0xC0 || remove[23] != 0xC3 ||
+        std::memcmp(insert + 0x85, siblingCompare, sizeof(siblingCompare)) ||
+        std::memcmp(insert + 0x244, siblingIndex, sizeof(siblingIndex)) ||
+        std::memcmp(insert + 0xFC, afterReference, sizeof(afterReference)) ||
+        std::memcmp(insert + 37, ownerLoad, sizeof(ownerLoad)) ||
+        std::memcmp(release, releasePrefix, sizeof(releasePrefix)) ||
+        std::memcmp(release + 14, releaseSuffix, sizeof(releaseSuffix)))
+    {
+        return false;
+    }
+    int32_t jump = 0;
+    std::memcpy(&jump, remove + 17, sizeof(jump));
+    return reinterpret_cast<uintptr_t>(remove) + 21 + jump ==
+           reinterpret_cast<uintptr_t>(g_nativeTileCollectionRemove);
+}
+
+static void* FindNativeTileSiblingCollection(void* root)
+{
+    if (!root || !IsReadableMemory(root, sizeof(void*)) ||
+        !IsDwmImageAddress(*reinterpret_cast<void**>(root), sizeof(void*)))
+    {
+        return nullptr;
+    }
+    void* parent = ReadPointerMember(root, 0x18);
+    if (!parent || parent != g_nativeProbeGetVisualParent(root) ||
+        !IsReadableMemory(parent, sizeof(void*)) ||
+        !IsDwmImageAddress(*reinterpret_cast<void**>(parent), sizeof(void*)))
+    {
+        return nullptr;
+    }
+    auto* collection = static_cast<BYTE*>(parent) + 0x20;
+    if (!IsReadableMemory(collection, 0x2C) ||
+        *reinterpret_cast<void**>(collection) != g_nativeTileCollectionVtable ||
+        ReadPointerMember(collection, 8) != parent)
+    {
+        return nullptr;
+    }
+    unsigned int count = 0;
+    std::memcpy(&count, collection + 0x28, sizeof(count));
+    if (!count || count > 256)
+        return nullptr;
+    void* entries = ReadPointerMember(collection, 0x10);
+    if (!IsReadableMemory(entries, count * sizeof(void*)))
+        return nullptr;
+    unsigned int matches = 0;
+    for (unsigned int i = 0; i < count; ++i)
+        matches += static_cast<void**>(entries)[i] == root;
+    return matches == 1 ? collection : nullptr;
+}
+
+static bool RetainNativeTileRoot(void* root)
+{
+    auto* count = reinterpret_cast<volatile LONG*>(static_cast<BYTE*>(root) + 8);
+    if (!IsWritableMemory(const_cast<LONG*>(count), sizeof(LONG)))
+        return false;
+    LONG current = InterlockedCompareExchange(count, 0, 0);
+    for (unsigned int i = 0; i < 8 && current > 0 && current < 0x100000; ++i)
+    {
+        LONG previous = InterlockedCompareExchange(count, current + 1, current);
+        if (previous == current) return true;
+        current = previous;
+    }
+    return false;
+}
+
+static void ReleaseNativeTileState(NativeTileState& state)
+{
+    if (state.visual) g_cBaseObjectRelease(state.visual);
+    if (state.transform) g_cBaseObjectRelease(state.transform);
+    if (state.instruction) g_cBaseObjectRelease(state.instruction);
+    if (state.image) g_cBaseObjectRelease(state.image);
+    if (state.root) g_cBaseObjectRelease(state.root);
+    state = {};
+}
+
+static bool DetachNativeTileProbe(const wchar_t* reason)
+{
+    auto& state = g_nativeTileState;
+    if (!state.visual)
+    {
+        g_nativeTileActive.store(false, std::memory_order_release);
+        return true;
+    }
+    void* parent = ReadPointerMember(state.visual, 0x18);
+    long result = parent ? g_nativeTileRemoveFromParent(state.visual) : S_OK;
+    parent = ReadPointerMember(state.visual, 0x18);
+    if (result < 0 || parent)
+    {
+        if (!state.detachFailureLogged)
+        {
+            Wh_Log(L"NATIVE TILE DETACH DEFERRED: HWND=%p reason=%s "
+                   L"result=0x%08X parent=%p", state.hwnd, reason,
+                   static_cast<unsigned>(result), parent);
+            state.detachFailureLogged = true;
+        }
+        RequestDwmScenePass();
+        return false;
+    }
+    Wh_Log(L"NATIVE TILE DETACHED: HWND=%p reason=%s", state.hwnd, reason);
+    ReleaseNativeTileState(state);
+    g_nativeTileActive.store(false, std::memory_order_release);
+    g_nativeTileStopRequested.store(false, std::memory_order_release);
+    return true;
+}
+
+static void MaintainNativeTileProbe()
+{
+    if (!IsOnDwmSceneThread() ||
+        !g_nativeTileActive.load(std::memory_order_acquire))
+        return;
+    auto& state = g_nativeTileState;
+    RECT bounds = {};
+    bool sourceValid = state.root &&
+        g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy &&
+        GetWindowRect(state.hwnd, &bounds) &&
+        bounds.right - bounds.left == state.width &&
+        bounds.bottom - bounds.top == state.height;
+    if (g_unloading.load(std::memory_order_acquire) ||
+        g_nativeTileStopRequested.load(std::memory_order_acquire) ||
+        GetTickCount64() >= state.expiresAt || !sourceValid)
+    {
+        DetachNativeTileProbe(!sourceValid ? L"source-changed" :
+                              (g_unloading.load(std::memory_order_acquire)
+                                   ? L"unload" :
+                               (g_nativeTileStopRequested.load(std::memory_order_acquire)
+                                   ? L"stop-requested" : L"five-second-test-ended")));
+    }
+}
+
+static bool TryAttachNativeTileProbe(HWND hwnd, void* topLevelWindow,
+                                     void* sourceProxy, void* compositor,
+                                     void*& image, int width, int height)
+{
+    AcquireSRWLockShared(&g_settingsLock);
+    bool affineSelected = g_settings.rendererMode == RendererMode::Affine;
+    ReleaseSRWLockShared(&g_settingsLock);
+    if (!affineSelected || !NativeTileAbiVerified() ||
+        !g_topLevelWindowGetRootVisual ||
+        g_nativeTileActive.load(std::memory_order_acquire) ||
+        g_unloading.load(std::memory_order_acquire))
+    {
+        Wh_Log(L"NATIVE TILE SKIPPED: HWND=%p affine=%d abi=%d",
+               hwnd, affineSelected, NativeTileAbiVerified());
+        return false;
+    }
+    g_nativeTileStopRequested.store(false, std::memory_order_release);
+    void* root = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
+    if (!root || !IsReadableMemory(root, sizeof(void*)) ||
+        !IsDwmImageAddress(*reinterpret_cast<void**>(root), sizeof(void*)) ||
+        g_nativeProbeGetVisualProxy(root) != sourceProxy)
+        return false;
+    void* collection = FindNativeTileSiblingCollection(root);
+    if (!collection || !RetainNativeTileRoot(root))
+    {
+        Wh_Log(L"NATIVE TILE SKIPPED: HWND=%p sibling=%p", hwnd, collection);
+        return false;
+    }
+    NativeTileState pending = {};
+    pending.root = root;
+    pending.hwnd = hwnd;
+    pending.sourceProxy = sourceProxy;
+    pending.width = width;
+    pending.height = height;
+    const RECT tile = {0, 0, std::max(1, width / 3), std::max(1, height / 3)};
+    const POINT origin = {0, 0};
+    const wchar_t* stage = L"CreateTileInstruction";
+    long result = g_nativeTileCreateInstruction(image, tile, origin, 1.0f,
+                                                &pending.instruction);
+    if (result >= 0 && !pending.instruction) result = E_UNEXPECTED;
+    if (result >= 0)
+    {
+        stage = L"CreateVisual";
+        result = g_nativeTileCreateVisual(&pending.visual);
+        if (result >= 0 && !pending.visual) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"AddInstruction";
+        result = g_nativeTileAddInstruction(pending.visual,
+                                            pending.instruction);
+    }
+    if (result >= 0)
+    {
+        stage = L"PublishRenderData";
+        result = g_nativeTileUpdateRenderData(pending.visual);
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateTransform";
+        result = g_createMatrixTransformProxy(compositor, &pending.transform);
+        if (result >= 0 && !pending.transform) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"PositionTile";
+        const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0,
+                                     static_cast<double>(width) * 0.55, 0.0};
+        result = UpdateMatrixTransformProxy(pending.transform, matrix);
+    }
+    if (result >= 0)
+    {
+        stage = L"InsertSibling";
+        result = g_nativeTileInsertRelative(collection, pending.visual,
+                                            root, true, false);
+    }
+    bool inserted = pending.visual && ReadPointerMember(pending.visual, 0x18);
+    if (result >= 0 && inserted)
+    {
+        stage = L"VerifySibling";
+        if (ReadPointerMember(pending.visual, 0x18) !=
+                ReadPointerMember(root, 0x18) ||
+            FindNativeTileSiblingCollection(root) != collection)
+            result = E_UNEXPECTED;
+    }
+    if (result >= 0 && inserted)
+    {
+        stage = L"BindTransform";
+        void* visualProxy = g_nativeProbeGetVisualProxy(pending.visual);
+        result = IsVisualProxyPointerValid(visualProxy)
+                     ? g_cVisualProxySetTransform(visualProxy, pending.transform)
+                     : E_NOINTERFACE;
+    }
+    if (result >= 0 && inserted)
+    {
+        pending.image = image;
+        image = nullptr;
+        pending.expiresAt = GetTickCount64() + 5000;
+        g_nativeTileState = pending;
+        g_nativeTileActive.store(true, std::memory_order_release);
+        Wh_Log(L"NATIVE TILE ATTACHED: HWND=%p root=%p visual=%p "
+               L"sourceRect=%ldx%ld durationMs=5000 affine=unchanged "
+               L"snapshot=none", hwnd, root, pending.visual,
+               tile.right, tile.bottom);
+        RequestDwmScenePass();
+        return true;
+    }
+    Wh_Log(L"NATIVE TILE FAILED: HWND=%p stage=%s result=0x%08X "
+           L"inserted=%d", hwnd, stage, static_cast<unsigned>(result), inserted);
+    if (inserted)
+    {
+        pending.image = image;
+        image = nullptr;
+        pending.expiresAt = GetTickCount64();
+        g_nativeTileState = pending;
+        g_nativeTileActive.store(true, std::memory_order_release);
+        DetachNativeTileProbe(L"failed-attach");
+    }
+    else
+    {
+        ReleaseNativeTileState(pending);
+    }
+    return false;
+}
+
 static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
                                  void* sourceVisualProxy)
 {
@@ -3707,6 +4059,8 @@ static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
         // factory may return S_OK for a wrong pointer type and fail later when
         // rendering, so never pass the cached image to that instruction.
         RunDetachedNativeGeometryProbe(hwnd, compositor);
+        TryAttachNativeTileProbe(hwnd, topLevelWindow, sourceVisualProxy,
+                                 compositor, image, width, height);
     }
     if (bitmapInstruction && drawBitmapResult >= 0 &&
         IsReadableMemory(bitmapInstruction, sizeof(void*)) &&
@@ -4004,6 +4358,7 @@ static void SubmitPendingWobblySceneWork()
     g_sceneWakeScheduled.store(false, std::memory_order_release);
     g_sceneWakePostTimestamp.store(0, std::memory_order_release);
     g_scenePassCounter.fetch_add(1, std::memory_order_release);
+    MaintainNativeTileProbe();
     // Restore retiring/quiet windows before discovery, creation or normal rendering.
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
@@ -4032,7 +4387,8 @@ static void SubmitPendingWobblySceneWork()
 
 static bool HasPendingWobblySceneWork()
 {
-    return g_sceneRequestedSerial.load(std::memory_order_acquire) >
+    return g_nativeTileActive.load(std::memory_order_acquire) ||
+           g_sceneRequestedSerial.load(std::memory_order_acquire) >
                g_sceneSubmittedSerial.load(std::memory_order_acquire) ||
            g_existingWindowBackfillIndex.load(std::memory_order_acquire) <
                g_existingWindowBackfillCount.load(std::memory_order_acquire) ||
@@ -6134,6 +6490,8 @@ static void StopAllAnimations()
     int slotsToRetire[MAX_ANIMATION_SLOTS] = {};
     bool sceneCleanupNeeded = false;
     int retireCount = CollectActiveAnimationSlots(slotsToRetire, &sceneCleanupNeeded);
+    sceneCleanupNeeded |= g_nativeTileActive.load(std::memory_order_acquire);
+    g_nativeTileStopRequested.store(true, std::memory_order_release);
     for (int i = 0; i < retireCount; i++)
     {
         RetireAnimationSlot(slotsToRetire[i]);
@@ -6167,7 +6525,8 @@ static void StopAllAnimations()
         // Wakes carry only an instance token, not pointers; keep their counter
         // intact for late acknowledgments, but don't mistake them for resources.
         bool wakePending = g_sceneWakeOutstanding.load(std::memory_order_acquire) != 0;
-        if (!hookUsers && !retainedProxies)
+        bool tileActive = g_nativeTileActive.load(std::memory_order_acquire);
+        if (!hookUsers && !retainedProxies && !tileActive)
         {
             break;
         }
@@ -6182,7 +6541,7 @@ static void StopAllAnimations()
             break;
         }
         ULONGLONG lastWakePost = g_sceneWakePostTimestamp.load(std::memory_order_acquire);
-        if (retainedProxies &&
+        if ((retainedProxies || tileActive) &&
             (!wakePending || !lastWakePost || now - lastWakePost >= 50))
         {
             PostPendingDwmSceneWake(true);
@@ -6195,6 +6554,8 @@ static void StopAllAnimations()
         // Off-scene private calls are unsafe. Drop bookkeeping and intentionally
         // retain any unresolved DWM proxies instead of blocking unload forever.
         AbandonAnimationSlotsAfterSceneStall(L"cleanup timeout");
+        if (g_nativeTileActive.load(std::memory_order_acquire))
+            Wh_Log(L"NATIVE TILE cleanup timed out; retaining DWM resources");
     }
     DisarmAnimationClock();
     ResetDragInputState();
@@ -9111,6 +9472,8 @@ BOOL Wh_ModInit()
     }
     g_unloading.store(false, std::memory_order_release);
     g_nativeProbeAttempted.store(false, std::memory_order_release);
+    g_nativeTileActive.store(false, std::memory_order_release);
+    g_nativeTileStopRequested.store(false, std::memory_order_release);
     g_dwmSceneWakeMessage =
         RegisterWindowMessageW(L"Windhawk.WobblyWindows.DwmSceneWake");
     if (g_dwmSceneWakeMessage == 0)
