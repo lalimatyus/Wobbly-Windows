@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.271
+// @version         0.272
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -433,6 +433,37 @@ using CVisualProxySetTransform_t = long(__cdecl*)(void* pThis, void* transform);
 CVisualProxySetTransform_t g_cVisualProxySetTransform = nullptr;
 using CCompositorCreateMatrixTransformProxy_t = long(__cdecl*)(void* pThis, void** transformProxy);
 CCompositorCreateMatrixTransformProxy_t g_createMatrixTransformProxy = nullptr;
+
+// Experimental one-shot source probe. It creates no visible DWM visual.
+struct NativeProbeRectF
+{
+    float left, top, right, bottom;
+};
+struct NativeProbeSizeD
+{
+    double width, height;
+};
+struct NativeProbeSizeF
+{
+    float width, height;
+};
+using NativeProbeCreateImage_t = long(__cdecl*)(void*, void**);
+using NativeProbeUpdateImageD_t = long(__cdecl*)(
+    void*, const NativeProbeRectF&, const NativeProbeSizeD&, const void*,
+    const void*, void*, int);
+using NativeProbeUpdateImageF_t = long(__cdecl*)(
+    void*, const NativeProbeRectF&, const NativeProbeSizeF&, const void*,
+    const void*, void*, int);
+using NativeProbeCreateBitmapInstruction_t = long(__cdecl*)(void*, void**);
+NativeProbeCreateImage_t g_nativeProbeCreateImage = nullptr;
+NativeProbeUpdateImageD_t g_nativeProbeUpdateImageD = nullptr;
+NativeProbeUpdateImageF_t g_nativeProbeUpdateImageF = nullptr;
+NativeProbeCreateBitmapInstruction_t g_nativeProbeCreateBitmapInstruction = nullptr;
+void* g_nativeProbeImageVtableSymbol = nullptr;
+void* g_nativeProbeBitmapVtableSymbol = nullptr;
+std::atomic<void*> g_nativeProbeImageVtable = nullptr;
+std::atomic<void*> g_nativeProbeBitmapVtable = nullptr;
+std::atomic_bool g_nativeProbeAttempted = false;
 
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
@@ -2969,6 +3000,29 @@ static bool InitializeDwmHooks()
          &g_cBaseObjectRelease,
          nullptr,
          true},
+        {{L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CCachedVisualImageProxy>("
+           L"class CCachedVisualImageProxy * *)"},
+         &g_nativeProbeCreateImage, nullptr, true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Update("
+           L"struct MilRectF const &,struct MilSizeD const &,"
+           L"class CRectResourceProxy const *,"
+           L"class CSizeResourceProxy const *,class CVisualProxy *,"
+           L"enum MilBrushMappingMode::Enum)"},
+         &g_nativeProbeUpdateImageD, nullptr, true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Update("
+           L"struct D2D_RECT_F const &,struct D2D_SIZE_F const &,"
+           L"class CRectResourceProxy const *,"
+           L"class CSizeResourceProxy const *,class CVisualProxy *,"
+           L"enum MilBrushMappingMode::Enum)"},
+         &g_nativeProbeUpdateImageF, nullptr, true},
+        {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
+           L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
+         &g_nativeProbeCreateBitmapInstruction, nullptr, true},
+        {{L"const CCachedVisualImageProxy::`vftable'"},
+         &g_nativeProbeImageVtableSymbol, nullptr, true},
+        {{L"const CBitmapSourceProxy::`vftable'"},
+         &g_nativeProbeBitmapVtableSymbol, nullptr, true},
 
         {{L"private: static class CDesktopManager * "
            L"CDesktopManager::s_pDesktopManagerInstance"},
@@ -3088,6 +3142,10 @@ static bool InitializeDwmHooks()
     keepValid(g_topLevelWindowGetWindowData);
     keepValid(g_desktopManagerPostStartAnimations);
     keepValid(g_cBaseObjectRelease);
+    keepValid(g_nativeProbeCreateImage);
+    keepValid(g_nativeProbeUpdateImageD);
+    keepValid(g_nativeProbeUpdateImageF);
+    keepValid(g_nativeProbeCreateBitmapInstruction);
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
@@ -3125,6 +3183,16 @@ static bool InitializeDwmHooks()
         hasExactVisualProxyVtable || hasExactRedirectProxyVtable || hasExactContainerProxyVtable;
     bool hasExactMatrixProxyVtable =
         cacheVtableSymbol(g_matrixTransformProxyVtableSymbol, g_matrixTransformProxyVtable);
+    cacheVtableSymbol(g_nativeProbeImageVtableSymbol, g_nativeProbeImageVtable);
+    cacheVtableSymbol(g_nativeProbeBitmapVtableSymbol, g_nativeProbeBitmapVtable);
+    Wh_Log(L"NATIVE SOURCE PROBE: create=%d update=%s drawBitmap=%d "
+           L"imageVtable=%p bitmapVtable=%p",
+           g_nativeProbeCreateImage != nullptr,
+           g_nativeProbeUpdateImageD ? L"double" :
+               (g_nativeProbeUpdateImageF ? L"float" : L"unavailable"),
+           g_nativeProbeCreateBitmapInstruction != nullptr,
+           g_nativeProbeImageVtable.load(std::memory_order_acquire),
+           g_nativeProbeBitmapVtable.load(std::memory_order_acquire));
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
@@ -3333,6 +3401,121 @@ static bool InitializeDwmHooks()
     return true;
 }
 
+static void RunNativeSourceProbe(HWND hwnd, void* sourceVisualProxy)
+{
+    if (!IsOnDwmSceneThread() || !IsVisualProxyPointerValid(sourceVisualProxy) ||
+        g_nativeProbeAttempted.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
+    void* expectedVtable =
+        g_nativeProbeImageVtable.load(std::memory_order_acquire);
+    if (!IsDwmObjectPointerValid(compositor, g_compositorVtable) ||
+        !expectedVtable || !g_cBaseObjectRelease || !g_nativeProbeCreateImage ||
+        !g_nativeProbeCreateBitmapInstruction ||
+        (g_nativeProbeUpdateImageD != nullptr) ==
+            (g_nativeProbeUpdateImageF != nullptr))
+    {
+        return;
+    }
+
+    RECT bounds = {};
+    if (!GetWindowRect(hwnd, &bounds))
+    {
+        return;
+    }
+    int width = bounds.right - bounds.left;
+    int height = bounds.bottom - bounds.top;
+    if (width < 1 || height < 1 || width > 8192 || height > 8192)
+    {
+        return;
+    }
+    if (g_nativeProbeAttempted.exchange(true, std::memory_order_acq_rel))
+    {
+        return;
+    }
+
+    void* image = nullptr;
+    void* bitmapInstruction = nullptr;
+    long createResult = g_nativeProbeCreateImage(compositor, &image);
+    long updateResult = E_NOTIMPL;
+    long drawBitmapResult = E_NOTIMPL;
+    bool exactImageType = image && IsReadableMemory(image, sizeof(void*)) &&
+                          *reinterpret_cast<void**>(image) == expectedVtable;
+    if (createResult >= 0 && exactImageType)
+    {
+        NativeProbeRectF rect = {0, 0, static_cast<float>(width),
+                                 static_cast<float>(height)};
+        constexpr int absoluteMappingMode = 0;
+        if (g_nativeProbeUpdateImageD)
+        {
+            NativeProbeSizeD size = {static_cast<double>(width),
+                                     static_cast<double>(height)};
+            updateResult = g_nativeProbeUpdateImageD(
+                image, rect, size, nullptr, nullptr, sourceVisualProxy,
+                absoluteMappingMode);
+        }
+        else
+        {
+            NativeProbeSizeF size = {static_cast<float>(width),
+                                     static_cast<float>(height)};
+            updateResult = g_nativeProbeUpdateImageF(
+                image, rect, size, nullptr, nullptr, sourceVisualProxy,
+                absoluteMappingMode);
+        }
+        if (updateResult >= 0)
+        {
+            drawBitmapResult =
+                g_nativeProbeCreateBitmapInstruction(image, &bitmapInstruction);
+        }
+    }
+
+    // Both writers read the image resource through +0x10 and its ID at +0x18
+    // on these two exact uDWM images. Skip this private-layout read elsewhere.
+    bool knownImageLayout =
+        (g_dwmModuleLayout.timeDateStamp == 0xE19C3234 &&
+         g_dwmModuleLayout.sizeOfImage == 0x16A000) ||
+        (g_dwmModuleLayout.timeDateStamp == 0x2EA6D2FA &&
+         g_dwmModuleLayout.sizeOfImage == 0x13F000);
+    unsigned int imageResourceId = 0;
+    bool resourceReadable = false;
+    if (knownImageLayout && updateResult >= 0 && exactImageType)
+    {
+        void* resource = ReadPointerMember(image, 0x10);
+        const BYTE* id = resource ? static_cast<const BYTE*>(resource) + 0x18
+                                  : nullptr;
+        if (id && IsReadableMemory(id, sizeof(imageResourceId)))
+        {
+            memcpy(&imageResourceId, id, sizeof(imageResourceId));
+            resourceReadable = true;
+        }
+    }
+    bool instructionKeepsImage = knownImageLayout && bitmapInstruction &&
+        ReadPointerMember(bitmapInstruction, 0x10) == image;
+    Wh_Log(L"NATIVE SOURCE PROBE: HWND=%p create=0x%08X update=0x%08X "
+           L"drawBitmap=0x%08X exactType=%d knownLayout=%d "
+           L"resourceReadable=%d resourceId=%u instructionKeepsImage=%d "
+           L"bitmapVtable=%p",
+           hwnd, static_cast<unsigned>(createResult),
+           static_cast<unsigned>(updateResult),
+           static_cast<unsigned>(drawBitmapResult), exactImageType,
+           knownImageLayout, resourceReadable, imageResourceId,
+           instructionKeepsImage,
+           g_nativeProbeBitmapVtable.load(std::memory_order_acquire));
+    if (bitmapInstruction && drawBitmapResult >= 0 &&
+        IsReadableMemory(bitmapInstruction, sizeof(void*)) &&
+        IsDwmImageAddress(*reinterpret_cast<void**>(bitmapInstruction),
+                          sizeof(void*)))
+    {
+        g_cBaseObjectRelease(bitmapInstruction);
+    }
+    if (image && createResult >= 0 && exactImageType)
+    {
+        g_cBaseObjectRelease(image);
+    }
+}
+
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
 {
     if (!IsOnDwmSceneThread() || g_unloading.load(std::memory_order_acquire) ||
@@ -3439,6 +3622,11 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             {
                 transitionVisualProxy = GetTransitionVisualProxy(topLevelWindow3D);
             }
+        }
+        if (topLevelVisualProxy &&
+            !g_nativeProbeAttempted.load(std::memory_order_acquire))
+        {
+            RunNativeSourceProbe(hwnd, topLevelVisualProxy);
         }
         bool topLevelBindingAttempted =
             topLevelVisualProxy &&
@@ -8661,6 +8849,7 @@ BOOL Wh_ModInit()
         return FALSE;
     }
     g_unloading.store(false, std::memory_order_release);
+    g_nativeProbeAttempted.store(false, std::memory_order_release);
     g_dwmSceneWakeMessage =
         RegisterWindowMessageW(L"Windhawk.WobblyWindows.DwmSceneWake");
     if (g_dwmSceneWakeMessage == 0)
