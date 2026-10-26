@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.281
+// @version         0.282
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -433,6 +433,70 @@ using CVisualProxySetTransform_t = long(__cdecl*)(void* pThis, void* transform);
 CVisualProxySetTransform_t g_cVisualProxySetTransform = nullptr;
 using CCompositorCreateMatrixTransformProxy_t = long(__cdecl*)(void* pThis, void** transformProxy);
 CCompositorCreateMatrixTransformProxy_t g_createMatrixTransformProxy = nullptr;
+
+// Experimental one-shot source and geometry probes. No DWM visual is attached.
+struct NativeProbeRectF
+{
+    float left, top, right, bottom;
+};
+struct NativeProbeSizeD
+{
+    double width, height;
+};
+struct NativeProbeSizeF
+{
+    float width, height;
+};
+struct NativeProbePoint3F
+{
+    float x, y, z;
+};
+struct NativeProbePoint2D
+{
+    double x, y;
+};
+using NativeProbeCreateImage_t = long(__cdecl*)(void*, void**);
+using NativeProbeUpdateImageD_t = long(__cdecl*)(
+    void*, const NativeProbeRectF&, const NativeProbeSizeD&, const void*,
+    const void*, void*, int);
+using NativeProbeUpdateImageF_t = long(__cdecl*)(
+    void*, const NativeProbeRectF&, const NativeProbeSizeF&, const void*,
+    const void*, void*, int);
+using NativeProbeCreateBitmapInstruction_t = long(__cdecl*)(void*, void**);
+using NativeProbeCreateImageBrush_t = long(__cdecl*)(void*, void**);
+using NativeProbeUpdateImageBrush_t = long(__cdecl*)(
+    void*, double, const NativeProbeRectF&, const NativeProbeRectF&,
+    const void*, int, int, const void*, const void*, int, int, int, int,
+    const void*);
+using NativeProbeCreateMesh_t = long(__cdecl*)(void*, void**);
+using NativeProbeUpdateMesh_t = long(__cdecl*)(
+    void*, int, const NativeProbePoint3F*, const NativeProbePoint2D*,
+    unsigned int, const unsigned int*, unsigned int);
+using NativeProbeUpdateGroup_t = long(__cdecl*)(void*, void*);
+// Its second argument is CBitmapSourceProxy*, not CCachedVisualImageProxy*.
+// Resolve for diagnostics only; do not call it with the live window source.
+using NativeProbeCreateMeshInstruction_t = long(__cdecl*)(void*, void*, void**);
+using NativeProbeGetVisual_t = void*(__cdecl*)(void*);
+NativeProbeCreateImage_t g_nativeProbeCreateImage = nullptr;
+NativeProbeUpdateImageD_t g_nativeProbeUpdateImageD = nullptr;
+NativeProbeUpdateImageF_t g_nativeProbeUpdateImageF = nullptr;
+NativeProbeCreateBitmapInstruction_t g_nativeProbeCreateBitmapInstruction = nullptr;
+NativeProbeCreateImageBrush_t g_nativeProbeCreateImageBrush = nullptr;
+NativeProbeUpdateImageBrush_t g_nativeProbeUpdateImageBrush = nullptr;
+NativeProbeCreateMesh_t g_nativeProbeCreateMesh = nullptr;
+NativeProbeUpdateMesh_t g_nativeProbeUpdateMesh = nullptr;
+NativeProbeCreateMesh_t g_nativeProbeCreateGroup = nullptr;
+NativeProbeUpdateGroup_t g_nativeProbeUpdateGroup = nullptr;
+NativeProbeCreateMeshInstruction_t g_nativeProbeCreateMeshInstruction = nullptr;
+NativeProbeGetVisual_t g_nativeProbeGetVisualParent = nullptr;
+NativeProbeGetVisual_t g_nativeProbeGetVisualProxy = nullptr;
+void* g_nativeProbeImageVtableSymbol = nullptr;
+void* g_nativeProbeBitmapVtableSymbol = nullptr;
+void* g_nativeProbeImageBrushVtableSymbol = nullptr;
+std::atomic<void*> g_nativeProbeImageVtable = nullptr;
+std::atomic<void*> g_nativeProbeBitmapVtable = nullptr;
+std::atomic<void*> g_nativeProbeImageBrushVtable = nullptr;
+std::atomic_bool g_nativeProbeAttempted = false;
 
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
@@ -2969,6 +3033,76 @@ static bool InitializeDwmHooks()
          &g_cBaseObjectRelease,
          nullptr,
          true},
+        {{L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CCachedVisualImageProxy>("
+           L"class CCachedVisualImageProxy * *)"},
+         &g_nativeProbeCreateImage, nullptr, true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Update("
+           L"struct MilRectF const &,struct MilSizeD const &,"
+           L"class CRectResourceProxy const *,"
+           L"class CSizeResourceProxy const *,class CVisualProxy *,"
+           L"enum MilBrushMappingMode::Enum)"},
+         &g_nativeProbeUpdateImageD, nullptr, true},
+        {{L"public: long __cdecl CCachedVisualImageProxy::Update("
+           L"struct D2D_RECT_F const &,struct D2D_SIZE_F const &,"
+           L"class CRectResourceProxy const *,"
+           L"class CSizeResourceProxy const *,class CVisualProxy *,"
+           L"enum MilBrushMappingMode::Enum)"},
+         &g_nativeProbeUpdateImageF, nullptr, true},
+        {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
+           L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
+         &g_nativeProbeCreateBitmapInstruction, nullptr, true},
+        {{L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CImageLegacyMilBrushProxy>("
+           L"class CImageLegacyMilBrushProxy * *)"},
+         &g_nativeProbeCreateImageBrush, nullptr, true},
+        {{L"public: long __cdecl CImageLegacyMilBrushProxy::Update("
+           L"double,struct MilRectF const &,struct MilRectF const &,"
+           L"class CDoubleResourceProxy const *,"
+           L"enum MilBrushMappingMode::Enum,"
+           L"enum MilBrushMappingMode::Enum,"
+           L"class CRectResourceProxy const *,"
+           L"class CRectResourceProxy const *,enum MilStretch::Enum,"
+           L"enum MilTileMode::Enum,"
+           L"enum MilHorizontalAlignment::Enum,"
+           L"enum MilVerticalAlignment::Enum,"
+           L"class CBaseImageProxy const *)"},
+         &g_nativeProbeUpdateImageBrush, nullptr, true},
+        {{L"public: long __cdecl CCompositor::CreateMeshGeometry2dProxy("
+           L"class CMeshGeometry2dProxy * *)",
+          L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CMeshGeometry2dProxy>(class CMeshGeometry2dProxy * *)"},
+         &g_nativeProbeCreateMesh, nullptr, true},
+        {{L"public: long __cdecl CMeshGeometry2dProxy::Update("
+           L"int,struct MilPoint3F const *,struct MilPoint2D const *,"
+           L"unsigned int,unsigned int const *,unsigned int)"},
+         &g_nativeProbeUpdateMesh, nullptr, true},
+        {{L"public: long __cdecl CCompositor::CreateGeometry2dGroupProxy("
+           L"class CGeometry2dGroupProxy * *)",
+          L"protected: long __cdecl CCompositor::CreateProxy<"
+           L"class CGeometry2dGroupProxy>(class CGeometry2dGroupProxy * *)"},
+         &g_nativeProbeCreateGroup, nullptr, true},
+        {{L"public: long __cdecl CGeometry2dGroupProxy::Update("
+           L"class CMeshGeometry2dProxy const *)"},
+         &g_nativeProbeUpdateGroup, nullptr, true},
+        {{L"public: static long __cdecl CDrawMesh2DInstruction::Create("
+           L"class CGeometry2dGroupProxy *,class CBitmapSourceProxy *,"
+           L"class CDrawMesh2DInstruction * *)"},
+         &g_nativeProbeCreateMeshInstruction, nullptr, true},
+        {{L"public: virtual class CVisual * __cdecl "
+           L"CVisual::GetTransformParent(void)const",
+          L"public: virtual class CVisual * __cdecl "
+           L"CVisual::GetTransformParent(void)const "},
+         &g_nativeProbeGetVisualParent, nullptr, true},
+        {{L"public: virtual class CVisualProxy * __cdecl "
+           L"CVisual::GetVisualProxyForStructure(void)"},
+         &g_nativeProbeGetVisualProxy, nullptr, true},
+        {{L"const CCachedVisualImageProxy::`vftable'"},
+         &g_nativeProbeImageVtableSymbol, nullptr, true},
+        {{L"const CBitmapSourceProxy::`vftable'"},
+         &g_nativeProbeBitmapVtableSymbol, nullptr, true},
+        {{L"const CImageLegacyMilBrushProxy::`vftable'"},
+         &g_nativeProbeImageBrushVtableSymbol, nullptr, true},
 
         {{L"private: static class CDesktopManager * "
            L"CDesktopManager::s_pDesktopManagerInstance"},
@@ -3088,6 +3222,19 @@ static bool InitializeDwmHooks()
     keepValid(g_topLevelWindowGetWindowData);
     keepValid(g_desktopManagerPostStartAnimations);
     keepValid(g_cBaseObjectRelease);
+    keepValid(g_nativeProbeCreateImage);
+    keepValid(g_nativeProbeUpdateImageD);
+    keepValid(g_nativeProbeUpdateImageF);
+    keepValid(g_nativeProbeCreateBitmapInstruction);
+    keepValid(g_nativeProbeCreateImageBrush);
+    keepValid(g_nativeProbeUpdateImageBrush);
+    keepValid(g_nativeProbeCreateMesh);
+    keepValid(g_nativeProbeUpdateMesh);
+    keepValid(g_nativeProbeCreateGroup);
+    keepValid(g_nativeProbeUpdateGroup);
+    keepValid(g_nativeProbeCreateMeshInstruction);
+    keepValid(g_nativeProbeGetVisualParent);
+    keepValid(g_nativeProbeGetVisualProxy);
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
@@ -3125,6 +3272,32 @@ static bool InitializeDwmHooks()
         hasExactVisualProxyVtable || hasExactRedirectProxyVtable || hasExactContainerProxyVtable;
     bool hasExactMatrixProxyVtable =
         cacheVtableSymbol(g_matrixTransformProxyVtableSymbol, g_matrixTransformProxyVtable);
+    cacheVtableSymbol(g_nativeProbeImageVtableSymbol, g_nativeProbeImageVtable);
+    cacheVtableSymbol(g_nativeProbeBitmapVtableSymbol, g_nativeProbeBitmapVtable);
+    cacheVtableSymbol(g_nativeProbeImageBrushVtableSymbol,
+                      g_nativeProbeImageBrushVtable);
+    Wh_Log(L"NATIVE SOURCE PROBE: create=%d update=%s drawBitmap=%d "
+           L"imageVtable=%p bitmapVtable=%p",
+           g_nativeProbeCreateImage != nullptr,
+           g_nativeProbeUpdateImageD ? L"double" :
+               (g_nativeProbeUpdateImageF ? L"float" : L"unavailable"),
+           g_nativeProbeCreateBitmapInstruction != nullptr,
+           g_nativeProbeImageVtable.load(std::memory_order_acquire),
+           g_nativeProbeBitmapVtable.load(std::memory_order_acquire));
+    Wh_Log(L"NATIVE IMAGE BRUSH PROBE: create=%d update=%d vtable=%p "
+           L"attached=0", g_nativeProbeCreateImageBrush != nullptr,
+           g_nativeProbeUpdateImageBrush != nullptr,
+           g_nativeProbeImageBrushVtable.load(std::memory_order_acquire));
+    Wh_Log(L"NATIVE MESH BRIDGE: mesh=%d update=%d group=%d "
+           L"groupUpdate=%d meshFactory=%d directCachedImageSource=0 "
+           L"getParent=%d getProxy=%d",
+           g_nativeProbeCreateMesh != nullptr,
+           g_nativeProbeUpdateMesh != nullptr,
+           g_nativeProbeCreateGroup != nullptr,
+           g_nativeProbeUpdateGroup != nullptr,
+           g_nativeProbeCreateMeshInstruction != nullptr,
+           g_nativeProbeGetVisualParent != nullptr,
+           g_nativeProbeGetVisualProxy != nullptr);
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
@@ -3333,6 +3506,296 @@ static bool InitializeDwmHooks()
     return true;
 }
 
+static void RunDetachedNativeGeometryProbe(HWND hwnd, void* compositor)
+{
+    // This ABI is verified only for the exact 23H2 uDWM image used here.
+    if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
+        g_dwmModuleLayout.sizeOfImage != 0x16A000)
+    {
+        Wh_Log(L"NATIVE MESH GEOMETRY: skipped HWND=%p (unverified uDWM ABI)", hwnd);
+        return;
+    }
+    if (!g_nativeProbeCreateMesh || !g_nativeProbeUpdateMesh ||
+        !g_nativeProbeCreateGroup || !g_nativeProbeUpdateGroup ||
+        !g_cBaseObjectRelease)
+    {
+        Wh_Log(L"NATIVE MESH GEOMETRY: skipped HWND=%p (missing symbols)", hwnd);
+        return;
+    }
+
+    NativeProbePoint3F positions[16] = {};
+    NativeProbePoint2D coordinates[16] = {};
+    unsigned int indices[54] = {};
+    for (int y = 0; y < 4; ++y)
+    {
+        for (int x = 0; x < 4; ++x)
+        {
+            int index = y * 4 + x;
+            float u = static_cast<float>(x) / 3.0f;
+            float v = static_cast<float>(y) / 3.0f;
+            positions[index] = {u, v, 0.0f};
+            coordinates[index] = {static_cast<double>(u), static_cast<double>(v)};
+        }
+    }
+    unsigned int count = 0;
+    for (unsigned int y = 0; y < 3; ++y)
+    {
+        for (unsigned int x = 0; x < 3; ++x)
+        {
+            unsigned int a = y * 4 + x;
+            unsigned int b = a + 1;
+            unsigned int c = a + 4;
+            unsigned int d = c + 1;
+            indices[count++] = a;
+            indices[count++] = c;
+            indices[count++] = b;
+            indices[count++] = b;
+            indices[count++] = c;
+            indices[count++] = d;
+        }
+    }
+
+    void* mesh = nullptr;
+    void* group = nullptr;
+    const wchar_t* stage = L"CreateMesh";
+    long result = g_nativeProbeCreateMesh(compositor, &mesh);
+    if (result >= 0 && mesh)
+    {
+        stage = L"UpdateMesh";
+        result = g_nativeProbeUpdateMesh(mesh, 0, positions, coordinates,
+                                         16, indices, count);
+    }
+    else if (result >= 0)
+    {
+        result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateGroup";
+        result = g_nativeProbeCreateGroup(compositor, &group);
+        if (result >= 0 && !group) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"UpdateGroup";
+        result = g_nativeProbeUpdateGroup(group, mesh);
+    }
+    Wh_Log(L"NATIVE MESH GEOMETRY: HWND=%p stage=%s result=0x%08X "
+           L"mesh=%p group=%p vertices=16 indices=%u attached=0 "
+           L"directCachedImageSource=unsupported",
+           hwnd, stage, static_cast<unsigned int>(result), mesh, group, count);
+
+    auto release = [](void* object)
+    {
+        if (object && IsReadableMemory(object, sizeof(void*)) &&
+            IsDwmImageAddress(*reinterpret_cast<void**>(object), sizeof(void*)))
+        {
+            g_cBaseObjectRelease(object);
+        }
+    };
+    release(group);
+    release(mesh);
+}
+
+static void ProbeNativeMeshHost(HWND hwnd, void* topLevelWindow,
+                                void* sourceVisualProxy)
+{
+    if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
+        g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
+        !g_topLevelWindowGetRootVisual || !g_nativeProbeGetVisualParent ||
+        !g_nativeProbeGetVisualProxy)
+    {
+        Wh_Log(L"NATIVE MESH HOST: skipped HWND=%p (unverified ABI or symbols)",
+               hwnd);
+        return;
+    }
+    void* root = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
+    bool validRoot = root && IsReadableMemory(root, sizeof(void*)) &&
+        IsDwmImageAddress(*reinterpret_cast<void**>(root), sizeof(void*));
+    void* parent = validRoot ? g_nativeProbeGetVisualParent(root) : nullptr;
+    bool validParent = parent && parent != root &&
+        IsReadableMemory(parent, sizeof(void*)) &&
+        IsDwmImageAddress(*reinterpret_cast<void**>(parent), sizeof(void*));
+    void* rootProxy = validRoot ? g_nativeProbeGetVisualProxy(root) : nullptr;
+    void* parentProxy = validParent ? g_nativeProbeGetVisualProxy(parent) : nullptr;
+    bool sourceMatches = rootProxy == sourceVisualProxy &&
+        IsVisualProxyPointerValid(rootProxy);
+    bool independentSiblingHost = sourceMatches && validParent &&
+        IsVisualProxyPointerValid(parentProxy) &&
+        parentProxy != sourceVisualProxy;
+    Wh_Log(L"NATIVE MESH HOST: HWND=%p root=%p parent=%p rootProxy=%p "
+           L"sourceProxy=%p parentProxy=%p sourceMatches=%d "
+           L"independentSiblingHost=%d attached=0",
+           hwnd, root, parent, rootProxy, sourceVisualProxy, parentProxy,
+           sourceMatches, independentSiblingHost);
+}
+
+static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* compositor,
+                                              void* image, int width, int height)
+{
+    if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
+        g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
+        !g_nativeProbeCreateImageBrush || !g_nativeProbeUpdateImageBrush ||
+        !g_cBaseObjectRelease ||
+        !g_nativeProbeImageBrushVtable.load(std::memory_order_acquire))
+    {
+        Wh_Log(L"NATIVE IMAGE BRUSH PROBE: skipped HWND=%p "
+               L"(unverified ABI or missing symbol)", hwnd);
+        return;
+    }
+
+    void* brush = nullptr;
+    Wh_Log(L"NATIVE IMAGE BRUSH STAGE: Create HWND=%p", hwnd);
+    long result = g_nativeProbeCreateImageBrush(compositor, &brush);
+    bool exactType = brush && IsReadableMemory(brush, sizeof(void*)) &&
+                     *reinterpret_cast<void**>(brush) ==
+                         g_nativeProbeImageBrushVtable.load(
+                             std::memory_order_acquire);
+    if (result >= 0 && !exactType) result = E_UNEXPECTED;
+    if (result >= 0)
+    {
+        const NativeProbeRectF viewport = {0.0f, 0.0f, 1.0f, 1.0f};
+        const NativeProbeRectF viewbox = {
+            0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)};
+        Wh_Log(L"NATIVE IMAGE BRUSH STAGE: Update HWND=%p", hwnd);
+        result = g_nativeProbeUpdateImageBrush(
+            brush, 1.0, viewport, viewbox, nullptr,
+            1, 0, nullptr, nullptr, 1, 0, 0, 0, image);
+    }
+    Wh_Log(L"NATIVE IMAGE BRUSH PROBE: HWND=%p result=0x%08X "
+           L"exactType=%d attached=0", hwnd,
+           static_cast<unsigned>(result), exactType);
+    if (exactType) g_cBaseObjectRelease(brush);
+}
+
+static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
+                                 void* sourceVisualProxy)
+{
+    if (!IsOnDwmSceneThread() || !IsVisualProxyPointerValid(sourceVisualProxy) ||
+        g_nativeProbeAttempted.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
+    void* expectedVtable =
+        g_nativeProbeImageVtable.load(std::memory_order_acquire);
+    if (!IsDwmObjectPointerValid(compositor, g_compositorVtable) ||
+        !expectedVtable || !g_cBaseObjectRelease || !g_nativeProbeCreateImage ||
+        !g_nativeProbeCreateBitmapInstruction ||
+        (g_nativeProbeUpdateImageD != nullptr) ==
+            (g_nativeProbeUpdateImageF != nullptr))
+    {
+        return;
+    }
+
+    RECT bounds = {};
+    if (!GetWindowRect(hwnd, &bounds))
+    {
+        return;
+    }
+    int width = bounds.right - bounds.left;
+    int height = bounds.bottom - bounds.top;
+    if (width < 1 || height < 1 || width > 8192 || height > 8192)
+    {
+        return;
+    }
+    if (g_nativeProbeAttempted.exchange(true, std::memory_order_acq_rel))
+    {
+        return;
+    }
+    ProbeNativeMeshHost(hwnd, topLevelWindow, sourceVisualProxy);
+
+    void* image = nullptr;
+    void* bitmapInstruction = nullptr;
+    long createResult = g_nativeProbeCreateImage(compositor, &image);
+    long updateResult = E_NOTIMPL;
+    long drawBitmapResult = E_NOTIMPL;
+    bool exactImageType = image && IsReadableMemory(image, sizeof(void*)) &&
+                          *reinterpret_cast<void**>(image) == expectedVtable;
+    if (createResult >= 0 && exactImageType)
+    {
+        NativeProbeRectF rect = {0, 0, static_cast<float>(width),
+                                 static_cast<float>(height)};
+        constexpr int absoluteMappingMode = 0;
+        if (g_nativeProbeUpdateImageD)
+        {
+            NativeProbeSizeD size = {static_cast<double>(width),
+                                     static_cast<double>(height)};
+            updateResult = g_nativeProbeUpdateImageD(
+                image, rect, size, nullptr, nullptr, sourceVisualProxy,
+                absoluteMappingMode);
+        }
+        else
+        {
+            NativeProbeSizeF size = {static_cast<float>(width),
+                                     static_cast<float>(height)};
+            updateResult = g_nativeProbeUpdateImageF(
+                image, rect, size, nullptr, nullptr, sourceVisualProxy,
+                absoluteMappingMode);
+        }
+        if (updateResult >= 0)
+        {
+            drawBitmapResult =
+                g_nativeProbeCreateBitmapInstruction(image, &bitmapInstruction);
+        }
+    }
+
+    // Both writers read the image resource through +0x10 and its ID at +0x18
+    // on these two exact uDWM images. Skip this private-layout read elsewhere.
+    bool knownImageLayout =
+        (g_dwmModuleLayout.timeDateStamp == 0xE19C3234 &&
+         g_dwmModuleLayout.sizeOfImage == 0x16A000) ||
+        (g_dwmModuleLayout.timeDateStamp == 0x2EA6D2FA &&
+         g_dwmModuleLayout.sizeOfImage == 0x13F000);
+    unsigned int imageResourceId = 0;
+    bool resourceReadable = false;
+    if (knownImageLayout && updateResult >= 0 && exactImageType)
+    {
+        void* resource = ReadPointerMember(image, 0x10);
+        const BYTE* id = resource ? static_cast<const BYTE*>(resource) + 0x18
+                                  : nullptr;
+        if (id && IsReadableMemory(id, sizeof(imageResourceId)))
+        {
+            memcpy(&imageResourceId, id, sizeof(imageResourceId));
+            resourceReadable = true;
+        }
+    }
+    bool instructionKeepsImage = knownImageLayout && bitmapInstruction &&
+        ReadPointerMember(bitmapInstruction, 0x10) == image;
+    Wh_Log(L"NATIVE SOURCE PROBE: HWND=%p create=0x%08X update=0x%08X "
+           L"drawBitmap=0x%08X exactType=%d knownLayout=%d "
+           L"resourceReadable=%d resourceId=%u instructionKeepsImage=%d "
+           L"bitmapVtable=%p",
+           hwnd, static_cast<unsigned>(createResult),
+           static_cast<unsigned>(updateResult),
+           static_cast<unsigned>(drawBitmapResult), exactImageType,
+           knownImageLayout, resourceReadable, imageResourceId,
+           instructionKeepsImage,
+           g_nativeProbeBitmapVtable.load(std::memory_order_acquire));
+    if (resourceReadable && imageResourceId && drawBitmapResult >= 0 &&
+        instructionKeepsImage)
+    {
+        // CDrawMesh2DInstruction::Create requires CBitmapSourceProxy*, while
+        // this live complete-window image is CCachedVisualImageProxy*. The
+        // factory may return S_OK for a wrong pointer type and fail later when
+        // rendering, so never pass the cached image to that instruction.
+        RunDetachedNativeGeometryProbe(hwnd, compositor);
+        RunDetachedNativeImageBrushProbe(hwnd, compositor, image,
+                                         width, height);
+    }
+    if (bitmapInstruction && drawBitmapResult >= 0 &&
+        IsReadableMemory(bitmapInstruction, sizeof(void*)) &&
+        IsDwmImageAddress(*reinterpret_cast<void**>(bitmapInstruction),
+                          sizeof(void*)))
+    {
+        g_cBaseObjectRelease(bitmapInstruction);
+    }
+    if (image && createResult >= 0 && exactImageType)
+    {
+        g_cBaseObjectRelease(image);
+    }
+}
+
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
 {
     if (!IsOnDwmSceneThread() || g_unloading.load(std::memory_order_acquire) ||
@@ -3439,6 +3902,11 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             {
                 transitionVisualProxy = GetTransitionVisualProxy(topLevelWindow3D);
             }
+        }
+        if (topLevelVisualProxy &&
+            !g_nativeProbeAttempted.load(std::memory_order_acquire))
+        {
+            RunNativeSourceProbe(hwnd, topLevelWindow, topLevelVisualProxy);
         }
         bool topLevelBindingAttempted =
             topLevelVisualProxy &&
@@ -7758,6 +8226,12 @@ public:
         if (!suspended_) return;
         if (!IsWindow(target_) || !pool_ || !item_)
             winrt::throw_hresult(E_INVALIDARG);
+        HMONITOR current = MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST);
+        if (captureMonitor_ && current != captureMonitor_) {
+            Wh_Log(L"GPU mesh cached capture monitor changed: HWND=%p from=%p to=%p",
+                   target_, captureMonitor_, current);
+            winrt::throw_hresult(E_FAIL);
+        }
         while (auto frame = pool_.TryGetNextFrame()) frame.Close();
         session_ = pool_.CreateCaptureSession(item_);
         session_.IsCursorCaptureEnabled(false);
@@ -8034,8 +8508,46 @@ private:
         session_ = pool_.CreateCaptureSession(item_);
         session_.IsCursorCaptureEnabled(false);
         session_.StartCapture();
-        Wh_Log(L"GPU mesh capture started: HWND=%p size=%dx%d",
-               target_, frameSize_.Width, frameSize_.Height);
+        captureMonitor_ = MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST);
+        pendingMonitor_ = nullptr;
+        Wh_Log(L"GPU mesh capture started: HWND=%p size=%dx%d monitor=%p dpi=%u",
+               target_, frameSize_.Width, frameSize_.Height,
+               captureMonitor_, GetDpiForWindow(target_));
+    }
+
+    void RefreshCaptureAfterMonitorChange() {
+        if (!IsWindow(target_)) return;
+        HMONITOR current = MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST);
+        if (!current || !captureMonitor_ || current == captureMonitor_) {
+            pendingMonitor_ = nullptr;
+            return;
+        }
+        ULONGLONG now = GetTickCount64();
+        if (current != pendingMonitor_) {
+            pendingMonitor_ = current;
+            pendingMonitorSince_ = now;
+            Wh_Log(L"GPU mesh monitor transition: HWND=%p from=%p to=%p",
+                   target_, captureMonitor_, current);
+            return;
+        }
+        ULONGLONG stableSince = std::max(pendingMonitorSince_,
+                                         lastFrameSizeChangeAt_);
+        if (now - stableSince < 250) return;
+
+        HMONITOR previous = captureMonitor_;
+        if (pool_) pool_.FrameArrived(frameToken_);
+        if (session_) session_.Close();
+        if (pool_) pool_.Close();
+        session_ = nullptr;
+        pool_ = nullptr;
+        item_ = nullptr;
+        captureDevice_ = nullptr;
+        haveFrameInsets_ = false;
+        StartCapture();
+        renderedLogged_ = false;
+        Wh_Log(L"GPU mesh capture refreshed for monitor: HWND=%p from=%p to=%p "
+               L"wait=%llums",
+               target_, previous, captureMonitor_, now - pendingMonitorSince_);
     }
 
     void StopCapture() noexcept {
@@ -8056,6 +8568,10 @@ private:
         textureWidth_ = textureHeight_ = 0;
         haveFrameInsets_ = false;
         overlayBounds_ = {};
+        captureMonitor_ = nullptr;
+        pendingMonitor_ = nullptr;
+        pendingMonitorSince_ = 0;
+        lastFrameSizeChangeAt_ = 0;
         if (overlayVisible_) ShowWindow(window_, SW_HIDE);
         overlayVisible_ = false;
     }
@@ -8077,6 +8593,7 @@ private:
             source->GetDesc(&desc);
             if (!capturedTexture_ || desc.Width != textureWidth_ ||
                 desc.Height != textureHeight_) {
+                lastFrameSizeChangeAt_ = GetTickCount64();
                 textureWidth_ = desc.Width;
                 textureHeight_ = desc.Height;
                 desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -8094,6 +8611,7 @@ private:
             frame.Close();
             if (size.Width > 0 && size.Height > 0 &&
                 (size.Width != frameSize_.Width || size.Height != frameSize_.Height)) {
+                lastFrameSizeChangeAt_ = GetTickCount64();
                 frameSize_ = size;
                 resize = true;
             }
@@ -8201,7 +8719,9 @@ private:
     }
 
     void Render() {
-        if (suspended_ || !capturedView_ || !renderTarget_) return;
+        if (suspended_ || !renderTarget_) return;
+        RefreshCaptureAfterMonitorChange();
+        if (!capturedView_) return;
         Bend bend{};
         double translationX = 0.0, translationY = 0.0;
         bend.options[3] = 8.0f / 9.0f;
@@ -8255,6 +8775,10 @@ private:
     bool haveFrameInsets_ = false;
     bool bridgeActive_ = false;
     bool renderedLogged_ = false;
+    HMONITOR captureMonitor_ = nullptr;
+    HMONITOR pendingMonitor_ = nullptr;
+    ULONGLONG pendingMonitorSince_ = 0;
+    ULONGLONG lastFrameSizeChangeAt_ = 0;
     HANDLE bridgeHandle_ = nullptr;
     const mesh_bridge::Data* bridge_ = nullptr;
     ULONGLONG lastBridgeOpenAttempt_ = 0;
@@ -8661,6 +9185,7 @@ BOOL Wh_ModInit()
         return FALSE;
     }
     g_unloading.store(false, std::memory_order_release);
+    g_nativeProbeAttempted.store(false, std::memory_order_release);
     g_dwmSceneWakeMessage =
         RegisterWindowMessageW(L"Windhawk.WobblyWindows.DwmSceneWake");
     if (g_dwmSceneWakeMessage == 0)
