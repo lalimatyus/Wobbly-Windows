@@ -2,14 +2,14 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.284
+// @version         0.285
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
 // @include         windhawk.exe
 // @architecture    amd64
 // @architecture    x86
-// @compilerOptions -lwevtapi -lole32 -lwindowscodecs -ladvapi32 -ld3d11 -ldxgi -ld3dcompiler -ldcomp -ldwmapi -lwindowsapp -luser32 -lshell32
+// @compilerOptions -lwevtapi -lole32 -lwindowscodecs -ladvapi32 -ld3d11 -ldxgi -ld3dcompiler -ldcomp -ldwmapi -lwindowsapp -luser32 -lshell32 -lgdi32
 // @license         GPL-3.0-only
 // ==/WindhawkMod==
 
@@ -469,6 +469,7 @@ using NativeProbeUpdateImageBrush_t = long(__cdecl*)(
     const void*, int, int, const void*, const void*, int, int, int, int,
     const void*);
 using NativeProbeCreateRectangle_t = long(__cdecl*)(const RECT*, void**);
+using NativeProbeCreateRegion_t = long(__cdecl*)(HRGN, void**);
 using NativeProbeCreateGeometryInstruction_t = long(__cdecl*)(
     void*, void*, void**);
 using NativeRectCreateVisual_t = long(__cdecl*)(void**);
@@ -493,6 +494,7 @@ NativeProbeCreateBitmapInstruction_t g_nativeProbeCreateBitmapInstruction = null
 NativeProbeCreateImageBrush_t g_nativeProbeCreateImageBrush = nullptr;
 NativeProbeUpdateImageBrush_t g_nativeProbeUpdateImageBrush = nullptr;
 NativeProbeCreateRectangle_t g_nativeProbeCreateRectangle = nullptr;
+NativeProbeCreateRegion_t g_nativeProbeCreateRegion = nullptr;
 NativeProbeCreateGeometryInstruction_t g_nativeProbeCreateGeometryInstruction = nullptr;
 NativeRectCreateVisual_t g_nativeRectCreateVisual = nullptr;
 NativeRectAddInstruction_t g_nativeRectAddInstruction = nullptr;
@@ -531,11 +533,13 @@ void* g_nativeProbeImageVtableSymbol = nullptr;
 void* g_nativeProbeBitmapVtableSymbol = nullptr;
 void* g_nativeProbeImageBrushVtableSymbol = nullptr;
 void* g_nativeProbeRectangleVtableSymbol = nullptr;
+void* g_nativeProbeRegionVtableSymbol = nullptr;
 void* g_nativeProbeGeometryInstructionVtableSymbol = nullptr;
 std::atomic<void*> g_nativeProbeImageVtable = nullptr;
 std::atomic<void*> g_nativeProbeBitmapVtable = nullptr;
 std::atomic<void*> g_nativeProbeImageBrushVtable = nullptr;
 std::atomic<void*> g_nativeProbeRectangleVtable = nullptr;
+std::atomic<void*> g_nativeProbeRegionVtable = nullptr;
 std::atomic<void*> g_nativeProbeGeometryInstructionVtable = nullptr;
 std::atomic_bool g_nativeProbeAttempted = false;
 
@@ -3112,6 +3116,9 @@ static bool InitializeDwmHooks()
         {{L"public: static long __cdecl ResourceHelper::CreateRectangleGeometry("
            L"struct tagRECT const *,class CRectangleGeometryProxy * *)"},
          &g_nativeProbeCreateRectangle, nullptr, true},
+        {{L"public: static long __cdecl ResourceHelper::CreateGeometryFromHRGN("
+           L"struct HRGN__ *,class CRgnGeometryProxy * *)"},
+         &g_nativeProbeCreateRegion, nullptr, true},
         {{L"public: static long __cdecl CDrawGeometryInstruction::Create("
            L"class CBaseLegacyMilBrushProxy *,class CBaseGeometryProxy *,"
            L"class CDrawGeometryInstruction * *)"},
@@ -3170,6 +3177,8 @@ static bool InitializeDwmHooks()
          &g_nativeProbeImageBrushVtableSymbol, nullptr, true},
         {{L"const CRectangleGeometryProxy::`vftable'"},
          &g_nativeProbeRectangleVtableSymbol, nullptr, true},
+        {{L"const CRgnGeometryProxy::`vftable'"},
+         &g_nativeProbeRegionVtableSymbol, nullptr, true},
         {{L"const CDrawGeometryInstruction::`vftable'"},
          &g_nativeProbeGeometryInstructionVtableSymbol, nullptr, true},
 
@@ -3298,6 +3307,7 @@ static bool InitializeDwmHooks()
     keepValid(g_nativeProbeCreateImageBrush);
     keepValid(g_nativeProbeUpdateImageBrush);
     keepValid(g_nativeProbeCreateRectangle);
+    keepValid(g_nativeProbeCreateRegion);
     keepValid(g_nativeProbeCreateGeometryInstruction);
     keepValid(g_nativeRectCreateVisual);
     keepValid(g_nativeRectAddInstruction);
@@ -3359,6 +3369,8 @@ static bool InitializeDwmHooks()
                       g_nativeProbeImageBrushVtable);
     cacheVtableSymbol(g_nativeProbeRectangleVtableSymbol,
                       g_nativeProbeRectangleVtable);
+    cacheVtableSymbol(g_nativeProbeRegionVtableSymbol,
+                      g_nativeProbeRegionVtable);
     cacheVtableSymbol(g_nativeProbeGeometryInstructionVtableSymbol,
                       g_nativeProbeGeometryInstructionVtable);
     Wh_Log(L"NATIVE SOURCE PROBE: create=%d update=%s drawBitmap=%d "
@@ -3380,6 +3392,9 @@ static bool InitializeDwmHooks()
            g_nativeProbeRectangleVtable.load(std::memory_order_acquire),
            g_nativeProbeGeometryInstructionVtable.load(
                std::memory_order_acquire));
+    Wh_Log(L"NATIVE TRIANGLE PROBE: region=%d regionVtable=%p attached=0",
+           g_nativeProbeCreateRegion != nullptr,
+           g_nativeProbeRegionVtable.load(std::memory_order_acquire));
     Wh_Log(L"NATIVE MESH BRIDGE: mesh=%d update=%d group=%d "
            L"groupUpdate=%d meshFactory=%d directCachedImageSource=0 "
            L"getParent=%d getProxy=%d",
@@ -4015,6 +4030,66 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
     return false;
 }
 
+static void RunDetachedNativeTriangleProbe(HWND hwnd, void* brush,
+                                            int width, int height)
+{
+    if (!IsOnDwmSceneThread() ||
+        g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
+        g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
+        !g_nativeProbeCreateRegion ||
+        !g_nativeProbeCreateGeometryInstruction ||
+        !g_cBaseObjectRelease ||
+        !g_nativeProbeRegionVtable.load(std::memory_order_acquire) ||
+        !g_nativeProbeGeometryInstructionVtable.load(
+            std::memory_order_acquire) ||
+        width < 32 || height < 32)
+    {
+        Wh_Log(L"NATIVE TRIANGLE PROBE: skipped HWND=%p", hwnd);
+        return;
+    }
+
+    const POINT points[3] = {{0, 0}, {std::min(width, 160), 0},
+                             {0, std::min(height, 100)}};
+    Wh_Log(L"NATIVE TRIANGLE STAGE: CreatePolygonRgn HWND=%p", hwnd);
+    HRGN region = CreatePolygonRgn(points, 3, WINDING);
+    void* geometry = nullptr;
+    void* instruction = nullptr;
+    bool geometryType = false;
+    bool instructionType = false;
+    long result = region ? S_OK : HRESULT_FROM_WIN32(GetLastError());
+    const wchar_t* stage = L"CreatePolygonRgn";
+    if (result >= 0)
+    {
+        stage = L"CreateGeometryFromHRGN";
+        Wh_Log(L"NATIVE TRIANGLE STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeProbeCreateRegion(region, &geometry);
+        geometryType = geometry && IsReadableMemory(geometry, sizeof(void*)) &&
+            *reinterpret_cast<void**>(geometry) ==
+                g_nativeProbeRegionVtable.load(std::memory_order_acquire);
+        if (result >= 0 && !geometryType) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateInstruction";
+        Wh_Log(L"NATIVE TRIANGLE STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeProbeCreateGeometryInstruction(
+            brush, geometry, &instruction);
+        instructionType = instruction &&
+            IsReadableMemory(instruction, sizeof(void*)) &&
+            *reinterpret_cast<void**>(instruction) ==
+                g_nativeProbeGeometryInstructionVtable.load(
+                    std::memory_order_acquire);
+        if (result >= 0 && !instructionType) result = E_UNEXPECTED;
+    }
+    Wh_Log(L"NATIVE TRIANGLE PROBE: HWND=%p stage=%s result=0x%08X "
+           L"geometryType=%d instructionType=%d attached=0",
+           hwnd, stage, static_cast<unsigned>(result), geometryType,
+           instructionType);
+    if (instructionType) g_cBaseObjectRelease(instruction);
+    if (geometryType) g_cBaseObjectRelease(geometry);
+    if (region) DeleteObject(region);
+}
+
 static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
                                               void* sourceProxy, void* compositor,
                                               void*& image, int width, int height)
@@ -4090,6 +4165,7 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
            exactRectangle, exactInstruction);
     if (result >= 0 && exactType && exactRectangle && exactInstruction)
     {
+        RunDetachedNativeTriangleProbe(hwnd, brush, width, height);
         TryAttachNativeRectProbe(hwnd, topLevelWindow, sourceProxy, compositor,
                                  image, brush, rectangle, instruction,
                                  width, height);
