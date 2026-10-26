@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.279
+// @version         0.280
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -431,10 +431,12 @@ CMatrixTransformProxyUpdateDouble_t g_cMatrixTransformProxyUpdate = nullptr;
 CMatrixTransformProxyUpdateFloat_t g_cMatrixTransformProxyUpdateFloat = nullptr;
 using CVisualProxySetTransform_t = long(__cdecl*)(void* pThis, void* transform);
 CVisualProxySetTransform_t g_cVisualProxySetTransform = nullptr;
+using CVisualProxySetClip_t = long(__cdecl*)(void* pThis, void* geometry);
+CVisualProxySetClip_t g_nativeTileSetClip = nullptr;
 using CCompositorCreateMatrixTransformProxy_t = long(__cdecl*)(void* pThis, void** transformProxy);
 CCompositorCreateMatrixTransformProxy_t g_createMatrixTransformProxy = nullptr;
 
-// Experimental one-shot source and geometry probes. No DWM visual is attached.
+// One-shot native live-image and triangular clip probe on the verified build.
 struct NativeProbeRectF
 {
     float left, top, right, bottom;
@@ -494,28 +496,17 @@ void* g_nativeTileCollectionRemove = nullptr;
 void* g_nativeTileCollectionVtable = nullptr;
 std::atomic_bool g_nativeTileActive = false;
 std::atomic_bool g_nativeTileStopRequested = false;
-static constexpr int NATIVE_TILE_ROWS = 3;
-struct NativeTilePart
-{
-    void* instruction = nullptr;
-    void* visual = nullptr;
-    void* transform = nullptr;
-    RECT source = {};
-};
 struct NativeTileState
 {
     void* root = nullptr;         // Owned reference while the sibling is attached.
-    void* collection = nullptr;
     void* image = nullptr;
-    NativeTilePart parts[NATIVE_TILE_ROWS] = {};
+    void* instruction = nullptr;
+    void* visual = nullptr;
+    void* transform = nullptr;
+    void* clipMesh = nullptr;
+    void* clipGroup = nullptr;
     void* sourceProxy = nullptr;  // Compared only while root is retained.
     HWND hwnd = nullptr;
-    int slotIndex = -1;
-    ULONGLONG generation = 0;
-    ULONGLONG lastMeshRevision = ULLONG_MAX;
-    ULONGLONG lastTransformAt = 0;
-    unsigned int transformUpdates = 0;
-    bool motionLogged = false;
     int width = 0;
     int height = 0;
     ULONGLONG expiresAt = 0;
@@ -3061,6 +3052,9 @@ static bool InitializeDwmHooks()
          &g_cVisualProxySetTransform,
          nullptr,
          true},
+        {{L"public: long __cdecl CVisualProxy::SetClip("
+           L"class CBaseGeometryProxy *)"},
+         &g_nativeTileSetClip, nullptr, true},
         {{L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CMatrixTransformProxy>(class CMatrixTransformProxy * *)"},
          &g_createMatrixTransformProxy,
@@ -3686,6 +3680,9 @@ static bool NativeTileAbiVerified()
         !g_nativeTileCollectionRemove || !g_nativeTileCollectionVtable ||
         !g_nativeProbeGetVisualParent || !g_nativeProbeGetVisualProxy ||
         !g_createMatrixTransformProxy || !g_cVisualProxySetTransform ||
+        !g_nativeTileSetClip || !g_nativeProbeCreateMesh ||
+        !g_nativeProbeUpdateMesh || !g_nativeProbeCreateGroup ||
+        !g_nativeProbeUpdateGroup ||
         !HasMatrixTransformUpdate() || !g_cBaseObjectRelease)
     {
         return false;
@@ -3773,12 +3770,17 @@ static bool RetainNativeTileRoot(void* root)
 
 static void ReleaseNativeTileState(NativeTileState& state)
 {
-    for (NativeTilePart& part : state.parts)
+    if (state.visual) g_cBaseObjectRelease(state.visual);
+    if (state.transform) g_cBaseObjectRelease(state.transform);
+    if (state.instruction) g_cBaseObjectRelease(state.instruction);
+    auto releaseClip = [](void* object)
     {
-        if (part.visual) g_cBaseObjectRelease(part.visual);
-        if (part.transform) g_cBaseObjectRelease(part.transform);
-        if (part.instruction) g_cBaseObjectRelease(part.instruction);
-    }
+        if (object && IsReadableMemory(object, sizeof(void*)) &&
+            IsDwmImageAddress(*reinterpret_cast<void**>(object), sizeof(void*)))
+            g_cBaseObjectRelease(object);
+    };
+    releaseClip(state.clipGroup);
+    releaseClip(state.clipMesh);
     if (state.image) g_cBaseObjectRelease(state.image);
     if (state.root) g_cBaseObjectRelease(state.root);
     state = {};
@@ -3787,22 +3789,15 @@ static void ReleaseNativeTileState(NativeTileState& state)
 static bool DetachNativeTileProbe(const wchar_t* reason)
 {
     auto& state = g_nativeTileState;
-    long result = S_OK;
-    void* parent = nullptr;
-    for (int i = NATIVE_TILE_ROWS - 1; i >= 0; --i)
+    if (!state.visual)
     {
-        NativeTilePart& part = state.parts[i];
-        if (!part.visual) continue;
-        void* currentParent = ReadPointerMember(part.visual, 0x18);
-        if (currentParent)
-        {
-            long currentResult = g_nativeTileRemoveFromParent(part.visual);
-            if (currentResult < 0) result = currentResult;
-            currentParent = ReadPointerMember(part.visual, 0x18);
-        }
-        if (currentParent) parent = currentParent;
+        g_nativeTileActive.store(false, std::memory_order_release);
+        return true;
     }
-    if (parent)
+    void* parent = ReadPointerMember(state.visual, 0x18);
+    long result = parent ? g_nativeTileRemoveFromParent(state.visual) : S_OK;
+    parent = ReadPointerMember(state.visual, 0x18);
+    if (result < 0 || parent)
     {
         if (!state.detachFailureLogged)
         {
@@ -3814,8 +3809,7 @@ static bool DetachNativeTileProbe(const wchar_t* reason)
         RequestDwmScenePass();
         return false;
     }
-    Wh_Log(L"NATIVE TILE DETACHED: HWND=%p reason=%s updates=%u motion=%d",
-           state.hwnd, reason, state.transformUpdates, state.motionLogged);
+    Wh_Log(L"NATIVE TILE DETACHED: HWND=%p reason=%s", state.hwnd, reason);
     ReleaseNativeTileState(state);
     g_nativeTileActive.store(false, std::memory_order_release);
     g_nativeTileStopRequested.store(false, std::memory_order_release);
@@ -3831,7 +3825,6 @@ static void MaintainNativeTileProbe()
     RECT bounds = {};
     bool sourceValid = state.root &&
         g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy &&
-        FindNativeTileSiblingCollection(state.root) == state.collection &&
         GetWindowRect(state.hwnd, &bounds) &&
         bounds.right - bounds.left == state.width &&
         bounds.bottom - bounds.top == state.height;
@@ -3844,124 +3837,10 @@ static void MaintainNativeTileProbe()
                                    ? L"unload" :
                                (g_nativeTileStopRequested.load(std::memory_order_acquire)
                                    ? L"stop-requested" : L"five-second-test-ended")));
-        return;
-    }
-
-    bool slotValid = false;
-    bool physicsActive = false;
-    ULONGLONG revision = 0;
-    double meshWidth = 0.0;
-    double meshHeight = 0.0;
-    Vec2 control[GRID_HEIGHT][2] = {};
-    AcquireSRWLockShared(&g_animationSlotsLock);
-    if (state.slotIndex >= 0 && state.slotIndex < MAX_ANIMATION_SLOTS)
-    {
-        const WindowAnimationSlot& slot = g_animationSlots[state.slotIndex];
-        slotValid = slot.active && !slot.retiring &&
-                    slot.generation == state.generation &&
-                    slot.hwnd == state.hwnd && !slot.mesh.resizing &&
-                    !slot.windowStateThrob &&
-                    slot.settings.rendererMode == RendererMode::Affine;
-        if (slotValid)
-        {
-            revision = slot.meshRevision;
-            meshWidth = slot.mesh.width;
-            meshHeight = slot.mesh.height;
-            physicsActive = slot.mesh.active;
-            if (physicsActive)
-            {
-                for (int y = 0; y < GRID_HEIGHT; ++y)
-                {
-                    control[y][0] = slot.mesh.points[y * GRID_WIDTH].position;
-                    control[y][1] = slot.mesh.points[y * GRID_WIDTH + 1].position;
-                }
-            }
-        }
-    }
-    ReleaseSRWLockShared(&g_animationSlotsLock);
-    if (!slotValid || meshWidth <= 0.0 || meshHeight <= 0.0)
-    {
-        DetachNativeTileProbe(L"slot-ended-or-transition");
-        return;
-    }
-    if (revision == state.lastMeshRevision)
-        return;
-    ULONGLONG now = GetTickCount64();
-    if (state.lastTransformAt && now - state.lastTransformAt < 7)
-        return;
-    if (!physicsActive)
-    {
-        for (int y = 0; y < GRID_HEIGHT; ++y)
-        {
-            control[y][0] = {0.0, meshHeight * y / 3.0};
-            control[y][1] = {meshWidth / 3.0, meshHeight * y / 3.0};
-        }
-    }
-    const double scaleX = state.width / meshWidth;
-    const double scaleY = state.height / meshHeight;
-    double peakDisplacement = 0.0;
-    double peakShear = 0.0;
-    for (int row = 0; row < NATIVE_TILE_ROWS; ++row)
-    {
-        const NativeTilePart& part = state.parts[row];
-        const double tileWidth = part.source.right - part.source.left;
-        const double tileHeight = part.source.bottom - part.source.top;
-        const double x0 = control[row][0].x * scaleX;
-        const double y0 = control[row][0].y * scaleY;
-        const double x1 = control[row][1].x * scaleX;
-        const double y1 = control[row][1].y * scaleY;
-        const double x2 = control[row + 1][0].x * scaleX;
-        const double y2 = control[row + 1][0].y * scaleY;
-        const double m11 = (x1 - x0) / tileWidth;
-        const double m12 = (y1 - y0) / tileWidth;
-        const double m21 = (x2 - x0) / tileHeight;
-        const double m22 = (y2 - y0) / tileHeight;
-        const MilMatrix3x2D matrix = {
-            m11, m12, m21, m22,
-            state.width * 0.55 + x0 - m11 * part.source.left -
-                m21 * part.source.top,
-            y0 - m12 * part.source.left - m22 * part.source.top};
-        if (!std::isfinite(matrix.m11) || !std::isfinite(matrix.m12) ||
-            !std::isfinite(matrix.m21) || !std::isfinite(matrix.m22) ||
-            !std::isfinite(matrix.dx) || !std::isfinite(matrix.dy) ||
-            matrix.m11 < 0.2 || matrix.m11 > 2.0 ||
-            matrix.m22 < 0.2 || matrix.m22 > 2.0 ||
-            std::abs(matrix.m12) > 1.0 || std::abs(matrix.m21) > 1.0 ||
-            std::abs(x0) > state.width || std::abs(y0) > state.height * 2.0)
-        {
-            Wh_Log(L"NATIVE TILE invalid physics: HWND=%p row=%d revision=%llu",
-                   state.hwnd, row, revision);
-            DetachNativeTileProbe(L"invalid-physics");
-            return;
-        }
-        long result = UpdateMatrixTransformProxy(part.transform, matrix);
-        if (result < 0)
-        {
-            Wh_Log(L"NATIVE TILE transform failed: HWND=%p row=%d result=0x%08X",
-                   state.hwnd, row, static_cast<unsigned>(result));
-            DetachNativeTileProbe(L"transform-failed");
-            return;
-        }
-        peakDisplacement = std::max(peakDisplacement,
-                                    std::hypot(x0, y0 - part.source.top));
-        peakShear = std::max(peakShear,
-                             std::max(std::abs(m12), std::abs(m21)));
-    }
-    state.lastMeshRevision = revision;
-    state.lastTransformAt = now;
-    state.transformUpdates++;
-    if (!state.motionLogged && (peakDisplacement > 2.0 || peakShear > 0.02))
-    {
-        state.motionLogged = true;
-        Wh_Log(L"NATIVE TILE MOTION: HWND=%p revision=%llu rows=%d "
-               L"peakDisplacement=%.2f peakShear=%.4f",
-               state.hwnd, revision, NATIVE_TILE_ROWS,
-               peakDisplacement, peakShear);
     }
 }
 
-static bool TryAttachNativeTileProbe(int slotIndex, ULONGLONG generation,
-                                     HWND hwnd, void* topLevelWindow,
+static bool TryAttachNativeTileProbe(HWND hwnd, void* topLevelWindow,
                                      void* sourceProxy, void* compositor,
                                      void*& image, int width, int height)
 {
@@ -3991,93 +3870,137 @@ static bool TryAttachNativeTileProbe(int slotIndex, ULONGLONG generation,
     }
     NativeTileState pending = {};
     pending.root = root;
-    pending.collection = collection;
     pending.hwnd = hwnd;
-    pending.slotIndex = slotIndex;
-    pending.generation = generation;
     pending.sourceProxy = sourceProxy;
     pending.width = width;
     pending.height = height;
-    if (width < 3 || height < 3)
-    {
-        ReleaseNativeTileState(pending);
-        return false;
-    }
+    const RECT tile = {0, 0, std::max(1, width / 3), std::max(1, height / 3)};
+    const POINT origin = {0, 0};
     const wchar_t* stage = L"CreateTileInstruction";
-    long result = S_OK;
-    int failedRow = -1;
-    for (int row = 0; row < NATIVE_TILE_ROWS; ++row)
+    long result = g_nativeTileCreateInstruction(image, tile, origin, 1.0f,
+                                                &pending.instruction);
+    if (result >= 0 && !pending.instruction) result = E_UNEXPECTED;
+    if (result >= 0)
     {
-        NativeTilePart& part = pending.parts[row];
-        part.source = {0, height * row / NATIVE_TILE_ROWS,
-                       width / 3, height * (row + 1) / NATIVE_TILE_ROWS};
-        const POINT origin = {0, part.source.top};
-        failedRow = row;
-        stage = L"CreateTileInstruction";
-        result = g_nativeTileCreateInstruction(image, part.source, origin,
-                                                1.0f, &part.instruction);
-        if (result >= 0 && !part.instruction) result = E_UNEXPECTED;
-        if (result < 0) break;
         stage = L"CreateVisual";
-        result = g_nativeTileCreateVisual(&part.visual);
-        if (result >= 0 && !part.visual) result = E_UNEXPECTED;
-        if (result < 0) break;
+        result = g_nativeTileCreateVisual(&pending.visual);
+        if (result >= 0 && !pending.visual) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
         stage = L"AddInstruction";
-        result = g_nativeTileAddInstruction(part.visual, part.instruction);
-        if (result < 0) break;
+        result = g_nativeTileAddInstruction(pending.visual,
+                                            pending.instruction);
+    }
+    if (result >= 0)
+    {
         stage = L"PublishRenderData";
-        result = g_nativeTileUpdateRenderData(part.visual);
-        if (result < 0) break;
+        result = g_nativeTileUpdateRenderData(pending.visual);
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateTriangleMesh";
+        result = g_nativeProbeCreateMesh(compositor, &pending.clipMesh);
+        if (result >= 0 && !pending.clipMesh) result = E_UNEXPECTED;
+        if (result >= 0 &&
+            (!IsReadableMemory(pending.clipMesh, sizeof(void*)) ||
+             !IsDwmImageAddress(*reinterpret_cast<void**>(pending.clipMesh),
+                                sizeof(void*))))
+            result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        const float triangleWidth = static_cast<float>(tile.right);
+        const float triangleHeight = static_cast<float>(tile.bottom);
+        const NativeProbePoint3F positions[3] = {
+            {0.0f, 0.0f, 0.0f},
+            {0.0f, triangleHeight, 0.0f},
+            {triangleWidth, 0.0f, 0.0f}};
+        const NativeProbePoint2D coordinates[3] = {
+            {0.0, 0.0}, {0.0, 1.0}, {1.0, 0.0}};
+        const unsigned int indices[3] = {0, 1, 2};
+        stage = L"UpdateTriangleMesh";
+        result = g_nativeProbeUpdateMesh(pending.clipMesh, 0, positions,
+                                         coordinates, 3, indices, 3);
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateTriangleGroup";
+        result = g_nativeProbeCreateGroup(compositor, &pending.clipGroup);
+        if (result >= 0 && !pending.clipGroup) result = E_UNEXPECTED;
+        if (result >= 0 &&
+            (!IsReadableMemory(pending.clipGroup, sizeof(void*)) ||
+             !IsDwmImageAddress(*reinterpret_cast<void**>(pending.clipGroup),
+                                sizeof(void*))))
+            result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"UpdateTriangleGroup";
+        result = g_nativeProbeUpdateGroup(pending.clipGroup,
+                                          pending.clipMesh);
+    }
+    if (result >= 0)
+    {
         stage = L"CreateTransform";
-        result = g_createMatrixTransformProxy(compositor, &part.transform);
-        if (result >= 0 && !part.transform) result = E_UNEXPECTED;
-        if (result < 0) break;
+        result = g_createMatrixTransformProxy(compositor, &pending.transform);
+        if (result >= 0 && !pending.transform) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
         stage = L"PositionTile";
         const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0,
                                      static_cast<double>(width) * 0.55, 0.0};
-        result = UpdateMatrixTransformProxy(part.transform, matrix);
-        if (result < 0) break;
-        stage = L"InsertSibling";
-        void* reference = row ? pending.parts[row - 1].visual : root;
-        result = g_nativeTileInsertRelative(collection, part.visual,
-                                            reference, true, false);
-        if (result < 0) break;
-        stage = L"VerifySibling";
-        if (ReadPointerMember(part.visual, 0x18) !=
-                ReadPointerMember(root, 0x18) ||
-            FindNativeTileSiblingCollection(root) != collection)
-        {
-            result = E_UNEXPECTED;
-            break;
-        }
-        stage = L"BindTransform";
-        void* visualProxy = g_nativeProbeGetVisualProxy(part.visual);
-        result = IsVisualProxyPointerValid(visualProxy)
-                     ? g_cVisualProxySetTransform(visualProxy, part.transform)
-                     : E_NOINTERFACE;
-        if (result < 0) break;
+        result = UpdateMatrixTransformProxy(pending.transform, matrix);
     }
     if (result >= 0)
+    {
+        stage = L"InsertSibling";
+        result = g_nativeTileInsertRelative(collection, pending.visual,
+                                            root, true, false);
+    }
+    bool inserted = pending.visual && ReadPointerMember(pending.visual, 0x18);
+    if (result >= 0 && inserted)
+    {
+        stage = L"VerifySibling";
+        if (ReadPointerMember(pending.visual, 0x18) !=
+                ReadPointerMember(root, 0x18) ||
+            FindNativeTileSiblingCollection(root) != collection)
+            result = E_UNEXPECTED;
+    }
+    if (result >= 0 && inserted)
+    {
+        stage = L"BindTriangleClip";
+        void* visualProxy = g_nativeProbeGetVisualProxy(pending.visual);
+        result = IsVisualProxyPointerValid(visualProxy)
+                     ? g_nativeTileSetClip(visualProxy, pending.clipGroup)
+                     : E_NOINTERFACE;
+    }
+    if (result >= 0 && inserted)
+    {
+        stage = L"BindTransform";
+        void* visualProxy = g_nativeProbeGetVisualProxy(pending.visual);
+        result = IsVisualProxyPointerValid(visualProxy)
+                     ? g_cVisualProxySetTransform(visualProxy, pending.transform)
+                     : E_NOINTERFACE;
+    }
+    if (result >= 0 && inserted)
     {
         pending.image = image;
         image = nullptr;
         pending.expiresAt = GetTickCount64() + 5000;
         g_nativeTileState = pending;
         g_nativeTileActive.store(true, std::memory_order_release);
-        Wh_Log(L"NATIVE TILE STRIP ATTACHED: Slot=%d HWND=%p root=%p "
-               L"parts=%d stripWidth=%d height=%d durationMs=5000 "
-               L"affine=unchanged snapshot=none", slotIndex, hwnd, root,
-               NATIVE_TILE_ROWS, width / 3, height);
+        Wh_Log(L"NATIVE TRIANGLE CLIP ATTACHED: HWND=%p root=%p visual=%p "
+               L"sourceRect=%ldx%ld durationMs=5000 affine=unchanged "
+               L"snapshot=none", hwnd, root, pending.visual,
+               tile.right, tile.bottom);
         RequestDwmScenePass();
         return true;
     }
-    bool anyInserted = false;
-    for (const NativeTilePart& part : pending.parts)
-        anyInserted |= part.visual && ReadPointerMember(part.visual, 0x18);
-    Wh_Log(L"NATIVE TILE FAILED: HWND=%p row=%d stage=%s result=0x%08X "
-           L"inserted=%d", hwnd, failedRow, stage,
-           static_cast<unsigned>(result), anyInserted);
-    if (anyInserted)
+    Wh_Log(L"NATIVE TILE FAILED: HWND=%p stage=%s result=0x%08X "
+           L"inserted=%d", hwnd, stage, static_cast<unsigned>(result), inserted);
+    if (inserted)
     {
         pending.image = image;
         image = nullptr;
@@ -4093,8 +4016,7 @@ static bool TryAttachNativeTileProbe(int slotIndex, ULONGLONG generation,
     return false;
 }
 
-static void RunNativeSourceProbe(int slotIndex, ULONGLONG generation,
-                                 HWND hwnd, void* topLevelWindow,
+static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
                                  void* sourceVisualProxy)
 {
     if (!IsOnDwmSceneThread() || !IsVisualProxyPointerValid(sourceVisualProxy) ||
@@ -4206,9 +4128,8 @@ static void RunNativeSourceProbe(int slotIndex, ULONGLONG generation,
         // factory may return S_OK for a wrong pointer type and fail later when
         // rendering, so never pass the cached image to that instruction.
         RunDetachedNativeGeometryProbe(hwnd, compositor);
-        TryAttachNativeTileProbe(slotIndex, generation, hwnd, topLevelWindow,
-                                 sourceVisualProxy, compositor, image, width,
-                                 height);
+        TryAttachNativeTileProbe(hwnd, topLevelWindow, sourceVisualProxy,
+                                 compositor, image, width, height);
     }
     if (bitmapInstruction && drawBitmapResult >= 0 &&
         IsReadableMemory(bitmapInstruction, sizeof(void*)) &&
@@ -4333,8 +4254,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         if (topLevelVisualProxy &&
             !g_nativeProbeAttempted.load(std::memory_order_acquire))
         {
-            RunNativeSourceProbe(i, generation, hwnd, topLevelWindow,
-                                 topLevelVisualProxy);
+            RunNativeSourceProbe(hwnd, topLevelWindow, topLevelVisualProxy);
         }
         bool topLevelBindingAttempted =
             topLevelVisualProxy &&
