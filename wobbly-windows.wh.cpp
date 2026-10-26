@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.275
+// @version         0.276
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -434,7 +434,7 @@ CVisualProxySetTransform_t g_cVisualProxySetTransform = nullptr;
 using CCompositorCreateMatrixTransformProxy_t = long(__cdecl*)(void* pThis, void** transformProxy);
 CCompositorCreateMatrixTransformProxy_t g_createMatrixTransformProxy = nullptr;
 
-// Experimental one-shot source probe. It creates no visible DWM visual.
+// Experimental one-shot source and geometry probes. No DWM visual is attached.
 struct NativeProbeRectF
 {
     float left, top, right, bottom;
@@ -468,6 +468,8 @@ using NativeProbeUpdateMesh_t = long(__cdecl*)(
     void*, int, const NativeProbePoint3F*, const NativeProbePoint2D*,
     unsigned int, const unsigned int*, unsigned int);
 using NativeProbeUpdateGroup_t = long(__cdecl*)(void*, void*);
+// Its second argument is CBitmapSourceProxy*, not CCachedVisualImageProxy*.
+// Resolve for diagnostics only; do not call it with the live window source.
 using NativeProbeCreateMeshInstruction_t = long(__cdecl*)(void*, void*, void**);
 using NativeProbeGetVisual_t = void*(__cdecl*)(void*);
 NativeProbeCreateImage_t g_nativeProbeCreateImage = nullptr;
@@ -3252,7 +3254,8 @@ static bool InitializeDwmHooks()
            g_nativeProbeImageVtable.load(std::memory_order_acquire),
            g_nativeProbeBitmapVtable.load(std::memory_order_acquire));
     Wh_Log(L"NATIVE MESH BRIDGE: mesh=%d update=%d group=%d "
-           L"groupUpdate=%d instruction=%d getParent=%d getProxy=%d",
+           L"groupUpdate=%d meshFactory=%d directCachedImageSource=0 "
+           L"getParent=%d getProxy=%d",
            g_nativeProbeCreateMesh != nullptr,
            g_nativeProbeUpdateMesh != nullptr,
            g_nativeProbeCreateGroup != nullptr,
@@ -3468,20 +3471,20 @@ static bool InitializeDwmHooks()
     return true;
 }
 
-static void RunDetachedNativeMeshProbe(HWND hwnd, void* compositor, void* image)
+static void RunDetachedNativeGeometryProbe(HWND hwnd, void* compositor)
 {
     // This ABI is verified only for the exact 23H2 uDWM image used here.
     if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000)
     {
-        Wh_Log(L"NATIVE MESH BRIDGE: skipped HWND=%p (unverified uDWM ABI)", hwnd);
+        Wh_Log(L"NATIVE MESH GEOMETRY: skipped HWND=%p (unverified uDWM ABI)", hwnd);
         return;
     }
     if (!g_nativeProbeCreateMesh || !g_nativeProbeUpdateMesh ||
         !g_nativeProbeCreateGroup || !g_nativeProbeUpdateGroup ||
-        !g_nativeProbeCreateMeshInstruction || !g_cBaseObjectRelease)
+        !g_cBaseObjectRelease)
     {
-        Wh_Log(L"NATIVE MESH BRIDGE: skipped HWND=%p (missing symbols)", hwnd);
+        Wh_Log(L"NATIVE MESH GEOMETRY: skipped HWND=%p (missing symbols)", hwnd);
         return;
     }
 
@@ -3519,7 +3522,6 @@ static void RunDetachedNativeMeshProbe(HWND hwnd, void* compositor, void* image)
 
     void* mesh = nullptr;
     void* group = nullptr;
-    void* instruction = nullptr;
     const wchar_t* stage = L"CreateMesh";
     long result = g_nativeProbeCreateMesh(compositor, &mesh);
     if (result >= 0 && mesh)
@@ -3543,18 +3545,10 @@ static void RunDetachedNativeMeshProbe(HWND hwnd, void* compositor, void* image)
         stage = L"UpdateGroup";
         result = g_nativeProbeUpdateGroup(group, mesh);
     }
-    if (result >= 0)
-    {
-        stage = L"CreateInstruction";
-        result = g_nativeProbeCreateMeshInstruction(group, image,
-                                                     &instruction);
-        if (result >= 0 && !instruction) result = E_UNEXPECTED;
-    }
-    Wh_Log(L"NATIVE MESH BRIDGE: HWND=%p stage=%s result=0x%08X "
-           L"mesh=%p group=%p instruction=%p vertices=16 indices=%u "
-           L"attached=0",
-           hwnd, stage, static_cast<unsigned int>(result), mesh, group,
-           instruction, count);
+    Wh_Log(L"NATIVE MESH GEOMETRY: HWND=%p stage=%s result=0x%08X "
+           L"mesh=%p group=%p vertices=16 indices=%u attached=0 "
+           L"directCachedImageSource=unsupported",
+           hwnd, stage, static_cast<unsigned int>(result), mesh, group, count);
 
     auto release = [](void* object)
     {
@@ -3564,7 +3558,6 @@ static void RunDetachedNativeMeshProbe(HWND hwnd, void* compositor, void* image)
             g_cBaseObjectRelease(object);
         }
     };
-    release(instruction);
     release(group);
     release(mesh);
 }
@@ -3709,7 +3702,11 @@ static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
     if (resourceReadable && imageResourceId && drawBitmapResult >= 0 &&
         instructionKeepsImage)
     {
-        RunDetachedNativeMeshProbe(hwnd, compositor, image);
+        // CDrawMesh2DInstruction::Create requires CBitmapSourceProxy*, while
+        // this live complete-window image is CCachedVisualImageProxy*. The
+        // factory may return S_OK for a wrong pointer type and fail later when
+        // rendering, so never pass the cached image to that instruction.
+        RunDetachedNativeGeometryProbe(hwnd, compositor);
     }
     if (bitmapInstruction && drawBitmapResult >= 0 &&
         IsReadableMemory(bitmapInstruction, sizeof(void*)) &&
