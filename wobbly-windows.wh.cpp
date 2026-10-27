@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.288
+// @version         0.289
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -506,6 +506,8 @@ void* g_nativeRectCollectionRemove = nullptr;
 void* g_nativeRectCollectionVtable = nullptr;
 std::atomic_bool g_nativeRectActive = false;
 std::atomic_bool g_nativeRectStopRequested = false;
+std::atomic<HWND> g_nativeRectHwnd = nullptr;
+std::atomic<ULONGLONG> g_nativeRectExpiresAt = 0;
 struct NativeRectState
 {
     void* root = nullptr;
@@ -3851,6 +3853,8 @@ static bool DetachNativeRectProbe(const wchar_t* reason)
     auto& state = g_nativeRectState;
     if (!state.visual)
     {
+        g_nativeRectHwnd.store(nullptr, std::memory_order_release);
+        g_nativeRectExpiresAt.store(0, std::memory_order_release);
         g_nativeRectActive.store(false, std::memory_order_release);
         return true;
     }
@@ -3872,6 +3876,8 @@ static bool DetachNativeRectProbe(const wchar_t* reason)
     Wh_Log(L"NATIVE SHAPE DETACHED: HWND=%p geometry=rectangle reason=%s",
            state.hwnd, reason);
     ReleaseNativeRectState(state);
+    g_nativeRectHwnd.store(nullptr, std::memory_order_release);
+    g_nativeRectExpiresAt.store(0, std::memory_order_release);
     g_nativeRectActive.store(false, std::memory_order_release);
     g_nativeRectStopRequested.store(false, std::memory_order_release);
     return true;
@@ -3883,22 +3889,25 @@ static void MaintainNativeRectProbe()
         !g_nativeRectActive.load(std::memory_order_acquire))
         return;
     auto& state = g_nativeRectState;
+    if (g_unloading.load(std::memory_order_acquire) ||
+        g_nativeRectStopRequested.load(std::memory_order_acquire) ||
+        GetTickCount64() >= state.expiresAt)
+    {
+        DetachNativeRectProbe(g_unloading.load(std::memory_order_acquire)
+                                  ? L"unload"
+                              : g_nativeRectStopRequested.load(
+                                    std::memory_order_acquire)
+                                  ? L"stop-requested"
+                                  : L"five-second-test-ended");
+        return;
+    }
     RECT bounds = {};
     bool sourceValid = state.root &&
         g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy &&
         GetWindowRect(state.hwnd, &bounds) &&
         bounds.right - bounds.left == state.width &&
         bounds.bottom - bounds.top == state.height;
-    if (g_unloading.load(std::memory_order_acquire) ||
-        g_nativeRectStopRequested.load(std::memory_order_acquire) ||
-        GetTickCount64() >= state.expiresAt || !sourceValid)
-    {
-        DetachNativeRectProbe(!sourceValid ? L"source-changed" :
-                              (g_unloading.load(std::memory_order_acquire)
-                                   ? L"unload" :
-                               (g_nativeRectStopRequested.load(std::memory_order_acquire)
-                                   ? L"stop-requested" : L"five-second-test-ended")));
-    }
+    if (!sourceValid) DetachNativeRectProbe(L"source-changed");
 }
 
 static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
@@ -4004,10 +4013,19 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
         image = brush = rectangle = instruction = nullptr;
         pending.expiresAt = GetTickCount64() + 5000;
         g_nativeRectState = pending;
+        g_nativeRectHwnd.store(hwnd, std::memory_order_release);
+        g_nativeRectExpiresAt.store(pending.expiresAt,
+                                    std::memory_order_release);
         g_nativeRectActive.store(true, std::memory_order_release);
+        if (!g_realDragging.load(std::memory_order_acquire) ||
+            g_realDraggedWindow.load(std::memory_order_acquire) != hwnd)
+            g_nativeRectStopRequested.store(true, std::memory_order_release);
         Wh_Log(L"NATIVE SHAPE ATTACHED: HWND=%p geometry=rectangle root=%p "
                L"visual=%p durationMs=5000 affine=unchanged snapshot=none",
                hwnd, root, pending.visual);
+        DWORD eventThread = g_eventThreadMessageTarget.load(
+            std::memory_order_acquire);
+        if (eventThread) PostThreadMessageW(eventThread, WM_NULL, 0, 0);
         RequestDwmScenePass();
         return true;
     }
@@ -4023,6 +4041,9 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
         image = brush = rectangle = instruction = nullptr;
         pending.expiresAt = GetTickCount64();
         g_nativeRectState = pending;
+        g_nativeRectHwnd.store(hwnd, std::memory_order_release);
+        g_nativeRectExpiresAt.store(pending.expiresAt,
+                                    std::memory_order_release);
         g_nativeRectActive.store(true, std::memory_order_release);
         DetachNativeRectProbe(L"failed-attach");
     }
@@ -8179,6 +8200,12 @@ static void CALLBACK WinEventCallback(HWINEVENTHOOK, DWORD event, HWND hwnd, LON
     }
     case EVENT_SYSTEM_MOVESIZEEND:
     {
+        if (g_nativeRectActive.load(std::memory_order_acquire) &&
+            g_nativeRectHwnd.load(std::memory_order_acquire) == hwnd)
+        {
+            g_nativeRectStopRequested.store(true, std::memory_order_release);
+            RequestDwmScenePass();
+        }
         HandleMoveSizeEnd(hwnd);
         break;
     }
@@ -8353,12 +8380,42 @@ static DWORD WINAPI WindowEventThreadProc(LPVOID)
     while (running)
     {
         bool frameDue = false;
+        DWORD waitTimeout = INFINITE;
+        if (g_nativeRectActive.load(std::memory_order_acquire))
+        {
+            ULONGLONG deadline = g_nativeRectExpiresAt.load(
+                std::memory_order_acquire);
+            ULONGLONG now = GetTickCount64();
+            waitTimeout = g_nativeRectStopRequested.load(
+                              std::memory_order_acquire)
+                              ? 100
+                          : deadline > now
+                              ? static_cast<DWORD>(
+                                    std::min<ULONGLONG>(deadline - now, 5000))
+                          : deadline ? 0 : 100;
+        }
         DWORD waitResult = MsgWaitForMultipleObjectsEx(
-            ARRAYSIZE(waitHandles), waitHandles, INFINITE, QS_ALLINPUT,
+            ARRAYSIZE(waitHandles), waitHandles, waitTimeout, QS_ALLINPUT,
             MWMO_INPUTAVAILABLE);
         if (waitResult == WAIT_OBJECT_0)
         {
             frameDue = true;
+        }
+        else if (waitResult == WAIT_TIMEOUT)
+        {
+            if (g_nativeRectActive.load(std::memory_order_acquire))
+            {
+                ULONGLONG deadline = g_nativeRectExpiresAt.load(
+                    std::memory_order_acquire);
+                if (g_nativeRectStopRequested.load(std::memory_order_acquire) ||
+                    (deadline && GetTickCount64() >= deadline))
+                {
+                    g_nativeRectStopRequested.store(true,
+                                                   std::memory_order_release);
+                    RequestDwmScenePass();
+                }
+            }
+            continue;
         }
         else if (waitResult == WAIT_OBJECT_0 + 1)
         {
@@ -9725,6 +9782,8 @@ BOOL Wh_ModInit()
     g_nativeProbeAttempted.store(false, std::memory_order_release);
     g_nativeRectActive.store(false, std::memory_order_release);
     g_nativeRectStopRequested.store(false, std::memory_order_release);
+    g_nativeRectHwnd.store(nullptr, std::memory_order_release);
+    g_nativeRectExpiresAt.store(0, std::memory_order_release);
     g_dwmSceneWakeMessage =
         RegisterWindowMessageW(L"Windhawk.WobblyWindows.DwmSceneWake");
     if (g_dwmSceneWakeMessage == 0)
