@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.287
+// @version         0.288
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -469,7 +469,8 @@ using NativeProbeUpdateImageBrush_t = long(__cdecl*)(
     const void*, int, int, const void*, const void*, int, int, int, int,
     const void*);
 using NativeProbeCreateRectangle_t = long(__cdecl*)(const RECT*, void**);
-using NativeProbeCreateRegion_t = long(__cdecl*)(HRGN, void**);
+using NativeProbeCreateCombined_t = long(__cdecl*)(
+    const void*, const void*, int, void**);
 using NativeProbeCreateGeometryInstruction_t = long(__cdecl*)(
     void*, void*, void**);
 using NativeRectCreateVisual_t = long(__cdecl*)(void**);
@@ -494,7 +495,7 @@ NativeProbeCreateBitmapInstruction_t g_nativeProbeCreateBitmapInstruction = null
 NativeProbeCreateImageBrush_t g_nativeProbeCreateImageBrush = nullptr;
 NativeProbeUpdateImageBrush_t g_nativeProbeUpdateImageBrush = nullptr;
 NativeProbeCreateRectangle_t g_nativeProbeCreateRectangle = nullptr;
-NativeProbeCreateRegion_t g_nativeProbeCreateRegion = nullptr;
+NativeProbeCreateCombined_t g_nativeProbeCreateCombined = nullptr;
 NativeProbeCreateGeometryInstruction_t g_nativeProbeCreateGeometryInstruction = nullptr;
 NativeRectCreateVisual_t g_nativeRectCreateVisual = nullptr;
 NativeRectAddInstruction_t g_nativeRectAddInstruction = nullptr;
@@ -514,13 +515,11 @@ struct NativeRectState
     void* instruction = nullptr;
     void* visual = nullptr;
     void* transform = nullptr;
-    HRGN region = nullptr;
     void* sourceProxy = nullptr;
     HWND hwnd = nullptr;
     int width = 0;
     int height = 0;
     ULONGLONG expiresAt = 0;
-    bool regionGeometry = false;
     bool detachFailureLogged = false;
 };
 NativeRectState g_nativeRectState; // DWM scene thread only.
@@ -535,13 +534,13 @@ void* g_nativeProbeImageVtableSymbol = nullptr;
 void* g_nativeProbeBitmapVtableSymbol = nullptr;
 void* g_nativeProbeImageBrushVtableSymbol = nullptr;
 void* g_nativeProbeRectangleVtableSymbol = nullptr;
-void* g_nativeProbeRegionVtableSymbol = nullptr;
+void* g_nativeProbeCombinedVtableSymbol = nullptr;
 void* g_nativeProbeGeometryInstructionVtableSymbol = nullptr;
 std::atomic<void*> g_nativeProbeImageVtable = nullptr;
 std::atomic<void*> g_nativeProbeBitmapVtable = nullptr;
 std::atomic<void*> g_nativeProbeImageBrushVtable = nullptr;
 std::atomic<void*> g_nativeProbeRectangleVtable = nullptr;
-std::atomic<void*> g_nativeProbeRegionVtable = nullptr;
+std::atomic<void*> g_nativeProbeCombinedVtable = nullptr;
 std::atomic<void*> g_nativeProbeGeometryInstructionVtable = nullptr;
 std::atomic_bool g_nativeProbeAttempted = false;
 
@@ -3118,9 +3117,10 @@ static bool InitializeDwmHooks()
         {{L"public: static long __cdecl ResourceHelper::CreateRectangleGeometry("
            L"struct tagRECT const *,class CRectangleGeometryProxy * *)"},
          &g_nativeProbeCreateRectangle, nullptr, true},
-        {{L"public: static long __cdecl ResourceHelper::CreateGeometryFromHRGN("
-           L"struct HRGN__ *,class CRgnGeometryProxy * *)"},
-         &g_nativeProbeCreateRegion, nullptr, true},
+        {{L"public: static long __cdecl ResourceHelper::CreateCombinedGeometry("
+           L"class CBaseGeometryProxy const *,class CBaseGeometryProxy const *,"
+           L"enum MilCombineMode::Enum,class CCombinedGeometryProxy * *)"},
+         &g_nativeProbeCreateCombined, nullptr, true},
         {{L"public: static long __cdecl CDrawGeometryInstruction::Create("
            L"class CBaseLegacyMilBrushProxy *,class CBaseGeometryProxy *,"
            L"class CDrawGeometryInstruction * *)"},
@@ -3179,8 +3179,8 @@ static bool InitializeDwmHooks()
          &g_nativeProbeImageBrushVtableSymbol, nullptr, true},
         {{L"const CRectangleGeometryProxy::`vftable'"},
          &g_nativeProbeRectangleVtableSymbol, nullptr, true},
-        {{L"const CRgnGeometryProxy::`vftable'"},
-         &g_nativeProbeRegionVtableSymbol, nullptr, true},
+        {{L"const CCombinedGeometryProxy::`vftable'"},
+         &g_nativeProbeCombinedVtableSymbol, nullptr, true},
         {{L"const CDrawGeometryInstruction::`vftable'"},
          &g_nativeProbeGeometryInstructionVtableSymbol, nullptr, true},
 
@@ -3309,7 +3309,7 @@ static bool InitializeDwmHooks()
     keepValid(g_nativeProbeCreateImageBrush);
     keepValid(g_nativeProbeUpdateImageBrush);
     keepValid(g_nativeProbeCreateRectangle);
-    keepValid(g_nativeProbeCreateRegion);
+    keepValid(g_nativeProbeCreateCombined);
     keepValid(g_nativeProbeCreateGeometryInstruction);
     keepValid(g_nativeRectCreateVisual);
     keepValid(g_nativeRectAddInstruction);
@@ -3371,8 +3371,8 @@ static bool InitializeDwmHooks()
                       g_nativeProbeImageBrushVtable);
     cacheVtableSymbol(g_nativeProbeRectangleVtableSymbol,
                       g_nativeProbeRectangleVtable);
-    cacheVtableSymbol(g_nativeProbeRegionVtableSymbol,
-                      g_nativeProbeRegionVtable);
+    cacheVtableSymbol(g_nativeProbeCombinedVtableSymbol,
+                      g_nativeProbeCombinedVtable);
     cacheVtableSymbol(g_nativeProbeGeometryInstructionVtableSymbol,
                       g_nativeProbeGeometryInstructionVtable);
     Wh_Log(L"NATIVE SOURCE PROBE: create=%d update=%s drawBitmap=%d "
@@ -3394,9 +3394,9 @@ static bool InitializeDwmHooks()
            g_nativeProbeRectangleVtable.load(std::memory_order_acquire),
            g_nativeProbeGeometryInstructionVtable.load(
                std::memory_order_acquire));
-    Wh_Log(L"NATIVE REGION RECT PROBE: region=%d regionVtable=%p attached=0",
-           g_nativeProbeCreateRegion != nullptr,
-           g_nativeProbeRegionVtable.load(std::memory_order_acquire));
+    Wh_Log(L"NATIVE COMBINED GEOMETRY PROBE: create=%d vtable=%p attached=0",
+           g_nativeProbeCreateCombined != nullptr,
+           g_nativeProbeCombinedVtable.load(std::memory_order_acquire));
     Wh_Log(L"NATIVE MESH BRIDGE: mesh=%d update=%d group=%d "
            L"groupUpdate=%d meshFactory=%d directCachedImageSource=0 "
            L"getParent=%d getProxy=%d",
@@ -3843,7 +3843,6 @@ static void ReleaseNativeRectState(NativeRectState& state)
     if (state.brush) g_cBaseObjectRelease(state.brush);
     if (state.image) g_cBaseObjectRelease(state.image);
     if (state.root) g_cBaseObjectRelease(state.root);
-    if (state.region) DeleteObject(state.region);
     state = {};
 }
 
@@ -3870,8 +3869,8 @@ static bool DetachNativeRectProbe(const wchar_t* reason)
         RequestDwmScenePass();
         return false;
     }
-    Wh_Log(L"NATIVE SHAPE DETACHED: HWND=%p geometry=%s reason=%s",
-           state.hwnd, state.regionGeometry ? L"region-rectangle" : L"rectangle", reason);
+    Wh_Log(L"NATIVE SHAPE DETACHED: HWND=%p geometry=rectangle reason=%s",
+           state.hwnd, reason);
     ReleaseNativeRectState(state);
     g_nativeRectActive.store(false, std::memory_order_release);
     g_nativeRectStopRequested.store(false, std::memory_order_release);
@@ -3906,8 +3905,7 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
                                      void* sourceProxy, void* compositor,
                                      void*& image, void*& brush,
                                      void*& rectangle, void*& instruction,
-                                     HRGN& region, int width, int height,
-                                     bool regionSelected)
+                                     int width, int height)
 {
     AcquireSRWLockShared(&g_settingsLock);
     bool affineSelected = g_settings.rendererMode == RendererMode::Affine;
@@ -3941,7 +3939,6 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
     pending.sourceProxy = sourceProxy;
     pending.width = width;
     pending.height = height;
-    pending.regionGeometry = regionSelected;
     const wchar_t* stage = L"CreateVisual";
     Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
     long result = g_nativeRectCreateVisual(&pending.visual);
@@ -4004,22 +4001,18 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
         pending.brush = brush;
         pending.rectangle = rectangle;
         pending.instruction = instruction;
-        pending.region = region;
         image = brush = rectangle = instruction = nullptr;
-        region = nullptr;
         pending.expiresAt = GetTickCount64() + 5000;
         g_nativeRectState = pending;
         g_nativeRectActive.store(true, std::memory_order_release);
-        Wh_Log(L"NATIVE SHAPE ATTACHED: HWND=%p geometry=%s root=%p "
+        Wh_Log(L"NATIVE SHAPE ATTACHED: HWND=%p geometry=rectangle root=%p "
                L"visual=%p durationMs=5000 affine=unchanged snapshot=none",
-               hwnd, regionSelected ? L"region-rectangle" : L"rectangle",
-               root, pending.visual);
+               hwnd, root, pending.visual);
         RequestDwmScenePass();
         return true;
     }
-    Wh_Log(L"NATIVE SHAPE FAILED: HWND=%p geometry=%s stage=%s "
-           L"result=0x%08X inserted=%d", hwnd,
-           regionSelected ? L"region-rectangle" : L"rectangle", stage,
+    Wh_Log(L"NATIVE SHAPE FAILED: HWND=%p geometry=rectangle stage=%s "
+           L"result=0x%08X inserted=%d", hwnd, stage,
            static_cast<unsigned>(result), inserted);
     if (inserted)
     {
@@ -4027,9 +4020,7 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
         pending.brush = brush;
         pending.rectangle = rectangle;
         pending.instruction = instruction;
-        pending.region = region;
         image = brush = rectangle = instruction = nullptr;
-        region = nullptr;
         pending.expiresAt = GetTickCount64();
         g_nativeRectState = pending;
         g_nativeRectActive.store(true, std::memory_order_release);
@@ -4042,91 +4033,84 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
     return false;
 }
 
-static bool CreateNativeRegionRectangleInstruction(HWND hwnd, void* brush,
-                                                    int width, int height,
-                                                    void*& geometryOut,
-                                                    void*& instructionOut,
-                                                    HRGN& regionOut)
+static void RunDetachedNativeCombinedGeometryProbe(HWND hwnd, void* brush,
+                                                    int width, int height)
 {
-    geometryOut = nullptr;
-    instructionOut = nullptr;
-    regionOut = nullptr;
     if (!IsOnDwmSceneThread() ||
         g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
-        !g_nativeProbeCreateRegion ||
-        !g_nativeProbeCreateGeometryInstruction ||
-        !g_cBaseObjectRelease ||
-        !g_nativeProbeRegionVtable.load(std::memory_order_acquire) ||
+        !g_nativeProbeCreateRectangle || !g_nativeProbeCreateCombined ||
+        !g_nativeProbeCreateGeometryInstruction || !g_cBaseObjectRelease ||
+        !g_nativeProbeRectangleVtable.load(std::memory_order_acquire) ||
+        !g_nativeProbeCombinedVtable.load(std::memory_order_acquire) ||
         !g_nativeProbeGeometryInstructionVtable.load(
             std::memory_order_acquire) ||
         width < 32 || height < 32)
     {
-        Wh_Log(L"NATIVE REGION RECT PROBE: skipped HWND=%p", hwnd);
-        return false;
+        Wh_Log(L"NATIVE COMBINED GEOMETRY: skipped HWND=%p", hwnd);
+        return;
     }
 
-    const int rectWidth = std::min(width, 160);
-    const int rectHeight = std::min(height, 100);
-    Wh_Log(L"NATIVE REGION RECT STAGE: CreateRectRgn HWND=%p", hwnd);
-    HRGN region = CreateRectRgn(0, 0, rectWidth, rectHeight);
-    void* geometry = nullptr;
+    const RECT top = {0, 0, std::min(width, 160), std::min(height, 50)};
+    const RECT left = {0, 0, std::min(width, 80), std::min(height, 100)};
+    void* topGeometry = nullptr;
+    void* leftGeometry = nullptr;
+    void* combined = nullptr;
     void* instruction = nullptr;
-    bool geometryType = false;
+    const wchar_t* stage = L"CreateTop";
+    Wh_Log(L"NATIVE COMBINED GEOMETRY STAGE: %s HWND=%p", stage, hwnd);
+    long result = g_nativeProbeCreateRectangle(&top, &topGeometry);
+    auto matches = [](void* object, void* vtable) {
+        return object && IsReadableMemory(object, sizeof(void*)) &&
+               *reinterpret_cast<void**>(object) == vtable;
+    };
+    bool topType = matches(topGeometry,
+                           g_nativeProbeRectangleVtable.load(
+                               std::memory_order_acquire));
+    if (result >= 0 && !topType) result = E_UNEXPECTED;
+    bool leftType = false;
+    bool combinedType = false;
     bool instructionType = false;
-    long result = region ? S_OK : HRESULT_FROM_WIN32(GetLastError());
-    const wchar_t* stage = L"CreateRectRgn";
-    RECT regionBox = {};
-    int regionKind = region ? GetRgnBox(region, &regionBox) : ERROR;
-    DWORD regionBytes = region ? GetRegionData(region, 0, nullptr) : 0;
-    Wh_Log(L"NATIVE REGION RECT INPUT: HWND=%p kind=%d box=%ld,%ld-%ld,%ld "
-           L"dataBytes=%lu", hwnd, regionKind, regionBox.left,
-           regionBox.top, regionBox.right, regionBox.bottom, regionBytes);
-    if (result >= 0 && (regionKind == ERROR || regionBox.right <= regionBox.left ||
-                        regionBox.bottom <= regionBox.top || !regionBytes))
-        result = E_INVALIDARG;
     if (result >= 0)
     {
-        stage = L"CreateGeometryFromHRGN";
-        Wh_Log(L"NATIVE REGION RECT STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeProbeCreateRegion(region, &geometry);
-        geometryType = geometry && IsReadableMemory(geometry, sizeof(void*)) &&
-            *reinterpret_cast<void**>(geometry) ==
-                g_nativeProbeRegionVtable.load(std::memory_order_acquire);
-        if (result >= 0 && !geometryType) result = E_UNEXPECTED;
+        stage = L"CreateLeft";
+        Wh_Log(L"NATIVE COMBINED GEOMETRY STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeProbeCreateRectangle(&left, &leftGeometry);
+        leftType = matches(leftGeometry,
+                           g_nativeProbeRectangleVtable.load(
+                               std::memory_order_acquire));
+        if (result >= 0 && !leftType) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"CombineMode0";
+        Wh_Log(L"NATIVE COMBINED GEOMETRY STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeProbeCreateCombined(topGeometry, leftGeometry,
+                                              0, &combined);
+        combinedType = matches(combined,
+                               g_nativeProbeCombinedVtable.load(
+                                   std::memory_order_acquire));
+        if (result >= 0 && !combinedType) result = E_UNEXPECTED;
     }
     if (result >= 0)
     {
         stage = L"CreateInstruction";
-        Wh_Log(L"NATIVE REGION RECT STAGE: %s HWND=%p", stage, hwnd);
+        Wh_Log(L"NATIVE COMBINED GEOMETRY STAGE: %s HWND=%p", stage, hwnd);
         result = g_nativeProbeCreateGeometryInstruction(
-            brush, geometry, &instruction);
-        instructionType = instruction &&
-            IsReadableMemory(instruction, sizeof(void*)) &&
-            *reinterpret_cast<void**>(instruction) ==
-                g_nativeProbeGeometryInstructionVtable.load(
-                    std::memory_order_acquire);
+            brush, combined, &instruction);
+        instructionType = matches(instruction,
+                                  g_nativeProbeGeometryInstructionVtable.load(
+                                      std::memory_order_acquire));
         if (result >= 0 && !instructionType) result = E_UNEXPECTED;
     }
-    Wh_Log(L"NATIVE REGION RECT PROBE: HWND=%p stage=%s result=0x%08X "
-           L"geometryType=%d instructionType=%d",
-           hwnd, stage, static_cast<unsigned>(result), geometryType,
-           instructionType);
-    bool ready = result >= 0 && geometryType && instructionType;
-    if (ready)
-    {
-        geometryOut = geometry;
-        instructionOut = instruction;
-        regionOut = region;
-        region = nullptr;
-    }
-    else
-    {
-        if (instructionType) g_cBaseObjectRelease(instruction);
-        if (geometryType) g_cBaseObjectRelease(geometry);
-    }
-    if (region) DeleteObject(region);
-    return ready;
+    Wh_Log(L"NATIVE COMBINED GEOMETRY: HWND=%p stage=%s result=0x%08X "
+           L"top=%d left=%d combined=%d instruction=%d attached=0",
+           hwnd, stage, static_cast<unsigned>(result), topType, leftType,
+           combinedType, instructionType);
+    if (instructionType) g_cBaseObjectRelease(instruction);
+    if (combinedType) g_cBaseObjectRelease(combined);
+    if (leftType) g_cBaseObjectRelease(leftGeometry);
+    if (topType) g_cBaseObjectRelease(topGeometry);
 }
 
 static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
@@ -4174,7 +4158,7 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
     const wchar_t* stage = L"UpdateBrush";
     if (result >= 0)
     {
-        // Keep the proven rectangle as a fallback if the region-rectangle factory fails.
+        // This visible rectangle is the control for the detached combined-geometry probe.
         const RECT rect = {0, 0, std::min(width, 160), std::min(height, 100)};
         stage = L"CreateRectangle";
         Wh_Log(L"NATIVE RECTANGLE STAGE: %s HWND=%p", stage, hwnd);
@@ -4203,24 +4187,10 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
            exactRectangle, exactInstruction);
     if (result >= 0 && exactType && exactRectangle && exactInstruction)
     {
-        void* regionGeometry = nullptr;
-        void* regionInstruction = nullptr;
-        HRGN regionHandle = nullptr;
-        bool regionSelected = CreateNativeRegionRectangleInstruction(
-            hwnd, brush, width, height,
-            regionGeometry, regionInstruction, regionHandle);
-        if (regionSelected)
-        {
-            g_cBaseObjectRelease(instruction);
-            g_cBaseObjectRelease(rectangle);
-            rectangle = regionGeometry;
-            instruction = regionInstruction;
-        }
+        RunDetachedNativeCombinedGeometryProbe(hwnd, brush, width, height);
         TryAttachNativeRectProbe(hwnd, topLevelWindow, sourceProxy, compositor,
                                  image, brush, rectangle, instruction,
-                                 regionHandle, width, height,
-                                 regionSelected);
-        if (regionHandle) DeleteObject(regionHandle);
+                                 width, height);
     }
     if (exactInstruction && instruction) g_cBaseObjectRelease(instruction);
     if (exactRectangle && rectangle) g_cBaseObjectRelease(rectangle);
