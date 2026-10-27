@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.293
+// @version         0.294
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -526,6 +526,9 @@ struct NativeRectState
     bool twoRectangles = false;
     bool vertexMesh = false;
     bool detachFailureLogged = false;
+    ULONGLONG meshGeneration = 0;
+    ULONGLONG submittedMeshRevision = 0;
+    unsigned int meshUpdateCount = 0;
 };
 NativeRectState g_nativeRectState; // DWM scene thread only.
 NativeProbeCreateMesh_t g_nativeProbeCreateMesh = nullptr;
@@ -3888,6 +3891,112 @@ static bool DetachNativeRectProbe(const wchar_t* reason)
     return true;
 }
 
+static float NativeMeshPreviewScale(int width, int height)
+{
+    return static_cast<float>(std::min(0.35,
+        std::min(300.0 / static_cast<double>(width),
+                 220.0 / static_cast<double>(height))));
+}
+
+static void UpdateNativeVertexMeshProbe(NativeRectState& state)
+{
+    if (!state.vertexMesh || !state.rectangleB || !g_nativeProbeUpdateMesh)
+        return;
+
+    WobbleMesh physics = {};
+    ULONGLONG generation = 0;
+    ULONGLONG revision = 0;
+    bool found = false;
+    AcquireSRWLockShared(&g_animationSlotsLock);
+    for (const WindowAnimationSlot& slot : g_animationSlots)
+    {
+        if (slot.active && slot.dragging && slot.hwnd == state.hwnd &&
+            !slot.mesh.resizing)
+        {
+            physics = slot.mesh;
+            generation = slot.generation;
+            revision = slot.meshRevision;
+            found = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_animationSlotsLock);
+    if (!found || !std::isfinite(physics.width) ||
+        !std::isfinite(physics.height) ||
+        physics.width < 1.0 || physics.height < 1.0 ||
+        std::abs(physics.width - state.width) > 2.0 ||
+        std::abs(physics.height - state.height) > 2.0)
+        return;
+    if (state.meshGeneration && state.meshGeneration != generation)
+    {
+        DetachNativeRectProbe(L"mesh-generation-changed");
+        return;
+    }
+    if (state.meshGeneration == generation &&
+        state.submittedMeshRevision == revision)
+        return;
+
+    NativeProbePoint3F positions[16] = {};
+    NativeProbePoint2D coordinates[16] = {};
+    unsigned int indices[54] = {};
+    const float scale = NativeMeshPreviewScale(state.width, state.height);
+    double maximumDisplacement = 0.0;
+    for (unsigned int i = 0; i < 16; ++i)
+    {
+        const WobblePoint& point = physics.points[i];
+        if (!std::isfinite(point.basePosition.x) ||
+            !std::isfinite(point.basePosition.y) ||
+            !std::isfinite(point.position.x) ||
+            !std::isfinite(point.position.y))
+        {
+            DetachNativeRectProbe(L"mesh-position-invalid");
+            return;
+        }
+        double limitX = std::min(100.0, physics.width * 0.1);
+        double limitY = std::min(100.0, physics.height * 0.1);
+        double dx = std::clamp(point.position.x - point.basePosition.x,
+                               -limitX, limitX);
+        double dy = std::clamp(point.position.y - point.basePosition.y,
+                               -limitY, limitY);
+        maximumDisplacement = std::max(maximumDisplacement,
+                                        std::hypot(dx, dy));
+        positions[i] = {
+            static_cast<float>((point.basePosition.x + dx) * scale),
+            static_cast<float>((point.basePosition.y + dy) * scale), 0.0f};
+        coordinates[i] = {point.basePosition.x, point.basePosition.y};
+    }
+    unsigned int count = 0;
+    for (unsigned int y = 0; y < 3; ++y)
+    {
+        for (unsigned int x = 0; x < 3; ++x)
+        {
+            unsigned int a = y * 4 + x;
+            unsigned int b = a + 1;
+            unsigned int c = a + 4;
+            unsigned int d = c + 1;
+            indices[count++] = a; indices[count++] = c; indices[count++] = b;
+            indices[count++] = b; indices[count++] = c; indices[count++] = d;
+        }
+    }
+    long result = g_nativeProbeUpdateMesh(state.rectangleB, 0, positions,
+                                           coordinates, 16, indices, count);
+    if (result < 0)
+    {
+        Wh_Log(L"NATIVE VERTEX MESH UPDATE FAILED: HWND=%p result=0x%08X",
+               state.hwnd, static_cast<unsigned>(result));
+        DetachNativeRectProbe(L"mesh-update-failed");
+        return;
+    }
+    state.meshGeneration = generation;
+    state.submittedMeshRevision = revision;
+    if (++state.meshUpdateCount == 1 || state.meshUpdateCount % 120 == 0)
+    {
+        Wh_Log(L"NATIVE VERTEX MESH UPDATE: HWND=%p count=%u revision=%llu "
+               L"maxDisplacement=%.1f", state.hwnd, state.meshUpdateCount,
+               revision, maximumDisplacement);
+    }
+}
+
 static void MaintainNativeRectProbe()
 {
     if (!IsOnDwmSceneThread() ||
@@ -3908,7 +4017,10 @@ static void MaintainNativeRectProbe()
         GetWindowRect(state.hwnd, &bounds) &&
         bounds.right - bounds.left == state.width &&
         bounds.bottom - bounds.top == state.height;
-    if (!sourceValid) DetachNativeRectProbe(L"source-changed");
+    if (!sourceValid)
+        DetachNativeRectProbe(L"source-changed");
+    else
+        UpdateNativeVertexMeshProbe(state);
 }
 
 static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
@@ -4239,18 +4351,17 @@ static void RunVisibleNativeMeshProbe(HWND hwnd, void* topLevelWindow,
     NativeProbePoint3F positions[16] = {};
     NativeProbePoint2D coordinates[16] = {};
     unsigned int indices[54] = {};
-    constexpr float rowShift[4] = {0.0f, 20.0f, -12.0f, 0.0f};
-    constexpr float columnShift[4] = {0.0f, 7.0f, -5.0f, 0.0f};
+    const float scale = NativeMeshPreviewScale(width, height);
     for (int y = 0; y < 4; ++y)
     {
         for (int x = 0; x < 4; ++x)
         {
             int index = y * 4 + x;
-            float px = static_cast<float>(160 * x) / 3.0f;
-            float py = static_cast<float>(100 * y) / 3.0f;
-            positions[index] = {px + rowShift[y], py + columnShift[x], 0.0f};
-            coordinates[index] = {static_cast<double>(px),
-                                  static_cast<double>(py)};
+            double px = static_cast<double>(width * x) / 3.0;
+            double py = static_cast<double>(height * y) / 3.0;
+            positions[index] = {static_cast<float>(px * scale),
+                                static_cast<float>(py * scale), 0.0f};
+            coordinates[index] = {px, py};
         }
     }
     unsigned int count = 0;
@@ -4317,7 +4428,7 @@ static void RunVisibleNativeMeshProbe(HWND hwnd, void* topLevelWindow,
                                      false, true, width, height))
         {
             Wh_Log(L"NATIVE VERTEX MESH: attached HWND=%p "
-                   L"staticBend=1 liveSource=1 affine=unchanged", hwnd);
+                   L"physicsLinked=1 liveSource=1 affine=unchanged", hwnd);
         }
     }
     if (instruction) g_cBaseObjectRelease(instruction);
