@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.291
+// @version         0.292
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -513,16 +513,16 @@ struct NativeRectState
     void* image = nullptr;
     void* brush = nullptr;
     void* rectangle = nullptr;
-    void* childGeometryA = nullptr;
-    void* childGeometryB = nullptr;
+    void* rectangleB = nullptr;
     void* instruction = nullptr;
+    void* instructionB = nullptr;
     void* visual = nullptr;
     void* transform = nullptr;
     void* sourceProxy = nullptr;
     HWND hwnd = nullptr;
     int width = 0;
     int height = 0;
-    bool combinedGeometry = false;
+    bool twoRectangles = false;
     bool detachFailureLogged = false;
 };
 NativeRectState g_nativeRectState; // DWM scene thread only.
@@ -3842,9 +3842,9 @@ static void ReleaseNativeRectState(NativeRectState& state)
     if (state.visual) g_cBaseObjectRelease(state.visual);
     if (state.transform) g_cBaseObjectRelease(state.transform);
     if (state.instruction) g_cBaseObjectRelease(state.instruction);
+    if (state.instructionB) g_cBaseObjectRelease(state.instructionB);
     if (state.rectangle) g_cBaseObjectRelease(state.rectangle);
-    if (state.childGeometryA) g_cBaseObjectRelease(state.childGeometryA);
-    if (state.childGeometryB) g_cBaseObjectRelease(state.childGeometryB);
+    if (state.rectangleB) g_cBaseObjectRelease(state.rectangleB);
     if (state.brush) g_cBaseObjectRelease(state.brush);
     if (state.image) g_cBaseObjectRelease(state.image);
     if (state.root) g_cBaseObjectRelease(state.root);
@@ -3877,7 +3877,7 @@ static bool DetachNativeRectProbe(const wchar_t* reason)
     }
     Wh_Log(L"NATIVE SHAPE DETACHED: HWND=%p geometry=%s reason=%s",
            state.hwnd,
-           state.combinedGeometry ? L"combined" : L"rectangle", reason);
+           state.twoRectangles ? L"two-rectangles" : L"rectangle", reason);
     ReleaseNativeRectState(state);
     g_nativeRectHwnd.store(nullptr, std::memory_order_release);
     g_nativeRectActive.store(false, std::memory_order_release);
@@ -3912,9 +3912,8 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
                                      void* sourceProxy, void* compositor,
                                      void*& image, void*& brush,
                                      void*& rectangle, void*& instruction,
-                                     void*& childGeometryA,
-                                     void*& childGeometryB,
-                                     bool combinedSelected,
+                                     void*& rectangleB, void*& instructionB,
+                                     bool twoRectanglesSelected,
                                      int width, int height)
 {
     AcquireSRWLockShared(&g_settingsLock);
@@ -3949,7 +3948,7 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
     pending.sourceProxy = sourceProxy;
     pending.width = width;
     pending.height = height;
-    pending.combinedGeometry = combinedSelected;
+    pending.twoRectangles = twoRectanglesSelected;
     const wchar_t* stage = L"CreateVisual";
     Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
     long result = g_nativeRectCreateVisual(&pending.visual);
@@ -3959,6 +3958,12 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
         stage = L"AddInstruction";
         Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
         result = g_nativeRectAddInstruction(pending.visual, instruction);
+    }
+    if (result >= 0 && instructionB)
+    {
+        stage = L"AddSecondInstruction";
+        Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeRectAddInstruction(pending.visual, instructionB);
     }
     if (result >= 0)
     {
@@ -4011,11 +4016,10 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
         pending.image = image;
         pending.brush = brush;
         pending.rectangle = rectangle;
-        pending.childGeometryA = childGeometryA;
-        pending.childGeometryB = childGeometryB;
+        pending.rectangleB = rectangleB;
         pending.instruction = instruction;
-        image = brush = rectangle = instruction = nullptr;
-        childGeometryA = childGeometryB = nullptr;
+        pending.instructionB = instructionB;
+        image = brush = rectangle = rectangleB = instruction = instructionB = nullptr;
         g_nativeRectState = pending;
         g_nativeRectHwnd.store(hwnd, std::memory_order_release);
         g_nativeRectActive.store(true, std::memory_order_release);
@@ -4024,25 +4028,24 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
             g_nativeRectStopRequested.store(true, std::memory_order_release);
         Wh_Log(L"NATIVE SHAPE ATTACHED: HWND=%p geometry=%s root=%p "
                L"visual=%p duration=until-release affine=unchanged snapshot=none",
-               hwnd, combinedSelected ? L"combined" : L"rectangle",
+               hwnd, twoRectanglesSelected ? L"two-rectangles" : L"rectangle",
                root, pending.visual);
         RequestDwmScenePass();
         return true;
     }
     Wh_Log(L"NATIVE SHAPE FAILED: HWND=%p geometry=%s stage=%s "
            L"result=0x%08X inserted=%d", hwnd,
-           combinedSelected ? L"combined" : L"rectangle", stage,
+           twoRectanglesSelected ? L"two-rectangles" : L"rectangle", stage,
            static_cast<unsigned>(result), inserted);
     if (inserted)
     {
         pending.image = image;
         pending.brush = brush;
         pending.rectangle = rectangle;
-        pending.childGeometryA = childGeometryA;
-        pending.childGeometryB = childGeometryB;
+        pending.rectangleB = rectangleB;
         pending.instruction = instruction;
-        image = brush = rectangle = instruction = nullptr;
-        childGeometryA = childGeometryB = nullptr;
+        pending.instructionB = instructionB;
+        image = brush = rectangle = rectangleB = instruction = instructionB = nullptr;
         g_nativeRectState = pending;
         g_nativeRectHwnd.store(hwnd, std::memory_order_release);
         g_nativeRectActive.store(true, std::memory_order_release);
@@ -4055,98 +4058,66 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
     return false;
 }
 
-static bool CreateNativeCombinedGeometryInstruction(
+static bool CreateNativeSecondRectangleInstruction(
     HWND hwnd, void* brush, int width, int height,
-    void*& geometryOut, void*& instructionOut,
-    void*& childAOut, void*& childBOut)
+    void*& rectangleOut, void*& instructionOut)
 {
-    geometryOut = instructionOut = childAOut = childBOut = nullptr;
+    rectangleOut = instructionOut = nullptr;
     if (!IsOnDwmSceneThread() ||
         g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
-        !g_nativeProbeCreateRectangle || !g_nativeProbeCreateCombined ||
+        !g_nativeProbeCreateRectangle ||
         !g_nativeProbeCreateGeometryInstruction || !g_cBaseObjectRelease ||
         !g_nativeProbeRectangleVtable.load(std::memory_order_acquire) ||
-        !g_nativeProbeCombinedVtable.load(std::memory_order_acquire) ||
         !g_nativeProbeGeometryInstructionVtable.load(
             std::memory_order_acquire) ||
-        width < 32 || height < 32)
+        width < 80 || height < 100)
     {
-        Wh_Log(L"NATIVE COMBINED GEOMETRY: skipped HWND=%p", hwnd);
+        Wh_Log(L"NATIVE SECOND RECTANGLE: skipped HWND=%p", hwnd);
         return false;
     }
 
-    const RECT top = {0, 0, std::min(width, 160), std::min(height, 50)};
-    const RECT left = {0, 0, std::min(width, 80), std::min(height, 100)};
-    void* topGeometry = nullptr;
-    void* leftGeometry = nullptr;
-    void* combined = nullptr;
+    // The first rectangle occupies the top strip. This one forms the left leg.
+    const RECT left = {0, 50, std::min(width, 80), std::min(height, 150)};
+    void* rectangle = nullptr;
     void* instruction = nullptr;
-    const wchar_t* stage = L"CreateTop";
-    Wh_Log(L"NATIVE COMBINED GEOMETRY STAGE: %s HWND=%p", stage, hwnd);
-    long result = g_nativeProbeCreateRectangle(&top, &topGeometry);
+    const wchar_t* stage = L"CreateRectangle";
+    Wh_Log(L"NATIVE SECOND RECTANGLE STAGE: %s HWND=%p", stage, hwnd);
+    long result = g_nativeProbeCreateRectangle(&left, &rectangle);
     auto matches = [](void* object, void* vtable) {
         return object && IsReadableMemory(object, sizeof(void*)) &&
                *reinterpret_cast<void**>(object) == vtable;
     };
-    bool topType = matches(topGeometry,
-                           g_nativeProbeRectangleVtable.load(
-                               std::memory_order_acquire));
-    if (result >= 0 && !topType) result = E_UNEXPECTED;
-    bool leftType = false;
-    bool combinedType = false;
+    bool rectangleType = matches(rectangle,
+                                 g_nativeProbeRectangleVtable.load(
+                                     std::memory_order_acquire));
+    if (result >= 0 && !rectangleType) result = E_UNEXPECTED;
     bool instructionType = false;
     if (result >= 0)
     {
-        stage = L"CreateLeft";
-        Wh_Log(L"NATIVE COMBINED GEOMETRY STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeProbeCreateRectangle(&left, &leftGeometry);
-        leftType = matches(leftGeometry,
-                           g_nativeProbeRectangleVtable.load(
-                               std::memory_order_acquire));
-        if (result >= 0 && !leftType) result = E_UNEXPECTED;
-    }
-    if (result >= 0)
-    {
-        stage = L"CombineMode0";
-        Wh_Log(L"NATIVE COMBINED GEOMETRY STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeProbeCreateCombined(topGeometry, leftGeometry,
-                                              0, &combined);
-        combinedType = matches(combined,
-                               g_nativeProbeCombinedVtable.load(
-                                   std::memory_order_acquire));
-        if (result >= 0 && !combinedType) result = E_UNEXPECTED;
-    }
-    if (result >= 0)
-    {
         stage = L"CreateInstruction";
-        Wh_Log(L"NATIVE COMBINED GEOMETRY STAGE: %s HWND=%p", stage, hwnd);
+        Wh_Log(L"NATIVE SECOND RECTANGLE STAGE: %s HWND=%p", stage, hwnd);
         result = g_nativeProbeCreateGeometryInstruction(
-            brush, combined, &instruction);
+            brush, rectangle, &instruction);
         instructionType = matches(instruction,
                                   g_nativeProbeGeometryInstructionVtable.load(
                                       std::memory_order_acquire));
         if (result >= 0 && !instructionType) result = E_UNEXPECTED;
     }
-    Wh_Log(L"NATIVE COMBINED GEOMETRY: HWND=%p stage=%s result=0x%08X "
-           L"top=%d left=%d combined=%d instruction=%d attached=0",
-           hwnd, stage, static_cast<unsigned>(result), topType, leftType,
-           combinedType, instructionType);
-    bool ready = result >= 0 && topType && leftType &&
-                 combinedType && instructionType;
+    Wh_Log(L"NATIVE SECOND RECTANGLE: HWND=%p stage=%s result=0x%08X "
+           L"rectangle=%d instruction=%d attached=0",
+           hwnd, stage, static_cast<unsigned>(result), rectangleType,
+           instructionType);
+    bool ready = result >= 0 && rectangleType && instructionType;
     if (ready)
     {
-        geometryOut = combined;
+        rectangleOut = rectangle;
         instructionOut = instruction;
-        childAOut = topGeometry;
-        childBOut = leftGeometry;
     }
     else
     {
         if (instructionType) g_cBaseObjectRelease(instruction);
-        if (combinedType) g_cBaseObjectRelease(combined);
-        if (leftType) g_cBaseObjectRelease(leftGeometry);
-        if (topType) g_cBaseObjectRelease(topGeometry);
+        if (rectangleType) g_cBaseObjectRelease(rectangle);
     }
     return ready;
 }
@@ -4197,7 +4168,7 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
     if (result >= 0)
     {
         // Keep the proven rectangle if combined geometry cannot be created.
-        const RECT rect = {0, 0, std::min(width, 160), std::min(height, 100)};
+        const RECT rect = {0, 0, std::min(width, 160), std::min(height, 50)};
         stage = L"CreateRectangle";
         Wh_Log(L"NATIVE RECTANGLE STAGE: %s HWND=%p", stage, hwnd);
         result = g_nativeProbeCreateRectangle(&rect, &rectangle);
@@ -4225,26 +4196,16 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
            exactRectangle, exactInstruction);
     if (result >= 0 && exactType && exactRectangle && exactInstruction)
     {
-        void* combinedGeometry = nullptr;
-        void* combinedInstruction = nullptr;
-        void* childGeometryA = nullptr;
-        void* childGeometryB = nullptr;
-        bool combinedSelected = CreateNativeCombinedGeometryInstruction(
-            hwnd, brush, width, height, combinedGeometry,
-            combinedInstruction, childGeometryA, childGeometryB);
-        if (combinedSelected)
-        {
-            g_cBaseObjectRelease(instruction);
-            g_cBaseObjectRelease(rectangle);
-            rectangle = combinedGeometry;
-            instruction = combinedInstruction;
-        }
+        void* rectangleB = nullptr;
+        void* instructionB = nullptr;
+        bool twoRectanglesSelected = CreateNativeSecondRectangleInstruction(
+            hwnd, brush, width, height, rectangleB, instructionB);
         TryAttachNativeRectProbe(hwnd, topLevelWindow, sourceProxy, compositor,
                                  image, brush, rectangle, instruction,
-                                 childGeometryA, childGeometryB,
-                                 combinedSelected, width, height);
-        if (childGeometryA) g_cBaseObjectRelease(childGeometryA);
-        if (childGeometryB) g_cBaseObjectRelease(childGeometryB);
+                                 rectangleB, instructionB,
+                                 twoRectanglesSelected, width, height);
+        if (instructionB) g_cBaseObjectRelease(instructionB);
+        if (rectangleB) g_cBaseObjectRelease(rectangleB);
     }
     if (exactInstruction && instruction) g_cBaseObjectRelease(instruction);
     if (exactRectangle && rectangle) g_cBaseObjectRelease(rectangle);
