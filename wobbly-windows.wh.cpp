@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.292
+// @version         0.293
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -484,8 +484,9 @@ using NativeProbeUpdateMesh_t = long(__cdecl*)(
     void*, int, const NativeProbePoint3F*, const NativeProbePoint2D*,
     unsigned int, const unsigned int*, unsigned int);
 using NativeProbeUpdateGroup_t = long(__cdecl*)(void*, void*);
-// Its second argument is CBitmapSourceProxy*, not CCachedVisualImageProxy*.
-// Resolve for diagnostics only; do not call it with the live window source.
+// Its declared second argument is CBitmapSourceProxy*. The exact 23H2
+// implementation only retains the base object and serializes its resource ID;
+// the receiving core path accepts CImageSource. Other builds stay disabled.
 using NativeProbeCreateMeshInstruction_t = long(__cdecl*)(void*, void*, void**);
 using NativeProbeGetVisual_t = void*(__cdecl*)(void*);
 NativeProbeCreateImage_t g_nativeProbeCreateImage = nullptr;
@@ -523,6 +524,7 @@ struct NativeRectState
     int width = 0;
     int height = 0;
     bool twoRectangles = false;
+    bool vertexMesh = false;
     bool detachFailureLogged = false;
 };
 NativeRectState g_nativeRectState; // DWM scene thread only.
@@ -3401,7 +3403,7 @@ static bool InitializeDwmHooks()
            g_nativeProbeCreateCombined != nullptr,
            g_nativeProbeCombinedVtable.load(std::memory_order_acquire));
     Wh_Log(L"NATIVE MESH BRIDGE: mesh=%d update=%d group=%d "
-           L"groupUpdate=%d meshFactory=%d directCachedImageSource=0 "
+           L"groupUpdate=%d meshFactory=%d cachedImageMesh=experimental "
            L"getParent=%d getProxy=%d",
            g_nativeProbeCreateMesh != nullptr,
            g_nativeProbeUpdateMesh != nullptr,
@@ -3618,7 +3620,7 @@ static bool InitializeDwmHooks()
     return true;
 }
 
-static void RunDetachedNativeGeometryProbe(HWND hwnd, void* compositor)
+[[maybe_unused]] static void RunDetachedNativeGeometryProbe(HWND hwnd, void* compositor)
 {
     // This ABI is verified only for the exact 23H2 uDWM image used here.
     if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
@@ -3877,7 +3879,8 @@ static bool DetachNativeRectProbe(const wchar_t* reason)
     }
     Wh_Log(L"NATIVE SHAPE DETACHED: HWND=%p geometry=%s reason=%s",
            state.hwnd,
-           state.twoRectangles ? L"two-rectangles" : L"rectangle", reason);
+           state.vertexMesh ? L"vertex-mesh" :
+               state.twoRectangles ? L"two-rectangles" : L"rectangle", reason);
     ReleaseNativeRectState(state);
     g_nativeRectHwnd.store(nullptr, std::memory_order_release);
     g_nativeRectActive.store(false, std::memory_order_release);
@@ -3913,7 +3916,7 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
                                      void*& image, void*& brush,
                                      void*& rectangle, void*& instruction,
                                      void*& rectangleB, void*& instructionB,
-                                     bool twoRectanglesSelected,
+                                     bool twoRectanglesSelected, bool vertexMeshSelected,
                                      int width, int height)
 {
     AcquireSRWLockShared(&g_settingsLock);
@@ -3949,6 +3952,7 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
     pending.width = width;
     pending.height = height;
     pending.twoRectangles = twoRectanglesSelected;
+    pending.vertexMesh = vertexMeshSelected;
     const wchar_t* stage = L"CreateVisual";
     Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
     long result = g_nativeRectCreateVisual(&pending.visual);
@@ -4028,14 +4032,16 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
             g_nativeRectStopRequested.store(true, std::memory_order_release);
         Wh_Log(L"NATIVE SHAPE ATTACHED: HWND=%p geometry=%s root=%p "
                L"visual=%p duration=until-release affine=unchanged snapshot=none",
-               hwnd, twoRectanglesSelected ? L"two-rectangles" : L"rectangle",
+               hwnd, vertexMeshSelected ? L"vertex-mesh" :
+                   twoRectanglesSelected ? L"two-rectangles" : L"rectangle",
                root, pending.visual);
         RequestDwmScenePass();
         return true;
     }
     Wh_Log(L"NATIVE SHAPE FAILED: HWND=%p geometry=%s stage=%s "
            L"result=0x%08X inserted=%d", hwnd,
-           twoRectanglesSelected ? L"two-rectangles" : L"rectangle", stage,
+           vertexMeshSelected ? L"vertex-mesh" :
+               twoRectanglesSelected ? L"two-rectangles" : L"rectangle", stage,
            static_cast<unsigned>(result), inserted);
     if (inserted)
     {
@@ -4122,7 +4128,7 @@ static bool CreateNativeSecondRectangleInstruction(
     return ready;
 }
 
-static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
+[[maybe_unused]] static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
                                               void* sourceProxy, void* compositor,
                                               void*& image, int width, int height)
 {
@@ -4203,13 +4209,120 @@ static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
         TryAttachNativeRectProbe(hwnd, topLevelWindow, sourceProxy, compositor,
                                  image, brush, rectangle, instruction,
                                  rectangleB, instructionB,
-                                 twoRectanglesSelected, width, height);
+                                 twoRectanglesSelected, false, width, height);
         if (instructionB) g_cBaseObjectRelease(instructionB);
         if (rectangleB) g_cBaseObjectRelease(rectangleB);
     }
     if (exactInstruction && instruction) g_cBaseObjectRelease(instruction);
     if (exactRectangle && rectangle) g_cBaseObjectRelease(rectangle);
     if (exactType && brush) g_cBaseObjectRelease(brush);
+}
+
+static void RunVisibleNativeMeshProbe(HWND hwnd, void* topLevelWindow,
+                                      void* sourceProxy, void* compositor,
+                                      void*& image, int width, int height)
+{
+    // Exact 23H2 ABI only. The instruction stores base-object references and
+    // serializes resource IDs; the core DrawMesh2D path consumes CImageSource.
+    if (!IsOnDwmSceneThread() ||
+        g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
+        g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
+        !g_nativeProbeCreateMesh || !g_nativeProbeUpdateMesh ||
+        !g_nativeProbeCreateGroup || !g_nativeProbeUpdateGroup ||
+        !g_nativeProbeCreateMeshInstruction || !g_cBaseObjectRelease ||
+        !image || width < 160 || height < 100)
+    {
+        Wh_Log(L"NATIVE VERTEX MESH: skipped HWND=%p", hwnd);
+        return;
+    }
+
+    NativeProbePoint3F positions[16] = {};
+    NativeProbePoint2D coordinates[16] = {};
+    unsigned int indices[54] = {};
+    constexpr float rowShift[4] = {0.0f, 20.0f, -12.0f, 0.0f};
+    constexpr float columnShift[4] = {0.0f, 7.0f, -5.0f, 0.0f};
+    for (int y = 0; y < 4; ++y)
+    {
+        for (int x = 0; x < 4; ++x)
+        {
+            int index = y * 4 + x;
+            float px = static_cast<float>(160 * x) / 3.0f;
+            float py = static_cast<float>(100 * y) / 3.0f;
+            positions[index] = {px + rowShift[y], py + columnShift[x], 0.0f};
+            coordinates[index] = {static_cast<double>(px),
+                                  static_cast<double>(py)};
+        }
+    }
+    unsigned int count = 0;
+    for (unsigned int y = 0; y < 3; ++y)
+    {
+        for (unsigned int x = 0; x < 3; ++x)
+        {
+            unsigned int a = y * 4 + x;
+            unsigned int b = a + 1;
+            unsigned int c = a + 4;
+            unsigned int d = c + 1;
+            indices[count++] = a; indices[count++] = c; indices[count++] = b;
+            indices[count++] = b; indices[count++] = c; indices[count++] = d;
+        }
+    }
+
+    void* mesh = nullptr;
+    void* group = nullptr;
+    void* instruction = nullptr;
+    const wchar_t* stage = L"CreateMesh";
+    Wh_Log(L"NATIVE VERTEX MESH STAGE: %s HWND=%p", stage, hwnd);
+    long result = g_nativeProbeCreateMesh(compositor, &mesh);
+    if (result >= 0 && !mesh) result = E_UNEXPECTED;
+    if (result >= 0)
+    {
+        stage = L"UpdateMesh";
+        Wh_Log(L"NATIVE VERTEX MESH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeProbeUpdateMesh(mesh, 0, positions, coordinates,
+                                         16, indices, count);
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateGroup";
+        Wh_Log(L"NATIVE VERTEX MESH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeProbeCreateGroup(compositor, &group);
+        if (result >= 0 && !group) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"UpdateGroup";
+        Wh_Log(L"NATIVE VERTEX MESH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeProbeUpdateGroup(group, mesh);
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateInstruction";
+        Wh_Log(L"NATIVE VERTEX MESH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeProbeCreateMeshInstruction(group, image, &instruction);
+        if (result >= 0 &&
+            (!instruction || ReadPointerMember(instruction, 0x10) != group ||
+             ReadPointerMember(instruction, 0x18) != image))
+            result = E_UNEXPECTED;
+    }
+    Wh_Log(L"NATIVE VERTEX MESH: HWND=%p stage=%s result=0x%08X "
+           L"vertices=16 indices=%u instruction=%p attached=0",
+           hwnd, stage, static_cast<unsigned>(result), count, instruction);
+    if (result >= 0)
+    {
+        void* brush = nullptr;
+        void* instructionB = nullptr;
+        if (TryAttachNativeRectProbe(hwnd, topLevelWindow, sourceProxy,
+                                     compositor, image, brush, group,
+                                     instruction, mesh, instructionB,
+                                     false, true, width, height))
+        {
+            Wh_Log(L"NATIVE VERTEX MESH: attached HWND=%p "
+                   L"staticBend=1 liveSource=1 affine=unchanged", hwnd);
+        }
+    }
+    if (instruction) g_cBaseObjectRelease(instruction);
+    if (group) g_cBaseObjectRelease(group);
+    if (mesh) g_cBaseObjectRelease(mesh);
 }
 
 static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
@@ -4319,14 +4432,8 @@ static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
     if (resourceReadable && imageResourceId && drawBitmapResult >= 0 &&
         instructionKeepsImage)
     {
-        // CDrawMesh2DInstruction::Create requires CBitmapSourceProxy*, while
-        // this live complete-window image is CCachedVisualImageProxy*. The
-        // factory may return S_OK for a wrong pointer type and fail later when
-        // rendering, so never pass the cached image to that instruction.
-        RunDetachedNativeGeometryProbe(hwnd, compositor);
-        RunDetachedNativeImageBrushProbe(hwnd, topLevelWindow,
-                                         sourceVisualProxy, compositor,
-                                         image, width, height);
+        RunVisibleNativeMeshProbe(hwnd, topLevelWindow, sourceVisualProxy,
+                                  compositor, image, width, height);
     }
     if (bitmapInstruction && drawBitmapResult >= 0 &&
         IsReadableMemory(bitmapInstruction, sizeof(void*)) &&
