@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.297
+// @version         0.298
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3773,8 +3773,10 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
             DetachNativeMesh(L"mesh-position-invalid");
             return;
         }
-        double limitX = std::min(400.0, std::max(100.0, physics.width * 0.35));
-        double limitY = std::min(400.0, std::max(100.0, physics.height * 0.35));
+        // Preserve the actual physics deformation. These generous bounds only
+        // guard the private DWM mesh API against corrupted coordinates.
+        const double limitX = std::max(4096.0, physics.width * 4.0);
+        const double limitY = std::max(4096.0, physics.height * 4.0);
         double dx = std::clamp(point.position.x - point.basePosition.x,
                                -limitX, limitX);
         double dy = std::clamp(point.position.y - point.basePosition.y,
@@ -6658,7 +6660,8 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         }
         useSurfacePivot = true;
     }
-    else if (snapshot.mesh.dragPointIndex >= 0 && snapshot.mesh.dragPointIndex < GRID_POINT_COUNT)
+    else if (!nativeMeshActive && snapshot.mesh.dragPointIndex >= 0 &&
+             snapshot.mesh.dragPointIndex < GRID_POINT_COUNT)
     {
         const WobblePoint& dragPoint = snapshot.mesh.points[snapshot.mesh.dragPointIndex];
         translationBase = {dragPoint.basePosition.x + snapshot.mesh.dragOffset.x,
@@ -6687,6 +6690,20 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
     }
     double translationX = translationRendered.x - m11 * translationBase.x - m21 * translationBase.y;
     double translationY = translationRendered.y - m12 * translationBase.x - m22 * translationBase.y;
+    double meshScaleX = 1.0;
+    double meshScaleY = 1.0;
+    if (nativeMeshActive && !snapshot.mesh.resizing &&
+        g_nativeMeshState.hwnd == snapshot.hwnd &&
+        g_nativeMeshState.width > 0 && g_nativeMeshState.height > 0)
+    {
+        // The source and sibling share a physical parent. The mesh stretches
+        // its physics coordinates to that parent's pixel bounds; apply the
+        // same conversion to the original window's translation only.
+        meshScaleX = static_cast<double>(g_nativeMeshState.width) / snapshot.mesh.width;
+        meshScaleY = static_cast<double>(g_nativeMeshState.height) / snapshot.mesh.height;
+        translationX *= meshScaleX;
+        translationY *= meshScaleY;
+    }
     // Keep the grab/resize pivot attached, with only a corruption guard.
     double emergencyTranslationLimit =
         std::max(4096.0, std::max(snapshot.mesh.width, snapshot.mesh.height) * 4.0);
@@ -6708,10 +6725,12 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         ShouldEmitTimedTrace(g_nextMatrixTraceAt))
     {
         Wh_Log(L"DRAG TRACE MATRIX: HWND=%p revision=%llu result=0x%08X "
-               L"m11=%.4f m12=%.4f m21=%.4f m22=%.4f dx=%.2f dy=%.2f",
+               L"m11=%.4f m12=%.4f m21=%.4f m22=%.4f dx=%.2f dy=%.2f "
+               L"nativeMesh=%d scale=(%.3f,%.3f)",
                snapshot.hwnd, snapshot.meshRevision,
                static_cast<unsigned int>(updateResult), matrix.m11, matrix.m12,
-               matrix.m21, matrix.m22, matrix.dx, matrix.dy);
+               matrix.m21, matrix.m22, matrix.dx, matrix.dy,
+               nativeMeshActive, meshScaleX, meshScaleY);
     }
 }
 
