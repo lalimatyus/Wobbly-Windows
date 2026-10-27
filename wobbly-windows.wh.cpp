@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.296
+// @version         0.300
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -106,6 +106,10 @@ the combined mod is not offered under GPLv2.
   - "affine": "Affine (stable)"
   - "mesh": "Mesh Renderer (experimental)"
   - "external-gpu": "GPU mesh overlay (experimental)"
+
+- MeshOriginalHideProbe: false
+  $name: Briefly hide the original window (test)
+  $description: With Mesh Renderer, hide the original visual for 0.75 seconds after each mesh attachment, then restore it automatically. Tests whether the curved image can render without its source being visible.
 
 - AdvancedMode:
   - enable: false
@@ -436,6 +440,9 @@ CMatrixTransformProxyUpdateDouble_t g_cMatrixTransformProxyUpdate = nullptr;
 CMatrixTransformProxyUpdateFloat_t g_cMatrixTransformProxyUpdateFloat = nullptr;
 using CVisualProxySetTransform_t = long(__cdecl*)(void* pThis, void* transform);
 CVisualProxySetTransform_t g_cVisualProxySetTransform = nullptr;
+using CVisualSetOpacity_t = void(__cdecl*)(void* pThis, double opacity);
+CVisualSetOpacity_t g_cVisualSetOpacity = nullptr;
+std::atomic_bool g_meshOriginalHideProbeEnabled = false;
 using CCompositorCreateMatrixTransformProxy_t = long(__cdecl*)(void* pThis, void** transformProxy);
 CCompositorCreateMatrixTransformProxy_t g_createMatrixTransformProxy = nullptr;
 
@@ -468,22 +475,12 @@ using NativeProbeUpdateImageF_t = long(__cdecl*)(
     void*, const NativeProbeRectF&, const NativeProbeSizeF&, const void*,
     const void*, void*, int);
 using NativeProbeCreateBitmapInstruction_t = long(__cdecl*)(void*, void**);
-using NativeProbeCreateImageBrush_t = long(__cdecl*)(void*, void**);
-using NativeProbeUpdateImageBrush_t = long(__cdecl*)(
-    void*, double, const NativeProbeRectF&, const NativeProbeRectF&,
-    const void*, int, int, const void*, const void*, int, int, int, int,
-    const void*);
-using NativeProbeCreateRectangle_t = long(__cdecl*)(const RECT*, void**);
-using NativeProbeCreateCombined_t = long(__cdecl*)(
-    const void*, const void*, int, void**);
-using NativeProbeCreateGeometryInstruction_t = long(__cdecl*)(
-    void*, void*, void**);
-using NativeRectCreateVisual_t = long(__cdecl*)(void**);
-using NativeRectAddInstruction_t = long(__cdecl*)(void*, void*);
-using NativeRectUpdateRenderData_t = long(__cdecl*)(void*);
-using NativeRectInsertRelative_t = long(__cdecl*)(
+using NativeMeshCreateVisual_t = long(__cdecl*)(void**);
+using NativeMeshAddInstruction_t = long(__cdecl*)(void*, void*);
+using NativeMeshUpdateRenderData_t = long(__cdecl*)(void*);
+using NativeMeshInsertRelative_t = long(__cdecl*)(
     void*, void*, void*, bool, bool);
-using NativeRectRemoveFromParent_t = long(__cdecl*)(void*);
+using NativeMeshRemoveFromParent_t = long(__cdecl*)(void*);
 using NativeProbeCreateMesh_t = long(__cdecl*)(void*, void**);
 using NativeProbeUpdateMesh_t = long(__cdecl*)(
     void*, int, const NativeProbePoint3F*, const NativeProbePoint2D*,
@@ -498,44 +495,38 @@ NativeProbeCreateImage_t g_nativeProbeCreateImage = nullptr;
 NativeProbeUpdateImageD_t g_nativeProbeUpdateImageD = nullptr;
 NativeProbeUpdateImageF_t g_nativeProbeUpdateImageF = nullptr;
 NativeProbeCreateBitmapInstruction_t g_nativeProbeCreateBitmapInstruction = nullptr;
-NativeProbeCreateImageBrush_t g_nativeProbeCreateImageBrush = nullptr;
-NativeProbeUpdateImageBrush_t g_nativeProbeUpdateImageBrush = nullptr;
-NativeProbeCreateRectangle_t g_nativeProbeCreateRectangle = nullptr;
-NativeProbeCreateCombined_t g_nativeProbeCreateCombined = nullptr;
-NativeProbeCreateGeometryInstruction_t g_nativeProbeCreateGeometryInstruction = nullptr;
-NativeRectCreateVisual_t g_nativeRectCreateVisual = nullptr;
-NativeRectAddInstruction_t g_nativeRectAddInstruction = nullptr;
-NativeRectUpdateRenderData_t g_nativeRectUpdateRenderData = nullptr;
-NativeRectInsertRelative_t g_nativeRectInsertRelative = nullptr;
-NativeRectRemoveFromParent_t g_nativeRectRemoveFromParent = nullptr;
-void* g_nativeRectCollectionRemove = nullptr;
-void* g_nativeRectCollectionVtable = nullptr;
-std::atomic_bool g_nativeRectActive = false;
-std::atomic_bool g_nativeRectStopRequested = false;
-std::atomic<HWND> g_nativeRectHwnd = nullptr;
-struct NativeRectState
+NativeMeshCreateVisual_t g_nativeMeshCreateVisual = nullptr;
+NativeMeshAddInstruction_t g_nativeMeshAddInstruction = nullptr;
+NativeMeshUpdateRenderData_t g_nativeMeshUpdateRenderData = nullptr;
+NativeMeshInsertRelative_t g_nativeMeshInsertRelative = nullptr;
+NativeMeshRemoveFromParent_t g_nativeMeshRemoveFromParent = nullptr;
+void* g_nativeMeshCollectionRemove = nullptr;
+void* g_nativeMeshCollectionVtable = nullptr;
+std::atomic_bool g_nativeMeshActive = false;
+std::atomic_bool g_nativeMeshStopRequested = false;
+std::atomic<HWND> g_nativeMeshHwnd = nullptr;
+struct NativeMeshState
 {
     void* root = nullptr;
     void* image = nullptr;
-    void* brush = nullptr;
-    void* rectangle = nullptr;
-    void* rectangleB = nullptr;
+    void* group = nullptr;
+    void* mesh = nullptr;
     void* instruction = nullptr;
-    void* instructionB = nullptr;
     void* visual = nullptr;
     void* transform = nullptr;
     void* sourceProxy = nullptr;
     HWND hwnd = nullptr;
     int width = 0;
     int height = 0;
-    bool twoRectangles = false;
-    bool vertexMesh = false;
     bool detachFailureLogged = false;
+    bool originalOpacityChanged = false;
+    double originalOpacity = 1.0;
+    ULONGLONG restoreOriginalAt = 0;
     ULONGLONG meshGeneration = 0;
     ULONGLONG submittedMeshRevision = 0;
     unsigned int meshUpdateCount = 0;
 };
-NativeRectState g_nativeRectState; // DWM scene thread only.
+NativeMeshState g_nativeMeshState; // DWM scene thread only.
 NativeProbeCreateMesh_t g_nativeProbeCreateMesh = nullptr;
 NativeProbeUpdateMesh_t g_nativeProbeUpdateMesh = nullptr;
 NativeProbeCreateMesh_t g_nativeProbeCreateGroup = nullptr;
@@ -544,19 +535,11 @@ NativeProbeCreateMeshInstruction_t g_nativeProbeCreateMeshInstruction = nullptr;
 NativeProbeGetVisual_t g_nativeProbeGetVisualParent = nullptr;
 NativeProbeGetVisual_t g_nativeProbeGetVisualProxy = nullptr;
 void* g_nativeProbeImageVtableSymbol = nullptr;
-void* g_nativeProbeBitmapVtableSymbol = nullptr;
-void* g_nativeProbeImageBrushVtableSymbol = nullptr;
-void* g_nativeProbeRectangleVtableSymbol = nullptr;
-void* g_nativeProbeCombinedVtableSymbol = nullptr;
-void* g_nativeProbeGeometryInstructionVtableSymbol = nullptr;
 std::atomic<void*> g_nativeProbeImageVtable = nullptr;
-std::atomic<void*> g_nativeProbeBitmapVtable = nullptr;
-std::atomic<void*> g_nativeProbeImageBrushVtable = nullptr;
-std::atomic<void*> g_nativeProbeRectangleVtable = nullptr;
-std::atomic<void*> g_nativeProbeCombinedVtable = nullptr;
-std::atomic<void*> g_nativeProbeGeometryInstructionVtable = nullptr;
 HWND g_nativeMeshLastAttemptHwnd = nullptr; // DWM scene thread only.
 ULONGLONG g_nativeMeshLastAttemptAt = 0;
+HWND g_originalHideProbeLastHwnd = nullptr; // DWM scene thread only.
+ULONGLONG g_originalHideProbeLastAt = 0;
 
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
@@ -3084,6 +3067,8 @@ static bool InitializeDwmHooks()
          &g_cVisualProxySetTransform,
          nullptr,
          true},
+        {{L"public: virtual void __cdecl CVisual::SetOpacity(double)"},
+          &g_cVisualSetOpacity, nullptr, true},
         {{L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CMatrixTransformProxy>(class CMatrixTransformProxy * *)"},
          &g_createMatrixTransformProxy,
@@ -3112,50 +3097,23 @@ static bool InitializeDwmHooks()
         {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
            L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
          &g_nativeProbeCreateBitmapInstruction, nullptr, true},
-        {{L"protected: long __cdecl CCompositor::CreateProxy<"
-           L"class CImageLegacyMilBrushProxy>("
-           L"class CImageLegacyMilBrushProxy * *)"},
-         &g_nativeProbeCreateImageBrush, nullptr, true},
-        {{L"public: long __cdecl CImageLegacyMilBrushProxy::Update("
-           L"double,struct MilRectF const &,struct MilRectF const &,"
-           L"class CDoubleResourceProxy const *,"
-           L"enum MilBrushMappingMode::Enum,"
-           L"enum MilBrushMappingMode::Enum,"
-           L"class CRectResourceProxy const *,"
-           L"class CRectResourceProxy const *,enum MilStretch::Enum,"
-           L"enum MilTileMode::Enum,"
-           L"enum MilHorizontalAlignment::Enum,"
-           L"enum MilVerticalAlignment::Enum,"
-           L"class CBaseImageProxy const *)"},
-         &g_nativeProbeUpdateImageBrush, nullptr, true},
-        {{L"public: static long __cdecl ResourceHelper::CreateRectangleGeometry("
-           L"struct tagRECT const *,class CRectangleGeometryProxy * *)"},
-         &g_nativeProbeCreateRectangle, nullptr, true},
-        {{L"public: static long __cdecl ResourceHelper::CreateCombinedGeometry("
-           L"class CBaseGeometryProxy const *,class CBaseGeometryProxy const *,"
-           L"enum MilCombineMode::Enum,class CCombinedGeometryProxy * *)"},
-         &g_nativeProbeCreateCombined, nullptr, true},
-        {{L"public: static long __cdecl CDrawGeometryInstruction::Create("
-           L"class CBaseLegacyMilBrushProxy *,class CBaseGeometryProxy *,"
-           L"class CDrawGeometryInstruction * *)"},
-         &g_nativeProbeCreateGeometryInstruction, nullptr, true},
         {{L"public: static long __cdecl CRenderDataVisual::Create("
            L"class CRenderDataVisual * *)"},
-         &g_nativeRectCreateVisual, nullptr, true},
+         &g_nativeMeshCreateVisual, nullptr, true},
         {{L"public: long __cdecl CRenderDataVisual::AddInstruction("
            L"class CRenderDataInstruction *)"},
-         &g_nativeRectAddInstruction, nullptr, true},
+         &g_nativeMeshAddInstruction, nullptr, true},
         {{L"public: virtual long __cdecl CRenderDataVisual::UpdateRenderData(void)"},
-         &g_nativeRectUpdateRenderData, nullptr, true},
+         &g_nativeMeshUpdateRenderData, nullptr, true},
         {{L"public: long __cdecl VisualCollection::InsertRelative("
            L"class CVisual *,class CVisual *,bool,bool)"},
-         &g_nativeRectInsertRelative, nullptr, true},
+         &g_nativeMeshInsertRelative, nullptr, true},
         {{L"public: long __cdecl VisualCollection::Remove(class CVisual *)"},
-         &g_nativeRectCollectionRemove, nullptr, true},
+         &g_nativeMeshCollectionRemove, nullptr, true},
         {{L"public: long __cdecl CVisual::RemoveSelfFromParent(void)"},
-         &g_nativeRectRemoveFromParent, nullptr, true},
+         &g_nativeMeshRemoveFromParent, nullptr, true},
         {{L"const VisualCollection::`vftable'"},
-         &g_nativeRectCollectionVtable, nullptr, true},
+         &g_nativeMeshCollectionVtable, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateMeshGeometry2dProxy("
            L"class CMeshGeometry2dProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
@@ -3187,16 +3145,6 @@ static bool InitializeDwmHooks()
          &g_nativeProbeGetVisualProxy, nullptr, true},
         {{L"const CCachedVisualImageProxy::`vftable'"},
          &g_nativeProbeImageVtableSymbol, nullptr, true},
-        {{L"const CBitmapSourceProxy::`vftable'"},
-         &g_nativeProbeBitmapVtableSymbol, nullptr, true},
-        {{L"const CImageLegacyMilBrushProxy::`vftable'"},
-         &g_nativeProbeImageBrushVtableSymbol, nullptr, true},
-        {{L"const CRectangleGeometryProxy::`vftable'"},
-         &g_nativeProbeRectangleVtableSymbol, nullptr, true},
-        {{L"const CCombinedGeometryProxy::`vftable'"},
-         &g_nativeProbeCombinedVtableSymbol, nullptr, true},
-        {{L"const CDrawGeometryInstruction::`vftable'"},
-         &g_nativeProbeGeometryInstructionVtableSymbol, nullptr, true},
 
         {{L"private: static class CDesktopManager * "
            L"CDesktopManager::s_pDesktopManagerInstance"},
@@ -3320,20 +3268,16 @@ static bool InitializeDwmHooks()
     keepValid(g_nativeProbeUpdateImageD);
     keepValid(g_nativeProbeUpdateImageF);
     keepValid(g_nativeProbeCreateBitmapInstruction);
-    keepValid(g_nativeProbeCreateImageBrush);
-    keepValid(g_nativeProbeUpdateImageBrush);
-    keepValid(g_nativeProbeCreateRectangle);
-    keepValid(g_nativeProbeCreateCombined);
-    keepValid(g_nativeProbeCreateGeometryInstruction);
-    keepValid(g_nativeRectCreateVisual);
-    keepValid(g_nativeRectAddInstruction);
-    keepValid(g_nativeRectUpdateRenderData);
-    keepValid(g_nativeRectInsertRelative);
-    keepValid(g_nativeRectRemoveFromParent);
-    keepValid(g_nativeRectCollectionRemove);
-    if (!IsDwmImageAddress(g_nativeRectCollectionVtable, sizeof(void*)))
+    keepValid(g_nativeMeshCreateVisual);
+    keepValid(g_nativeMeshAddInstruction);
+    keepValid(g_nativeMeshUpdateRenderData);
+    keepValid(g_nativeMeshInsertRelative);
+    keepValid(g_nativeMeshRemoveFromParent);
+    keepValid(g_nativeMeshCollectionRemove);
+    keepValid(g_cVisualSetOpacity);
+    if (!IsDwmImageAddress(g_nativeMeshCollectionVtable, sizeof(void*)))
     {
-        g_nativeRectCollectionVtable = nullptr;
+        g_nativeMeshCollectionVtable = nullptr;
     }
     keepValid(g_nativeProbeCreateMesh);
     keepValid(g_nativeProbeUpdateMesh);
@@ -3380,37 +3324,11 @@ static bool InitializeDwmHooks()
     bool hasExactMatrixProxyVtable =
         cacheVtableSymbol(g_matrixTransformProxyVtableSymbol, g_matrixTransformProxyVtable);
     cacheVtableSymbol(g_nativeProbeImageVtableSymbol, g_nativeProbeImageVtable);
-    cacheVtableSymbol(g_nativeProbeBitmapVtableSymbol, g_nativeProbeBitmapVtable);
-    cacheVtableSymbol(g_nativeProbeImageBrushVtableSymbol,
-                      g_nativeProbeImageBrushVtable);
-    cacheVtableSymbol(g_nativeProbeRectangleVtableSymbol,
-                      g_nativeProbeRectangleVtable);
-    cacheVtableSymbol(g_nativeProbeCombinedVtableSymbol,
-                      g_nativeProbeCombinedVtable);
-    cacheVtableSymbol(g_nativeProbeGeometryInstructionVtableSymbol,
-                      g_nativeProbeGeometryInstructionVtable);
-    Wh_Log(L"NATIVE SOURCE PROBE: create=%d update=%s drawBitmap=%d "
-           L"imageVtable=%p bitmapVtable=%p",
+    Wh_Log(L"NATIVE MESH SOURCE: create=%d update=%s imageVtable=%p",
            g_nativeProbeCreateImage != nullptr,
            g_nativeProbeUpdateImageD ? L"double" :
                (g_nativeProbeUpdateImageF ? L"float" : L"unavailable"),
-           g_nativeProbeCreateBitmapInstruction != nullptr,
-           g_nativeProbeImageVtable.load(std::memory_order_acquire),
-           g_nativeProbeBitmapVtable.load(std::memory_order_acquire));
-    Wh_Log(L"NATIVE IMAGE BRUSH PROBE: create=%d update=%d vtable=%p "
-           L"attached=0", g_nativeProbeCreateImageBrush != nullptr,
-           g_nativeProbeUpdateImageBrush != nullptr,
-           g_nativeProbeImageBrushVtable.load(std::memory_order_acquire));
-    Wh_Log(L"NATIVE RECTANGLE PROBE: geometry=%d instruction=%d "
-           L"geometryVtable=%p instructionVtable=%p attached=0",
-           g_nativeProbeCreateRectangle != nullptr,
-           g_nativeProbeCreateGeometryInstruction != nullptr,
-           g_nativeProbeRectangleVtable.load(std::memory_order_acquire),
-           g_nativeProbeGeometryInstructionVtable.load(
-               std::memory_order_acquire));
-    Wh_Log(L"NATIVE COMBINED GEOMETRY PROBE: create=%d vtable=%p attached=0",
-           g_nativeProbeCreateCombined != nullptr,
-           g_nativeProbeCombinedVtable.load(std::memory_order_acquire));
+           g_nativeProbeImageVtable.load(std::memory_order_acquire));
     Wh_Log(L"NATIVE MESH BRIDGE: mesh=%d update=%d group=%d "
            L"groupUpdate=%d meshFactory=%d cachedImageMesh=experimental "
            L"getParent=%d getProxy=%d",
@@ -3629,146 +3547,22 @@ static bool InitializeDwmHooks()
     return true;
 }
 
-[[maybe_unused]] static void RunDetachedNativeGeometryProbe(HWND hwnd, void* compositor)
-{
-    // This ABI is verified only for the exact 23H2 uDWM image used here.
-    if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
-        g_dwmModuleLayout.sizeOfImage != 0x16A000)
-    {
-        Wh_Log(L"NATIVE MESH GEOMETRY: skipped HWND=%p (unverified uDWM ABI)", hwnd);
-        return;
-    }
-    if (!g_nativeProbeCreateMesh || !g_nativeProbeUpdateMesh ||
-        !g_nativeProbeCreateGroup || !g_nativeProbeUpdateGroup ||
-        !g_cBaseObjectRelease)
-    {
-        Wh_Log(L"NATIVE MESH GEOMETRY: skipped HWND=%p (missing symbols)", hwnd);
-        return;
-    }
-
-    NativeProbePoint3F positions[16] = {};
-    NativeProbePoint2D coordinates[16] = {};
-    unsigned int indices[54] = {};
-    for (int y = 0; y < 4; ++y)
-    {
-        for (int x = 0; x < 4; ++x)
-        {
-            int index = y * 4 + x;
-            float u = static_cast<float>(x) / 3.0f;
-            float v = static_cast<float>(y) / 3.0f;
-            positions[index] = {u, v, 0.0f};
-            coordinates[index] = {static_cast<double>(u), static_cast<double>(v)};
-        }
-    }
-    unsigned int count = 0;
-    for (unsigned int y = 0; y < 3; ++y)
-    {
-        for (unsigned int x = 0; x < 3; ++x)
-        {
-            unsigned int a = y * 4 + x;
-            unsigned int b = a + 1;
-            unsigned int c = a + 4;
-            unsigned int d = c + 1;
-            indices[count++] = a;
-            indices[count++] = c;
-            indices[count++] = b;
-            indices[count++] = b;
-            indices[count++] = c;
-            indices[count++] = d;
-        }
-    }
-
-    void* mesh = nullptr;
-    void* group = nullptr;
-    const wchar_t* stage = L"CreateMesh";
-    long result = g_nativeProbeCreateMesh(compositor, &mesh);
-    if (result >= 0 && mesh)
-    {
-        stage = L"UpdateMesh";
-        result = g_nativeProbeUpdateMesh(mesh, 0, positions, coordinates,
-                                         16, indices, count);
-    }
-    else if (result >= 0)
-    {
-        result = E_UNEXPECTED;
-    }
-    if (result >= 0)
-    {
-        stage = L"CreateGroup";
-        result = g_nativeProbeCreateGroup(compositor, &group);
-        if (result >= 0 && !group) result = E_UNEXPECTED;
-    }
-    if (result >= 0)
-    {
-        stage = L"UpdateGroup";
-        result = g_nativeProbeUpdateGroup(group, mesh);
-    }
-    Wh_Log(L"NATIVE MESH GEOMETRY: HWND=%p stage=%s result=0x%08X "
-           L"mesh=%p group=%p vertices=16 indices=%u attached=0 "
-           L"directCachedImageSource=unsupported",
-           hwnd, stage, static_cast<unsigned int>(result), mesh, group, count);
-
-    auto release = [](void* object)
-    {
-        if (object && IsReadableMemory(object, sizeof(void*)) &&
-            IsDwmImageAddress(*reinterpret_cast<void**>(object), sizeof(void*)))
-        {
-            g_cBaseObjectRelease(object);
-        }
-    };
-    release(group);
-    release(mesh);
-}
-
-static void ProbeNativeMeshHost(HWND hwnd, void* topLevelWindow,
-                                void* sourceVisualProxy)
+static bool NativeMeshAbiVerified()
 {
     if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
-        !g_topLevelWindowGetRootVisual || !g_nativeProbeGetVisualParent ||
-        !g_nativeProbeGetVisualProxy)
-    {
-        Wh_Log(L"NATIVE MESH HOST: skipped HWND=%p (unverified ABI or symbols)",
-               hwnd);
-        return;
-    }
-    void* root = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
-    bool validRoot = root && IsReadableMemory(root, sizeof(void*)) &&
-        IsDwmImageAddress(*reinterpret_cast<void**>(root), sizeof(void*));
-    void* parent = validRoot ? g_nativeProbeGetVisualParent(root) : nullptr;
-    bool validParent = parent && parent != root &&
-        IsReadableMemory(parent, sizeof(void*)) &&
-        IsDwmImageAddress(*reinterpret_cast<void**>(parent), sizeof(void*));
-    void* rootProxy = validRoot ? g_nativeProbeGetVisualProxy(root) : nullptr;
-    void* parentProxy = validParent ? g_nativeProbeGetVisualProxy(parent) : nullptr;
-    bool sourceMatches = rootProxy == sourceVisualProxy &&
-        IsVisualProxyPointerValid(rootProxy);
-    bool independentSiblingHost = sourceMatches && validParent &&
-        IsVisualProxyPointerValid(parentProxy) &&
-        parentProxy != sourceVisualProxy;
-    Wh_Log(L"NATIVE MESH HOST: HWND=%p root=%p parent=%p rootProxy=%p "
-           L"sourceProxy=%p parentProxy=%p sourceMatches=%d "
-           L"independentSiblingHost=%d attached=0",
-           hwnd, root, parent, rootProxy, sourceVisualProxy, parentProxy,
-           sourceMatches, independentSiblingHost);
-}
-
-static bool NativeRectAbiVerified()
-{
-    if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
-        g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
-        !g_nativeProbeCreateGeometryInstruction || !g_nativeRectCreateVisual ||
-        !g_nativeRectAddInstruction || !g_nativeRectUpdateRenderData ||
-        !g_nativeRectInsertRelative || !g_nativeRectRemoveFromParent ||
-        !g_nativeRectCollectionRemove || !g_nativeRectCollectionVtable ||
+        !g_nativeMeshCreateVisual ||
+        !g_nativeMeshAddInstruction || !g_nativeMeshUpdateRenderData ||
+        !g_nativeMeshInsertRelative || !g_nativeMeshRemoveFromParent ||
+        !g_nativeMeshCollectionRemove || !g_nativeMeshCollectionVtable ||
         !g_nativeProbeGetVisualParent || !g_nativeProbeGetVisualProxy ||
         !g_createMatrixTransformProxy || !g_cVisualProxySetTransform ||
         !HasMatrixTransformUpdate() || !g_cBaseObjectRelease)
     {
         return false;
     }
-    const auto* remove = reinterpret_cast<const BYTE*>(g_nativeRectRemoveFromParent);
-    const auto* insert = reinterpret_cast<const BYTE*>(g_nativeRectInsertRelative);
+    const auto* remove = reinterpret_cast<const BYTE*>(g_nativeMeshRemoveFromParent);
+    const auto* insert = reinterpret_cast<const BYTE*>(g_nativeMeshInsertRelative);
     const auto* release = reinterpret_cast<const BYTE*>(g_cBaseObjectRelease);
     constexpr BYTE removePrefix[] = {0x48,0x8B,0xD1,0x48,0x8B,0x49,0x18,
                                       0x48,0x85,0xC9,0x74,0x09,0x48,0x83,0xC1,0x20};
@@ -3796,10 +3590,10 @@ static bool NativeRectAbiVerified()
     int32_t jump = 0;
     std::memcpy(&jump, remove + 17, sizeof(jump));
     return reinterpret_cast<uintptr_t>(remove) + 21 + jump ==
-           reinterpret_cast<uintptr_t>(g_nativeRectCollectionRemove);
+           reinterpret_cast<uintptr_t>(g_nativeMeshCollectionRemove);
 }
 
-static void* FindNativeRectSiblingCollection(void* root)
+static void* FindNativeMeshSiblingCollection(void* root)
 {
     if (!root || !IsReadableMemory(root, sizeof(void*)) ||
         !IsDwmImageAddress(*reinterpret_cast<void**>(root), sizeof(void*)))
@@ -3815,7 +3609,7 @@ static void* FindNativeRectSiblingCollection(void* root)
     }
     auto* collection = static_cast<BYTE*>(parent) + 0x20;
     if (!IsReadableMemory(collection, 0x2C) ||
-        *reinterpret_cast<void**>(collection) != g_nativeRectCollectionVtable ||
+        *reinterpret_cast<void**>(collection) != g_nativeMeshCollectionVtable ||
         ReadPointerMember(collection, 8) != parent)
     {
         return nullptr;
@@ -3833,7 +3627,7 @@ static void* FindNativeRectSiblingCollection(void* root)
     return matches == 1 ? collection : nullptr;
 }
 
-static bool RetainNativeRectRoot(void* root)
+static bool RetainNativeMeshRoot(void* root)
 {
     auto* count = reinterpret_cast<volatile LONG*>(static_cast<BYTE*>(root) + 8);
     if (!IsWritableMemory(const_cast<LONG*>(count), sizeof(LONG)))
@@ -3848,15 +3642,119 @@ static bool RetainNativeRectRoot(void* root)
     return false;
 }
 
-static void ReleaseNativeRectState(NativeRectState& state)
+static bool NativeVisualOpacityAbiVerified()
 {
+    if (!NativeMeshAbiVerified() || !g_cVisualSetOpacity)
+        return false;
+    const auto* code = reinterpret_cast<const BYTE*>(g_cVisualSetOpacity);
+    constexpr BYTE load[] = {0xF2, 0x0F, 0x10, 0x91, 0xC0, 0, 0, 0};
+    constexpr BYTE store[] = {0xF2, 0x0F, 0x11, 0x89, 0xC0, 0, 0, 0};
+    return IsReadableMemory(code, 0x38) &&
+           std::memcmp(code, load, sizeof(load)) == 0 &&
+           std::memcmp(code + 0x30, store, sizeof(store)) == 0;
+}
+
+static void RestoreNativeMeshOriginalOpacity(NativeMeshState& state)
+{
+    if (!state.originalOpacityChanged)
+        return;
+    state.originalOpacityChanged = false;
+    if (NativeVisualOpacityAbiVerified() && state.root &&
+        IsReadableMemory(state.root, sizeof(void*)) &&
+        IsReadableMemory(static_cast<const BYTE*>(state.root) + 0xC0,
+                         sizeof(double)) &&
+        IsDwmImageAddress(*reinterpret_cast<void**>(state.root), sizeof(void*)))
+    {
+        double currentOpacity = 0.0;
+        std::memcpy(&currentOpacity,
+                    static_cast<const BYTE*>(state.root) + 0xC0,
+                    sizeof(currentOpacity));
+        if (std::isfinite(currentOpacity) &&
+            std::abs(currentOpacity) < 0.0001)
+        {
+            g_cVisualSetOpacity(state.root, state.originalOpacity);
+            Wh_Log(L"NATIVE MESH ORIGINAL RESTORED: HWND=%p opacity=%.2f",
+                   state.hwnd, state.originalOpacity);
+        }
+        else
+        {
+            Wh_Log(L"NATIVE MESH ORIGINAL PROBE: HWND=%p opacity changed "
+                   L"externally to %.2f; leaving it intact",
+                   state.hwnd, currentOpacity);
+        }
+    }
+}
+
+static void StartNativeMeshOriginalHideProbe(NativeMeshState& state)
+{
+    if (!g_meshOriginalHideProbeEnabled.load(std::memory_order_acquire) ||
+        !state.root)
+        return;
+    if (!NativeVisualOpacityAbiVerified())
+    {
+        Wh_Log(L"NATIVE MESH ORIGINAL PROBE UNAVAILABLE: opacity ABI not verified");
+        return;
+    }
+    if (!IsReadableMemory(static_cast<const BYTE*>(state.root) + 0xC0,
+                          sizeof(double)))
+        return;
+    bool activeDrag = false;
+    AcquireSRWLockShared(&g_animationSlotsLock);
+    for (const WindowAnimationSlot& slot : g_animationSlots)
+    {
+        if (slot.active && slot.hwnd == state.hwnd && slot.dragging &&
+            !slot.windowStateThrob)
+        {
+            activeDrag = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_animationSlotsLock);
+    if (!activeDrag)
+        return;
+    ULONGLONG now = GetTickCount64();
+    if (g_originalHideProbeLastHwnd == state.hwnd &&
+        now - g_originalHideProbeLastAt < 5000)
+        return;
+    double opacity = 0.0;
+    std::memcpy(&opacity, static_cast<const BYTE*>(state.root) + 0xC0,
+                sizeof(opacity));
+    if (!std::isfinite(opacity) || opacity < 0.999 || opacity > 1.001)
+    {
+        Wh_Log(L"NATIVE MESH ORIGINAL PROBE SKIPPED: HWND=%p opacity=%.2f",
+               state.hwnd, opacity);
+        return;
+    }
+    DWORD backdrop = 0;
+    long backdropResult = g_dwmGetWindowAttribute
+        ? g_dwmGetWindowAttribute(state.hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
+                                  &backdrop, sizeof(backdrop))
+        : E_NOTIMPL;
+    state.originalOpacity = opacity;
+    state.originalOpacityChanged = true;
+    state.restoreOriginalAt = now + 750;
+    g_originalHideProbeLastHwnd = state.hwnd;
+    g_originalHideProbeLastAt = now;
+    g_cVisualSetOpacity(state.root, 0.0);
+    double appliedOpacity = opacity;
+    std::memcpy(&appliedOpacity,
+                static_cast<const BYTE*>(state.root) + 0xC0,
+                sizeof(appliedOpacity));
+    Wh_Log(L"NATIVE MESH ORIGINAL HIDE PROBE: HWND=%p durationMs=750 "
+           L"appliedOpacity=%.2f backdrop=%u backdropResult=0x%08X",
+           state.hwnd, appliedOpacity, backdrop,
+           static_cast<unsigned>(backdropResult));
+    RequestDwmScenePass();
+}
+
+static void ReleaseNativeMeshState(NativeMeshState& state)
+{
+    RestoreNativeMeshOriginalOpacity(state);
     if (state.visual) g_cBaseObjectRelease(state.visual);
     if (state.transform) g_cBaseObjectRelease(state.transform);
     if (state.instruction) g_cBaseObjectRelease(state.instruction);
-    if (state.instructionB) g_cBaseObjectRelease(state.instructionB);
-    if (state.rectangle) g_cBaseObjectRelease(state.rectangle);
-    if (state.rectangleB) g_cBaseObjectRelease(state.rectangleB);
-    if (state.brush) g_cBaseObjectRelease(state.brush);
+    if (state.group) g_cBaseObjectRelease(state.group);
+    if (state.mesh) g_cBaseObjectRelease(state.mesh);
     if (state.image) g_cBaseObjectRelease(state.image);
     if (state.root) g_cBaseObjectRelease(state.root);
     state = {};
@@ -3877,17 +3775,18 @@ static void InvalidateAnimationTransformForNativeMesh(HWND hwnd)
     RequestDwmScenePass();
 }
 
-static bool DetachNativeRectProbe(const wchar_t* reason)
+static bool DetachNativeMesh(const wchar_t* reason)
 {
-    auto& state = g_nativeRectState;
+    auto& state = g_nativeMeshState;
+    RestoreNativeMeshOriginalOpacity(state);
     if (!state.visual)
     {
-        g_nativeRectHwnd.store(nullptr, std::memory_order_release);
-        g_nativeRectActive.store(false, std::memory_order_release);
+        g_nativeMeshHwnd.store(nullptr, std::memory_order_release);
+        g_nativeMeshActive.store(false, std::memory_order_release);
         return true;
     }
     void* parent = ReadPointerMember(state.visual, 0x18);
-    long result = parent ? g_nativeRectRemoveFromParent(state.visual) : S_OK;
+    long result = parent ? g_nativeMeshRemoveFromParent(state.visual) : S_OK;
     parent = ReadPointerMember(state.visual, 0x18);
     if (result < 0 || parent)
     {
@@ -3902,14 +3801,11 @@ static bool DetachNativeRectProbe(const wchar_t* reason)
         return false;
     }
     HWND hwnd = state.hwnd;
-    Wh_Log(L"NATIVE SHAPE DETACHED: HWND=%p geometry=%s reason=%s",
-           hwnd,
-           state.vertexMesh ? L"vertex-mesh" :
-               state.twoRectangles ? L"two-rectangles" : L"rectangle", reason);
-    ReleaseNativeRectState(state);
-    g_nativeRectHwnd.store(nullptr, std::memory_order_release);
-    g_nativeRectActive.store(false, std::memory_order_release);
-    g_nativeRectStopRequested.store(false, std::memory_order_release);
+    Wh_Log(L"NATIVE MESH DETACHED: HWND=%p reason=%s", hwnd, reason);
+    ReleaseNativeMeshState(state);
+    g_nativeMeshHwnd.store(nullptr, std::memory_order_release);
+    g_nativeMeshActive.store(false, std::memory_order_release);
+    g_nativeMeshStopRequested.store(false, std::memory_order_release);
     if (!g_unloading.load(std::memory_order_acquire))
         InvalidateAnimationTransformForNativeMesh(hwnd);
     return true;
@@ -3941,9 +3837,9 @@ static void BuildNativeMeshIndices(unsigned int (&indices)[NATIVE_MESH_INDEX_COU
     }
 }
 
-static void UpdateNativeVertexMeshProbe(NativeRectState& state)
+static void UpdateNativeVertexMesh(NativeMeshState& state)
 {
-    if (!state.vertexMesh || !state.rectangleB || !g_nativeProbeUpdateMesh)
+    if (!state.mesh || !g_nativeProbeUpdateMesh)
         return;
 
     WobbleMesh physics = {};
@@ -3965,7 +3861,7 @@ static void UpdateNativeVertexMeshProbe(NativeRectState& state)
     ReleaseSRWLockShared(&g_animationSlotsLock);
     if (!found)
     {
-        DetachNativeRectProbe(L"slot-inactive");
+        DetachNativeMesh(L"slot-inactive");
         return;
     }
     if (!std::isfinite(physics.width) ||
@@ -3974,7 +3870,7 @@ static void UpdateNativeVertexMeshProbe(NativeRectState& state)
         return;
     if (state.meshGeneration && state.meshGeneration != generation)
     {
-        DetachNativeRectProbe(L"mesh-generation-changed");
+        DetachNativeMesh(L"mesh-generation-changed");
         return;
     }
     if (state.meshGeneration == generation &&
@@ -3996,11 +3892,13 @@ static void UpdateNativeVertexMeshProbe(NativeRectState& state)
             !std::isfinite(point.position.x) ||
             !std::isfinite(point.position.y))
         {
-            DetachNativeRectProbe(L"mesh-position-invalid");
+            DetachNativeMesh(L"mesh-position-invalid");
             return;
         }
-        double limitX = std::min(400.0, std::max(100.0, physics.width * 0.35));
-        double limitY = std::min(400.0, std::max(100.0, physics.height * 0.35));
+        // Preserve the actual physics deformation. These generous bounds only
+        // guard the private DWM mesh API against corrupted coordinates.
+        const double limitX = std::max(4096.0, physics.width * 4.0);
+        const double limitY = std::max(4096.0, physics.height * 4.0);
         double dx = std::clamp(point.position.x - point.basePosition.x,
                                -limitX, limitX);
         double dy = std::clamp(point.position.y - point.basePosition.y,
@@ -4038,14 +3936,14 @@ static void UpdateNativeVertexMeshProbe(NativeRectState& state)
         }
     }
     BuildNativeMeshIndices(indices);
-    long result = g_nativeProbeUpdateMesh(state.rectangleB, 0, positions,
+    long result = g_nativeProbeUpdateMesh(state.mesh, 0, positions,
                                            coordinates, NATIVE_MESH_VERTEX_COUNT,
                                            indices, NATIVE_MESH_INDEX_COUNT);
     if (result < 0)
     {
         Wh_Log(L"NATIVE VERTEX MESH UPDATE FAILED: HWND=%p result=0x%08X",
                state.hwnd, static_cast<unsigned>(result));
-        DetachNativeRectProbe(L"mesh-update-failed");
+        DetachNativeMesh(L"mesh-update-failed");
         return;
     }
     state.meshGeneration = generation;
@@ -4074,20 +3972,40 @@ static bool GetNativeMeshWindowSize(HWND hwnd, int& width, int& height,
         frameBounds.right - frameBounds.left : 0;
     const int frameHeight = hasFrameBounds ?
         frameBounds.bottom - frameBounds.top : 0;
-    // Extended frame bounds are physical pixels; GetWindowRect may be virtualized.
+    // Extended frame bounds are physical but omit invisible resize borders.
+    // If GetWindowRect is virtualized, restore its full physical outer size.
+    UINT windowDpi = GetDpiForWindow(hwnd);
+    UINT monitorDpiX = 0;
+    UINT monitorDpiY = 0;
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!monitor || !g_getDpiForMonitor ||
+        FAILED(g_getDpiForMonitor(monitor, 0, &monitorDpiX, &monitorDpiY)))
+        monitorDpiX = monitorDpiY = 0;
     width = std::max(windowWidth, frameWidth);
     height = std::max(windowHeight, frameHeight);
+    if (hasFrameBounds && frameWidth > windowWidth && windowDpi &&
+        monitorDpiX > windowDpi)
+    {
+        width = std::max(width, static_cast<int>(std::lround(
+            static_cast<double>(windowWidth) * monitorDpiX / windowDpi)));
+    }
+    if (hasFrameBounds && frameHeight > windowHeight && windowDpi &&
+        monitorDpiY > windowDpi)
+    {
+        height = std::max(height, static_cast<int>(std::lround(
+            static_cast<double>(windowHeight) * monitorDpiY / windowDpi)));
+    }
     if (logDimensions)
     {
         Wh_Log(L"NATIVE MESH BOUNDS: HWND=%p window=%dx%d frame=%dx%d "
-               L"selected=%dx%d windowDpi=%u",
+               L"selected=%dx%d windowDpi=%u monitorDpi=%ux%u",
                hwnd, windowWidth, windowHeight, frameWidth, frameHeight,
-               width, height, GetDpiForWindow(hwnd));
+               width, height, windowDpi, monitorDpiX, monitorDpiY);
     }
     return width >= 1 && height >= 1 && width <= 8192 && height <= 8192;
 }
 
-static long ResizeNativeMeshSourceImage(NativeRectState& state,
+static long ResizeNativeMeshSourceImage(NativeMeshState& state,
                                         int width, int height)
 {
     if (!state.image || !IsVisualProxyPointerValid(state.sourceProxy))
@@ -4114,16 +4032,20 @@ static long ResizeNativeMeshSourceImage(NativeRectState& state,
     return E_NOTIMPL;
 }
 
-static void MaintainNativeRectProbe()
+static void MaintainNativeMesh()
 {
     if (!IsOnDwmSceneThread() ||
-        !g_nativeRectActive.load(std::memory_order_acquire))
+        !g_nativeMeshActive.load(std::memory_order_acquire))
         return;
-    auto& state = g_nativeRectState;
+    auto& state = g_nativeMeshState;
+    if (state.originalOpacityChanged &&
+        (GetTickCount64() >= state.restoreOriginalAt ||
+         !g_meshOriginalHideProbeEnabled.load(std::memory_order_acquire)))
+        RestoreNativeMeshOriginalOpacity(state);
     if (g_unloading.load(std::memory_order_acquire) ||
-        g_nativeRectStopRequested.load(std::memory_order_acquire))
+        g_nativeMeshStopRequested.load(std::memory_order_acquire))
     {
-        DetachNativeRectProbe(g_unloading.load(std::memory_order_acquire)
+        DetachNativeMesh(g_unloading.load(std::memory_order_acquire)
                                   ? L"unload"
                                   : L"stop-requested");
         return;
@@ -4134,7 +4056,7 @@ static void MaintainNativeRectProbe()
         g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy &&
         GetNativeMeshWindowSize(state.hwnd, width, height);
     if (!sourceValid)
-        DetachNativeRectProbe(L"source-changed");
+        DetachNativeMesh(L"source-changed");
     else
     {
         if (width != state.width || height != state.height)
@@ -4145,7 +4067,7 @@ static void MaintainNativeRectProbe()
                 Wh_Log(L"NATIVE MESH SOURCE RESIZE FAILED: HWND=%p "
                        L"size=%dx%d result=0x%08X", state.hwnd,
                        width, height, static_cast<unsigned>(result));
-                DetachNativeRectProbe(L"source-resize-failed");
+                DetachNativeMesh(L"source-resize-failed");
                 return;
             }
             state.width = width;
@@ -4154,96 +4076,109 @@ static void MaintainNativeRectProbe()
             Wh_Log(L"NATIVE MESH SOURCE RESIZED: HWND=%p size=%dx%d",
                    state.hwnd, width, height);
         }
-        UpdateNativeVertexMeshProbe(state);
+        UpdateNativeVertexMesh(state);
     }
 }
 
-static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
+static bool HasAttachableNativeMeshSlot(HWND hwnd)
+{
+    bool attachable = false;
+    AcquireSRWLockShared(&g_animationSlotsLock);
+    for (const WindowAnimationSlot& slot : g_animationSlots)
+    {
+        if (slot.active && slot.hwnd == hwnd &&
+            slot.settings.rendererMode == RendererMode::Mesh &&
+            !(slot.windowStateThrob && !slot.dragging))
+        {
+            attachable = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_animationSlotsLock);
+    return attachable;
+}
+
+static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow,
                                      void* sourceProxy, void* compositor,
-                                     void*& image, void*& brush,
-                                     void*& rectangle, void*& instruction,
-                                     void*& rectangleB, void*& instructionB,
-                                     bool twoRectanglesSelected, bool vertexMeshSelected,
+                                     void*& image, void*& group,
+                                     void*& instruction, void*& mesh,
                                      int width, int height)
 {
     AcquireSRWLockShared(&g_settingsLock);
     bool meshSelected = g_settings.rendererMode == RendererMode::Mesh;
     ReleaseSRWLockShared(&g_settingsLock);
-    if (!meshSelected || !vertexMeshSelected || !NativeRectAbiVerified() ||
+    if (!meshSelected || !NativeMeshAbiVerified() ||
         !g_topLevelWindowGetRootVisual ||
-        g_nativeRectActive.load(std::memory_order_acquire) ||
+        g_nativeMeshActive.load(std::memory_order_acquire) ||
         g_unloading.load(std::memory_order_acquire))
     {
-        Wh_Log(L"NATIVE SHAPE SKIPPED: HWND=%p mesh=%d abi=%d",
-               hwnd, meshSelected, NativeRectAbiVerified());
+        Wh_Log(L"NATIVE MESH SKIPPED: HWND=%p mesh=%d abi=%d",
+               hwnd, meshSelected, NativeMeshAbiVerified());
         return false;
     }
-    g_nativeRectStopRequested.store(false, std::memory_order_release);
+    g_nativeMeshStopRequested.store(false, std::memory_order_release);
     void* root = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
     if (!root || !IsReadableMemory(root, sizeof(void*)) ||
         !IsDwmImageAddress(*reinterpret_cast<void**>(root), sizeof(void*)) ||
         g_nativeProbeGetVisualProxy(root) != sourceProxy)
         return false;
-    void* collection = FindNativeRectSiblingCollection(root);
-    if (!collection || !RetainNativeRectRoot(root))
+    void* collection = FindNativeMeshSiblingCollection(root);
+    if (!collection || !RetainNativeMeshRoot(root))
     {
-        Wh_Log(L"NATIVE SHAPE SKIPPED: HWND=%p sibling=%p",
+        Wh_Log(L"NATIVE MESH SKIPPED: HWND=%p sibling=%p",
                hwnd, collection);
         return false;
     }
 
-    NativeRectState pending = {};
+    NativeMeshState pending = {};
     pending.root = root;
     pending.hwnd = hwnd;
     pending.sourceProxy = sourceProxy;
     pending.width = width;
     pending.height = height;
-    pending.twoRectangles = twoRectanglesSelected;
-    pending.vertexMesh = vertexMeshSelected;
     const wchar_t* stage = L"CreateVisual";
-    Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
-    long result = g_nativeRectCreateVisual(&pending.visual);
+    Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
+    long result = g_nativeMeshCreateVisual(&pending.visual);
     if (result >= 0 && !pending.visual) result = E_UNEXPECTED;
     if (result >= 0)
     {
         stage = L"AddInstruction";
-        Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeRectAddInstruction(pending.visual, instruction);
-    }
-    if (result >= 0 && instructionB)
-    {
-        stage = L"AddSecondInstruction";
-        Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeRectAddInstruction(pending.visual, instructionB);
+        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeMeshAddInstruction(pending.visual, instruction);
     }
     if (result >= 0)
     {
         stage = L"PublishRenderData";
-        Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeRectUpdateRenderData(pending.visual);
+        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeMeshUpdateRenderData(pending.visual);
     }
     if (result >= 0)
     {
         stage = L"CreateTransform";
-        Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
         result = g_createMatrixTransformProxy(compositor, &pending.transform);
         if (result >= 0 && !pending.transform) result = E_UNEXPECTED;
     }
     if (result >= 0)
     {
         stage = L"PositionShape";
-        const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0,
-                                     vertexMeshSelected ? 0.0 :
-                                         static_cast<double>(width) * 0.55,
-                                     0.0};
-        Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
         result = UpdateMatrixTransformProxy(pending.transform, matrix);
     }
     if (result >= 0)
     {
+        stage = L"ValidateSibling";
+        if (!IsWindow(hwnd) || !HasAttachableNativeMeshSlot(hwnd) ||
+            FindNativeMeshSiblingCollection(root) != collection ||
+            g_nativeProbeGetVisualProxy(root) != sourceProxy)
+            result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
         stage = L"InsertSibling";
-        Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeRectInsertRelative(collection, pending.visual,
+        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        result = g_nativeMeshInsertRelative(collection, pending.visual,
                                             root, true, false);
     }
     bool inserted = pending.visual && ReadPointerMember(pending.visual, 0x18);
@@ -4252,13 +4187,13 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
         stage = L"VerifySibling";
         if (ReadPointerMember(pending.visual, 0x18) !=
                 ReadPointerMember(root, 0x18) ||
-            FindNativeRectSiblingCollection(root) != collection)
+            FindNativeMeshSiblingCollection(root) != collection)
             result = E_UNEXPECTED;
     }
     if (result >= 0 && inserted)
     {
         stage = L"BindTransform";
-        Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
         void* visualProxy = g_nativeProbeGetVisualProxy(pending.visual);
         result = IsVisualProxyPointerValid(visualProxy)
                      ? g_cVisualProxySetTransform(visualProxy, pending.transform)
@@ -4267,205 +4202,44 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
     if (result >= 0 && inserted)
     {
         pending.image = image;
-        pending.brush = brush;
-        pending.rectangle = rectangle;
-        pending.rectangleB = rectangleB;
+        pending.group = group;
+        pending.mesh = mesh;
         pending.instruction = instruction;
-        pending.instructionB = instructionB;
-        image = brush = rectangle = rectangleB = instruction = instructionB = nullptr;
-        g_nativeRectState = pending;
-        g_nativeRectHwnd.store(hwnd, std::memory_order_release);
-        g_nativeRectActive.store(true, std::memory_order_release);
+        image = group = mesh = instruction = nullptr;
+        g_nativeMeshState = pending;
+        g_nativeMeshHwnd.store(hwnd, std::memory_order_release);
+        g_nativeMeshActive.store(true, std::memory_order_release);
         InvalidateAnimationTransformForNativeMesh(hwnd);
-        Wh_Log(L"NATIVE SHAPE ATTACHED: HWND=%p geometry=%s root=%p "
+        StartNativeMeshOriginalHideProbe(g_nativeMeshState);
+        Wh_Log(L"NATIVE MESH ATTACHED: HWND=%p root=%p "
                L"visual=%p duration=until-slot-retirement snapshot=none",
-               hwnd, vertexMeshSelected ? L"vertex-mesh" :
-                   twoRectanglesSelected ? L"two-rectangles" : L"rectangle",
-               root, pending.visual);
+               hwnd, root, pending.visual);
         RequestDwmScenePass();
         return true;
     }
-    Wh_Log(L"NATIVE SHAPE FAILED: HWND=%p geometry=%s stage=%s "
-           L"result=0x%08X inserted=%d", hwnd,
-           vertexMeshSelected ? L"vertex-mesh" :
-               twoRectanglesSelected ? L"two-rectangles" : L"rectangle", stage,
+    Wh_Log(L"NATIVE MESH ATTACH FAILED: HWND=%p stage=%s "
+           L"result=0x%08X inserted=%d", hwnd, stage,
            static_cast<unsigned>(result), inserted);
     if (inserted)
     {
         pending.image = image;
-        pending.brush = brush;
-        pending.rectangle = rectangle;
-        pending.rectangleB = rectangleB;
+        pending.group = group;
+        pending.mesh = mesh;
         pending.instruction = instruction;
-        pending.instructionB = instructionB;
-        image = brush = rectangle = rectangleB = instruction = instructionB = nullptr;
-        g_nativeRectState = pending;
-        g_nativeRectHwnd.store(hwnd, std::memory_order_release);
-        g_nativeRectActive.store(true, std::memory_order_release);
-        DetachNativeRectProbe(L"failed-attach");
+        image = group = mesh = instruction = nullptr;
+        g_nativeMeshState = pending;
+        g_nativeMeshHwnd.store(hwnd, std::memory_order_release);
+        g_nativeMeshActive.store(true, std::memory_order_release);
+        DetachNativeMesh(L"failed-attach");
     }
     else
     {
-        ReleaseNativeRectState(pending);
+        ReleaseNativeMeshState(pending);
     }
     return false;
 }
 
-static bool CreateNativeSecondRectangleInstruction(
-    HWND hwnd, void* brush, int width, int height,
-    void*& rectangleOut, void*& instructionOut)
-{
-    rectangleOut = instructionOut = nullptr;
-    if (!IsOnDwmSceneThread() ||
-        g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
-        g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
-        !g_nativeProbeCreateRectangle ||
-        !g_nativeProbeCreateGeometryInstruction || !g_cBaseObjectRelease ||
-        !g_nativeProbeRectangleVtable.load(std::memory_order_acquire) ||
-        !g_nativeProbeGeometryInstructionVtable.load(
-            std::memory_order_acquire) ||
-        width < 80 || height < 100)
-    {
-        Wh_Log(L"NATIVE SECOND RECTANGLE: skipped HWND=%p", hwnd);
-        return false;
-    }
-
-    // The first rectangle occupies the top strip. This one forms the left leg.
-    const RECT left = {0, 50, std::min(width, 80), std::min(height, 150)};
-    void* rectangle = nullptr;
-    void* instruction = nullptr;
-    const wchar_t* stage = L"CreateRectangle";
-    Wh_Log(L"NATIVE SECOND RECTANGLE STAGE: %s HWND=%p", stage, hwnd);
-    long result = g_nativeProbeCreateRectangle(&left, &rectangle);
-    auto matches = [](void* object, void* vtable) {
-        return object && IsReadableMemory(object, sizeof(void*)) &&
-               *reinterpret_cast<void**>(object) == vtable;
-    };
-    bool rectangleType = matches(rectangle,
-                                 g_nativeProbeRectangleVtable.load(
-                                     std::memory_order_acquire));
-    if (result >= 0 && !rectangleType) result = E_UNEXPECTED;
-    bool instructionType = false;
-    if (result >= 0)
-    {
-        stage = L"CreateInstruction";
-        Wh_Log(L"NATIVE SECOND RECTANGLE STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeProbeCreateGeometryInstruction(
-            brush, rectangle, &instruction);
-        instructionType = matches(instruction,
-                                  g_nativeProbeGeometryInstructionVtable.load(
-                                      std::memory_order_acquire));
-        if (result >= 0 && !instructionType) result = E_UNEXPECTED;
-    }
-    Wh_Log(L"NATIVE SECOND RECTANGLE: HWND=%p stage=%s result=0x%08X "
-           L"rectangle=%d instruction=%d attached=0",
-           hwnd, stage, static_cast<unsigned>(result), rectangleType,
-           instructionType);
-    bool ready = result >= 0 && rectangleType && instructionType;
-    if (ready)
-    {
-        rectangleOut = rectangle;
-        instructionOut = instruction;
-    }
-    else
-    {
-        if (instructionType) g_cBaseObjectRelease(instruction);
-        if (rectangleType) g_cBaseObjectRelease(rectangle);
-    }
-    return ready;
-}
-
-[[maybe_unused]] static void RunDetachedNativeImageBrushProbe(HWND hwnd, void* topLevelWindow,
-                                              void* sourceProxy, void* compositor,
-                                              void*& image, int width, int height)
-{
-    if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
-        g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
-        !g_nativeProbeCreateImageBrush || !g_nativeProbeUpdateImageBrush ||
-        !g_nativeProbeCreateRectangle ||
-        !g_nativeProbeCreateGeometryInstruction ||
-        !g_cBaseObjectRelease ||
-        !g_nativeProbeImageBrushVtable.load(std::memory_order_acquire) ||
-        !g_nativeProbeRectangleVtable.load(std::memory_order_acquire) ||
-        !g_nativeProbeGeometryInstructionVtable.load(
-            std::memory_order_acquire))
-    {
-        Wh_Log(L"NATIVE IMAGE BRUSH PROBE: skipped HWND=%p "
-               L"(unverified ABI or missing symbol)", hwnd);
-        return;
-    }
-
-    void* brush = nullptr;
-    void* rectangle = nullptr;
-    void* instruction = nullptr;
-    Wh_Log(L"NATIVE IMAGE BRUSH STAGE: Create HWND=%p", hwnd);
-    long result = g_nativeProbeCreateImageBrush(compositor, &brush);
-    bool exactType = brush && IsReadableMemory(brush, sizeof(void*)) &&
-                     *reinterpret_cast<void**>(brush) ==
-                         g_nativeProbeImageBrushVtable.load(
-                             std::memory_order_acquire);
-    if (result >= 0 && !exactType) result = E_UNEXPECTED;
-    if (result >= 0)
-    {
-        const NativeProbeRectF viewport = {0.0f, 0.0f, 1.0f, 1.0f};
-        const NativeProbeRectF viewbox = {
-            0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)};
-        Wh_Log(L"NATIVE IMAGE BRUSH STAGE: Update HWND=%p", hwnd);
-        result = g_nativeProbeUpdateImageBrush(
-            brush, 1.0, viewport, viewbox, nullptr,
-            1, 0, nullptr, nullptr, 1, 0, 0, 0, image);
-    }
-    bool exactRectangle = false;
-    bool exactInstruction = false;
-    const wchar_t* stage = L"UpdateBrush";
-    if (result >= 0)
-    {
-        // Keep the proven rectangle if combined geometry cannot be created.
-        const RECT rect = {0, 0, std::min(width, 160), std::min(height, 50)};
-        stage = L"CreateRectangle";
-        Wh_Log(L"NATIVE RECTANGLE STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeProbeCreateRectangle(&rect, &rectangle);
-        exactRectangle = rectangle && IsReadableMemory(rectangle, sizeof(void*)) &&
-            *reinterpret_cast<void**>(rectangle) ==
-                g_nativeProbeRectangleVtable.load(std::memory_order_acquire);
-        if (result >= 0 && !exactRectangle) result = E_UNEXPECTED;
-    }
-    if (result >= 0)
-    {
-        stage = L"CreateInstruction";
-        Wh_Log(L"NATIVE RECTANGLE STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeProbeCreateGeometryInstruction(
-            brush, rectangle, &instruction);
-        exactInstruction = instruction &&
-            IsReadableMemory(instruction, sizeof(void*)) &&
-            *reinterpret_cast<void**>(instruction) ==
-                g_nativeProbeGeometryInstructionVtable.load(
-                    std::memory_order_acquire);
-        if (result >= 0 && !exactInstruction) result = E_UNEXPECTED;
-    }
-    Wh_Log(L"NATIVE RECTANGLE PROBE: HWND=%p stage=%s result=0x%08X "
-           L"brushType=%d rectangleType=%d instructionType=%d",
-           hwnd, stage, static_cast<unsigned>(result), exactType,
-           exactRectangle, exactInstruction);
-    if (result >= 0 && exactType && exactRectangle && exactInstruction)
-    {
-        void* rectangleB = nullptr;
-        void* instructionB = nullptr;
-        bool twoRectanglesSelected = CreateNativeSecondRectangleInstruction(
-            hwnd, brush, width, height, rectangleB, instructionB);
-        TryAttachNativeRectProbe(hwnd, topLevelWindow, sourceProxy, compositor,
-                                 image, brush, rectangle, instruction,
-                                 rectangleB, instructionB,
-                                 twoRectanglesSelected, false, width, height);
-        if (instructionB) g_cBaseObjectRelease(instructionB);
-        if (rectangleB) g_cBaseObjectRelease(rectangleB);
-    }
-    if (exactInstruction && instruction) g_cBaseObjectRelease(instruction);
-    if (exactRectangle && rectangle) g_cBaseObjectRelease(rectangle);
-    if (exactType && brush) g_cBaseObjectRelease(brush);
-}
-
-static void RunVisibleNativeMeshProbe(HWND hwnd, void* topLevelWindow,
+static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow,
                                       void* sourceProxy, void* compositor,
                                       void*& image, int width, int height)
 {
@@ -4544,15 +4318,12 @@ static void RunVisibleNativeMeshProbe(HWND hwnd, void* topLevelWindow,
            NATIVE_MESH_VERTEX_COUNT, NATIVE_MESH_INDEX_COUNT, instruction);
     if (result >= 0)
     {
-        void* brush = nullptr;
-        void* instructionB = nullptr;
-        if (TryAttachNativeRectProbe(hwnd, topLevelWindow, sourceProxy,
-                                     compositor, image, brush, group,
-                                     instruction, mesh, instructionB,
-                                     false, true, width, height))
+        if (TryAttachNativeMesh(hwnd, topLevelWindow, sourceProxy,
+                                     compositor, image, group, instruction,
+                                     mesh, width, height))
         {
             Wh_Log(L"NATIVE VERTEX MESH: attached HWND=%p "
-                   L"physicsLinked=1 liveSource=1 affine=identity", hwnd);
+                   L"physicsLinked=1 liveSource=1 original=translation", hwnd);
         }
     }
     if (instruction) g_cBaseObjectRelease(instruction);
@@ -4560,34 +4331,22 @@ static void RunVisibleNativeMeshProbe(HWND hwnd, void* topLevelWindow,
     if (mesh) g_cBaseObjectRelease(mesh);
 }
 
-static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
+static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
                                  void* sourceVisualProxy)
 {
     if (!IsOnDwmSceneThread() || !IsVisualProxyPointerValid(sourceVisualProxy) ||
-        g_nativeRectActive.load(std::memory_order_acquire))
+        g_nativeMeshActive.load(std::memory_order_acquire))
     {
         return;
     }
     AcquireSRWLockShared(&g_settingsLock);
     bool meshSelected = g_settings.rendererMode == RendererMode::Mesh;
     ReleaseSRWLockShared(&g_settingsLock);
-    if (!meshSelected || !NativeRectAbiVerified() ||
+    if (!meshSelected || !NativeMeshAbiVerified() ||
         g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000)
         return;
-    bool meshSlotActive = false;
-    AcquireSRWLockShared(&g_animationSlotsLock);
-    for (const WindowAnimationSlot& slot : g_animationSlots)
-    {
-        if (slot.active && slot.hwnd == hwnd &&
-            slot.settings.rendererMode == RendererMode::Mesh)
-        {
-            meshSlotActive = true;
-            break;
-        }
-    }
-    ReleaseSRWLockShared(&g_animationSlotsLock);
-    if (!meshSlotActive)
+    if (!HasAttachableNativeMeshSlot(hwnd))
         return;
     ULONGLONG now = GetTickCount64();
     if (g_nativeMeshLastAttemptHwnd == hwnd &&
@@ -4613,13 +4372,11 @@ static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
     {
         return;
     }
-    ProbeNativeMeshHost(hwnd, topLevelWindow, sourceVisualProxy);
-
     void* image = nullptr;
-    void* bitmapInstruction = nullptr;
+    void* validationInstruction = nullptr;
     long createResult = g_nativeProbeCreateImage(compositor, &image);
     long updateResult = E_NOTIMPL;
-    long drawBitmapResult = E_NOTIMPL;
+    long validationResult = E_NOTIMPL;
     bool exactImageType = image && IsReadableMemory(image, sizeof(void*)) &&
                           *reinterpret_cast<void**>(image) == expectedVtable;
     if (createResult >= 0 && exactImageType)
@@ -4644,22 +4401,15 @@ static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
                 absoluteMappingMode);
         }
         if (updateResult >= 0)
-        {
-            drawBitmapResult =
-                g_nativeProbeCreateBitmapInstruction(image, &bitmapInstruction);
-        }
+            validationResult = g_nativeProbeCreateBitmapInstruction(
+                image, &validationInstruction);
     }
 
-    // Both writers read the image resource through +0x10 and its ID at +0x18
-    // on these two exact uDWM images. Skip this private-layout read elsewhere.
-    bool knownImageLayout =
-        (g_dwmModuleLayout.timeDateStamp == 0xE19C3234 &&
-         g_dwmModuleLayout.sizeOfImage == 0x16A000) ||
-        (g_dwmModuleLayout.timeDateStamp == 0x2EA6D2FA &&
-         g_dwmModuleLayout.sizeOfImage == 0x13F000);
+    // The exact uDWM build was checked before entering this path.
+    // Its image resource is at +0x10 and the resource ID at +0x18.
     unsigned int imageResourceId = 0;
     bool resourceReadable = false;
-    if (knownImageLayout && updateResult >= 0 && exactImageType)
+    if (updateResult >= 0 && exactImageType)
     {
         void* resource = ReadPointerMember(image, 0x10);
         const BYTE* id = resource ? static_cast<const BYTE*>(resource) + 0x18
@@ -4670,30 +4420,27 @@ static void RunNativeSourceProbe(HWND hwnd, void* topLevelWindow,
             resourceReadable = true;
         }
     }
-    bool instructionKeepsImage = knownImageLayout && bitmapInstruction &&
-        ReadPointerMember(bitmapInstruction, 0x10) == image;
-    Wh_Log(L"NATIVE SOURCE PROBE: HWND=%p create=0x%08X update=0x%08X "
-           L"drawBitmap=0x%08X exactType=%d knownLayout=%d "
-           L"resourceReadable=%d resourceId=%u instructionKeepsImage=%d "
-           L"bitmapVtable=%p",
+    bool instructionKeepsImage = validationInstruction &&
+        ReadPointerMember(validationInstruction, 0x10) == image;
+    Wh_Log(L"NATIVE MESH SOURCE: HWND=%p create=0x%08X update=0x%08X "
+           L"validation=0x%08X exactType=%d resourceReadable=%d "
+           L"resourceId=%u retain=%d",
            hwnd, static_cast<unsigned>(createResult),
            static_cast<unsigned>(updateResult),
-           static_cast<unsigned>(drawBitmapResult), exactImageType,
-           knownImageLayout, resourceReadable, imageResourceId,
-           instructionKeepsImage,
-           g_nativeProbeBitmapVtable.load(std::memory_order_acquire));
-    if (resourceReadable && imageResourceId && drawBitmapResult >= 0 &&
+           static_cast<unsigned>(validationResult), exactImageType,
+           resourceReadable, imageResourceId, instructionKeepsImage);
+    if (resourceReadable && imageResourceId && validationResult >= 0 &&
         instructionKeepsImage)
     {
-        RunVisibleNativeMeshProbe(hwnd, topLevelWindow, sourceVisualProxy,
+        CreateVisibleNativeMesh(hwnd, topLevelWindow, sourceVisualProxy,
                                   compositor, image, width, height);
     }
-    if (bitmapInstruction && drawBitmapResult >= 0 &&
-        IsReadableMemory(bitmapInstruction, sizeof(void*)) &&
-        IsDwmImageAddress(*reinterpret_cast<void**>(bitmapInstruction),
+    if (validationInstruction && validationResult >= 0 &&
+        IsReadableMemory(validationInstruction, sizeof(void*)) &&
+        IsDwmImageAddress(*reinterpret_cast<void**>(validationInstruction),
                           sizeof(void*)))
     {
-        g_cBaseObjectRelease(bitmapInstruction);
+        g_cBaseObjectRelease(validationInstruction);
     }
     if (image && createResult >= 0 && exactImageType)
     {
@@ -4809,9 +4556,9 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             }
         }
         if (topLevelVisualProxy &&
-            !g_nativeRectActive.load(std::memory_order_acquire))
+            !g_nativeMeshActive.load(std::memory_order_acquire))
         {
-            RunNativeSourceProbe(hwnd, topLevelWindow, topLevelVisualProxy);
+            CreateNativeMeshSource(hwnd, topLevelWindow, topLevelVisualProxy);
         }
         bool topLevelBindingAttempted =
             topLevelVisualProxy &&
@@ -4984,7 +4731,7 @@ static void SubmitPendingWobblySceneWork()
     g_sceneWakeScheduled.store(false, std::memory_order_release);
     g_sceneWakePostTimestamp.store(0, std::memory_order_release);
     g_scenePassCounter.fetch_add(1, std::memory_order_release);
-    MaintainNativeRectProbe();
+    MaintainNativeMesh();
     // Restore retiring/quiet windows before discovery, creation or normal rendering.
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
@@ -5013,7 +4760,7 @@ static void SubmitPendingWobblySceneWork()
 
 static bool HasPendingWobblySceneWork()
 {
-    return g_nativeRectActive.load(std::memory_order_acquire) ||
+    return g_nativeMeshActive.load(std::memory_order_acquire) ||
            g_sceneRequestedSerial.load(std::memory_order_acquire) >
                g_sceneSubmittedSerial.load(std::memory_order_acquire) ||
            g_existingWindowBackfillIndex.load(std::memory_order_acquire) <
@@ -6896,6 +6643,7 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         WobbleMesh mesh;
     } snapshot = {};
     bool identityUpdate = false;
+    bool nativeMeshActive = false;
     AcquireSRWLockExclusive(&g_animationSlotsLock);
     WindowAnimationSlot& slot = g_animationSlots[slotIndex];
     // The slot owns its verified proxy until scene-thread retirement.
@@ -6913,10 +6661,10 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         snapshot.meshRevision = slot.meshRevision;
         snapshot.hwnd = slot.hwnd;
         snapshot.matrixTransformProxy = slot.matrixTransformProxy;
-        bool nativeMeshActive = slot.settings.rendererMode == RendererMode::Mesh &&
-            g_nativeRectActive.load(std::memory_order_acquire) &&
-            g_nativeRectHwnd.load(std::memory_order_acquire) == slot.hwnd;
-        identityUpdate = nativeMeshActive || slot.retiring || slot.meshIdentityPending ||
+        nativeMeshActive = slot.settings.rendererMode == RendererMode::Mesh &&
+            g_nativeMeshActive.load(std::memory_order_acquire) &&
+            g_nativeMeshHwnd.load(std::memory_order_acquire) == slot.hwnd;
+        identityUpdate = slot.retiring || slot.meshIdentityPending ||
                          !slot.mesh.active ||
                          g_unloading.load(std::memory_order_acquire);
         if (!identityUpdate)
@@ -7022,6 +6770,13 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
     m12 = std::clamp(m12, -1.25, 1.25);
     m21 = std::clamp(m21, -1.25, 1.25);
     m22 = std::clamp(m22, 0.10, 2.00);
+    if (nativeMeshActive)
+    {
+        // The curved layer owns deformation. The original visual follows only
+        // the physical grab/resize pivot so it cannot jump at direction changes.
+        m11 = m22 = 1.0;
+        m12 = m21 = 0.0;
+    }
     Vec2 translationBase = baseCenter;
     Vec2 translationRendered = renderedCenter;
     bool useSurfacePivot = false;
@@ -7046,7 +6801,8 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         }
         useSurfacePivot = true;
     }
-    else if (snapshot.mesh.dragPointIndex >= 0 && snapshot.mesh.dragPointIndex < GRID_POINT_COUNT)
+    else if (!nativeMeshActive && snapshot.mesh.dragPointIndex >= 0 &&
+             snapshot.mesh.dragPointIndex < GRID_POINT_COUNT)
     {
         const WobblePoint& dragPoint = snapshot.mesh.points[snapshot.mesh.dragPointIndex];
         translationBase = {dragPoint.basePosition.x + snapshot.mesh.dragOffset.x,
@@ -7075,6 +6831,20 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
     }
     double translationX = translationRendered.x - m11 * translationBase.x - m21 * translationBase.y;
     double translationY = translationRendered.y - m12 * translationBase.x - m22 * translationBase.y;
+    double meshScaleX = 1.0;
+    double meshScaleY = 1.0;
+    if (nativeMeshActive && !snapshot.mesh.resizing &&
+        g_nativeMeshState.hwnd == snapshot.hwnd &&
+        g_nativeMeshState.width > 0 && g_nativeMeshState.height > 0)
+    {
+        // The source and sibling share a physical parent. The mesh stretches
+        // its physics coordinates to that parent's pixel bounds; apply the
+        // same conversion to the original window's translation only.
+        meshScaleX = static_cast<double>(g_nativeMeshState.width) / snapshot.mesh.width;
+        meshScaleY = static_cast<double>(g_nativeMeshState.height) / snapshot.mesh.height;
+        translationX *= meshScaleX;
+        translationY *= meshScaleY;
+    }
     // Keep the grab/resize pivot attached, with only a corruption guard.
     double emergencyTranslationLimit =
         std::max(4096.0, std::max(snapshot.mesh.width, snapshot.mesh.height) * 4.0);
@@ -7096,10 +6866,12 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         ShouldEmitTimedTrace(g_nextMatrixTraceAt))
     {
         Wh_Log(L"DRAG TRACE MATRIX: HWND=%p revision=%llu result=0x%08X "
-               L"m11=%.4f m12=%.4f m21=%.4f m22=%.4f dx=%.2f dy=%.2f",
+               L"m11=%.4f m12=%.4f m21=%.4f m22=%.4f dx=%.2f dy=%.2f "
+               L"nativeMesh=%d scale=(%.3f,%.3f)",
                snapshot.hwnd, snapshot.meshRevision,
                static_cast<unsigned int>(updateResult), matrix.m11, matrix.m12,
-               matrix.m21, matrix.m22, matrix.dx, matrix.dy);
+               matrix.m21, matrix.m22, matrix.dx, matrix.dy,
+               nativeMeshActive, meshScaleX, meshScaleY);
     }
 }
 
@@ -7121,8 +6893,8 @@ static void StopAllAnimations()
     int slotsToRetire[MAX_ANIMATION_SLOTS] = {};
     bool sceneCleanupNeeded = false;
     int retireCount = CollectActiveAnimationSlots(slotsToRetire, &sceneCleanupNeeded);
-    sceneCleanupNeeded |= g_nativeRectActive.load(std::memory_order_acquire);
-    g_nativeRectStopRequested.store(true, std::memory_order_release);
+    sceneCleanupNeeded |= g_nativeMeshActive.load(std::memory_order_acquire);
+    g_nativeMeshStopRequested.store(true, std::memory_order_release);
     for (int i = 0; i < retireCount; i++)
     {
         RetireAnimationSlot(slotsToRetire[i]);
@@ -7156,7 +6928,7 @@ static void StopAllAnimations()
         // Wakes carry only an instance token, not pointers; keep their counter
         // intact for late acknowledgments, but don't mistake them for resources.
         bool wakePending = g_sceneWakeOutstanding.load(std::memory_order_acquire) != 0;
-        bool rectActive = g_nativeRectActive.load(std::memory_order_acquire);
+        bool rectActive = g_nativeMeshActive.load(std::memory_order_acquire);
         if (!hookUsers && !retainedProxies && !rectActive)
         {
             break;
@@ -7185,7 +6957,7 @@ static void StopAllAnimations()
         // Off-scene private calls are unsafe. Drop bookkeeping and intentionally
         // retain any unresolved DWM proxies instead of blocking unload forever.
         AbandonAnimationSlotsAfterSceneStall(L"cleanup timeout");
-        if (g_nativeRectActive.load(std::memory_order_acquire))
+        if (g_nativeMeshActive.load(std::memory_order_acquire))
             Wh_Log(L"NATIVE RECTANGLE cleanup timed out; retaining DWM resources");
     }
     DisarmAnimationClock();
@@ -8736,26 +8508,26 @@ static DWORD WINAPI WindowEventThreadProc(LPVOID)
     Wh_Log(L"Window event thread ready");
     bool running = true;
     HANDLE waitHandles[] = {g_animationTimer, g_eventThreadStop};
-    ULONGLONG nextNativeRectWakeAt = 0;
+    ULONGLONG nextNativeMeshWakeAt = 0;
     while (running)
     {
         bool frameDue = false;
         DWORD waitTimeout = INFINITE;
-        if (g_nativeRectActive.load(std::memory_order_acquire) &&
-            g_nativeRectStopRequested.load(std::memory_order_acquire))
+        if (g_nativeMeshActive.load(std::memory_order_acquire) &&
+            g_nativeMeshStopRequested.load(std::memory_order_acquire))
         {
             ULONGLONG now = GetTickCount64();
-            if (!nextNativeRectWakeAt || now >= nextNativeRectWakeAt)
+            if (!nextNativeMeshWakeAt || now >= nextNativeMeshWakeAt)
             {
                 RequestDwmScenePass();
-                nextNativeRectWakeAt = now + 100;
+                nextNativeMeshWakeAt = now + 100;
             }
             waitTimeout = static_cast<DWORD>(
-                std::max<ULONGLONG>(1, nextNativeRectWakeAt - now));
+                std::max<ULONGLONG>(1, nextNativeMeshWakeAt - now));
         }
         else
         {
-            nextNativeRectWakeAt = 0;
+            nextNativeMeshWakeAt = 0;
         }
         DWORD waitResult = MsgWaitForMultipleObjectsEx(
             ARRAYSIZE(waitHandles), waitHandles, waitTimeout, QS_ALLINPUT,
@@ -8944,6 +8716,10 @@ static void LoadSettings()
                                 : rendererValue == L"mesh"
                                       ? RendererMode::Mesh
                                       : RendererMode::Affine;
+    bool originalHideProbe =
+        Wh_GetIntSetting(L"MeshOriginalHideProbe") != 0;
+    g_meshOriginalHideProbeEnabled.store(originalHideProbe,
+                                         std::memory_order_release);
     g_meshBridgeEnabled.store(
         settings.rendererMode == RendererMode::ExternalGpu,
         std::memory_order_release);
@@ -8967,9 +8743,14 @@ static void LoadSettings()
     g_settings = settings;
     ReleaseSRWLockExclusive(&g_settingsLock);
     if (settings.rendererMode != RendererMode::Mesh &&
-        g_nativeRectActive.load(std::memory_order_acquire))
+        g_nativeMeshActive.load(std::memory_order_acquire))
     {
-        g_nativeRectStopRequested.store(true, std::memory_order_release);
+        g_nativeMeshStopRequested.store(true, std::memory_order_release);
+        RequestDwmScenePass();
+    }
+    else if (!originalHideProbe &&
+             g_nativeMeshActive.load(std::memory_order_acquire))
+    {
         RequestDwmScenePass();
     }
     Wh_Log(L"Settings: "
@@ -8980,13 +8761,14 @@ static void LoadSettings()
            L"WindowStateWobble=%d, "
            L"Stiffness=%.2f, "
            L"Drag=%.2f, "
-           L"MoveFactor=%.2f",
+           L"MoveFactor=%.2f, "
+           L"HideProbe=%d",
            wobbliness, advancedMode,
            settings.rendererMode == RendererMode::ExternalGpu ? L"external-gpu" :
                settings.rendererMode == RendererMode::Mesh ? L"mesh" : L"affine",
            settings.resizeWobbleEnabled,
            settings.windowStateWobbleEnabled, settings.stiffness, settings.drag,
-           settings.moveFactor);
+           settings.moveFactor, originalHideProbe);
 }
 
 static bool HasRecentDwmCrashLoop()
@@ -10141,9 +9923,11 @@ BOOL Wh_ModInit()
     g_unloading.store(false, std::memory_order_release);
     g_nativeMeshLastAttemptHwnd = nullptr;
     g_nativeMeshLastAttemptAt = 0;
-    g_nativeRectActive.store(false, std::memory_order_release);
-    g_nativeRectStopRequested.store(false, std::memory_order_release);
-    g_nativeRectHwnd.store(nullptr, std::memory_order_release);
+    g_originalHideProbeLastHwnd = nullptr;
+    g_originalHideProbeLastAt = 0;
+    g_nativeMeshActive.store(false, std::memory_order_release);
+    g_nativeMeshStopRequested.store(false, std::memory_order_release);
+    g_nativeMeshHwnd.store(nullptr, std::memory_order_release);
     g_dwmSceneWakeMessage =
         RegisterWindowMessageW(L"Windhawk.WobblyWindows.DwmSceneWake");
     if (g_dwmSceneWakeMessage == 0)
