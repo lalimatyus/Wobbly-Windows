@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.294
+// @version         0.295
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3891,11 +3891,30 @@ static bool DetachNativeRectProbe(const wchar_t* reason)
     return true;
 }
 
-static float NativeMeshPreviewScale(int width, int height)
+static constexpr unsigned int NATIVE_MESH_CELLS = 20;
+static constexpr unsigned int NATIVE_MESH_SIDE = NATIVE_MESH_CELLS + 1;
+static constexpr unsigned int NATIVE_MESH_VERTEX_COUNT =
+    NATIVE_MESH_SIDE * NATIVE_MESH_SIDE;
+static constexpr unsigned int NATIVE_MESH_INDEX_COUNT =
+    NATIVE_MESH_CELLS * NATIVE_MESH_CELLS * 6;
+
+static void CalculateBernsteinBasis(double value, double basis[4]);
+
+static void BuildNativeMeshIndices(unsigned int (&indices)[NATIVE_MESH_INDEX_COUNT])
 {
-    return static_cast<float>(std::min(0.35,
-        std::min(300.0 / static_cast<double>(width),
-                 220.0 / static_cast<double>(height))));
+    unsigned int count = 0;
+    for (unsigned int y = 0; y < NATIVE_MESH_CELLS; ++y)
+    {
+        for (unsigned int x = 0; x < NATIVE_MESH_CELLS; ++x)
+        {
+            const unsigned int a = y * NATIVE_MESH_SIDE + x;
+            const unsigned int b = a + 1;
+            const unsigned int c = a + NATIVE_MESH_SIDE;
+            const unsigned int d = c + 1;
+            indices[count++] = a; indices[count++] = c; indices[count++] = b;
+            indices[count++] = b; indices[count++] = c; indices[count++] = d;
+        }
+    }
 }
 
 static void UpdateNativeVertexMeshProbe(NativeRectState& state)
@@ -3936,12 +3955,14 @@ static void UpdateNativeVertexMeshProbe(NativeRectState& state)
         state.submittedMeshRevision == revision)
         return;
 
-    NativeProbePoint3F positions[16] = {};
-    NativeProbePoint2D coordinates[16] = {};
-    unsigned int indices[54] = {};
-    const float scale = NativeMeshPreviewScale(state.width, state.height);
+    NativeProbePoint3F positions[NATIVE_MESH_VERTEX_COUNT] = {};
+    NativeProbePoint2D coordinates[NATIVE_MESH_VERTEX_COUNT] = {};
+    unsigned int indices[NATIVE_MESH_INDEX_COUNT] = {};
+    Vec2 control[GRID_POINT_COUNT] = {};
+    const double scaleX = static_cast<double>(state.width) / physics.width;
+    const double scaleY = static_cast<double>(state.height) / physics.height;
     double maximumDisplacement = 0.0;
-    for (unsigned int i = 0; i < 16; ++i)
+    for (unsigned int i = 0; i < GRID_POINT_COUNT; ++i)
     {
         const WobblePoint& point = physics.points[i];
         if (!std::isfinite(point.basePosition.x) ||
@@ -3960,26 +3981,40 @@ static void UpdateNativeVertexMeshProbe(NativeRectState& state)
                                -limitY, limitY);
         maximumDisplacement = std::max(maximumDisplacement,
                                         std::hypot(dx, dy));
-        positions[i] = {
-            static_cast<float>((point.basePosition.x + dx) * scale),
-            static_cast<float>((point.basePosition.y + dy) * scale), 0.0f};
-        coordinates[i] = {point.basePosition.x, point.basePosition.y};
+        control[i] = {(point.basePosition.x + dx) * scaleX,
+                      (point.basePosition.y + dy) * scaleY};
     }
-    unsigned int count = 0;
-    for (unsigned int y = 0; y < 3; ++y)
+    for (unsigned int y = 0; y < NATIVE_MESH_SIDE; ++y)
     {
-        for (unsigned int x = 0; x < 3; ++x)
+        const double v = static_cast<double>(y) / NATIVE_MESH_CELLS;
+        double basisY[4];
+        CalculateBernsteinBasis(v, basisY);
+        for (unsigned int x = 0; x < NATIVE_MESH_SIDE; ++x)
         {
-            unsigned int a = y * 4 + x;
-            unsigned int b = a + 1;
-            unsigned int c = a + 4;
-            unsigned int d = c + 1;
-            indices[count++] = a; indices[count++] = c; indices[count++] = b;
-            indices[count++] = b; indices[count++] = c; indices[count++] = d;
+            const double u = static_cast<double>(x) / NATIVE_MESH_CELLS;
+            double basisX[4];
+            CalculateBernsteinBasis(u, basisX);
+            Vec2 position = {};
+            for (unsigned int cy = 0; cy < GRID_HEIGHT; ++cy)
+            {
+                for (unsigned int cx = 0; cx < GRID_WIDTH; ++cx)
+                {
+                    const double weight = basisY[cy] * basisX[cx];
+                    const Vec2& point = control[cy * GRID_WIDTH + cx];
+                    position.x += weight * point.x;
+                    position.y += weight * point.y;
+                }
+            }
+            const unsigned int index = y * NATIVE_MESH_SIDE + x;
+            positions[index] = {static_cast<float>(position.x),
+                                static_cast<float>(position.y), 0.0f};
+            coordinates[index] = {u * state.width, v * state.height};
         }
     }
+    BuildNativeMeshIndices(indices);
     long result = g_nativeProbeUpdateMesh(state.rectangleB, 0, positions,
-                                           coordinates, 16, indices, count);
+                                           coordinates, NATIVE_MESH_VERTEX_COUNT,
+                                           indices, NATIVE_MESH_INDEX_COUNT);
     if (result < 0)
     {
         Wh_Log(L"NATIVE VERTEX MESH UPDATE FAILED: HWND=%p result=0x%08X",
@@ -4098,7 +4133,9 @@ static bool TryAttachNativeRectProbe(HWND hwnd, void* topLevelWindow,
     {
         stage = L"PositionShape";
         const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0,
-                                     static_cast<double>(width) * 0.55, 0.0};
+                                     vertexMeshSelected ? 0.0 :
+                                         static_cast<double>(width) * 0.55,
+                                     0.0};
         Wh_Log(L"NATIVE SHAPE ATTACH STAGE: %s HWND=%p", stage, hwnd);
         result = UpdateMatrixTransformProxy(pending.transform, matrix);
     }
@@ -4348,35 +4385,22 @@ static void RunVisibleNativeMeshProbe(HWND hwnd, void* topLevelWindow,
         return;
     }
 
-    NativeProbePoint3F positions[16] = {};
-    NativeProbePoint2D coordinates[16] = {};
-    unsigned int indices[54] = {};
-    const float scale = NativeMeshPreviewScale(width, height);
-    for (int y = 0; y < 4; ++y)
+    NativeProbePoint3F positions[NATIVE_MESH_VERTEX_COUNT] = {};
+    NativeProbePoint2D coordinates[NATIVE_MESH_VERTEX_COUNT] = {};
+    unsigned int indices[NATIVE_MESH_INDEX_COUNT] = {};
+    for (unsigned int y = 0; y < NATIVE_MESH_SIDE; ++y)
     {
-        for (int x = 0; x < 4; ++x)
+        for (unsigned int x = 0; x < NATIVE_MESH_SIDE; ++x)
         {
-            int index = y * 4 + x;
-            double px = static_cast<double>(width * x) / 3.0;
-            double py = static_cast<double>(height * y) / 3.0;
-            positions[index] = {static_cast<float>(px * scale),
-                                static_cast<float>(py * scale), 0.0f};
+            const unsigned int index = y * NATIVE_MESH_SIDE + x;
+            const double px = static_cast<double>(width) * x / NATIVE_MESH_CELLS;
+            const double py = static_cast<double>(height) * y / NATIVE_MESH_CELLS;
+            positions[index] = {static_cast<float>(px),
+                                static_cast<float>(py), 0.0f};
             coordinates[index] = {px, py};
         }
     }
-    unsigned int count = 0;
-    for (unsigned int y = 0; y < 3; ++y)
-    {
-        for (unsigned int x = 0; x < 3; ++x)
-        {
-            unsigned int a = y * 4 + x;
-            unsigned int b = a + 1;
-            unsigned int c = a + 4;
-            unsigned int d = c + 1;
-            indices[count++] = a; indices[count++] = c; indices[count++] = b;
-            indices[count++] = b; indices[count++] = c; indices[count++] = d;
-        }
-    }
+    BuildNativeMeshIndices(indices);
 
     void* mesh = nullptr;
     void* group = nullptr;
@@ -4390,7 +4414,8 @@ static void RunVisibleNativeMeshProbe(HWND hwnd, void* topLevelWindow,
         stage = L"UpdateMesh";
         Wh_Log(L"NATIVE VERTEX MESH STAGE: %s HWND=%p", stage, hwnd);
         result = g_nativeProbeUpdateMesh(mesh, 0, positions, coordinates,
-                                         16, indices, count);
+                                         NATIVE_MESH_VERTEX_COUNT, indices,
+                                         NATIVE_MESH_INDEX_COUNT);
     }
     if (result >= 0)
     {
@@ -4416,8 +4441,9 @@ static void RunVisibleNativeMeshProbe(HWND hwnd, void* topLevelWindow,
             result = E_UNEXPECTED;
     }
     Wh_Log(L"NATIVE VERTEX MESH: HWND=%p stage=%s result=0x%08X "
-           L"vertices=16 indices=%u instruction=%p attached=0",
-           hwnd, stage, static_cast<unsigned>(result), count, instruction);
+           L"vertices=%u indices=%u instruction=%p attached=0",
+           hwnd, stage, static_cast<unsigned>(result),
+           NATIVE_MESH_VERTEX_COUNT, NATIVE_MESH_INDEX_COUNT, instruction);
     if (result >= 0)
     {
         void* brush = nullptr;
