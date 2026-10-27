@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.299
+// @version         0.300
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -106,6 +106,10 @@ the combined mod is not offered under GPLv2.
   - "affine": "Affine (stable)"
   - "mesh": "Mesh Renderer (experimental)"
   - "external-gpu": "GPU mesh overlay (experimental)"
+
+- MeshOriginalHideProbe: false
+  $name: Briefly hide the original window (test)
+  $description: With Mesh Renderer, hide the original visual for 0.75 seconds after each mesh attachment, then restore it automatically. Tests whether the curved image can render without its source being visible.
 
 - AdvancedMode:
   - enable: false
@@ -436,6 +440,9 @@ CMatrixTransformProxyUpdateDouble_t g_cMatrixTransformProxyUpdate = nullptr;
 CMatrixTransformProxyUpdateFloat_t g_cMatrixTransformProxyUpdateFloat = nullptr;
 using CVisualProxySetTransform_t = long(__cdecl*)(void* pThis, void* transform);
 CVisualProxySetTransform_t g_cVisualProxySetTransform = nullptr;
+using CVisualSetOpacity_t = void(__cdecl*)(void* pThis, double opacity);
+CVisualSetOpacity_t g_cVisualSetOpacity = nullptr;
+std::atomic_bool g_meshOriginalHideProbeEnabled = false;
 using CCompositorCreateMatrixTransformProxy_t = long(__cdecl*)(void* pThis, void** transformProxy);
 CCompositorCreateMatrixTransformProxy_t g_createMatrixTransformProxy = nullptr;
 
@@ -512,6 +519,9 @@ struct NativeMeshState
     int width = 0;
     int height = 0;
     bool detachFailureLogged = false;
+    bool originalOpacityChanged = false;
+    double originalOpacity = 1.0;
+    ULONGLONG restoreOriginalAt = 0;
     ULONGLONG meshGeneration = 0;
     ULONGLONG submittedMeshRevision = 0;
     unsigned int meshUpdateCount = 0;
@@ -528,6 +538,8 @@ void* g_nativeProbeImageVtableSymbol = nullptr;
 std::atomic<void*> g_nativeProbeImageVtable = nullptr;
 HWND g_nativeMeshLastAttemptHwnd = nullptr; // DWM scene thread only.
 ULONGLONG g_nativeMeshLastAttemptAt = 0;
+HWND g_originalHideProbeLastHwnd = nullptr; // DWM scene thread only.
+ULONGLONG g_originalHideProbeLastAt = 0;
 
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
@@ -3055,6 +3067,8 @@ static bool InitializeDwmHooks()
          &g_cVisualProxySetTransform,
          nullptr,
          true},
+        {{L"public: virtual void __cdecl CVisual::SetOpacity(double)"},
+          &g_cVisualSetOpacity, nullptr, true},
         {{L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CMatrixTransformProxy>(class CMatrixTransformProxy * *)"},
          &g_createMatrixTransformProxy,
@@ -3260,6 +3274,7 @@ static bool InitializeDwmHooks()
     keepValid(g_nativeMeshInsertRelative);
     keepValid(g_nativeMeshRemoveFromParent);
     keepValid(g_nativeMeshCollectionRemove);
+    keepValid(g_cVisualSetOpacity);
     if (!IsDwmImageAddress(g_nativeMeshCollectionVtable, sizeof(void*)))
     {
         g_nativeMeshCollectionVtable = nullptr;
@@ -3627,8 +3642,114 @@ static bool RetainNativeMeshRoot(void* root)
     return false;
 }
 
+static bool NativeVisualOpacityAbiVerified()
+{
+    if (!NativeMeshAbiVerified() || !g_cVisualSetOpacity)
+        return false;
+    const auto* code = reinterpret_cast<const BYTE*>(g_cVisualSetOpacity);
+    constexpr BYTE load[] = {0xF2, 0x0F, 0x10, 0x91, 0xC0, 0, 0, 0};
+    constexpr BYTE store[] = {0xF2, 0x0F, 0x11, 0x89, 0xC0, 0, 0, 0};
+    return IsReadableMemory(code, 0x38) &&
+           std::memcmp(code, load, sizeof(load)) == 0 &&
+           std::memcmp(code + 0x30, store, sizeof(store)) == 0;
+}
+
+static void RestoreNativeMeshOriginalOpacity(NativeMeshState& state)
+{
+    if (!state.originalOpacityChanged)
+        return;
+    state.originalOpacityChanged = false;
+    if (NativeVisualOpacityAbiVerified() && state.root &&
+        IsReadableMemory(state.root, sizeof(void*)) &&
+        IsReadableMemory(static_cast<const BYTE*>(state.root) + 0xC0,
+                         sizeof(double)) &&
+        IsDwmImageAddress(*reinterpret_cast<void**>(state.root), sizeof(void*)))
+    {
+        double currentOpacity = 0.0;
+        std::memcpy(&currentOpacity,
+                    static_cast<const BYTE*>(state.root) + 0xC0,
+                    sizeof(currentOpacity));
+        if (std::isfinite(currentOpacity) &&
+            std::abs(currentOpacity) < 0.0001)
+        {
+            g_cVisualSetOpacity(state.root, state.originalOpacity);
+            Wh_Log(L"NATIVE MESH ORIGINAL RESTORED: HWND=%p opacity=%.2f",
+                   state.hwnd, state.originalOpacity);
+        }
+        else
+        {
+            Wh_Log(L"NATIVE MESH ORIGINAL PROBE: HWND=%p opacity changed "
+                   L"externally to %.2f; leaving it intact",
+                   state.hwnd, currentOpacity);
+        }
+    }
+}
+
+static void StartNativeMeshOriginalHideProbe(NativeMeshState& state)
+{
+    if (!g_meshOriginalHideProbeEnabled.load(std::memory_order_acquire) ||
+        !state.root)
+        return;
+    if (!NativeVisualOpacityAbiVerified())
+    {
+        Wh_Log(L"NATIVE MESH ORIGINAL PROBE UNAVAILABLE: opacity ABI not verified");
+        return;
+    }
+    if (!IsReadableMemory(static_cast<const BYTE*>(state.root) + 0xC0,
+                          sizeof(double)))
+        return;
+    bool activeDrag = false;
+    AcquireSRWLockShared(&g_animationSlotsLock);
+    for (const WindowAnimationSlot& slot : g_animationSlots)
+    {
+        if (slot.active && slot.hwnd == state.hwnd && slot.dragging &&
+            !slot.windowStateThrob)
+        {
+            activeDrag = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_animationSlotsLock);
+    if (!activeDrag)
+        return;
+    ULONGLONG now = GetTickCount64();
+    if (g_originalHideProbeLastHwnd == state.hwnd &&
+        now - g_originalHideProbeLastAt < 5000)
+        return;
+    double opacity = 0.0;
+    std::memcpy(&opacity, static_cast<const BYTE*>(state.root) + 0xC0,
+                sizeof(opacity));
+    if (!std::isfinite(opacity) || opacity < 0.999 || opacity > 1.001)
+    {
+        Wh_Log(L"NATIVE MESH ORIGINAL PROBE SKIPPED: HWND=%p opacity=%.2f",
+               state.hwnd, opacity);
+        return;
+    }
+    DWORD backdrop = 0;
+    long backdropResult = g_dwmGetWindowAttribute
+        ? g_dwmGetWindowAttribute(state.hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
+                                  &backdrop, sizeof(backdrop))
+        : E_NOTIMPL;
+    state.originalOpacity = opacity;
+    state.originalOpacityChanged = true;
+    state.restoreOriginalAt = now + 750;
+    g_originalHideProbeLastHwnd = state.hwnd;
+    g_originalHideProbeLastAt = now;
+    g_cVisualSetOpacity(state.root, 0.0);
+    double appliedOpacity = opacity;
+    std::memcpy(&appliedOpacity,
+                static_cast<const BYTE*>(state.root) + 0xC0,
+                sizeof(appliedOpacity));
+    Wh_Log(L"NATIVE MESH ORIGINAL HIDE PROBE: HWND=%p durationMs=750 "
+           L"appliedOpacity=%.2f backdrop=%u backdropResult=0x%08X",
+           state.hwnd, appliedOpacity, backdrop,
+           static_cast<unsigned>(backdropResult));
+    RequestDwmScenePass();
+}
+
 static void ReleaseNativeMeshState(NativeMeshState& state)
 {
+    RestoreNativeMeshOriginalOpacity(state);
     if (state.visual) g_cBaseObjectRelease(state.visual);
     if (state.transform) g_cBaseObjectRelease(state.transform);
     if (state.instruction) g_cBaseObjectRelease(state.instruction);
@@ -3657,6 +3778,7 @@ static void InvalidateAnimationTransformForNativeMesh(HWND hwnd)
 static bool DetachNativeMesh(const wchar_t* reason)
 {
     auto& state = g_nativeMeshState;
+    RestoreNativeMeshOriginalOpacity(state);
     if (!state.visual)
     {
         g_nativeMeshHwnd.store(nullptr, std::memory_order_release);
@@ -3916,6 +4038,10 @@ static void MaintainNativeMesh()
         !g_nativeMeshActive.load(std::memory_order_acquire))
         return;
     auto& state = g_nativeMeshState;
+    if (state.originalOpacityChanged &&
+        (GetTickCount64() >= state.restoreOriginalAt ||
+         !g_meshOriginalHideProbeEnabled.load(std::memory_order_acquire)))
+        RestoreNativeMeshOriginalOpacity(state);
     if (g_unloading.load(std::memory_order_acquire) ||
         g_nativeMeshStopRequested.load(std::memory_order_acquire))
     {
@@ -4084,6 +4210,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow,
         g_nativeMeshHwnd.store(hwnd, std::memory_order_release);
         g_nativeMeshActive.store(true, std::memory_order_release);
         InvalidateAnimationTransformForNativeMesh(hwnd);
+        StartNativeMeshOriginalHideProbe(g_nativeMeshState);
         Wh_Log(L"NATIVE MESH ATTACHED: HWND=%p root=%p "
                L"visual=%p duration=until-slot-retirement snapshot=none",
                hwnd, root, pending.visual);
@@ -8589,6 +8716,10 @@ static void LoadSettings()
                                 : rendererValue == L"mesh"
                                       ? RendererMode::Mesh
                                       : RendererMode::Affine;
+    bool originalHideProbe =
+        Wh_GetIntSetting(L"MeshOriginalHideProbe") != 0;
+    g_meshOriginalHideProbeEnabled.store(originalHideProbe,
+                                         std::memory_order_release);
     g_meshBridgeEnabled.store(
         settings.rendererMode == RendererMode::ExternalGpu,
         std::memory_order_release);
@@ -8617,6 +8748,11 @@ static void LoadSettings()
         g_nativeMeshStopRequested.store(true, std::memory_order_release);
         RequestDwmScenePass();
     }
+    else if (!originalHideProbe &&
+             g_nativeMeshActive.load(std::memory_order_acquire))
+    {
+        RequestDwmScenePass();
+    }
     Wh_Log(L"Settings: "
            L"WobblinessPreset=%d, "
            L"Advanced=%d, "
@@ -8625,13 +8761,14 @@ static void LoadSettings()
            L"WindowStateWobble=%d, "
            L"Stiffness=%.2f, "
            L"Drag=%.2f, "
-           L"MoveFactor=%.2f",
+           L"MoveFactor=%.2f, "
+           L"HideProbe=%d",
            wobbliness, advancedMode,
            settings.rendererMode == RendererMode::ExternalGpu ? L"external-gpu" :
                settings.rendererMode == RendererMode::Mesh ? L"mesh" : L"affine",
            settings.resizeWobbleEnabled,
            settings.windowStateWobbleEnabled, settings.stiffness, settings.drag,
-           settings.moveFactor);
+           settings.moveFactor, originalHideProbe);
 }
 
 static bool HasRecentDwmCrashLoop()
@@ -9786,6 +9923,8 @@ BOOL Wh_ModInit()
     g_unloading.store(false, std::memory_order_release);
     g_nativeMeshLastAttemptHwnd = nullptr;
     g_nativeMeshLastAttemptAt = 0;
+    g_originalHideProbeLastHwnd = nullptr;
+    g_originalHideProbeLastAt = 0;
     g_nativeMeshActive.store(false, std::memory_order_release);
     g_nativeMeshStopRequested.store(false, std::memory_order_release);
     g_nativeMeshHwnd.store(nullptr, std::memory_order_release);
