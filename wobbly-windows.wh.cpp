@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.298
+// @version         0.299
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3954,6 +3954,24 @@ static void MaintainNativeMesh()
     }
 }
 
+static bool HasAttachableNativeMeshSlot(HWND hwnd)
+{
+    bool attachable = false;
+    AcquireSRWLockShared(&g_animationSlotsLock);
+    for (const WindowAnimationSlot& slot : g_animationSlots)
+    {
+        if (slot.active && slot.hwnd == hwnd &&
+            slot.settings.rendererMode == RendererMode::Mesh &&
+            !(slot.windowStateThrob && !slot.dragging))
+        {
+            attachable = true;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_animationSlotsLock);
+    return attachable;
+}
+
 static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow,
                                      void* sourceProxy, void* compositor,
                                      void*& image, void*& group,
@@ -4021,6 +4039,14 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow,
         const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
         Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
         result = UpdateMatrixTransformProxy(pending.transform, matrix);
+    }
+    if (result >= 0)
+    {
+        stage = L"ValidateSibling";
+        if (!IsWindow(hwnd) || !HasAttachableNativeMeshSlot(hwnd) ||
+            FindNativeMeshSiblingCollection(root) != collection ||
+            g_nativeProbeGetVisualProxy(root) != sourceProxy)
+            result = E_UNEXPECTED;
     }
     if (result >= 0)
     {
@@ -4193,19 +4219,7 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
         g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000)
         return;
-    bool meshSlotActive = false;
-    AcquireSRWLockShared(&g_animationSlotsLock);
-    for (const WindowAnimationSlot& slot : g_animationSlots)
-    {
-        if (slot.active && slot.hwnd == hwnd &&
-            slot.settings.rendererMode == RendererMode::Mesh)
-        {
-            meshSlotActive = true;
-            break;
-        }
-    }
-    ReleaseSRWLockShared(&g_animationSlotsLock);
-    if (!meshSlotActive)
+    if (!HasAttachableNativeMeshSlot(hwnd))
         return;
     ULONGLONG now = GetTickCount64();
     if (g_nativeMeshLastAttemptHwnd == hwnd &&
