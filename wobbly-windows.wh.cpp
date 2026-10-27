@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.301
+// @version         0.302
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -495,6 +495,7 @@ NativeMeshInsertRelative_t g_nativeMeshInsertRelative = nullptr;
 NativeMeshRemoveFromParent_t g_nativeMeshRemoveFromParent = nullptr;
 void* g_nativeMeshCollectionRemove = nullptr;
 void* g_nativeMeshCollectionVtable = nullptr;
+void* g_nativeBackdropVisualVtable = nullptr;
 std::atomic_bool g_nativeMeshActive = false;
 std::atomic_bool g_nativeMeshStopRequested = false;
 std::atomic<HWND> g_nativeMeshHwnd = nullptr;
@@ -508,6 +509,8 @@ struct NativeMeshState
     void* visual = nullptr;
     void* transform = nullptr;
     void* sourceProxy = nullptr;
+    void* sourceOwner = nullptr;
+    bool backdropSource = false;
     HWND hwnd = nullptr;
     int width = 0;
     int height = 0;
@@ -3103,6 +3106,8 @@ static bool InitializeDwmHooks()
          &g_nativeMeshRemoveFromParent, nullptr, true},
         {{L"const VisualCollection::`vftable'"},
          &g_nativeMeshCollectionVtable, nullptr, true},
+        {{L"const CWindowBackgroundTreatmentVisual::`vftable'"},
+         &g_nativeBackdropVisualVtable, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateMeshGeometry2dProxy("
            L"class CMeshGeometry2dProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
@@ -3267,6 +3272,8 @@ static bool InitializeDwmHooks()
     {
         g_nativeMeshCollectionVtable = nullptr;
     }
+    if (!IsDwmImageAddress(g_nativeBackdropVisualVtable, sizeof(void*)))
+        g_nativeBackdropVisualVtable = nullptr;
     keepValid(g_nativeProbeCreateMesh);
     keepValid(g_nativeProbeUpdateMesh);
     keepValid(g_nativeProbeCreateGroup);
@@ -3543,6 +3550,7 @@ static bool NativeMeshAbiVerified()
         !g_nativeMeshAddInstruction || !g_nativeMeshUpdateRenderData ||
         !g_nativeMeshInsertRelative || !g_nativeMeshRemoveFromParent ||
         !g_nativeMeshCollectionRemove || !g_nativeMeshCollectionVtable ||
+        !g_topLevelWindowGetRootVisual ||
         !g_nativeProbeGetVisualParent || !g_nativeProbeGetVisualProxy ||
         !g_createMatrixTransformProxy || !g_cVisualProxySetTransform ||
         !HasMatrixTransformUpdate() || !g_cBaseObjectRelease)
@@ -3661,6 +3669,31 @@ static bool ReadNativeVisualChildren(void* visual, void**& entries,
             return false;
     }
     return true;
+}
+
+static bool IsNativeBackdropSourceRoot(void* topLevelWindow, void* border,
+                                       void* sourceRoot)
+{
+    if (!g_nativeBackdropVisualVtable || !border || !sourceRoot ||
+        ReadPointerMember(sourceRoot, 0) != g_nativeBackdropVisualVtable ||
+        ReadPointerMember(border, 0x18) != sourceRoot ||
+        ReadPointerMember(sourceRoot, 0x18) != topLevelWindow)
+        return false;
+    void** children = nullptr;
+    unsigned int count = 0;
+    return ReadNativeVisualChildren(sourceRoot, children, count) &&
+           count == 1 && children[0] == border;
+}
+
+static bool IsNativeMeshSourceCurrent(void* topLevelWindow, void* sourceRoot,
+                                      void* sourceProxy, bool backdropSource)
+{
+    void* border = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
+    if (backdropSource ? !IsNativeBackdropSourceRoot(topLevelWindow, border, sourceRoot)
+                       : border != sourceRoot)
+        return false;
+    return sourceRoot && NativeVisualVtableRva(sourceRoot) &&
+           g_nativeProbeGetVisualProxy(sourceRoot) == sourceProxy;
 }
 
 static void LogNativeMeshSourceTopology(HWND hwnd, void* topLevelWindow,
@@ -4040,6 +4073,12 @@ static void MaintainNativeMesh()
     bool sourceValid = state.root &&
         g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy &&
         GetNativeMeshWindowSize(state.hwnd, width, height);
+    if (sourceValid && state.backdropSource)
+    {
+        sourceValid = ReadPointerMember(state.root, 0x18) == state.sourceOwner &&
+                      ReadPointerMember(state.visual, 0x18) == state.sourceOwner &&
+                      FindNativeMeshSiblingCollection(state.root);
+    }
     if (!sourceValid)
         DetachNativeMesh(L"source-changed");
     else
@@ -4083,8 +4122,9 @@ static bool HasAttachableNativeMeshSlot(HWND hwnd)
     return attachable;
 }
 
-static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow,
-                                     void* sourceProxy, void* compositor,
+static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
+                                     void* sourceProxy, bool backdropSource,
+                                     void* compositor,
                                      void*& image, void*& group,
                                      void*& instruction, void*& mesh,
                                      int width, int height)
@@ -4102,10 +4142,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow,
         return false;
     }
     g_nativeMeshStopRequested.store(false, std::memory_order_release);
-    void* root = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
-    if (!root || !IsReadableMemory(root, sizeof(void*)) ||
-        !IsDwmImageAddress(*reinterpret_cast<void**>(root), sizeof(void*)) ||
-        g_nativeProbeGetVisualProxy(root) != sourceProxy)
+    if (!IsNativeMeshSourceCurrent(topLevelWindow, root, sourceProxy, backdropSource))
         return false;
     void* collection = FindNativeMeshSiblingCollection(root);
     if (!collection || !RetainNativeMeshRoot(root))
@@ -4114,12 +4151,15 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow,
                hwnd, collection);
         return false;
     }
-    LogNativeMeshSourceTopology(hwnd, topLevelWindow, root);
+    LogNativeMeshSourceTopology(hwnd, topLevelWindow,
+                                 g_topLevelWindowGetRootVisual(topLevelWindow, 0));
 
     NativeMeshState pending = {};
     pending.root = root;
     pending.hwnd = hwnd;
     pending.sourceProxy = sourceProxy;
+    pending.sourceOwner = ReadPointerMember(root, 0x18);
+    pending.backdropSource = backdropSource;
     pending.width = width;
     pending.height = height;
     const wchar_t* stage = L"CreateVisual";
@@ -4157,7 +4197,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow,
         stage = L"ValidateSibling";
         if (!IsWindow(hwnd) || !HasAttachableNativeMeshSlot(hwnd) ||
             FindNativeMeshSiblingCollection(root) != collection ||
-            g_nativeProbeGetVisualProxy(root) != sourceProxy)
+            !IsNativeMeshSourceCurrent(topLevelWindow, root, sourceProxy, backdropSource))
             result = E_UNEXPECTED;
     }
     if (result >= 0)
@@ -4197,8 +4237,9 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow,
         g_nativeMeshActive.store(true, std::memory_order_release);
         InvalidateAnimationTransformForNativeMesh(hwnd);
         Wh_Log(L"NATIVE MESH ATTACHED: HWND=%p root=%p "
-               L"visual=%p duration=until-slot-retirement snapshot=none",
-               hwnd, root, pending.visual);
+               L"visual=%p source=%s duration=until-slot-retirement snapshot=none",
+               hwnd, root, pending.visual,
+               backdropSource ? L"BackgroundTreatment" : L"WindowBorder");
         RequestDwmScenePass();
         return true;
     }
@@ -4224,8 +4265,9 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow,
     return false;
 }
 
-static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow,
-                                      void* sourceProxy, void* compositor,
+static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourceRoot,
+                                      void* sourceProxy, bool backdropSource,
+                                      void* compositor,
                                       void*& image, int width, int height)
 {
     // Exact 23H2 ABI only. The instruction stores base-object references and
@@ -4303,12 +4345,13 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow,
            NATIVE_MESH_VERTEX_COUNT, NATIVE_MESH_INDEX_COUNT, instruction);
     if (result >= 0)
     {
-        if (TryAttachNativeMesh(hwnd, topLevelWindow, sourceProxy,
+        if (TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy, backdropSource,
                                      compositor, image, group, instruction,
                                      mesh, width, height))
         {
             Wh_Log(L"NATIVE VERTEX MESH: attached HWND=%p "
-                   L"physicsLinked=1 liveSource=1 original=translation", hwnd);
+                   L"physicsLinked=1 liveSource=1 original=%s", hwnd,
+                   backdropSource ? L"identity" : L"translation");
         }
     }
     if (instruction) g_cBaseObjectRelease(instruction);
@@ -4350,6 +4393,26 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
     {
         return;
     }
+
+    void* sourceRoot = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
+    if (!IsNativeMeshSourceCurrent(topLevelWindow, sourceRoot, sourceVisualProxy, false))
+        return;
+    void* treatment = ReadPointerMember(sourceRoot, 0x18);
+    bool backdropSource = false;
+    if (IsNativeBackdropSourceRoot(topLevelWindow, sourceRoot, treatment))
+    {
+        void* treatmentProxy = g_nativeProbeGetVisualProxy(treatment);
+        if (IsVisualProxyPointerValid(treatmentProxy))
+        {
+            sourceRoot = treatment;
+            sourceVisualProxy = treatmentProxy;
+            backdropSource = true;
+        }
+    }
+    Wh_Log(L"NATIVE MESH SOURCE CHOICE: HWND=%p source=%s visual=%p proxy=%p "
+           L"host=%p", hwnd,
+           backdropSource ? L"BackgroundTreatment" : L"WindowBorder",
+           sourceRoot, sourceVisualProxy, ReadPointerMember(sourceRoot, 0x18));
 
     int width = 0;
     int height = 0;
@@ -4417,7 +4480,8 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
     if (resourceReadable && imageResourceId && validationResult >= 0 &&
         instructionKeepsImage)
     {
-        CreateVisibleNativeMesh(hwnd, topLevelWindow, sourceVisualProxy,
+        CreateVisibleNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceVisualProxy,
+                                  backdropSource,
                                   compositor, image, width, height);
     }
     if (validationInstruction && validationResult >= 0 &&
@@ -6649,7 +6713,10 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         nativeMeshActive = slot.settings.rendererMode == RendererMode::Mesh &&
             g_nativeMeshActive.load(std::memory_order_acquire) &&
             g_nativeMeshHwnd.load(std::memory_order_acquire) == slot.hwnd;
-        identityUpdate = slot.retiring || slot.meshIdentityPending ||
+        // A treatment source includes this child transform; keep it neutral so
+        // the captured image is not translated a second time inside the mesh.
+        identityUpdate = (nativeMeshActive && g_nativeMeshState.backdropSource) ||
+                         slot.retiring || slot.meshIdentityPending ||
                          !slot.mesh.active ||
                          g_unloading.load(std::memory_order_acquire);
         if (!identityUpdate)
