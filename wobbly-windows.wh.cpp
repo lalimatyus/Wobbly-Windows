@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.303
+// @version         0.304
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -106,6 +106,7 @@ the combined mod is not offered under GPLv2.
   - "affine": "Affine (stable)"
   - "mesh": "Mesh Renderer (experimental)"
   - "mesh-flat-source": "Flat source image (diagnostic)"
+  - "mesh-flat-padded": "Flat source + shadow margin (diagnostic)"
   - "external-gpu": "GPU mesh overlay (experimental)"
 
 - AdvancedMode:
@@ -500,7 +501,8 @@ void* g_nativeBackdropVisualVtable = nullptr;
 std::atomic_bool g_nativeMeshActive = false;
 std::atomic_bool g_nativeMeshStopRequested = false;
 std::atomic<HWND> g_nativeMeshHwnd = nullptr;
-std::atomic_bool g_nativeFlatSourceProbeEnabled = false;
+enum class NativeSourceProbeMode : unsigned char { None, Flat, PaddedFlat };
+std::atomic<NativeSourceProbeMode> g_nativeSourceProbeMode = NativeSourceProbeMode::None;
 struct NativeMeshState
 {
     void* root = nullptr;
@@ -514,6 +516,7 @@ struct NativeMeshState
     void* sourceOwner = nullptr;
     bool backdropSource = false;
     bool flatSourceProbe = false;
+    int sourcePadding = 0;
     HWND hwnd = nullptr;
     int width = 0;
     int height = 0;
@@ -4036,35 +4039,42 @@ static bool GetNativeMeshWindowSize(HWND hwnd, int& width, int& height,
     return width >= 1 && height >= 1 && width <= 8192 && height <= 8192;
 }
 
-static MilMatrix3x2D NativeMeshVisualPlacement(bool flatSourceProbe, int width, int height)
+static MilMatrix3x2D NativeMeshVisualPlacement(bool flatSourceProbe, int width, int height,
+                                              int padding)
 {
-    return flatSourceProbe
-        ? MilMatrix3x2D{0.5, 0.0, 0.0, 0.5, width * 0.4, height * 0.4}
-        : MilMatrix3x2D{1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+    if (!flatSourceProbe)
+        return {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+    double scale = std::min(0.5 * width / (width + 2.0 * padding),
+                            0.5 * height / (height + 2.0 * padding));
+    return {scale, 0.0, 0.0, scale, width * 0.4, height * 0.4};
 }
 
-static long ResizeNativeMeshSourceImage(NativeMeshState& state,
-                                        int width, int height)
+static long UpdateNativeMeshSourceImage(void* image, void* sourceProxy,
+                                         int width, int height, int padding)
 {
-    if (!state.image || !IsVisualProxyPointerValid(state.sourceProxy))
+    if (!image || !IsVisualProxyPointerValid(sourceProxy))
         return E_NOINTERFACE;
-    NativeProbeRectF rect = {0, 0, static_cast<float>(width),
-                             static_cast<float>(height)};
+    if (padding < 0 || padding > 64 || width < 1 || height < 1 ||
+        width > 8192 - 2 * padding || height > 8192 - 2 * padding)
+        return E_INVALIDARG;
+    NativeProbeRectF rect = {-static_cast<float>(padding), -static_cast<float>(padding),
+                             static_cast<float>(width + padding),
+                             static_cast<float>(height + padding)};
     constexpr int absoluteMappingMode = 0;
     if (g_nativeProbeUpdateImageD)
     {
-        NativeProbeSizeD size = {static_cast<double>(width),
-                                 static_cast<double>(height)};
-        return g_nativeProbeUpdateImageD(state.image, rect, size, nullptr,
-                                         nullptr, state.sourceProxy,
+        NativeProbeSizeD size = {static_cast<double>(width + 2 * padding),
+                                 static_cast<double>(height + 2 * padding)};
+        return g_nativeProbeUpdateImageD(image, rect, size, nullptr,
+                                         nullptr, sourceProxy,
                                          absoluteMappingMode);
     }
     if (g_nativeProbeUpdateImageF)
     {
-        NativeProbeSizeF size = {static_cast<float>(width),
-                                 static_cast<float>(height)};
-        return g_nativeProbeUpdateImageF(state.image, rect, size, nullptr,
-                                         nullptr, state.sourceProxy,
+        NativeProbeSizeF size = {static_cast<float>(width + 2 * padding),
+                                 static_cast<float>(height + 2 * padding)};
+        return g_nativeProbeUpdateImageF(image, rect, size, nullptr,
+                                         nullptr, sourceProxy,
                                          absoluteMappingMode);
     }
     return E_NOTIMPL;
@@ -4101,10 +4111,12 @@ static void MaintainNativeMesh()
     {
         if (width != state.width || height != state.height)
         {
-            long result = ResizeNativeMeshSourceImage(state, width, height);
+            long result = UpdateNativeMeshSourceImage(state.image, state.sourceProxy,
+                                                       width, height, state.sourcePadding);
             if (result >= 0 && state.flatSourceProbe)
                 result = UpdateMatrixTransformProxy(
-                    state.transform, NativeMeshVisualPlacement(true, width, height));
+                    state.transform, NativeMeshVisualPlacement(true, width, height,
+                                                                state.sourcePadding));
             if (result < 0)
             {
                 Wh_Log(L"NATIVE MESH SOURCE RESIZE FAILED: HWND=%p "
@@ -4146,7 +4158,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
                                      void* compositor,
                                      void*& image, void*& group,
                                      void*& instruction, void*& mesh,
-                                     int width, int height)
+                                     int width, int height, int sourcePadding)
 {
     AcquireSRWLockShared(&g_settingsLock);
     bool meshSelected = g_settings.rendererMode == RendererMode::Mesh;
@@ -4180,6 +4192,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     pending.sourceOwner = ReadPointerMember(root, 0x18);
     pending.backdropSource = backdropSource;
     pending.flatSourceProbe = flatSourceProbe;
+    pending.sourcePadding = sourcePadding;
     pending.width = width;
     pending.height = height;
     const wchar_t* stage = L"CreateVisual";
@@ -4208,7 +4221,8 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     if (result >= 0)
     {
         stage = L"PositionShape";
-        const MilMatrix3x2D matrix = NativeMeshVisualPlacement(flatSourceProbe, width, height);
+        const MilMatrix3x2D matrix = NativeMeshVisualPlacement(
+            flatSourceProbe, width, height, sourcePadding);
         Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
         result = UpdateMatrixTransformProxy(pending.transform, matrix);
     }
@@ -4289,7 +4303,8 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
 static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourceRoot,
                                       void* sourceProxy, bool backdropSource,
                                       void* compositor,
-                                      void*& image, int width, int height)
+                                      void*& image, int width, int height,
+                                      bool flatSourceProbe, int sourcePadding)
 {
     // Exact 23H2 ABI only. The instruction stores base-object references and
     // serializes resource IDs; the core DrawMesh2D path consumes CImageSource.
@@ -4305,7 +4320,7 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
         return;
     }
 
-    if (g_nativeFlatSourceProbeEnabled.load(std::memory_order_acquire))
+    if (flatSourceProbe)
     {
         void* instruction = nullptr;
         void* group = nullptr;
@@ -4314,15 +4329,16 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
             ? g_nativeProbeCreateBitmapInstruction(image, &instruction)
             : E_NOTIMPL;
         Wh_Log(L"NATIVE FLAT SOURCE PROBE: HWND=%p create=0x%08X "
-               L"image=%p source=%s size=%dx%d scale=0.5 position=inside-bottom-right",
+               L"image=%p source=%s size=%dx%d padding=%d "
+               L"position=inside-bottom-right",
                hwnd, static_cast<unsigned>(result), image,
                backdropSource ? L"BackgroundTreatment" : L"WindowBorder",
-               width, height);
+               width, height, sourcePadding);
         if (result >= 0 && instruction)
         {
             TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy,
                                 backdropSource, true, compositor, image, group,
-                                instruction, mesh, width, height);
+                                instruction, mesh, width, height, sourcePadding);
         }
         if (instruction) g_cBaseObjectRelease(instruction);
         return;
@@ -4392,7 +4408,7 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
         if (TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy,
                                      backdropSource, false,
                                      compositor, image, group, instruction,
-                                     mesh, width, height))
+                                     mesh, width, height, 0))
         {
             Wh_Log(L"NATIVE VERTEX MESH: attached HWND=%p "
                    L"physicsLinked=1 liveSource=1 original=%s", hwnd,
@@ -4465,6 +4481,18 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
     {
         return;
     }
+    NativeSourceProbeMode probeMode =
+        g_nativeSourceProbeMode.load(std::memory_order_acquire);
+    bool flatSourceProbe = probeMode != NativeSourceProbeMode::None;
+    int sourcePadding = probeMode == NativeSourceProbeMode::PaddedFlat ? 64 : 0;
+    if (flatSourceProbe)
+    {
+        Wh_Log(L"NATIVE SOURCE RECT: HWND=%p rect=(%d,%d,%d,%d) "
+               L"realization=%dx%d padding=%d", hwnd,
+               -sourcePadding, -sourcePadding,
+               width + sourcePadding, height + sourcePadding,
+               width + 2 * sourcePadding, height + 2 * sourcePadding, sourcePadding);
+    }
     void* image = nullptr;
     void* validationInstruction = nullptr;
     long createResult = g_nativeProbeCreateImage(compositor, &image);
@@ -4474,25 +4502,8 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
                           *reinterpret_cast<void**>(image) == expectedVtable;
     if (createResult >= 0 && exactImageType)
     {
-        NativeProbeRectF rect = {0, 0, static_cast<float>(width),
-                                 static_cast<float>(height)};
-        constexpr int absoluteMappingMode = 0;
-        if (g_nativeProbeUpdateImageD)
-        {
-            NativeProbeSizeD size = {static_cast<double>(width),
-                                     static_cast<double>(height)};
-            updateResult = g_nativeProbeUpdateImageD(
-                image, rect, size, nullptr, nullptr, sourceVisualProxy,
-                absoluteMappingMode);
-        }
-        else
-        {
-            NativeProbeSizeF size = {static_cast<float>(width),
-                                     static_cast<float>(height)};
-            updateResult = g_nativeProbeUpdateImageF(
-                image, rect, size, nullptr, nullptr, sourceVisualProxy,
-                absoluteMappingMode);
-        }
+        updateResult = UpdateNativeMeshSourceImage(image, sourceVisualProxy,
+                                                    width, height, sourcePadding);
         if (updateResult >= 0)
             validationResult = g_nativeProbeCreateBitmapInstruction(
                 image, &validationInstruction);
@@ -4527,7 +4538,8 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
     {
         CreateVisibleNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceVisualProxy,
                                   backdropSource,
-                                  compositor, image, width, height);
+                                  compositor, image, width, height,
+                                  flatSourceProbe, sourcePadding);
     }
     if (validationInstruction && validationResult >= 0 &&
         IsReadableMemory(validationInstruction, sizeof(void*)) &&
@@ -8809,10 +8821,14 @@ static void LoadSettings()
     WobblySettings settings = PHYSICS_PRESETS[wobbliness];
     auto rendererSetting = WindhawkUtils::StringSetting::make(L"Renderer");
     std::wstring_view rendererValue(rendererSetting.get());
-    bool flatSourceProbe = rendererValue == L"mesh-flat-source";
+    NativeSourceProbeMode probeMode = rendererValue == L"mesh-flat-padded"
+        ? NativeSourceProbeMode::PaddedFlat
+        : rendererValue == L"mesh-flat-source" ? NativeSourceProbeMode::Flat
+                                             : NativeSourceProbeMode::None;
+    bool flatSourceProbe = probeMode != NativeSourceProbeMode::None;
     bool flatSourceProbeChanged =
-        g_nativeFlatSourceProbeEnabled.exchange(flatSourceProbe,
-                                                std::memory_order_acq_rel) != flatSourceProbe;
+        g_nativeSourceProbeMode.exchange(probeMode,
+                                         std::memory_order_acq_rel) != probeMode;
     settings.rendererMode = rendererValue == L"external-gpu"
                                 ? RendererMode::ExternalGpu
                                 : (rendererValue == L"mesh" || flatSourceProbe)
@@ -8858,7 +8874,10 @@ static void LoadSettings()
            wobbliness, advancedMode,
            settings.rendererMode == RendererMode::ExternalGpu ? L"external-gpu" :
                 settings.rendererMode == RendererMode::Mesh
-                    ? (flatSourceProbe ? L"flat-source-diagnostic" : L"mesh") : L"affine",
+                    ? (flatSourceProbe
+                        ? (probeMode == NativeSourceProbeMode::PaddedFlat
+                            ? L"flat-padded-source-diagnostic" : L"flat-source-diagnostic")
+                        : L"mesh") : L"affine",
            settings.resizeWobbleEnabled,
            settings.windowStateWobbleEnabled, settings.stiffness, settings.drag,
            settings.moveFactor);
