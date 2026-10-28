@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.305
+// @version         0.306
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -503,6 +503,37 @@ std::atomic_bool g_nativeMeshStopRequested = false;
 std::atomic<HWND> g_nativeMeshHwnd = nullptr;
 enum class NativeSourceProbeMode : unsigned char { None, Flat, PaddedFlat };
 std::atomic<NativeSourceProbeMode> g_nativeSourceProbeMode = NativeSourceProbeMode::None;
+// Native material refresh begin: shared with the pacing tests.
+struct NativeMaterialRefreshSchedule
+{
+    int originX = 0;
+    int originY = 0;
+    bool originKnown = false;
+    std::uint64_t lastUpdateAt = 0;
+    std::uint64_t refreshUntil = 0;
+};
+
+static bool ShouldRefreshNativeMaterial(NativeMaterialRefreshSchedule& schedule,
+                                         int x, int y, std::uint64_t now, bool resized)
+{
+    if (!schedule.originKnown || x != schedule.originX ||
+        y != schedule.originY || resized)
+    {
+        schedule.originX = x;
+        schedule.originY = y;
+        schedule.originKnown = true;
+        schedule.refreshUntil = now + 120;
+    }
+    if (resized)
+    {
+        schedule.lastUpdateAt = now;
+        return false; // Resizing already refreshed the source in this pass.
+    }
+    // A short tail catches backdrop changes published after the last move.
+    return now <= schedule.refreshUntil && now - schedule.lastUpdateAt >= 34;
+}
+// Native material refresh end.
+
 struct NativeMeshState
 {
     void* root = nullptr;
@@ -524,6 +555,8 @@ struct NativeMeshState
     ULONGLONG meshGeneration = 0;
     ULONGLONG submittedMeshRevision = 0;
     unsigned int meshUpdateCount = 0;
+    NativeMaterialRefreshSchedule materialRefresh;
+    unsigned int materialRefreshCount = 0;
 };
 NativeMeshState g_nativeMeshState; // DWM scene thread only.
 NativeProbeCreateMesh_t g_nativeProbeCreateMesh = nullptr;
@@ -4047,11 +4080,13 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
 }
 
 static bool GetNativeMeshWindowSize(HWND hwnd, int& width, int& height,
-                                    bool logDimensions = false)
+                                    bool logDimensions = false, POINT* windowOrigin = nullptr)
 {
     RECT windowBounds = {};
     if (!GetWindowRect(hwnd, &windowBounds))
         return false;
+    if (windowOrigin)
+        *windowOrigin = {windowBounds.left, windowBounds.top};
     const int windowWidth = windowBounds.right - windowBounds.left;
     const int windowHeight = windowBounds.bottom - windowBounds.top;
     RECT frameBounds = {};
@@ -4152,9 +4187,10 @@ static void MaintainNativeMesh()
     }
     int width = 0;
     int height = 0;
+    POINT origin = {};
     bool sourceValid = state.root &&
         g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy &&
-        GetNativeMeshWindowSize(state.hwnd, width, height);
+        GetNativeMeshWindowSize(state.hwnd, width, height, false, &origin);
     if (sourceValid && state.backdropSource)
     {
         sourceValid = ReadPointerMember(state.root, 0x18) == state.sourceOwner &&
@@ -4165,7 +4201,8 @@ static void MaintainNativeMesh()
         DetachNativeMesh(L"source-changed");
     else
     {
-        if (width != state.width || height != state.height)
+        const bool resized = width != state.width || height != state.height;
+        if (resized)
         {
             long result = UpdateNativeMeshSourceImage(state.image, state.sourceProxy,
                                                        width, height, state.sourcePadding);
@@ -4186,6 +4223,24 @@ static void MaintainNativeMesh()
             state.submittedMeshRevision = 0;
             Wh_Log(L"NATIVE MESH SOURCE RESIZED: HWND=%p size=%dx%d",
                    state.hwnd, width, height);
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (ShouldRefreshNativeMaterial(state.materialRefresh,
+                                         origin.x, origin.y, now, resized))
+        {
+            const long result = UpdateNativeMeshSourceImage(
+                state.image, state.sourceProxy, width, height, state.sourcePadding);
+            if (result < 0)
+            {
+                Wh_Log(L"NATIVE BACKDROP SOURCE REFRESH FAILED: HWND=%p result=0x%08X",
+                       state.hwnd, static_cast<unsigned>(result));
+                DetachNativeMesh(L"source-refresh-failed");
+                return;
+            }
+            state.materialRefresh.lastUpdateAt = now;
+            if (++state.materialRefreshCount == 1 || state.materialRefreshCount % 30 == 0)
+                Wh_Log(L"NATIVE BACKDROP SOURCE REFRESH: HWND=%p count=%u origin=(%d,%d)",
+                       state.hwnd, state.materialRefreshCount, origin.x, origin.y);
         }
         UpdateNativeVertexMesh(state);
     }
@@ -4251,6 +4306,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     pending.sourcePadding = sourcePadding;
     pending.width = width;
     pending.height = height;
+    pending.materialRefresh.lastUpdateAt = GetTickCount64();
     const wchar_t* stage = L"CreateVisual";
     Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
     long result = g_nativeMeshCreateVisual(&pending.visual);
