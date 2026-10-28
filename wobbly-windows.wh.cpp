@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.306
+// @version         0.307
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -548,6 +548,7 @@ struct NativeMeshState
     bool backdropSource = false;
     bool flatSourceProbe = false;
     int sourcePadding = 0;
+    int sourceRealizationExtra = 0;
     HWND hwnd = nullptr;
     int width = 0;
     int height = 0;
@@ -3917,11 +3918,16 @@ static void CalculateNativeMeshBasis(double value, double basis[4])
 static bool BuildNativeMeshVertices(const Vec2 (&control)[16],
     int width, int height, int padding,
     NativeProbePoint3F (&positions)[NATIVE_MESH_VERTEX_COUNT],
-    NativeProbePoint2D (&coordinates)[NATIVE_MESH_VERTEX_COUNT])
+    NativeProbePoint2D (&coordinates)[NATIVE_MESH_VERTEX_COUNT],
+    int realizationExtra = 0)
 {
     if (width < 1 || height < 1 || padding < 0 || padding > 64 ||
-        width > 8192 - 2 * padding || height > 8192 - 2 * padding)
+        realizationExtra < 0 || realizationExtra > 1 ||
+        width > 8192 - 2 * padding - realizationExtra ||
+        height > 8192 - 2 * padding - realizationExtra)
         return false;
+    const double textureScaleX = 1.0 + static_cast<double>(realizationExtra) / (width + 2 * padding);
+    const double textureScaleY = 1.0 + static_cast<double>(realizationExtra) / (height + 2 * padding);
     for (const Vec2& point : control)
         if (!std::isfinite(point.x) || !std::isfinite(point.y)) return false;
     for (unsigned int y = 0; y < NATIVE_MESH_SIDE; ++y)
@@ -3950,7 +3956,8 @@ static bool BuildNativeMeshVertices(const Vec2 (&control)[16],
             positions[index] = {static_cast<float>(position.x),
                                 static_cast<float>(position.y), 0.0f};
             // The realized image starts at (0,0); the window starts at (padding,padding).
-            coordinates[index] = {sourceX + padding, sourceY + padding};
+            coordinates[index] = {(sourceX + padding) * textureScaleX,
+                                   (sourceY + padding) * textureScaleY};
         }
     }
     return true;
@@ -4053,7 +4060,8 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
                       (point.basePosition.y + dy) * scaleY};
     }
     if (!BuildNativeMeshVertices(control, state.width, state.height,
-                                  state.sourcePadding, positions, coordinates))
+                                  state.sourcePadding, positions, coordinates,
+                                  state.sourceRealizationExtra))
     {
         DetachNativeMesh(L"mesh-vertices-invalid");
         return;
@@ -4141,12 +4149,15 @@ static MilMatrix3x2D NativeMeshVisualPlacement(bool flatSourceProbe, int width, 
 }
 
 static long UpdateNativeMeshSourceImage(void* image, void* sourceProxy,
-                                         int width, int height, int padding)
+                                         int width, int height, int padding,
+                                         int realizationExtra = 0)
 {
     if (!image || !IsVisualProxyPointerValid(sourceProxy))
         return E_NOINTERFACE;
     if (padding < 0 || padding > 64 || width < 1 || height < 1 ||
-        width > 8192 - 2 * padding || height > 8192 - 2 * padding)
+        realizationExtra < 0 || realizationExtra > 1 ||
+        width > 8192 - 2 * padding - realizationExtra ||
+        height > 8192 - 2 * padding - realizationExtra)
         return E_INVALIDARG;
     NativeProbeRectF rect = {-static_cast<float>(padding), -static_cast<float>(padding),
                              static_cast<float>(width + padding),
@@ -4154,16 +4165,16 @@ static long UpdateNativeMeshSourceImage(void* image, void* sourceProxy,
     constexpr int absoluteMappingMode = 0;
     if (g_nativeProbeUpdateImageD)
     {
-        NativeProbeSizeD size = {static_cast<double>(width + 2 * padding),
-                                 static_cast<double>(height + 2 * padding)};
+        NativeProbeSizeD size = {static_cast<double>(width + 2 * padding + realizationExtra),
+                                 static_cast<double>(height + 2 * padding + realizationExtra)};
         return g_nativeProbeUpdateImageD(image, rect, size, nullptr,
                                          nullptr, sourceProxy,
                                          absoluteMappingMode);
     }
     if (g_nativeProbeUpdateImageF)
     {
-        NativeProbeSizeF size = {static_cast<float>(width + 2 * padding),
-                                 static_cast<float>(height + 2 * padding)};
+        NativeProbeSizeF size = {static_cast<float>(width + 2 * padding + realizationExtra),
+                                 static_cast<float>(height + 2 * padding + realizationExtra)};
         return g_nativeProbeUpdateImageF(image, rect, size, nullptr,
                                          nullptr, sourceProxy,
                                          absoluteMappingMode);
@@ -4220,27 +4231,39 @@ static void MaintainNativeMesh()
             }
             state.width = width;
             state.height = height;
+            state.sourceRealizationExtra = 0;
             state.submittedMeshRevision = 0;
             Wh_Log(L"NATIVE MESH SOURCE RESIZED: HWND=%p size=%dx%d",
                    state.hwnd, width, height);
         }
         const ULONGLONG now = GetTickCount64();
-        if (ShouldRefreshNativeMaterial(state.materialRefresh,
+        if (!state.flatSourceProbe &&
+            ShouldRefreshNativeMaterial(state.materialRefresh,
                                          origin.x, origin.y, now, resized))
         {
+            // Diagnostic: change only our offscreen target size. Matched UVs
+            // keep the window and source crop unchanged; the original is untouched.
+            const int nextExtra = width + 2 * state.sourcePadding < 8192 &&
+                                  height + 2 * state.sourcePadding < 8192
+                ? 1 - state.sourceRealizationExtra : 0;
             const long result = UpdateNativeMeshSourceImage(
-                state.image, state.sourceProxy, width, height, state.sourcePadding);
+                state.image, state.sourceProxy, width, height, state.sourcePadding, nextExtra);
             if (result < 0)
             {
-                Wh_Log(L"NATIVE BACKDROP SOURCE REFRESH FAILED: HWND=%p result=0x%08X",
+                Wh_Log(L"NATIVE MATERIAL CACHE RESIZE FAILED: HWND=%p result=0x%08X",
                        state.hwnd, static_cast<unsigned>(result));
                 DetachNativeMesh(L"source-refresh-failed");
                 return;
             }
+            state.sourceRealizationExtra = nextExtra;
+            state.submittedMeshRevision = 0;
             state.materialRefresh.lastUpdateAt = now;
             if (++state.materialRefreshCount == 1 || state.materialRefreshCount % 30 == 0)
-                Wh_Log(L"NATIVE BACKDROP SOURCE REFRESH: HWND=%p count=%u origin=(%d,%d)",
-                       state.hwnd, state.materialRefreshCount, origin.x, origin.y);
+                Wh_Log(L"NATIVE MATERIAL CACHE RESIZE: HWND=%p count=%u origin=(%d,%d) "
+                       L"realization=%dx%d extra=%d original=unchanged",
+                       state.hwnd, state.materialRefreshCount, origin.x, origin.y,
+                       width + 2 * state.sourcePadding + nextExtra,
+                       height + 2 * state.sourcePadding + nextExtra, nextExtra);
         }
         UpdateNativeVertexMesh(state);
     }
