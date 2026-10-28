@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.309
+// @version         0.310
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -183,19 +183,18 @@ namespace
 {
 
 // Physical coordinate scope begin: shared with the DPI regression test.
-class ScopedPhysicalCoordinates
+class ScopedDpiContext
 {
 public:
-    explicit ScopedPhysicalCoordinates(bool enabled)
-        : previous_(enabled ? SetThreadDpiAwarenessContext(
-              DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) : nullptr),
-          valid_(!enabled || previous_ != nullptr) {}
-    ~ScopedPhysicalCoordinates()
+    explicit ScopedDpiContext(DPI_AWARENESS_CONTEXT desired)
+        : previous_(desired ? SetThreadDpiAwarenessContext(desired) : nullptr),
+          valid_(!desired || previous_ != nullptr) {}
+    ~ScopedDpiContext()
     {
         if (previous_) SetThreadDpiAwarenessContext(previous_);
     }
-    ScopedPhysicalCoordinates(const ScopedPhysicalCoordinates&) = delete;
-    ScopedPhysicalCoordinates& operator=(const ScopedPhysicalCoordinates&) = delete;
+    ScopedDpiContext(const ScopedDpiContext&) = delete;
+    ScopedDpiContext& operator=(const ScopedDpiContext&) = delete;
     bool valid() const { return valid_; }
 private:
     DPI_AWARENESS_CONTEXT previous_;
@@ -240,10 +239,27 @@ static WobblySettings GetSettingsSnapshot();
 
 static bool ReadWindowRectForRenderer(HWND hwnd, RECT* bounds)
 {
-    // Scene callbacks and WinEvent/timer callbacks can carry different DPI
-    // contexts. Mesh observations and input must use the same screen units.
-    ScopedPhysicalCoordinates coordinates(GetSettingsSnapshot().rendererMode == RendererMode::Mesh);
-    return coordinates.valid() && GetWindowRect(hwnd, bounds);
+    if (GetSettingsSnapshot().rendererMode != RendererMode::Mesh)
+        return GetWindowRect(hwnd, bounds) != FALSE;
+    const auto windowContext = GetWindowDpiAwarenessContext(hwnd);
+    if (!windowContext) return false;
+    // Read in the HWND's own units, then explicitly convert BOTH corners.
+    // A PMv2 caller scope alone still yielded virtualized bounds inside DWM.
+    ScopedDpiContext coordinates(windowContext);
+    RECT localBounds = {};
+    if (!coordinates.valid() || !GetWindowRect(hwnd, &localBounds)) return false;
+    if (GetAwarenessFromDpiAwarenessContext(windowContext) != DPI_AWARENESS_PER_MONITOR_AWARE)
+    {
+        POINT topLeft = {localBounds.left, localBounds.top};
+        POINT bottomRight = {localBounds.right, localBounds.bottom};
+        if (!LogicalToPhysicalPointForPerMonitorDPI(hwnd, &topLeft) ||
+            !LogicalToPhysicalPointForPerMonitorDPI(hwnd, &bottomRight)) return false;
+        localBounds = {topLeft.x, topLeft.y, bottomRight.x, bottomRight.y};
+    }
+    if (localBounds.right <= localBounds.left || localBounds.bottom <= localBounds.top)
+        return false;
+    *bounds = localBounds;
+    return true;
 }
 
 struct Vec2
@@ -4343,7 +4359,7 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
 static bool GetNativeMeshWindowSize(HWND hwnd, int& width, int& height,
                                     bool logDimensions = false)
 {
-    ScopedPhysicalCoordinates coordinates(true);
+    ScopedDpiContext coordinates(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if (!coordinates.valid()) return false;
     RECT windowBounds = {};
     if (!ReadWindowRectForRenderer(hwnd, &windowBounds))
@@ -7031,7 +7047,7 @@ static void HandleMoveSizeStart(HWND hwnd)
     }
     WobblySettings activeSettings = GetSettingsSnapshot();
     const bool physicalCoordinates = activeSettings.rendererMode == RendererMode::Mesh;
-    ScopedPhysicalCoordinates coordinates(physicalCoordinates);
+    ScopedDpiContext coordinates(physicalCoordinates ? DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 : nullptr);
     if (!coordinates.valid()) return;
     // Reset Snap state so the same side can trigger again.
     ResetObservedSnapStateForInteractiveMove(hwnd);
@@ -7779,7 +7795,7 @@ static void UpdateAnimationFrame()
 
 static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
 {
-    ScopedPhysicalCoordinates coordinates(g_dragUsesPhysicalCoordinates);
+    ScopedDpiContext coordinates(g_dragUsesPhysicalCoordinates ? DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 : nullptr);
     if (!coordinates.valid()) return;
     HWND draggedWindow = g_realDraggedWindow.load(std::memory_order_relaxed);
     if (!g_realDragging.load(std::memory_order_relaxed) || !draggedWindow ||
@@ -8095,7 +8111,7 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
 
 static void HandleMoveSizeEnd(HWND hwnd)
 {
-    ScopedPhysicalCoordinates coordinates(g_dragUsesPhysicalCoordinates);
+    ScopedDpiContext coordinates(g_dragUsesPhysicalCoordinates ? DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 : nullptr);
     if (!coordinates.valid()) return;
     HWND draggedWindow = g_realDraggedWindow.load(std::memory_order_relaxed);
     if (!g_realDragging.load(std::memory_order_relaxed) || hwnd != draggedWindow ||
