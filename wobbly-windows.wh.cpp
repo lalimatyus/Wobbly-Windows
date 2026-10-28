@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.302
+// @version         0.303
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -101,10 +101,11 @@ the combined mod is not offered under GPLv2.
 
 - Renderer: "affine"
   $name: Renderer
-  $description: Mesh Renderer bends a live DWM image on the validated 23H2 build. Windows with backdrop materials may look different; unsupported builds use Affine.
+  $description: Mesh Renderer bends a live DWM image on the validated 23H2 build. Flat source image shows a small unwarped copy inside the window for comparing shadows and materials. Unsupported builds use Affine.
   $options:
   - "affine": "Affine (stable)"
   - "mesh": "Mesh Renderer (experimental)"
+  - "mesh-flat-source": "Flat source image (diagnostic)"
   - "external-gpu": "GPU mesh overlay (experimental)"
 
 - AdvancedMode:
@@ -499,6 +500,7 @@ void* g_nativeBackdropVisualVtable = nullptr;
 std::atomic_bool g_nativeMeshActive = false;
 std::atomic_bool g_nativeMeshStopRequested = false;
 std::atomic<HWND> g_nativeMeshHwnd = nullptr;
+std::atomic_bool g_nativeFlatSourceProbeEnabled = false;
 struct NativeMeshState
 {
     void* root = nullptr;
@@ -511,6 +513,7 @@ struct NativeMeshState
     void* sourceProxy = nullptr;
     void* sourceOwner = nullptr;
     bool backdropSource = false;
+    bool flatSourceProbe = false;
     HWND hwnd = nullptr;
     int width = 0;
     int height = 0;
@@ -3861,7 +3864,7 @@ static void BuildNativeMeshIndices(unsigned int (&indices)[NATIVE_MESH_INDEX_COU
 
 static void UpdateNativeVertexMesh(NativeMeshState& state)
 {
-    if (!state.mesh || !g_nativeProbeUpdateMesh)
+    if (!state.flatSourceProbe && (!state.mesh || !g_nativeProbeUpdateMesh))
         return;
 
     WobbleMesh physics = {};
@@ -3893,6 +3896,12 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
     if (state.meshGeneration && state.meshGeneration != generation)
     {
         DetachNativeMesh(L"mesh-generation-changed");
+        return;
+    }
+    if (state.flatSourceProbe)
+    {
+        state.meshGeneration = generation;
+        state.submittedMeshRevision = revision;
         return;
     }
     if (state.meshGeneration == generation &&
@@ -4027,6 +4036,13 @@ static bool GetNativeMeshWindowSize(HWND hwnd, int& width, int& height,
     return width >= 1 && height >= 1 && width <= 8192 && height <= 8192;
 }
 
+static MilMatrix3x2D NativeMeshVisualPlacement(bool flatSourceProbe, int width, int height)
+{
+    return flatSourceProbe
+        ? MilMatrix3x2D{0.5, 0.0, 0.0, 0.5, width * 0.4, height * 0.4}
+        : MilMatrix3x2D{1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+}
+
 static long ResizeNativeMeshSourceImage(NativeMeshState& state,
                                         int width, int height)
 {
@@ -4086,6 +4102,9 @@ static void MaintainNativeMesh()
         if (width != state.width || height != state.height)
         {
             long result = ResizeNativeMeshSourceImage(state, width, height);
+            if (result >= 0 && state.flatSourceProbe)
+                result = UpdateMatrixTransformProxy(
+                    state.transform, NativeMeshVisualPlacement(true, width, height));
             if (result < 0)
             {
                 Wh_Log(L"NATIVE MESH SOURCE RESIZE FAILED: HWND=%p "
@@ -4123,7 +4142,7 @@ static bool HasAttachableNativeMeshSlot(HWND hwnd)
 }
 
 static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
-                                     void* sourceProxy, bool backdropSource,
+                                     void* sourceProxy, bool backdropSource, bool flatSourceProbe,
                                      void* compositor,
                                      void*& image, void*& group,
                                      void*& instruction, void*& mesh,
@@ -4160,6 +4179,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     pending.sourceProxy = sourceProxy;
     pending.sourceOwner = ReadPointerMember(root, 0x18);
     pending.backdropSource = backdropSource;
+    pending.flatSourceProbe = flatSourceProbe;
     pending.width = width;
     pending.height = height;
     const wchar_t* stage = L"CreateVisual";
@@ -4188,7 +4208,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     if (result >= 0)
     {
         stage = L"PositionShape";
-        const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+        const MilMatrix3x2D matrix = NativeMeshVisualPlacement(flatSourceProbe, width, height);
         Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
         result = UpdateMatrixTransformProxy(pending.transform, matrix);
     }
@@ -4237,9 +4257,10 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
         g_nativeMeshActive.store(true, std::memory_order_release);
         InvalidateAnimationTransformForNativeMesh(hwnd);
         Wh_Log(L"NATIVE MESH ATTACHED: HWND=%p root=%p "
-               L"visual=%p source=%s duration=until-slot-retirement snapshot=none",
+               L"visual=%p source=%s path=%s duration=until-slot-retirement snapshot=none",
                hwnd, root, pending.visual,
-               backdropSource ? L"BackgroundTreatment" : L"WindowBorder");
+               backdropSource ? L"BackgroundTreatment" : L"WindowBorder",
+               flatSourceProbe ? L"DrawBitmap" : L"DrawMesh2D");
         RequestDwmScenePass();
         return true;
     }
@@ -4281,6 +4302,29 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
         !image || width < 160 || height < 100)
     {
         Wh_Log(L"NATIVE VERTEX MESH: skipped HWND=%p", hwnd);
+        return;
+    }
+
+    if (g_nativeFlatSourceProbeEnabled.load(std::memory_order_acquire))
+    {
+        void* instruction = nullptr;
+        void* group = nullptr;
+        void* mesh = nullptr;
+        long result = g_nativeProbeCreateBitmapInstruction
+            ? g_nativeProbeCreateBitmapInstruction(image, &instruction)
+            : E_NOTIMPL;
+        Wh_Log(L"NATIVE FLAT SOURCE PROBE: HWND=%p create=0x%08X "
+               L"image=%p source=%s size=%dx%d scale=0.5 position=inside-bottom-right",
+               hwnd, static_cast<unsigned>(result), image,
+               backdropSource ? L"BackgroundTreatment" : L"WindowBorder",
+               width, height);
+        if (result >= 0 && instruction)
+        {
+            TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy,
+                                backdropSource, true, compositor, image, group,
+                                instruction, mesh, width, height);
+        }
+        if (instruction) g_cBaseObjectRelease(instruction);
         return;
     }
 
@@ -4345,7 +4389,8 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
            NATIVE_MESH_VERTEX_COUNT, NATIVE_MESH_INDEX_COUNT, instruction);
     if (result >= 0)
     {
-        if (TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy, backdropSource,
+        if (TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy,
+                                     backdropSource, false,
                                      compositor, image, group, instruction,
                                      mesh, width, height))
         {
@@ -6715,7 +6760,8 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
             g_nativeMeshHwnd.load(std::memory_order_acquire) == slot.hwnd;
         // A treatment source includes this child transform; keep it neutral so
         // the captured image is not translated a second time inside the mesh.
-        identityUpdate = (nativeMeshActive && g_nativeMeshState.backdropSource) ||
+        identityUpdate = (nativeMeshActive && (g_nativeMeshState.backdropSource ||
+                                              g_nativeMeshState.flatSourceProbe)) ||
                          slot.retiring || slot.meshIdentityPending ||
                          !slot.mesh.active ||
                          g_unloading.load(std::memory_order_acquire);
@@ -8763,9 +8809,13 @@ static void LoadSettings()
     WobblySettings settings = PHYSICS_PRESETS[wobbliness];
     auto rendererSetting = WindhawkUtils::StringSetting::make(L"Renderer");
     std::wstring_view rendererValue(rendererSetting.get());
+    bool flatSourceProbe = rendererValue == L"mesh-flat-source";
+    bool flatSourceProbeChanged =
+        g_nativeFlatSourceProbeEnabled.exchange(flatSourceProbe,
+                                                std::memory_order_acq_rel) != flatSourceProbe;
     settings.rendererMode = rendererValue == L"external-gpu"
                                 ? RendererMode::ExternalGpu
-                                : rendererValue == L"mesh"
+                                : (rendererValue == L"mesh" || flatSourceProbe)
                                       ? RendererMode::Mesh
                                       : RendererMode::Affine;
     g_meshBridgeEnabled.store(
@@ -8790,7 +8840,7 @@ static void LoadSettings()
     AcquireSRWLockExclusive(&g_settingsLock);
     g_settings = settings;
     ReleaseSRWLockExclusive(&g_settingsLock);
-    if (settings.rendererMode != RendererMode::Mesh &&
+    if ((settings.rendererMode != RendererMode::Mesh || flatSourceProbeChanged) &&
         g_nativeMeshActive.load(std::memory_order_acquire))
     {
         g_nativeMeshStopRequested.store(true, std::memory_order_release);
@@ -8807,7 +8857,8 @@ static void LoadSettings()
            L"MoveFactor=%.2f",
            wobbliness, advancedMode,
            settings.rendererMode == RendererMode::ExternalGpu ? L"external-gpu" :
-               settings.rendererMode == RendererMode::Mesh ? L"mesh" : L"affine",
+                settings.rendererMode == RendererMode::Mesh
+                    ? (flatSourceProbe ? L"flat-source-diagnostic" : L"mesh") : L"affine",
            settings.resizeWobbleEnabled,
            settings.windowStateWobbleEnabled, settings.stiffness, settings.drag,
            settings.moveFactor);
