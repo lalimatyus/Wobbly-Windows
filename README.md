@@ -1,6 +1,5 @@
 > [!CAUTION]
-> ## This repo has test/experimental releases. If you want to download the stable release download it directly from Windhawk.
-
+> ## This repo has develpoment/test builds, which can cause instability and other issues. If you want to download the stable release download it directly from Windhawk.
 
 # Wobbly Windows
 
