@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.304
+// @version         0.305
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3839,21 +3839,96 @@ static bool DetachNativeMesh(const wchar_t* reason)
     return true;
 }
 
+static void CalculateBernsteinBasis(double value, double basis[4]);
+
+// Native mesh math begin: shared with the standalone geometry checks.
 static constexpr unsigned int NATIVE_MESH_CELLS = 20;
-static constexpr unsigned int NATIVE_MESH_SIDE = NATIVE_MESH_CELLS + 1;
+static constexpr unsigned int NATIVE_MESH_RENDER_CELLS = NATIVE_MESH_CELLS + 2;
+static constexpr unsigned int NATIVE_MESH_SIDE = NATIVE_MESH_RENDER_CELLS + 1;
 static constexpr unsigned int NATIVE_MESH_VERTEX_COUNT =
     NATIVE_MESH_SIDE * NATIVE_MESH_SIDE;
 static constexpr unsigned int NATIVE_MESH_INDEX_COUNT =
-    NATIVE_MESH_CELLS * NATIVE_MESH_CELLS * 6;
+    NATIVE_MESH_RENDER_CELLS * NATIVE_MESH_RENDER_CELLS * 6;
 
-static void CalculateBernsteinBasis(double value, double basis[4]);
+static double NativeMeshWindowCoordinate(unsigned int index, int length, int padding)
+{
+    if (index == 0) return -static_cast<double>(padding);
+    if (index == NATIVE_MESH_SIDE - 1) return static_cast<double>(length + padding);
+    return static_cast<double>(length) * (index - 1) / NATIVE_MESH_CELLS;
+}
+
+static void CalculateNativeMeshBasis(double value, double basis[4])
+{
+    // Continue the edge tangent into the shadow margin instead of extending
+    // the cubic polynomial, which can amplify extreme corner deformation.
+    if (value < 0.0)
+    {
+        basis[0] = 1.0 - 3.0 * value; basis[1] = 3.0 * value;
+        basis[2] = basis[3] = 0.0;
+    }
+    else if (value > 1.0)
+    {
+        basis[0] = basis[1] = 0.0;
+        basis[2] = -3.0 * (value - 1.0); basis[3] = 1.0 + 3.0 * (value - 1.0);
+    }
+    else
+    {
+        double remaining = 1.0 - value;
+        basis[0] = remaining * remaining * remaining;
+        basis[1] = 3.0 * value * remaining * remaining;
+        basis[2] = 3.0 * value * value * remaining;
+        basis[3] = value * value * value;
+    }
+}
+
+static bool BuildNativeMeshVertices(const Vec2 (&control)[16],
+    int width, int height, int padding,
+    NativeProbePoint3F (&positions)[NATIVE_MESH_VERTEX_COUNT],
+    NativeProbePoint2D (&coordinates)[NATIVE_MESH_VERTEX_COUNT])
+{
+    if (width < 1 || height < 1 || padding < 0 || padding > 64 ||
+        width > 8192 - 2 * padding || height > 8192 - 2 * padding)
+        return false;
+    for (const Vec2& point : control)
+        if (!std::isfinite(point.x) || !std::isfinite(point.y)) return false;
+    for (unsigned int y = 0; y < NATIVE_MESH_SIDE; ++y)
+    {
+        double sourceY = NativeMeshWindowCoordinate(y, height, padding);
+        double basisY[4];
+        CalculateNativeMeshBasis(sourceY / height, basisY);
+        for (unsigned int x = 0; x < NATIVE_MESH_SIDE; ++x)
+        {
+            double sourceX = NativeMeshWindowCoordinate(x, width, padding);
+            double basisX[4];
+            CalculateNativeMeshBasis(sourceX / width, basisX);
+            Vec2 position = {};
+            for (unsigned int cy = 0; cy < 4; ++cy)
+                for (unsigned int cx = 0; cx < 4; ++cx)
+                {
+                    double weight = basisY[cy] * basisX[cx];
+                    const Vec2& point = control[cy * 4 + cx];
+                    position.x += weight * point.x;
+                    position.y += weight * point.y;
+                }
+            if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+                std::abs(position.x) > FLT_MAX || std::abs(position.y) > FLT_MAX)
+                return false;
+            unsigned int index = y * NATIVE_MESH_SIDE + x;
+            positions[index] = {static_cast<float>(position.x),
+                                static_cast<float>(position.y), 0.0f};
+            // The realized image starts at (0,0); the window starts at (padding,padding).
+            coordinates[index] = {sourceX + padding, sourceY + padding};
+        }
+    }
+    return true;
+}
 
 static void BuildNativeMeshIndices(unsigned int (&indices)[NATIVE_MESH_INDEX_COUNT])
 {
     unsigned int count = 0;
-    for (unsigned int y = 0; y < NATIVE_MESH_CELLS; ++y)
+    for (unsigned int y = 0; y < NATIVE_MESH_RENDER_CELLS; ++y)
     {
-        for (unsigned int x = 0; x < NATIVE_MESH_CELLS; ++x)
+        for (unsigned int x = 0; x < NATIVE_MESH_RENDER_CELLS; ++x)
         {
             const unsigned int a = y * NATIVE_MESH_SIDE + x;
             const unsigned int b = a + 1;
@@ -3864,6 +3939,8 @@ static void BuildNativeMeshIndices(unsigned int (&indices)[NATIVE_MESH_INDEX_COU
         }
     }
 }
+// Native mesh math end.
+static_assert(GRID_WIDTH == 4 && GRID_HEIGHT == 4);
 
 static void UpdateNativeVertexMesh(NativeMeshState& state)
 {
@@ -3942,32 +4019,11 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
         control[i] = {(point.basePosition.x + dx) * scaleX,
                       (point.basePosition.y + dy) * scaleY};
     }
-    for (unsigned int y = 0; y < NATIVE_MESH_SIDE; ++y)
+    if (!BuildNativeMeshVertices(control, state.width, state.height,
+                                  state.sourcePadding, positions, coordinates))
     {
-        const double v = static_cast<double>(y) / NATIVE_MESH_CELLS;
-        double basisY[4];
-        CalculateBernsteinBasis(v, basisY);
-        for (unsigned int x = 0; x < NATIVE_MESH_SIDE; ++x)
-        {
-            const double u = static_cast<double>(x) / NATIVE_MESH_CELLS;
-            double basisX[4];
-            CalculateBernsteinBasis(u, basisX);
-            Vec2 position = {};
-            for (unsigned int cy = 0; cy < GRID_HEIGHT; ++cy)
-            {
-                for (unsigned int cx = 0; cx < GRID_WIDTH; ++cx)
-                {
-                    const double weight = basisY[cy] * basisX[cx];
-                    const Vec2& point = control[cy * GRID_WIDTH + cx];
-                    position.x += weight * point.x;
-                    position.y += weight * point.y;
-                }
-            }
-            const unsigned int index = y * NATIVE_MESH_SIDE + x;
-            positions[index] = {static_cast<float>(position.x),
-                                static_cast<float>(position.y), 0.0f};
-            coordinates[index] = {u * state.width, v * state.height};
-        }
+        DetachNativeMesh(L"mesh-vertices-invalid");
+        return;
     }
     BuildNativeMeshIndices(indices);
     long result = g_nativeProbeUpdateMesh(state.mesh, 0, positions,
@@ -4347,18 +4403,18 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
     NativeProbePoint3F positions[NATIVE_MESH_VERTEX_COUNT] = {};
     NativeProbePoint2D coordinates[NATIVE_MESH_VERTEX_COUNT] = {};
     unsigned int indices[NATIVE_MESH_INDEX_COUNT] = {};
-    for (unsigned int y = 0; y < NATIVE_MESH_SIDE; ++y)
+    Vec2 control[GRID_POINT_COUNT] = {};
+    for (unsigned int y = 0; y < GRID_HEIGHT; ++y)
     {
-        for (unsigned int x = 0; x < NATIVE_MESH_SIDE; ++x)
+        for (unsigned int x = 0; x < GRID_WIDTH; ++x)
         {
-            const unsigned int index = y * NATIVE_MESH_SIDE + x;
-            const double px = static_cast<double>(width) * x / NATIVE_MESH_CELLS;
-            const double py = static_cast<double>(height) * y / NATIVE_MESH_CELLS;
-            positions[index] = {static_cast<float>(px),
-                                static_cast<float>(py), 0.0f};
-            coordinates[index] = {px, py};
+            control[y * GRID_WIDTH + x] = {
+                static_cast<double>(width) * x / (GRID_WIDTH - 1),
+                static_cast<double>(height) * y / (GRID_HEIGHT - 1)};
         }
     }
+    if (!BuildNativeMeshVertices(control, width, height, sourcePadding, positions, coordinates))
+        return;
     BuildNativeMeshIndices(indices);
 
     void* mesh = nullptr;
@@ -4408,7 +4464,7 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
         if (TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy,
                                      backdropSource, false,
                                      compositor, image, group, instruction,
-                                     mesh, width, height, 0))
+                                     mesh, width, height, sourcePadding))
         {
             Wh_Log(L"NATIVE VERTEX MESH: attached HWND=%p "
                    L"physicsLinked=1 liveSource=1 original=%s", hwnd,
@@ -4484,15 +4540,12 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
     NativeSourceProbeMode probeMode =
         g_nativeSourceProbeMode.load(std::memory_order_acquire);
     bool flatSourceProbe = probeMode != NativeSourceProbeMode::None;
-    int sourcePadding = probeMode == NativeSourceProbeMode::PaddedFlat ? 64 : 0;
-    if (flatSourceProbe)
-    {
-        Wh_Log(L"NATIVE SOURCE RECT: HWND=%p rect=(%d,%d,%d,%d) "
-               L"realization=%dx%d padding=%d", hwnd,
-               -sourcePadding, -sourcePadding,
-               width + sourcePadding, height + sourcePadding,
-               width + 2 * sourcePadding, height + 2 * sourcePadding, sourcePadding);
-    }
+    int sourcePadding = probeMode == NativeSourceProbeMode::Flat ? 0 : 64;
+    Wh_Log(L"NATIVE SOURCE RECT: HWND=%p rect=(%d,%d,%d,%d) "
+           L"realization=%dx%d padding=%d", hwnd,
+           -sourcePadding, -sourcePadding,
+           width + sourcePadding, height + sourcePadding,
+           width + 2 * sourcePadding, height + 2 * sourcePadding, sourcePadding);
     void* image = nullptr;
     void* validationInstruction = nullptr;
     long createResult = g_nativeProbeCreateImage(compositor, &image);
