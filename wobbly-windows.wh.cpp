@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.312
+// @version         0.313
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -773,7 +773,7 @@ static long UpdateMatrixTransformProxy(void* proxy, const MilMatrix3x2D& matrix)
     return E_NOTIMPL;
 }
 
-static void* ReadPointerMember(void* object, size_t offset)
+static void* ReadPointerMember(const void* object, size_t offset)
 {
     if (!object || offset == SIZE_MAX)
     {
@@ -3700,6 +3700,8 @@ std::atomic<void*> g_coreMaterialSourceImage = nullptr; // Comparison only outsi
 std::atomic<HWND> g_coreMaterialTargetHwnd = nullptr;
 std::atomic<ULONGLONG> g_coreMaterialPrecomputeLogAt = 0;
 std::atomic<ULONGLONG> g_coreMaterialRealizeLogAt = 0;
+std::atomic<ULONGLONG> g_coreMaterialTreeProbeEpoch = 0;
+uintptr_t g_coreMaterialModuleBase = 0; // Exact-image gate, published before observer readiness.
 SRWLOCK g_coreMaterialTargetLock = SRWLOCK_INIT;
 std::atomic<ULONGLONG> g_coreMaterialTargetEpoch = 0;
 
@@ -3848,6 +3850,98 @@ static long __cdecl CoreMaterialInputHook(void* context, const void* size, void*
     return result;
 }
 
+struct CoreMaterialTreeSnapshot
+{
+    unsigned nodes = 0, ancestors = 0, treatments = 0, caches = 0, invalid = 0;
+    bool truncated = false;
+    struct Hit { void* visual; void* treatment; void* cache; unsigned depth; bool ancestor; };
+    Hit hits[4] = {};
+    unsigned hitCount = 0;
+};
+
+static bool IsCoreMaterialVisual(const void* visual)
+{
+    if (!g_coreMaterialModuleBase || !IsReadableMemory(visual, 0xF0)) return false;
+    const uintptr_t vtable = reinterpret_cast<uintptr_t>(ReadPointerMember(visual, 0));
+    if (vtable < g_coreMaterialModuleBase ||
+        vtable - g_coreMaterialModuleBase >= 0x41A000) return false;
+    const auto* properties = static_cast<const BYTE*>(ReadPointerMember(visual, 0xE8));
+    unsigned flags = 0, count = 0;
+    if (!IsReadableMemory(properties, 8)) return false;
+    std::memcpy(&flags, properties, 4);
+    std::memcpy(&count, properties + 4, 4);
+    if (count > 64 || !IsReadableMemory(properties, ((8 + count + 7) & ~size_t{7}) + count * sizeof(void*)))
+        return false;
+    if ((flags & 0x200000) && !std::memchr(properties + 8, 11, count)) return false;
+    if ((flags & 0x100000) && !std::memchr(properties + 8, 12, count)) return false;
+    return true;
+}
+
+static CoreMaterialTreeSnapshot InspectCoreMaterialTree(void* root)
+{
+    // CVisual parent/children and tagged collection layout are verified from
+    // this exact core's InsertChild, RemoveAllChildren and collection GetAt.
+    CoreMaterialTreeSnapshot result;
+    struct Entry { void* visual; unsigned depth; } pending[64] = {{root, 0}};
+    unsigned queued = 1;
+    auto record = [&](void* visual, unsigned depth, bool ancestor)
+    {
+        void* treatment = g_coreTreatmentFunction(visual);
+        void* cache = g_coreCachedTreatmentOriginal(visual);
+        result.treatments += treatment != nullptr;
+        result.caches += cache != nullptr;
+        if ((treatment || cache) && result.hitCount < ARRAYSIZE(result.hits))
+            result.hits[result.hitCount++] = {visual, treatment, cache, depth, ancestor};
+    };
+    for (unsigned cursor = 0; cursor < queued; ++cursor)
+    {
+        void* visual = pending[cursor].visual;
+        if (!IsCoreMaterialVisual(visual)) { ++result.invalid; continue; }
+        ++result.nodes;
+        record(visual, pending[cursor].depth, false);
+        uintptr_t tagged = reinterpret_cast<uintptr_t>(ReadPointerMember(visual, 0x50));
+        auto* storage = reinterpret_cast<const BYTE*>(tagged & ~uintptr_t{3});
+        size_t count = tagged & 1;
+        if (tagged & 2)
+        {
+            size_t capacity = 0;
+            if (!IsReadableMemory(storage, 16)) { ++result.invalid; continue; }
+            std::memcpy(&count, storage, sizeof(count));
+            std::memcpy(&capacity, storage + 8, sizeof(capacity));
+            if (count > 256) { result.truncated = true; continue; }
+            if (count == 1 || capacity < count ||
+                !IsReadableMemory(storage, 16 + count * sizeof(void*)))
+                { ++result.invalid; continue; }
+        }
+        else if (!count && tagged) { ++result.invalid; continue; }
+        for (size_t i = 0; i < count; ++i)
+        {
+            void* child = (tagged & 2) ? ReadPointerMember(storage, 16 + i * sizeof(void*))
+                                      : const_cast<BYTE*>(storage);
+            bool duplicate = false;
+            for (unsigned j = 0; j < queued; ++j) duplicate |= pending[j].visual == child;
+            if (duplicate || !IsCoreMaterialVisual(child) || ReadPointerMember(child, 0x58) != visual)
+                { ++result.invalid; continue; }
+            if (queued == ARRAYSIZE(pending)) { result.truncated = true; break; }
+            pending[queued++] = {child, pending[cursor].depth + 1};
+        }
+    }
+    void* visited[17] = {root};
+    void* parent = IsCoreMaterialVisual(root) ? ReadPointerMember(root, 0x58) : nullptr;
+    for (unsigned depth = 1; parent && depth < ARRAYSIZE(visited); ++depth)
+    {
+        if (!IsCoreMaterialVisual(parent) ||
+            std::find(visited, visited + depth, parent) != visited + depth)
+            { ++result.invalid; parent = nullptr; break; }
+        visited[depth] = parent;
+        ++result.ancestors;
+        record(parent, depth, true);
+        parent = ReadPointerMember(parent, 0x58);
+    }
+    result.truncated |= parent != nullptr;
+    return result;
+}
+
 static long __cdecl CoreImageRealizeHook(void* image, const void* targetInfo, void** bitmap)
 {
     bool observe = g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) &&
@@ -3891,6 +3985,26 @@ static long __cdecl CoreImageRealizeHook(void* image, const void* targetInfo, vo
                observation.precomputeCalls, observation.rootPrecomputeCalls,
                observation.cachedHits, observation.cachedMisses,
                observation.effectCalls, observation.effectFailures);
+        // Wait for the second timed sample so initial composition updates settle.
+        if (last && g_coreMaterialTreeProbeEpoch.exchange(epoch, std::memory_order_relaxed) != epoch)
+        {
+            const auto tree = InspectCoreMaterialTree(rootAfter);
+            if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
+            {
+                Wh_Log(L"MESH MATERIAL TREE: HWND=%p nodes=%u ancestors=%u treatments=%u "
+                       L"caches=%u invalid=%u truncated=%d readOnly=1",
+                       hwnd, tree.nodes, tree.ancestors, tree.treatments,
+                       tree.caches, tree.invalid, tree.truncated);
+                for (unsigned i = 0; i < tree.hitCount; ++i)
+                {
+                    const auto& hit = tree.hits[i];
+                    Wh_Log(L"MESH MATERIAL OWNER: HWND=%p visual=%p relation=%s depth=%u "
+                           L"treatment=%p cache=%p readOnly=1", hwnd, hit.visual,
+                           hit.ancestor ? L"ancestor" : L"subtree", hit.depth,
+                           hit.treatment, hit.cache);
+                }
+            }
+        }
     }
     return result;
 }
@@ -3989,6 +4103,7 @@ static void InitializeCoreMaterialDiagnostics()
         Wh_Log(L"MESH MATERIAL OBSERVER: unavailable symbol/layout mismatch");
         return;
     }
+    g_coreMaterialModuleBase = base;
     const bool ready =
         WindhawkUtils::SetFunctionHook(g_coreCachedTreatmentFunction,
             CoreCachedTreatmentHook, &g_coreCachedTreatmentOriginal) &&
