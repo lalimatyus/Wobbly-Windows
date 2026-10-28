@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.311
+// @version         0.312
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3683,19 +3683,23 @@ using CoreMaterialInput_t = long(__cdecl*)(void*, const void*, void*);
 using CoreCachedTreatment_t = void*(__cdecl*)(const void*);
 using CoreImageUpdate_t = long(__cdecl*)(void*, void*, const void*);
 using CorePrecomputeTreatment_t = long(__cdecl*)(void*, void*, bool);
+using CoreImageRealize_t = long(__cdecl*)(void*, const void*, void**);
 CoreDrawMesh_t g_coreDrawMeshFunction = nullptr, g_coreDrawMeshOriginal = nullptr;
 CoreMaterialInput_t g_coreMaterialInputFunction = nullptr, g_coreMaterialInputOriginal = nullptr;
 CoreCachedTreatment_t g_coreCachedTreatmentFunction = nullptr, g_coreCachedTreatmentOriginal = nullptr;
 CoreCachedTreatment_t g_coreTreatmentFunction = nullptr;
 CoreImageUpdate_t g_coreImageUpdateFunction = nullptr, g_coreImageUpdateOriginal = nullptr;
 CorePrecomputeTreatment_t g_corePrecomputeTreatmentFunction = nullptr, g_corePrecomputeTreatmentOriginal = nullptr;
+CoreImageRealize_t g_coreImageRealizeFunction = nullptr, g_coreImageRealizeOriginal = nullptr;
 void* g_coreCachedImageVtable = nullptr;
 std::atomic_bool g_coreMaterialDiagnosticsReady = false;
 std::atomic<ULONGLONG> g_coreMaterialLastLogAt = 0;
 std::atomic<std::uint64_t> g_coreMaterialTargetKey = 0;
 std::atomic<void*> g_coreMaterialSourceRoot = nullptr; // Comparison only outside core callbacks.
+std::atomic<void*> g_coreMaterialSourceImage = nullptr; // Comparison only outside its callbacks.
 std::atomic<HWND> g_coreMaterialTargetHwnd = nullptr;
 std::atomic<ULONGLONG> g_coreMaterialPrecomputeLogAt = 0;
+std::atomic<ULONGLONG> g_coreMaterialRealizeLogAt = 0;
 SRWLOCK g_coreMaterialTargetLock = SRWLOCK_INIT;
 std::atomic<ULONGLONG> g_coreMaterialTargetEpoch = 0;
 
@@ -3713,6 +3717,7 @@ static void ClearCoreMaterialTarget()
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
     g_coreMaterialTargetKey.store(0, std::memory_order_release);
     g_coreMaterialSourceRoot.store(nullptr, std::memory_order_release);
+    g_coreMaterialSourceImage.store(nullptr, std::memory_order_release);
     g_coreMaterialTargetHwnd.store(nullptr, std::memory_order_release);
     g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
@@ -3728,6 +3733,7 @@ static void SetCoreMaterialTarget(void* image, void* sourceProxy, HWND hwnd)
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
     g_coreMaterialTargetHwnd.store(hwnd, std::memory_order_relaxed);
     g_coreMaterialPrecomputeLogAt.store(0, std::memory_order_relaxed);
+    g_coreMaterialRealizeLogAt.store(0, std::memory_order_relaxed);
     g_coreMaterialTargetKey.store((std::uint64_t{sourceId} << 32) | imageId,
                                    std::memory_order_release);
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
@@ -3758,6 +3764,7 @@ static long __cdecl CoreImageUpdateHook(void* image, void* table, const void* co
         epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
     {
         void* previous = g_coreMaterialSourceRoot.exchange(root, std::memory_order_acq_rel);
+        g_coreMaterialSourceImage.store(image, std::memory_order_release);
         changed = previous != root;
         hwnd = g_coreMaterialTargetHwnd.load(std::memory_order_acquire);
     }
@@ -3768,8 +3775,23 @@ static long __cdecl CoreImageUpdateHook(void* image, void* table, const void* co
     return result;
 }
 
+struct CoreMaterialObservation
+{
+    unsigned cachedHits = 0, cachedMisses = 0;
+    unsigned effectCalls = 0, effectFailures = 0;
+    unsigned precomputeCalls = 0, rootPrecomputeCalls = 0;
+    void* firstCache = nullptr;
+};
+thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
+
 static long __cdecl CorePrecomputeTreatmentHook(void* context, void* visual, bool phaseFlag)
 {
+    if (auto* observation = g_coreMaterialObservation)
+    {
+        ++observation->precomputeCalls;
+        observation->rootPrecomputeCalls +=
+            visual == g_coreMaterialSourceRoot.load(std::memory_order_acquire);
+    }
     bool observe =
         g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) &&
         !g_unloading.load(std::memory_order_acquire) &&
@@ -3800,14 +3822,6 @@ static long __cdecl CorePrecomputeTreatmentHook(void* context, void* visual, boo
     }
     return result;
 }
-struct CoreMaterialObservation
-{
-    unsigned cachedHits = 0, cachedMisses = 0;
-    unsigned effectCalls = 0, effectFailures = 0;
-    void* firstCache = nullptr;
-};
-thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
-
 static void* __cdecl CoreCachedTreatmentHook(const void* visual)
 {
     void* result = g_coreCachedTreatmentOriginal(visual);
@@ -3834,6 +3848,53 @@ static long __cdecl CoreMaterialInputHook(void* context, const void* size, void*
     return result;
 }
 
+static long __cdecl CoreImageRealizeHook(void* image, const void* targetInfo, void** bitmap)
+{
+    bool observe = g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) &&
+        !g_unloading.load(std::memory_order_acquire) &&
+        image == g_coreMaterialSourceImage.load(std::memory_order_acquire);
+    ULONGLONG epoch = 0;
+    HWND hwnd = nullptr;
+    if (observe)
+    {
+        AcquireSRWLockShared(&g_coreMaterialTargetLock);
+        observe = g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
+                  image == g_coreMaterialSourceImage.load(std::memory_order_relaxed);
+        epoch = g_coreMaterialTargetEpoch.load(std::memory_order_relaxed);
+        hwnd = g_coreMaterialTargetHwnd.load(std::memory_order_relaxed);
+        ReleaseSRWLockShared(&g_coreMaterialTargetLock);
+    }
+    if (!observe) return g_coreImageRealizeOriginal(image, targetInfo, bitmap);
+
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG last = g_coreMaterialRealizeLogAt.load(std::memory_order_relaxed);
+    const bool log = now - last >= 1000 &&
+        g_coreMaterialRealizeLogAt.compare_exchange_strong(last, now, std::memory_order_relaxed);
+    // The current CVI owns this root throughout the callback. Never query a
+    // remembered CVisual from an animation/event thread.
+    void* rootBefore = log ? ReadPointerMember(image, 0x90) : nullptr;
+    void* treatment = rootBefore ? g_coreTreatmentFunction(rootBefore) : nullptr;
+    void* cachedBefore = rootBefore ? g_coreCachedTreatmentOriginal(rootBefore) : nullptr;
+    CoreMaterialObservation observation;
+    auto* previous = g_coreMaterialObservation;
+    g_coreMaterialObservation = &observation;
+    const long result = g_coreImageRealizeOriginal(image, targetInfo, bitmap);
+    g_coreMaterialObservation = previous;
+    if (log && epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
+    {
+        void* rootAfter = ReadPointerMember(image, 0x90);
+        Wh_Log(L"MESH MATERIAL REALIZE: HWND=%p result=0x%08X rootBefore=%p rootAfter=%p treatment=%p "
+               L"cachedBefore=%p cachedAfter=%p precompute=%u rootPrecompute=%u "
+               L"cachedHits=%u cacheMisses=%u effectCalls=%u effectFailures=%u readOnly=1",
+               hwnd, static_cast<unsigned>(result), rootBefore, rootAfter, treatment, cachedBefore,
+               rootAfter ? g_coreCachedTreatmentOriginal(rootAfter) : nullptr,
+               observation.precomputeCalls, observation.rootPrecomputeCalls,
+               observation.cachedHits, observation.cachedMisses,
+               observation.effectCalls, observation.effectFailures);
+    }
+    return result;
+}
+
 static long __cdecl CoreDrawMeshHook(void* context, void* geometry, void* image)
 {
     if (!g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) ||
@@ -3850,7 +3911,9 @@ static long __cdecl CoreDrawMeshHook(void* context, void* geometry, void* image)
     g_coreMaterialObservation = previous;
     const ULONGLONG now = GetTickCount64();
     ULONGLONG last = g_coreMaterialLastLogAt.load(std::memory_order_relaxed);
-    if (now - last >= 1000 && g_coreMaterialLastLogAt.compare_exchange_strong(
+    if ((result < 0 || observation.cachedHits || observation.cachedMisses ||
+         observation.effectCalls || observation.precomputeCalls) &&
+        now - last >= 1000 && g_coreMaterialLastLogAt.compare_exchange_strong(
             last, now, std::memory_order_relaxed))
         Wh_Log(L"MESH MATERIAL PATH: HWND=%p draw=0x%08X cachedHits=%u cacheMisses=%u "
                L"effectCalls=%u effectFailures=%u firstCache=%p readOnly=1",
@@ -3906,6 +3969,9 @@ static void InitializeCoreMaterialDiagnostics()
           L"public: class CWindowBackgroundTreatment * __cdecl "
            L"CVisual::GetWindowBackgroundTreatmentInternal(void)const "},
          &g_coreTreatmentFunction, nullptr, true},
+        {{L"protected: long __cdecl CCachedVisualImage::EnsureRenderTargetBitmap("
+           L"class RenderTargetInfo const &,class IRenderTargetBitmap * *)"},
+         &g_coreImageRealizeFunction, nullptr, true},
     };
     if (!WindhawkUtils::HookSymbols(core, dwmcoreDllHooks, ARRAYSIZE(dwmcoreDllHooks)))
         return;
@@ -3917,7 +3983,8 @@ static void InitializeCoreMaterialDiagnostics()
         reinterpret_cast<uintptr_t>(g_coreCachedImageVtable) != base + 0x2C4350 ||
         reinterpret_cast<uintptr_t>(g_coreImageUpdateFunction) != base + 0xA923C ||
         reinterpret_cast<uintptr_t>(g_corePrecomputeTreatmentFunction) != base + 0xA44FC ||
-        reinterpret_cast<uintptr_t>(g_coreTreatmentFunction) != base + 0xA4BAC)
+        reinterpret_cast<uintptr_t>(g_coreTreatmentFunction) != base + 0xA4BAC ||
+        reinterpret_cast<uintptr_t>(g_coreImageRealizeFunction) != base + 0x3A8B0)
     {
         Wh_Log(L"MESH MATERIAL OBSERVER: unavailable symbol/layout mismatch");
         return;
@@ -3932,7 +3999,9 @@ static void InitializeCoreMaterialDiagnostics()
         WindhawkUtils::SetFunctionHook(g_coreImageUpdateFunction,
             CoreImageUpdateHook, &g_coreImageUpdateOriginal) &&
         WindhawkUtils::SetFunctionHook(g_corePrecomputeTreatmentFunction,
-            CorePrecomputeTreatmentHook, &g_corePrecomputeTreatmentOriginal);
+            CorePrecomputeTreatmentHook, &g_corePrecomputeTreatmentOriginal) &&
+        WindhawkUtils::SetFunctionHook(g_coreImageRealizeFunction,
+            CoreImageRealizeHook, &g_coreImageRealizeOriginal);
     g_coreMaterialDiagnosticsReady.store(ready, std::memory_order_release);
     Wh_Log(L"MESH MATERIAL OBSERVER: %s core=22621.4596 readOnly=1",
            ready ? L"ready" : L"unavailable");
