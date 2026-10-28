@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.310
+// @version         0.311
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4465,8 +4465,7 @@ static void MaintainNativeMesh()
     int width = 0;
     int height = 0;
     bool sourceValid = state.root &&
-        g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy &&
-        GetNativeMeshWindowSize(state.hwnd, width, height);
+        g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy;
     if (sourceValid && state.backdropSource)
     {
         sourceValid = ReadPointerMember(state.root, 0x18) == state.sourceOwner &&
@@ -4477,6 +4476,32 @@ static void MaintainNativeMesh()
         DetachNativeMesh(L"source-changed");
     else
     {
+        // A temporarily unavailable HWND rectangle is not a replaced visual.
+        // Keep the validated source and retry its bounds on the next scene pass.
+        if (!GetNativeMeshWindowSize(state.hwnd, width, height))
+        {
+            UpdateNativeVertexMesh(state);
+            return;
+        }
+        if ((width != state.width || height != state.height) &&
+            std::abs(width - state.width) <= 1 && std::abs(height - state.height) <= 1)
+        {
+            bool moving = false;
+            AcquireSRWLockShared(&g_animationSlotsLock);
+            for (const auto& slot : g_animationSlots)
+                if (slot.active && slot.hwnd == state.hwnd &&
+                    slot.generation == state.meshGeneration)
+                {
+                    moving = slot.dragging && !slot.mesh.resizing;
+                    break;
+                }
+            ReleaseSRWLockShared(&g_animationSlotsLock);
+            if (moving)
+            {
+                width = state.width;
+                height = state.height;
+            }
+        }
         if (width != state.width || height != state.height)
         {
             long result = UpdateNativeMeshSourceImage(state.image, state.sourceProxy,
@@ -5567,6 +5592,16 @@ static void OffsetMeshPositions(WobbleMesh& mesh, double x, double y)
         point.position.x += x;
         point.position.y += y;
     }
+}
+
+static void ContinuePhysicalMeshDrag(WobbleMesh& mesh, double width, double height,
+                                      const Vec2& localMouse, const Vec2& windowDelta,
+                                      bool rebaseCoordinates)
+{
+    if (!rebaseCoordinates)
+        OffsetMeshPositions(mesh, -windowDelta.x, -windowDelta.y);
+    ResizeMeshPreservingDeformation(mesh, width, height);
+    UpdateMeshDragOffset(mesh, localMouse);
 }
 
 static void SetMeshResizeMode(WobbleMesh& mesh, bool resizing)
@@ -7923,7 +7958,10 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         g_monitorTransitionRebaseUntil = now + 750;
         RetargetAnimationClock(cursorMonitor);
     }
-    bool dpiReflow = !g_realResizing && sizeChanged && !zoomStateChanged &&
+    bool physicalRoundingChange = g_dragUsesPhysicalCoordinates && sizeChanged &&
+        std::abs(currentWidth - previousWidth) <= 1 &&
+        std::abs(currentHeight - previousHeight) <= 1;
+    bool dpiReflow = !g_realResizing && sizeChanged && !physicalRoundingChange && !zoomStateChanged &&
                      g_interactiveStateThrob == InteractiveStateThrobKind::None;
     if (dpiReflow)
     {
@@ -8045,6 +8083,15 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
             ResizeMeshPreservingDeformation(slot.mesh, currentMeshWidth, currentMeshHeight);
         }
         UpdateMeshDragOffset(slot.mesh, localMousePosition);
+    }
+    else if (g_dragUsesPhysicalCoordinates && !zoomStateChanged &&
+             (sizeChanged || rebaseMonitorTransition))
+    {
+        // Rounded physical bounds and DPI reflow must not reset the springs
+        // or select a different grabbed point in the middle of a move.
+        ContinuePhysicalMeshDrag(slot.mesh, currentMeshWidth, currentMeshHeight,
+                                 localMousePosition, {windowDeltaX, windowDeltaY},
+                                 rebaseMonitorTransition && !physicalRoundingChange);
     }
     else if (rebaseMonitorTransition)
     {
