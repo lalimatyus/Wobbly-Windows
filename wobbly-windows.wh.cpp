@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.323
+// @version         0.324
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3741,7 +3741,92 @@ struct CoreBackdropSnapshot
     void* parentContext = nullptr;
     void* image = nullptr;
     void* root = nullptr;
+    unsigned tables = 0, alternateCount = 0;
+    bool incomplete = false;
+    struct Alternate { void* image; void* root; void* tree; unsigned pathPairs; } alternates[4] = {};
 };
+
+static bool ReadCoreBackdropRegistry(void* data, void**& images, unsigned& count)
+{
+    const auto first = reinterpret_cast<uintptr_t>(ReadPointerMember(data, 0xA8));
+    const auto last = reinterpret_cast<uintptr_t>(ReadPointerMember(data, 0xB0));
+    if (last < first || (last - first) % sizeof(void*) || last - first > 32 * sizeof(void*) ||
+        (last != first && (!first || !IsReadableMemory(reinterpret_cast<void*>(first), last - first))))
+        return false;
+    images = reinterpret_cast<void**>(first);
+    count = static_cast<unsigned>((last - first) / sizeof(void*));
+    return true;
+}
+
+static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapshot& hit)
+{
+    auto collect = [&](void* data)
+    {
+        void** images = nullptr;
+        unsigned count = 0;
+        if (!ReadCoreBackdropRegistry(data, images, count)) { hit.incomplete = true; return; }
+        ++hit.tables;
+        for (unsigned i = 0; i < count; ++i)
+        {
+            void* image = images[i];
+            if (image == hit.image || ReadPointerMember(image, 0) != g_coreBackdropImageVtable) continue;
+            void* root = ReadPointerMember(image, 0x90);
+            if (!root || root == hit.root) continue;
+            const auto first = reinterpret_cast<uintptr_t>(ReadPointerMember(image, 0x700));
+            const auto last = reinterpret_cast<uintptr_t>(ReadPointerMember(image, 0x708));
+            if (!first || last <= first || (last - first) % 16 || last - first > 32 * 16 ||
+                !IsReadableMemory(reinterpret_cast<void*>(first), last - first))
+                { hit.incomplete = true; continue; }
+            bool duplicate = false;
+            for (unsigned j = 0; j < hit.alternateCount; ++j)
+                duplicate |= hit.alternates[j].image == image;
+            if (duplicate) continue;
+            if (hit.alternateCount == ARRAYSIZE(hit.alternates)) { hit.incomplete = true; continue; }
+            hit.alternates[hit.alternateCount++] = {
+                image, root, ReadPointerMember(reinterpret_cast<void*>(first + 8), 0),
+                static_cast<unsigned>((last - first) / 16)};
+        }
+    };
+    collect(currentData);
+    // Native FindTreeData uses tagged property 1 for its intrusive association
+    // list. Validate the entire bounded list before making another native query.
+    const auto* properties = static_cast<const BYTE*>(ReadPointerMember(hit.currentVisual, 0xE8));
+    unsigned flags = 0, count = 0;
+    if (!IsReadableMemory(properties, 8)) { hit.incomplete = true; return; }
+    std::memcpy(&flags, properties, 4);
+    std::memcpy(&count, properties + 4, 4);
+    if (!(flags & 0x80000000)) return;
+    if (count > 64 || !IsReadableMemory(properties, ((8 + count + 7) & ~size_t{7}) + count * sizeof(void*)))
+        { hit.incomplete = true; return; }
+    const auto* tag = static_cast<const BYTE*>(std::memchr(properties + 8, 1, count));
+    if (!tag) return;
+    const size_t index = static_cast<size_t>(tag - properties - 8);
+    void* head = ReadPointerMember(properties, ((8 + count + 7) & ~size_t{7}) + index * sizeof(void*));
+    if (!head) return;
+    void* nodes[32] = {}, *trees[32] = {};
+    unsigned used = 0;
+    void* node = ReadPointerMember(head, 0);
+    while (node != head)
+    {
+        if (!node || used == ARRAYSIZE(nodes) ||
+            std::find(nodes, nodes + used, node) != nodes + used || !IsReadableMemory(node, 0x28))
+            { hit.incomplete = true; return; }
+        nodes[used] = node;
+        trees[used++] = ReadPointerMember(node, 0x20);
+        node = ReadPointerMember(node, 0);
+    }
+    for (unsigned i = 0; i < used; ++i)
+    {
+        const auto address = reinterpret_cast<uintptr_t>(nodes[i]);
+        if (address < 0x168 || !trees[i]) { hit.incomplete = true; continue; }
+        void* data = reinterpret_cast<void*>(address - 0x168);
+        if (data != currentData)
+        {
+            if (g_coreFindTreeDataFunction(hit.currentVisual, trees[i]) == data) collect(data);
+            else hit.incomplete = true;
+        }
+    }
+}
 
 static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context)
 {
@@ -3760,17 +3845,13 @@ static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context)
     if (!hit.currentTree || !IsCoreMaterialVisual(hit.currentVisual)) return hit;
     void* data = g_coreFindTreeDataFunction(hit.currentVisual, hit.currentTree);
     if (!data) return hit;
-    const auto first = reinterpret_cast<uintptr_t>(ReadPointerMember(data, 0xA8));
-    const auto last = reinterpret_cast<uintptr_t>(ReadPointerMember(data, 0xB0));
-    if (last < first || (last - first) % sizeof(void*) || last - first > 32 * sizeof(void*) ||
-        (last != first && (!first || !IsReadableMemory(reinterpret_cast<void*>(first), last - first))))
-        return hit;
-    hit.images = static_cast<unsigned>((last - first) / sizeof(void*));
+    void** images = nullptr;
+    if (!ReadCoreBackdropRegistry(data, images, hit.images)) return hit;
     hit.parentContext = ReadPointerMember(context, 0xD0);
     hit.valid = true;
     for (unsigned i = 0; i < hit.images; ++i)
     {
-        void* image = ReadPointerMember(reinterpret_cast<void*>(first), i * sizeof(void*));
+        void* image = images[i];
         if (ReadPointerMember(image, 0) != g_coreBackdropImageVtable) continue;
         const auto imageBegin = reinterpret_cast<uintptr_t>(ReadPointerMember(image, 0x700));
         const auto imageEnd = reinterpret_cast<uintptr_t>(ReadPointerMember(image, 0x708));
@@ -3782,6 +3863,7 @@ static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context)
         hit.root = ReadPointerMember(image, 0x90);
         break;
     }
+    CollectCoreBackdropAlternates(data, hit);
     return hit;
 }
 
@@ -3908,7 +3990,9 @@ static long __cdecl CoreBviValidationHook(void* context, const void* bounds, voi
     if (auto* observation = g_coreMaterialObservation)
     {
         ++observation->bviCalls;
-        if (observation->collectBackdrop && !observation->backdrop.valid)
+        if (observation->collectBackdrop && !observation->backdrop.valid &&
+            g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) &&
+            !g_unloading.load(std::memory_order_acquire))
             observation->backdrop = ReadCoreBackdropSnapshot(context);
         observation->bviFailures += result < 0;
         if (result >= 0 && IsReadableMemory(flag, 1))
@@ -4001,14 +4085,24 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
                observation.bviCalls, observation.bviFailures, observation.bviFlag,
                static_cast<unsigned>(result));
         if (observation.bviCalls && observation.collectBackdrop)
+        {
             Wh_Log(L"MESH ACRYLIC INPUT: HWND=%p imageMatch=%d valid=%d pathPairs=%u "
                    L"currentVisual=%p currentTree=%p parentContext=%p candidates=%u "
-                   L"matchedImage=%p backdropRoot=%p sampledRoot=%p readOnly=1", hwnd, imageMatch,
+                   L"matchedImage=%p backdropRoot=%p sampledRoot=%p tables=%u alternates=%u incomplete=%d readOnly=1", hwnd, imageMatch,
                    observation.backdrop.valid, observation.backdrop.pathPairs,
                    observation.backdrop.currentVisual, observation.backdrop.currentTree,
                    observation.backdrop.parentContext, observation.backdrop.images,
                    observation.backdrop.image, observation.backdrop.root,
-                   g_coreMaterialSourceRoot.load(std::memory_order_acquire));
+                   g_coreMaterialSourceRoot.load(std::memory_order_acquire), observation.backdrop.tables,
+                   observation.backdrop.alternateCount, observation.backdrop.incomplete);
+            for (unsigned i = 0; i < observation.backdrop.alternateCount; ++i)
+            {
+                const auto& candidate = observation.backdrop.alternates[i];
+                Wh_Log(L"MESH ACRYLIC CANDIDATE: HWND=%p index=%u image=%p backdropRoot=%p "
+                       L"pathTree=%p pathPairs=%u readOnly=1", hwnd, i, candidate.image,
+                       candidate.root, candidate.tree, candidate.pathPairs);
+            }
+        }
     }
     return result;
 }
