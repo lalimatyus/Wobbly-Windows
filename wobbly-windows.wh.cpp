@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.315
+// @version         0.316
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3684,7 +3684,7 @@ using CoreImageUpdate_t = long(__cdecl*)(void*, void*, const void*);
 using CorePrecomputeTreatment_t = long(__cdecl*)(void*, void*, bool);
 using CoreImageRealize_t = long(__cdecl*)(void*, const void*, void**);
 using CoreMaterialWorld_t = void(__cdecl*)(void*, const void*, int);
-CoreMaterialWorld_t g_coreMaterialWorldFunction = nullptr, g_coreMaterialWorldOriginal = nullptr;
+CoreMaterialWorld_t g_coreMaterialWorldFunction = nullptr; // Layout verification only; never detoured.
 CoreMaterialInput_t g_coreMaterialInputFunction = nullptr, g_coreMaterialInputOriginal = nullptr;
 CoreCachedTreatment_t g_coreCachedTreatmentFunction = nullptr, g_coreCachedTreatmentOriginal = nullptr;
 CoreCachedTreatment_t g_coreTreatmentFunction = nullptr;
@@ -3855,12 +3855,47 @@ static long __cdecl CoreImageUpdateHook(void* image, void* table, const void* co
 
 struct CoreMaterialObservation
 {
-    unsigned cachedHits = 0, cachedMisses = 0;
     unsigned effectCalls = 0, effectFailures = 0;
     unsigned precomputeCalls = 0, rootPrecomputeCalls = 0;
-    void* firstCache = nullptr;
 };
 thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
+
+struct CoreMaterialWorldSnapshot
+{
+    float matrix[16] = {};
+    int reason = 0;
+};
+
+static bool ReadCoreMaterialWorldSnapshot(const void* treatment, CoreMaterialWorldSnapshot& snapshot)
+{
+    if (!treatment) return false;
+    const auto* matrix = static_cast<const BYTE*>(treatment) + 0xA0;
+    if (!IsReadableMemory(matrix, 0x48)) return false;
+    // The exact native setter copies 16 floats + flags at A0, reason at E4.
+    std::memcpy(snapshot.matrix, matrix, sizeof(snapshot.matrix));
+    std::memcpy(&snapshot.reason, matrix + 0x44, sizeof(snapshot.reason));
+    return true;
+}
+
+static void LogCoreMaterialWorldSnapshot(HWND hwnd, ULONGLONG epoch, unsigned index,
+                                        void* treatment, bool sourceScope)
+{
+    CoreMaterialWorldSnapshot snapshot;
+    if (index >= ARRAYSIZE(g_coreMaterialOwners) ||
+        epoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
+        !ReadCoreMaterialWorldSnapshot(treatment, snapshot)) return;
+    const unsigned kind = snapshot.reason >= 0 && snapshot.reason < 2
+        ? static_cast<unsigned>(snapshot.reason) : 2U;
+    auto& logAt = g_coreMaterialWorldLogAt[index][kind][sourceScope ? 1 : 0];
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG last = logAt.load(std::memory_order_relaxed);
+    if (now - last >= 1000 && logAt.compare_exchange_strong(last, now, std::memory_order_relaxed))
+        Wh_Log(L"MESH MATERIAL WORLD SNAPSHOT: HWND=%p treatment=%p reason=%d sourceScope=%d "
+               L"basis=(%.3f,%.3f,%.3f,%.3f) origin=(%.1f,%.1f) effectBitmap=%p readOnly=1",
+               hwnd, treatment, snapshot.reason, sourceScope, snapshot.matrix[0], snapshot.matrix[1],
+               snapshot.matrix[4], snapshot.matrix[5], snapshot.matrix[12], snapshot.matrix[13],
+               g_coreMaterialBitmapFunction(treatment));
+}
 
 static long __cdecl CorePrecomputeTreatmentHook(void* context, void* visual, bool phaseFlag)
 {
@@ -3899,43 +3934,8 @@ static long __cdecl CorePrecomputeTreatmentHook(void* context, void* visual, boo
                    g_coreCachedTreatmentOriginal(visual),
                    treatment ? g_coreMaterialBitmapFunction(treatment) : nullptr,
                    static_cast<unsigned>(result));
-    }
-    return result;
-}
-
-static void __cdecl CoreMaterialWorldHook(void* treatment, const void* matrix, int reason)
-{
-    CoreMaterialOwnerTarget target;
-    const bool sourceScope = g_coreMaterialObservation != nullptr;
-    const bool observe = MatchCoreMaterialOwner(treatment, true, target) &&
-                         IsReadableMemory(matrix, 16 * sizeof(float));
-    float values[16] = {};
-    if (observe) std::memcpy(values, matrix, sizeof(values));
-    g_coreMaterialWorldOriginal(treatment, matrix, reason);
-    if (observe && target.epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
-    {
-        const unsigned kind = reason >= 0 && reason < 2 ? static_cast<unsigned>(reason) : 2U;
-        auto& logAt = g_coreMaterialWorldLogAt[target.index][kind][sourceScope ? 1 : 0];
-        const ULONGLONG now = GetTickCount64();
-        ULONGLONG last = logAt.load(std::memory_order_relaxed);
-        if (now - last >= 1000 && logAt.compare_exchange_strong(last, now, std::memory_order_relaxed))
-            Wh_Log(L"MESH MATERIAL WORLD: HWND=%p treatment=%p reason=%d sourceScope=%d "
-                   L"basis=(%.3f,%.3f,%.3f,%.3f) origin=(%.1f,%.1f) effectBitmap=%p readOnly=1",
-                   target.hwnd, treatment, reason, sourceScope, values[0], values[1], values[4],
-                   values[5], values[12], values[13], g_coreMaterialBitmapFunction(treatment));
-    }
-}
-static void* __cdecl CoreCachedTreatmentHook(const void* visual)
-{
-    void* result = g_coreCachedTreatmentOriginal(visual);
-    if (auto* observation = g_coreMaterialObservation)
-    {
-        if (result)
-        {
-            ++observation->cachedHits;
-            if (!observation->firstCache) observation->firstCache = result;
-        }
-        else ++observation->cachedMisses;
+        LogCoreMaterialWorldSnapshot(target.hwnd, target.epoch, target.index,
+                                     treatment, g_coreMaterialObservation != nullptr);
     }
     return result;
 }
@@ -4086,22 +4086,26 @@ static long __cdecl CoreImageRealizeHook(void* image, const void* targetInfo, vo
         ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
         Wh_Log(L"MESH MATERIAL REALIZE: HWND=%p result=0x%08X rootBefore=%p rootAfter=%p treatment=%p "
                L"cachedBefore=%p cachedAfter=%p precompute=%u rootPrecompute=%u "
-               L"cachedHits=%u cacheMisses=%u effectCalls=%u effectFailures=%u readOnly=1",
+               L"effectCalls=%u effectFailures=%u readOnly=1",
                hwnd, static_cast<unsigned>(result), rootBefore, rootAfter, treatment, cachedBefore,
                rootAfter ? g_coreCachedTreatmentOriginal(rootAfter) : nullptr,
                observation.precomputeCalls, observation.rootPrecomputeCalls,
-               observation.cachedHits, observation.cachedMisses,
                observation.effectCalls, observation.effectFailures);
-        // Wait for the second timed sample so initial composition updates settle.
-        if (last && g_coreMaterialTreeProbeEpoch.exchange(epoch, std::memory_order_relaxed) != epoch)
+        // Sample only the current image's live tree, at most once per second.
+        if (last)
         {
+            bool changedOwners = g_coreMaterialTreeProbeEpoch.exchange(epoch, std::memory_order_relaxed) != epoch;
             const auto tree = InspectCoreMaterialTree(rootAfter);
             AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
             if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed) &&
                 image == g_coreMaterialSourceImage.load(std::memory_order_relaxed) &&
                 rootAfter == g_coreMaterialSourceRoot.load(std::memory_order_relaxed))
             {
-                ResetCoreMaterialOwnersLocked(false);
+                changedOwners |= tree.hitCount != g_coreMaterialOwnerCount.load(std::memory_order_relaxed);
+                for (unsigned i = 0; i < tree.hitCount; ++i)
+                    changedOwners |= g_coreMaterialOwners[i].visual != tree.hits[i].visual ||
+                                     g_coreMaterialOwners[i].treatment != tree.hits[i].treatment;
+                if (changedOwners) ResetCoreMaterialOwnersLocked(false);
                 for (unsigned i = 0; i < tree.hitCount; ++i)
                     g_coreMaterialOwners[i] = {tree.hits[i].visual, tree.hits[i].treatment};
                 g_coreMaterialOwnerCount.store(tree.hitCount, std::memory_order_release);
@@ -4109,17 +4113,20 @@ static long __cdecl CoreImageRealizeHook(void* image, const void* targetInfo, vo
             ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
             if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
             {
-                Wh_Log(L"MESH MATERIAL TREE: HWND=%p nodes=%u ancestors=%u treatments=%u "
-                       L"caches=%u invalid=%u truncated=%d readOnly=1",
-                       hwnd, tree.nodes, tree.ancestors, tree.treatments,
-                       tree.caches, tree.invalid, tree.truncated);
+                if (changedOwners)
+                    Wh_Log(L"MESH MATERIAL TREE: HWND=%p nodes=%u ancestors=%u treatments=%u "
+                           L"caches=%u invalid=%u truncated=%d readOnly=1",
+                           hwnd, tree.nodes, tree.ancestors, tree.treatments,
+                           tree.caches, tree.invalid, tree.truncated);
                 for (unsigned i = 0; i < tree.hitCount; ++i)
                 {
                     const auto& hit = tree.hits[i];
-                    Wh_Log(L"MESH MATERIAL OWNER: HWND=%p visual=%p relation=%s depth=%u "
-                           L"treatment=%p cache=%p readOnly=1", hwnd, hit.visual,
-                           hit.ancestor ? L"ancestor" : L"subtree", hit.depth,
-                           hit.treatment, hit.cache);
+                    if (changedOwners)
+                        Wh_Log(L"MESH MATERIAL OWNER: HWND=%p visual=%p relation=%s depth=%u "
+                               L"treatment=%p cache=%p readOnly=1", hwnd, hit.visual,
+                               hit.ancestor ? L"ancestor" : L"subtree", hit.depth,
+                               hit.treatment, hit.cache);
+                    LogCoreMaterialWorldSnapshot(hwnd, epoch, i, hit.treatment, true);
                 }
             }
         }
@@ -4200,13 +4207,12 @@ static void InitializeCoreMaterialDiagnostics()
         return;
     }
     g_coreMaterialModuleBase = base;
+    // Native callers retain extra volatile registers across these leaf getters/
+    // setters (e.g. R10 across SetWorldTransform). Never detour them with C++.
+    g_coreCachedTreatmentOriginal = g_coreCachedTreatmentFunction;
     const bool ready =
-        WindhawkUtils::SetFunctionHook(g_coreCachedTreatmentFunction,
-            CoreCachedTreatmentHook, &g_coreCachedTreatmentOriginal) &&
         WindhawkUtils::SetFunctionHook(g_coreMaterialInputFunction,
             CoreMaterialInputHook, &g_coreMaterialInputOriginal) &&
-        WindhawkUtils::SetFunctionHook(g_coreMaterialWorldFunction,
-            CoreMaterialWorldHook, &g_coreMaterialWorldOriginal) &&
         WindhawkUtils::SetFunctionHook(g_coreImageUpdateFunction,
             CoreImageUpdateHook, &g_coreImageUpdateOriginal) &&
         WindhawkUtils::SetFunctionHook(g_corePrecomputeTreatmentFunction,
@@ -4214,8 +4220,8 @@ static void InitializeCoreMaterialDiagnostics()
         WindhawkUtils::SetFunctionHook(g_coreImageRealizeFunction,
             CoreImageRealizeHook, &g_coreImageRealizeOriginal);
     g_coreMaterialDiagnosticsReady.store(ready, std::memory_order_release);
-    Wh_Log(L"MESH MATERIAL OBSERVER: %s core=22621.4596 readOnly=1",
-           ready ? L"ready" : L"unavailable");
+    Wh_Log(L"MESH MATERIAL OBSERVER: %s coreTimestamp=0x%08X hooks=4 leafHooks=0 readOnly=1",
+           ready ? L"ready" : L"unavailable", nt->FileHeader.TimeDateStamp);
 }
 
 static bool RetainNativeMeshRoot(void* root)
