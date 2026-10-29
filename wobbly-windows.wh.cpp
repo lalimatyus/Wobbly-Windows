@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.319
+// @version         0.320
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3685,9 +3685,6 @@ using CorePrecomputeTreatment_t = long(__cdecl*)(void*, void*, bool);
 using CoreImageRealize_t = long(__cdecl*)(void*, const void*, void**);
 using CoreMaterialWorld_t = void(__cdecl*)(void*, const void*, int);
 using CoreDrawVisualTree_t = long(__cdecl*)(void*, const void*, const void*, const void*, int, bool, void*);
-using CorePostSubgraph_t = long(__cdecl*)(void*, const void*, bool*);
-CorePostSubgraph_t g_corePostSubgraphFunction = nullptr, g_corePostSubgraphOriginal = nullptr;
-CoreCachedTreatment_t g_coreWalkCurrentVisualFunction = nullptr; // Pure query through the +18 interface; not detoured.
 CoreDrawVisualTree_t g_coreDrawVisualTreeFunction = nullptr, g_coreDrawVisualTreeOriginal = nullptr;
 CoreMaterialWorld_t g_coreMaterialWorldFunction = nullptr; // Layout verification only; never detoured.
 CoreMaterialInput_t g_coreMaterialInputFunction = nullptr, g_coreMaterialInputOriginal = nullptr;
@@ -3719,8 +3716,6 @@ CoreMaterialOwnerWatch g_coreMaterialOwners[4]; // Protected by target lock; com
 std::atomic_uint g_coreMaterialOwnerCount = 0;
 std::atomic<ULONGLONG> g_coreMaterialPrecomputeLogAt[4][3] = {};
 std::atomic<ULONGLONG> g_coreMaterialWorldLogAt[4][3][2] = {};
-std::atomic<ULONGLONG> g_coreMaterialPostLogAt[4][3][3] = {};
-unsigned g_coreMaterialPostCount[4][3][3] = {}; // Protected by target lock.
 
 static void ResetCoreMaterialOwnersLocked(bool resetProbe = true)
 {
@@ -3731,11 +3726,6 @@ static void ResetCoreMaterialOwnersLocked(bool resetProbe = true)
         g_coreMaterialOwners[i] = {};
         for (unsigned kind = 0; kind < 3; ++kind)
         {
-            for (unsigned imageKind = 0; imageKind < 3; ++imageKind)
-            {
-                g_coreMaterialPostLogAt[i][kind][imageKind].store(0, std::memory_order_relaxed);
-                g_coreMaterialPostCount[i][kind][imageKind] = 0;
-            }
             g_coreMaterialPrecomputeLogAt[i][kind].store(0, std::memory_order_relaxed);
             for (unsigned scope = 0; scope < 2; ++scope)
                 g_coreMaterialWorldLogAt[i][kind][scope].store(0, std::memory_order_relaxed);
@@ -3886,22 +3876,6 @@ struct CoreMaterialObservation
 thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
 thread_local unsigned g_coreMaterialRealizeDepth = 0;
 thread_local void* g_coreMaterialCurrentImage = nullptr; // Borrowed only within its callback.
-
-static void AccumulateCoreMaterialObservation(CoreMaterialObservation* parent,
-                                               const CoreMaterialObservation& child)
-{
-    if (!parent) return;
-    parent->effectCalls += child.effectCalls;
-    parent->effectFailures += child.effectFailures;
-    parent->precomputeCalls += child.precomputeCalls;
-    parent->rootPrecomputeCalls += child.rootPrecomputeCalls;
-    parent->wallpaperCalls += child.wallpaperCalls;
-    parent->wallpaperFailures += child.wallpaperFailures;
-    parent->bviCalls += child.bviCalls;
-    parent->bviFailures += child.bviFailures;
-    if (child.wallpaperCalls) parent->wallpaperOutput = child.wallpaperOutput;
-    if (child.bviFlag >= 0) parent->bviFlag = child.bviFlag;
-}
 
 struct CoreMaterialWorldSnapshot
 {
@@ -4056,7 +4030,19 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
     const long result = g_coreDrawVisualTreeOriginal(
         context, tree, bounds, occlusion, clearMode, drawFlag, root);
     g_coreMaterialObservation = previous;
-    AccumulateCoreMaterialObservation(previous, observation);
+    if (previous)
+    {
+        previous->effectCalls += observation.effectCalls;
+        previous->effectFailures += observation.effectFailures;
+        previous->precomputeCalls += observation.precomputeCalls;
+        previous->rootPrecomputeCalls += observation.rootPrecomputeCalls;
+        previous->wallpaperCalls += observation.wallpaperCalls;
+        previous->wallpaperFailures += observation.wallpaperFailures;
+        previous->bviCalls += observation.bviCalls;
+        previous->bviFailures += observation.bviFailures;
+        if (observation.wallpaperCalls) previous->wallpaperOutput = observation.wallpaperOutput;
+        if (observation.bviFlag >= 0) previous->bviFlag = observation.bviFlag;
+    }
     unsigned count = 0;
     bool log = false;
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
@@ -4177,77 +4163,6 @@ static CoreMaterialTreeSnapshot InspectCoreMaterialTree(void* root)
         parent = ReadPointerMember(parent, 0x58);
     }
     result.truncated |= parent != nullptr;
-    return result;
-}
-
-static long __cdecl CorePostSubgraphHook(void* context, const void* tree, bool* continueWalk)
-{
-    CoreMaterialOwnerTarget target;
-    void* visual = nullptr;
-    if (context && g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) &&
-        !g_unloading.load(std::memory_order_acquire) &&
-        g_coreMaterialOwnerCount.load(std::memory_order_acquire) &&
-        g_coreWalkCurrentVisualFunction)
-    {
-        // The native PostSubgraph calls this getter through the interface at
-        // context+18. The resolved function expects that adjusted this pointer.
-        void* vtable = ReadPointerMember(context, 0x18);
-        if (ReadPointerMember(vtable, 0x20) ==
-            reinterpret_cast<void*>(g_coreWalkCurrentVisualFunction))
-            visual = g_coreWalkCurrentVisualFunction(static_cast<BYTE*>(context) + 0x18);
-    }
-    if (!MatchCoreMaterialOwner(visual, false, target))
-        return g_corePostSubgraphOriginal(context, tree, continueWalk);
-
-    const unsigned treeKind = tree && target.sourceTree
-        ? (tree == target.sourceTree ? 0U : 1U) : 2U;
-    void* image = g_coreMaterialCurrentImage;
-    const int imageMatch = image
-        ? (image == g_coreMaterialSourceImage.load(std::memory_order_acquire) ? 1 : 0) : -1;
-    const unsigned imageKind = static_cast<unsigned>(imageMatch + 1);
-    std::uint64_t flags = 0;
-    const bool validVisual = IsCoreMaterialVisual(visual);
-    if (validVisual)
-        std::memcpy(&flags, static_cast<const BYTE*>(visual) + 0x60, sizeof(flags));
-    void* backdrop = ReadPointerMember(context, 0xC8);
-    void* alternate = ReadPointerMember(context, 0xD0);
-    CoreMaterialObservation observation;
-    auto* previous = g_coreMaterialObservation;
-    g_coreMaterialObservation = &observation;
-    const long result = g_corePostSubgraphOriginal(context, tree, continueWalk);
-    g_coreMaterialObservation = previous;
-    AccumulateCoreMaterialObservation(previous, observation);
-
-    unsigned count = 0;
-    bool log = false;
-    AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
-    if (target.epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed) &&
-        g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
-        g_coreMaterialOwners[target.index].visual == visual)
-    {
-        count = ++g_coreMaterialPostCount[target.index][treeKind][imageKind];
-        auto& logAt = g_coreMaterialPostLogAt[target.index][treeKind][imageKind];
-        const ULONGLONG now = GetTickCount64();
-        if (!logAt.load(std::memory_order_relaxed) || now - logAt.load(std::memory_order_relaxed) >= 1000)
-        {
-            logAt.store(now, std::memory_order_relaxed);
-            log = true;
-        }
-    }
-    ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
-    if (log)
-    {
-        int next = -1;
-        if (result >= 0 && IsReadableMemory(continueWalk, sizeof(bool)))
-            next = *continueWalk;
-        Wh_Log(L"MESH MATERIAL POST: HWND=%p count=%u visual=%p tree=%p sourceMatch=%d "
-               L"image=%p imageMatch=%d validVisual=%d flags=0x%016llX backdropImage=%p alternate=%p "
-               L"wallpaperCalls=%u bviCalls=%u bviFlag=%d effectCalls=%u continue=%d "
-               L"result=0x%08X readOnly=1", target.hwnd, count, visual, tree, treeKind == 0,
-               image, imageMatch, validVisual, static_cast<unsigned long long>(flags), backdrop, alternate,
-               observation.wallpaperCalls, observation.bviCalls, observation.bviFlag,
-               observation.effectCalls, next, static_cast<unsigned>(result));
-    }
     return result;
 }
 
@@ -4379,11 +4294,6 @@ static void InitializeCoreMaterialDiagnostics()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
-        {{L"public: long __cdecl CDrawingContext::PostSubgraph(class CVisualTree const *,bool *)"},
-         &g_corePostSubgraphFunction, nullptr, true},
-        {{L"public: virtual class CVisual * __cdecl CDrawingContext::GetCurrentVisual(void)const",
-          L"public: virtual class CVisual * __cdecl CDrawingContext::GetCurrentVisual(void)const "},
-         &g_coreWalkCurrentVisualFunction, nullptr, true},
         {{L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
            L"struct D2D_SIZE_F const &,struct EffectInput *)const",
           L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
@@ -4442,8 +4352,6 @@ static void InitializeCoreMaterialDiagnostics()
     const auto base = reinterpret_cast<uintptr_t>(core);
     // PDB resolution plus exact-image RVAs prevent a same-name ABI mismatch.
     if (reinterpret_cast<uintptr_t>(g_coreDrawVisualTreeFunction) != base + 0x87B2C ||
-        reinterpret_cast<uintptr_t>(g_corePostSubgraphFunction) != base + 0x8B040 ||
-        reinterpret_cast<uintptr_t>(g_coreWalkCurrentVisualFunction) != base + 0xD4950 ||
         reinterpret_cast<uintptr_t>(g_coreWallpaperInputFunction) != base + 0xB3790 ||
         reinterpret_cast<uintptr_t>(g_coreBviValidationFunction) != base + 0x8850C ||
         reinterpret_cast<uintptr_t>(g_coreMaterialWorldFunction) != base + 0xE35EC ||
@@ -4464,8 +4372,6 @@ static void InitializeCoreMaterialDiagnostics()
     // setters (e.g. R10 across SetWorldTransform). Never detour them with C++.
     g_coreCachedTreatmentOriginal = g_coreCachedTreatmentFunction;
     const bool ready =
-        WindhawkUtils::SetFunctionHook(g_corePostSubgraphFunction,
-            CorePostSubgraphHook, &g_corePostSubgraphOriginal) &&
         WindhawkUtils::SetFunctionHook(g_coreWallpaperInputFunction,
             CoreWallpaperInputHook, &g_coreWallpaperInputOriginal) &&
         WindhawkUtils::SetFunctionHook(g_coreBviValidationFunction,
@@ -4481,7 +4387,7 @@ static void InitializeCoreMaterialDiagnostics()
         WindhawkUtils::SetFunctionHook(g_coreImageRealizeFunction,
             CoreImageRealizeHook, &g_coreImageRealizeOriginal);
     g_coreMaterialDiagnosticsReady.store(ready, std::memory_order_release);
-    Wh_Log(L"MESH MATERIAL OBSERVER: %s coreTimestamp=0x%08X hooks=8 leafHooks=0 readOnly=1",
+    Wh_Log(L"MESH MATERIAL OBSERVER: %s coreTimestamp=0x%08X hooks=7 leafHooks=0 readOnly=1",
            ready ? L"ready" : L"unavailable", nt->FileHeader.TimeDateStamp);
 }
 
