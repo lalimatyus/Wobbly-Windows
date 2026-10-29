@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.317
+// @version         0.318
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3688,6 +3688,8 @@ using CoreDrawVisualTree_t = long(__cdecl*)(void*, const void*, const void*, con
 CoreDrawVisualTree_t g_coreDrawVisualTreeFunction = nullptr, g_coreDrawVisualTreeOriginal = nullptr;
 CoreMaterialWorld_t g_coreMaterialWorldFunction = nullptr; // Layout verification only; never detoured.
 CoreMaterialInput_t g_coreMaterialInputFunction = nullptr, g_coreMaterialInputOriginal = nullptr;
+CoreMaterialInput_t g_coreWallpaperInputFunction = nullptr, g_coreWallpaperInputOriginal = nullptr;
+CoreMaterialInput_t g_coreBviValidationFunction = nullptr, g_coreBviValidationOriginal = nullptr;
 CoreCachedTreatment_t g_coreCachedTreatmentFunction = nullptr, g_coreCachedTreatmentOriginal = nullptr;
 CoreCachedTreatment_t g_coreTreatmentFunction = nullptr;
 CoreCachedTreatment_t g_coreMaterialBitmapFunction = nullptr;
@@ -3703,7 +3705,7 @@ std::atomic<void*> g_coreMaterialSourceTree = nullptr; // Comparison only outsid
 std::atomic<HWND> g_coreMaterialTargetHwnd = nullptr;
 std::atomic<ULONGLONG> g_coreMaterialRealizeLogAt = 0;
 std::atomic<ULONGLONG> g_coreMaterialSourceRejectLogAt = 0;
-std::atomic<ULONGLONG> g_coreMaterialRasterLogAt[2] = {};
+std::atomic<ULONGLONG> g_coreMaterialRasterLogAt[2][3] = {};
 std::atomic_uint g_coreMaterialRasterCount = 0;
 std::atomic<ULONGLONG> g_coreMaterialTreeProbeEpoch = 0;
 uintptr_t g_coreMaterialModuleBase = 0; // Exact-image gate, published before observer readiness.
@@ -3777,7 +3779,8 @@ static void ClearCoreMaterialTarget()
     g_coreMaterialSourceImage.store(nullptr, std::memory_order_release);
     g_coreMaterialSourceTree.store(nullptr, std::memory_order_release);
     g_coreMaterialSourceRejectLogAt.store(0, std::memory_order_relaxed);
-    for (auto& time : g_coreMaterialRasterLogAt) time.store(0, std::memory_order_relaxed);
+    for (auto& scope : g_coreMaterialRasterLogAt)
+        for (auto& time : scope) time.store(0, std::memory_order_relaxed);
     g_coreMaterialRasterCount.store(0, std::memory_order_relaxed);
     ResetCoreMaterialOwnersLocked();
     g_coreMaterialTargetHwnd.store(nullptr, std::memory_order_release);
@@ -3844,7 +3847,8 @@ static long __cdecl CoreImageUpdateHook(void* image, void* table, const void* co
         if (changed)
         {
             ResetCoreMaterialOwnersLocked();
-            for (auto& time : g_coreMaterialRasterLogAt) time.store(0, std::memory_order_relaxed);
+            for (auto& scope : g_coreMaterialRasterLogAt)
+                for (auto& time : scope) time.store(0, std::memory_order_relaxed);
             g_coreMaterialRasterCount.store(0, std::memory_order_relaxed);
             g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
         }
@@ -3865,9 +3869,13 @@ struct CoreMaterialObservation
 {
     unsigned effectCalls = 0, effectFailures = 0;
     unsigned precomputeCalls = 0, rootPrecomputeCalls = 0;
+    unsigned wallpaperCalls = 0, wallpaperFailures = 0, bviCalls = 0, bviFailures = 0;
+    void* wallpaperOutput = nullptr; // Opaque first output word, never reused/dereferenced.
+    int bviFlag = -1;
 };
 thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
 thread_local unsigned g_coreMaterialRealizeDepth = 0;
+thread_local void* g_coreMaterialCurrentImage = nullptr; // Borrowed only within its callback.
 
 struct CoreMaterialWorldSnapshot
 {
@@ -3960,6 +3968,35 @@ static long __cdecl CoreMaterialInputHook(void* context, const void* size, void*
     return result;
 }
 
+static long __cdecl CoreWallpaperInputHook(void* context, const void* size, void* input)
+{
+    const long result = g_coreWallpaperInputOriginal(context, size, input);
+    if (auto* observation = g_coreMaterialObservation)
+    {
+        ++observation->wallpaperCalls;
+        observation->wallpaperFailures += result < 0;
+        if (result >= 0) observation->wallpaperOutput = ReadPointerMember(input, 0);
+    }
+    return result;
+}
+
+static long __cdecl CoreBviValidationHook(void* context, const void* bounds, void* flag)
+{
+    const long result = g_coreBviValidationOriginal(context, bounds, flag);
+    if (auto* observation = g_coreMaterialObservation)
+    {
+        ++observation->bviCalls;
+        observation->bviFailures += result < 0;
+        if (result >= 0 && IsReadableMemory(flag, 1))
+        {
+            BYTE value;
+            std::memcpy(&value, flag, 1);
+            observation->bviFlag = value;
+        }
+    }
+    return result;
+}
+
 static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, const void* bounds,
                                           const void* occlusion, int clearMode, bool drawFlag, void* root)
 {
@@ -3984,6 +4021,9 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
     // this live field without transferring images or changing render options.
     void* backdrop = ReadPointerMember(context, 0xC8);
     const bool insideRealize = g_coreMaterialRealizeDepth != 0;
+    void* currentImage = g_coreMaterialCurrentImage;
+    const int imageMatch = currentImage
+        ? (currentImage == g_coreMaterialSourceImage.load(std::memory_order_acquire) ? 1 : 0) : -1;
     CoreMaterialObservation observation;
     auto* previous = g_coreMaterialObservation;
     g_coreMaterialObservation = &observation;
@@ -3996,6 +4036,12 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
         previous->effectFailures += observation.effectFailures;
         previous->precomputeCalls += observation.precomputeCalls;
         previous->rootPrecomputeCalls += observation.rootPrecomputeCalls;
+        previous->wallpaperCalls += observation.wallpaperCalls;
+        previous->wallpaperFailures += observation.wallpaperFailures;
+        previous->bviCalls += observation.bviCalls;
+        previous->bviFailures += observation.bviFailures;
+        if (observation.wallpaperCalls) previous->wallpaperOutput = observation.wallpaperOutput;
+        if (observation.bviFlag >= 0) previous->bviFlag = observation.bviFlag;
     }
     unsigned count = 0;
     bool log = false;
@@ -4006,7 +4052,7 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
     {
         count = g_coreMaterialRasterCount.fetch_add(1, std::memory_order_relaxed) + 1;
         const ULONGLONG now = GetTickCount64();
-        auto& logAt = g_coreMaterialRasterLogAt[insideRealize ? 1 : 0];
+        auto& logAt = g_coreMaterialRasterLogAt[insideRealize ? 1 : 0][imageMatch + 1];
         if (!logAt.load(std::memory_order_relaxed) ||
             now - logAt.load(std::memory_order_relaxed) >= 1000)
         {
@@ -4017,10 +4063,13 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
     if (log)
         Wh_Log(L"MESH MATERIAL RASTER: HWND=%p count=%u context=%p tree=%p root=%p backdropImage=%p "
-               L"insideRealize=%d clearMode=%d drawFlag=%d precompute=%u effectCalls=%u "
-               L"effectFailures=%u result=0x%08X readOnly=1",
-               hwnd, count, context, tree, root, backdrop, insideRealize, clearMode, drawFlag,
+               L"insideRealize=%d image=%p imageMatch=%d clearMode=%d drawFlag=%d precompute=%u effectCalls=%u "
+               L"effectFailures=%u wallpaperCalls=%u wallpaperFailures=%u wallpaperOutput=%p "
+               L"bviCalls=%u bviFailures=%u bviFlag=%d result=0x%08X readOnly=1",
+               hwnd, count, context, tree, root, backdrop, insideRealize, currentImage, imageMatch, clearMode, drawFlag,
                observation.precomputeCalls, observation.effectCalls, observation.effectFailures,
+               observation.wallpaperCalls, observation.wallpaperFailures, observation.wallpaperOutput,
+               observation.bviCalls, observation.bviFailures, observation.bviFlag,
                static_cast<unsigned>(result));
     return result;
 }
@@ -4133,7 +4182,17 @@ static long __cdecl CoreImageRealizeHook(void* image, const void* targetInfo, vo
         hwnd = g_coreMaterialTargetHwnd.load(std::memory_order_relaxed);
         ReleaseSRWLockShared(&g_coreMaterialTargetLock);
     }
-    if (!observe) return g_coreImageRealizeOriginal(image, targetInfo, bitmap);
+    if (!observe)
+    {
+        if (!g_coreMaterialRealizeDepth) return g_coreImageRealizeOriginal(image, targetInfo, bitmap);
+        // A backdrop image can draw the same tree recursively. Track its live
+        // identity as well, without querying or retaining another native image.
+        void* previousImage = g_coreMaterialCurrentImage;
+        g_coreMaterialCurrentImage = image;
+        const long result = g_coreImageRealizeOriginal(image, targetInfo, bitmap);
+        g_coreMaterialCurrentImage = previousImage;
+        return result;
+    }
 
     const ULONGLONG now = GetTickCount64();
     ULONGLONG last = g_coreMaterialRealizeLogAt.load(std::memory_order_relaxed);
@@ -4147,9 +4206,12 @@ static long __cdecl CoreImageRealizeHook(void* image, const void* targetInfo, vo
     CoreMaterialObservation observation;
     auto* previous = g_coreMaterialObservation;
     g_coreMaterialObservation = &observation;
+    void* previousImage = g_coreMaterialCurrentImage;
+    g_coreMaterialCurrentImage = image;
     ++g_coreMaterialRealizeDepth;
     const long result = g_coreImageRealizeOriginal(image, targetInfo, bitmap);
     --g_coreMaterialRealizeDepth;
+    g_coreMaterialCurrentImage = previousImage;
     g_coreMaterialObservation = previous;
     if (log && epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
     {
@@ -4162,11 +4224,12 @@ static long __cdecl CoreImageRealizeHook(void* image, const void* targetInfo, vo
         ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
         Wh_Log(L"MESH MATERIAL REALIZE: HWND=%p result=0x%08X rootBefore=%p rootAfter=%p treatment=%p "
                L"cachedBefore=%p cachedAfter=%p precompute=%u rootPrecompute=%u "
-               L"effectCalls=%u effectFailures=%u rasterCalls=%u readOnly=1",
+               L"effectCalls=%u effectFailures=%u wallpaperCalls=%u bviCalls=%u rasterCalls=%u readOnly=1",
                hwnd, static_cast<unsigned>(result), rootBefore, rootAfter, treatment, cachedBefore,
                rootAfter ? g_coreCachedTreatmentOriginal(rootAfter) : nullptr,
                observation.precomputeCalls, observation.rootPrecomputeCalls,
                observation.effectCalls, observation.effectFailures,
+               observation.wallpaperCalls, observation.bviCalls,
                g_coreMaterialRasterCount.load(std::memory_order_relaxed));
         // Sample only the current image's live tree, at most once per second.
         if (last)
@@ -4231,6 +4294,18 @@ static void InitializeCoreMaterialDiagnostics()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
+        {{L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
+           L"struct D2D_SIZE_F const &,struct EffectInput *)const",
+          L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
+           L"struct D2D_SIZE_F const &,struct EffectInput *)const "},
+         &g_coreWallpaperInputFunction, nullptr, true},
+        {{L"public: long __cdecl CDrawingContext::ValidateBVIEffectInputForRender("
+           L"class TMilRect_<float,struct MilRectF,struct Mil3DRectF,struct MilPointAndSizeF,"
+           L"struct RectUniqueness::NotNeeded> const &,bool *)const",
+          L"public: long __cdecl CDrawingContext::ValidateBVIEffectInputForRender("
+           L"class TMilRect_<float,struct MilRectF,struct Mil3DRectF,struct MilPointAndSizeF,"
+           L"struct RectUniqueness::NotNeeded> const &,bool *)const "},
+         &g_coreBviValidationFunction, nullptr, true},
         {{L"public: long __cdecl CDrawingContext::DrawVisualTree("
            L"class CVisualTree const *,class TMil3DRect<float,class TMilRect_<float,"
            L"struct MilRectF,struct Mil3DRectF,struct MilPointAndSizeF,struct RectUniqueness::NotNeeded>,"
@@ -4277,6 +4352,8 @@ static void InitializeCoreMaterialDiagnostics()
     const auto base = reinterpret_cast<uintptr_t>(core);
     // PDB resolution plus exact-image RVAs prevent a same-name ABI mismatch.
     if (reinterpret_cast<uintptr_t>(g_coreDrawVisualTreeFunction) != base + 0x87B2C ||
+        reinterpret_cast<uintptr_t>(g_coreWallpaperInputFunction) != base + 0xB3790 ||
+        reinterpret_cast<uintptr_t>(g_coreBviValidationFunction) != base + 0x8850C ||
         reinterpret_cast<uintptr_t>(g_coreMaterialWorldFunction) != base + 0xE35EC ||
         reinterpret_cast<uintptr_t>(g_coreMaterialInputFunction) != base + 0xA984 ||
         reinterpret_cast<uintptr_t>(g_coreCachedTreatmentFunction) != base + 0xB148 ||
@@ -4295,6 +4372,10 @@ static void InitializeCoreMaterialDiagnostics()
     // setters (e.g. R10 across SetWorldTransform). Never detour them with C++.
     g_coreCachedTreatmentOriginal = g_coreCachedTreatmentFunction;
     const bool ready =
+        WindhawkUtils::SetFunctionHook(g_coreWallpaperInputFunction,
+            CoreWallpaperInputHook, &g_coreWallpaperInputOriginal) &&
+        WindhawkUtils::SetFunctionHook(g_coreBviValidationFunction,
+            CoreBviValidationHook, &g_coreBviValidationOriginal) &&
         WindhawkUtils::SetFunctionHook(g_coreDrawVisualTreeFunction,
             CoreDrawVisualTreeHook, &g_coreDrawVisualTreeOriginal) &&
         WindhawkUtils::SetFunctionHook(g_coreMaterialInputFunction,
@@ -4306,7 +4387,7 @@ static void InitializeCoreMaterialDiagnostics()
         WindhawkUtils::SetFunctionHook(g_coreImageRealizeFunction,
             CoreImageRealizeHook, &g_coreImageRealizeOriginal);
     g_coreMaterialDiagnosticsReady.store(ready, std::memory_order_release);
-    Wh_Log(L"MESH MATERIAL OBSERVER: %s coreTimestamp=0x%08X hooks=5 leafHooks=0 readOnly=1",
+    Wh_Log(L"MESH MATERIAL OBSERVER: %s coreTimestamp=0x%08X hooks=7 leafHooks=0 readOnly=1",
            ready ? L"ready" : L"unavailable", nt->FileHeader.TimeDateStamp);
 }
 
