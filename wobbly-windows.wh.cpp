@@ -2,14 +2,12 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.320
+// @version         0.321
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
-// @include         windhawk.exe
 // @architecture    amd64
-// @architecture    x86
-// @compilerOptions -lwevtapi -lole32 -lwindowscodecs -ladvapi32 -ld3d11 -ldxgi -ld3dcompiler -ldcomp -ldwmapi -lwindowsapp -luser32 -lshell32 -lgdi32
+// @compilerOptions -lwevtapi -luser32
 // @license         GPL-3.0-only
 // ==/WindhawkMod==
 
@@ -43,8 +41,7 @@ initialize instead of using unverified addresses.
 **Mesh Renderer** is an experimental in-process DWM path on the validated 23H2
 build. Other builds use the Affine fallback. Its live image can render backdrop
 materials such as Mica and acrylic differently from the original window, and
-the original window remains beneath the curved layer. The separate **GPU mesh
-overlay** uses a companion process and may show a Windows capture border.
+the original window remains beneath the curved layer.
 Keep **Affine** selected for normal use.
 
 ## Known Issues
@@ -101,13 +98,17 @@ the combined mod is not offered under GPLv2.
 
 - Renderer: "affine"
   $name: Renderer
-  $description: Mesh Renderer bends a live DWM image on the validated 23H2 build. Flat source image shows a small unwarped copy inside the window for comparing shadows and materials. Unsupported builds use Affine.
+  $description: Mesh Renderer bends a live DWM image on the validated 23H2 build. Diagnostic sources show a small unwarped copy for comparing materials. Unsupported builds use Affine.
   $options:
   - "affine": "Affine (stable)"
   - "mesh": "Mesh Renderer (experimental)"
   - "mesh-flat-source": "Flat source image (diagnostic)"
   - "mesh-flat-padded": "Flat source + shadow margin (diagnostic)"
-  - "external-gpu": "GPU mesh overlay (experimental)"
+  - "mesh-captured-source": "Captured window source (diagnostic)"
+
+- CaptureOriginalHideProbe: false
+  $name: Original window isolation test
+  $description: With Captured window source selected, briefly hide the original for 750 ms after the preview warms up, then restore it. Tests whether the new source is independent.
 
 - AdvancedMode:
   - enable: false
@@ -133,21 +134,8 @@ the combined mod is not offered under GPLv2.
 
 
 #include <windows.h>
-#include <shellapi.h>
 #include <winevt.h>
-#include <wincodec.h>
-#include <sddl.h>
-#include <dxgiformat.h>
-#include <d3d11.h>
-#include <d3dcompiler.h>
-#include <dcomp.h>
 #include <dwmapi.h>
-#include <dxgi1_2.h>
-#include <wrl/client.h>
-#include <windows.graphics.capture.interop.h>
-#include <winrt/Windows.Foundation.h>
-#include <winrt/Windows.Graphics.Capture.h>
-#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
@@ -156,24 +144,12 @@ the combined mod is not offered under GPLv2.
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <memory>
 #include <regex>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 #include <windhawk_utils.h>
-
-// The Windhawk SDK omits this Windows SDK interop header.
-extern "C" HRESULT WINAPI CreateDirect3D11DeviceFromDXGIDevice(
-    IDXGIDevice* dxgiDevice, IInspectable** graphicsDevice);
-struct IDirect3DDxgiInterfaceAccess : IUnknown
-{
-    virtual HRESULT STDMETHODCALLTYPE GetInterface(REFIID iid, void** result) = 0;
-};
-__CRT_UUID_DECL(IDirect3DDxgiInterfaceAccess, 0xA9B3D012, 0x3DF2, 0x4EE3,
-                0xB8, 0xD1, 0x86, 0x95, 0xF4, 0x57, 0xD3, 0xC1)
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -212,7 +188,6 @@ enum class RendererMode : unsigned char
 {
     Affine,
     Mesh,
-    ExternalGpu,
 };
 
 struct WobblySettings
@@ -549,8 +524,17 @@ void* g_nativeBackdropVisualVtable = nullptr;
 std::atomic_bool g_nativeMeshActive = false;
 std::atomic_bool g_nativeMeshStopRequested = false;
 std::atomic<HWND> g_nativeMeshHwnd = nullptr;
-enum class NativeSourceProbeMode : unsigned char { None, Flat, PaddedFlat };
+enum class NativeSourceProbeMode : unsigned char { None, Flat, PaddedFlat, CapturedFlat };
 std::atomic<NativeSourceProbeMode> g_nativeSourceProbeMode = NativeSourceProbeMode::None;
+using NativeCapturedWindowCreate_t = long(__cdecl*)(HWND, void**);
+using NativeVisualSetOpacity_t = void(__cdecl*)(void*, double);
+NativeCapturedWindowCreate_t g_nativeCapturedWindowCreate = nullptr;
+NativeVisualSetOpacity_t g_nativeVisualSetOpacity = nullptr;
+void* g_nativeCapturedWindowVtable = nullptr;
+void* g_nativeCaptureCriticalSection = nullptr;
+bool g_nativeCapturedSourceReady = false;
+std::atomic_bool g_nativeOriginalHideProbe = false;
+std::atomic<ULONGLONG> g_nativeOriginalHideWakeUntil = 0;
 struct NativeMeshState
 {
     void* root = nullptr;
@@ -561,7 +545,14 @@ struct NativeMeshState
     void* visual = nullptr;
     void* transform = nullptr;
     void* sourceProxy = nullptr;
+    void* imageSourceProxy = nullptr;
+    void* capturedWindow = nullptr;
     void* sourceOwner = nullptr;
+    ULONGLONG attachedAt = 0;
+    ULONGLONG hideUntil = 0;
+    bool hideProbeAttempted = false;
+    bool originalHidden = false;
+    double originalOpacity = 1.0;
     bool backdropSource = false;
     bool flatSourceProbe = false;
     int sourcePadding = 0;
@@ -585,9 +576,6 @@ void* g_nativeProbeImageVtableSymbol = nullptr;
 std::atomic<void*> g_nativeProbeImageVtable = nullptr;
 HWND g_nativeMeshLastAttemptHwnd = nullptr; // DWM scene thread only.
 ULONGLONG g_nativeMeshLastAttemptAt = 0;
-HWND g_nativeMeshTopologyHwnd = nullptr; // DWM scene thread only.
-void* g_nativeMeshTopologyRoot = nullptr;
-ULONGLONG g_nativeMeshTopologyAt = 0;
 
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
@@ -892,189 +880,6 @@ thread_local bool g_insideWobblyScenePass = false;
 WindowAnimationSlot g_animationSlots[MAX_ANIMATION_SLOTS] = {};
 SRWLOCK g_animationSlotsLock = SRWLOCK_INIT;
 CONDITION_VARIABLE g_animationSlotsCondition = CONDITION_VARIABLE_INIT;
-
-// DWM publishes 4x4 physics. The companion captures and renders windows.
-static constexpr wchar_t MESH_BRIDGE_NAME[] =
-    L"Local\\Windhawk.WobblyWindows.MeshBridge.v1";
-static constexpr DWORD MESH_BRIDGE_MAGIC = 0x48535757; // "WWSH"
-struct MeshBridgePoint
-{
-    float baseX, baseY, x, y;
-};
-struct MeshBridgePayload
-{
-    DWORD active, reserved;
-    ULONGLONG hwnd, generation, timestamp;
-    float width, height;
-    MeshBridgePoint points[16];
-};
-struct MeshBridgeSlot
-{
-    volatile LONG sequence;
-    LONG reserved;
-    MeshBridgePayload payload;
-};
-struct MeshBridgeData
-{
-    DWORD magic, version, size, ownerPid;
-    MeshBridgeSlot slots[MAX_ANIMATION_SLOTS];
-};
-static_assert(sizeof(MeshBridgePoint) == 16);
-static_assert(sizeof(MeshBridgePayload) == 296);
-static_assert(sizeof(MeshBridgeSlot) == 304);
-static_assert(offsetof(MeshBridgeData, slots) == 16);
-
-HANDLE g_meshBridgeHandle = nullptr;
-std::atomic<MeshBridgeData*> g_meshBridge = nullptr;
-std::atomic_bool g_meshBridgeEnabled = false;
-
-static void InitializeMeshBridge()
-{
-    if (!g_meshBridgeEnabled.load(std::memory_order_acquire) ||
-        g_meshBridge.load(std::memory_order_acquire))
-        return;
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-    {
-        Wh_Log(L"External mesh bridge unavailable: OpenProcessToken error=%u",
-               GetLastError());
-        return;
-    }
-    DWORD userBytes = 0;
-    GetTokenInformation(token, TokenUser, nullptr, 0, &userBytes);
-    std::vector<BYTE> userBuffer(userBytes);
-    bool gotUser = userBytes >= sizeof(TOKEN_USER) &&
-                   GetTokenInformation(token, TokenUser, userBuffer.data(),
-                                       userBytes, &userBytes);
-    CloseHandle(token);
-    LPWSTR ownerSid = nullptr;
-    if (!gotUser || !ConvertSidToStringSidW(
-            reinterpret_cast<TOKEN_USER*>(userBuffer.data())->User.Sid,
-            &ownerSid))
-    {
-        Wh_Log(L"External mesh bridge unavailable: token SID error=%u",
-               GetLastError());
-        return;
-    }
-    // The compositor's account can write. Other authenticated processes in
-    // this session can read the physics snapshot but cannot modify it.
-    std::wstring sddl = L"D:(A;;GR;;;AU)(A;;GA;;;";
-    sddl += ownerSid;
-    sddl += L")";
-    LocalFree(ownerSid);
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr))
-    {
-        Wh_Log(L"External mesh bridge unavailable: security descriptor error=%u",
-               GetLastError());
-        return;
-    }
-    SECURITY_ATTRIBUTES security{sizeof(security), descriptor, FALSE};
-    HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &security,
-        PAGE_READWRITE, 0, sizeof(MeshBridgeData), MESH_BRIDGE_NAME);
-    LocalFree(descriptor);
-    if (!mapping)
-    {
-        Wh_Log(L"External mesh bridge unavailable: CreateFileMapping error=%u",
-               GetLastError());
-        return;
-    }
-    auto* bridge = static_cast<MeshBridgeData*>(
-        MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
-                      sizeof(MeshBridgeData)));
-    if (!bridge)
-    {
-        Wh_Log(L"External mesh bridge unavailable: MapViewOfFile error=%u",
-               GetLastError());
-        CloseHandle(mapping);
-        return;
-    }
-    bridge->magic = 0;
-    MemoryBarrier();
-    for (auto& slot : bridge->slots)
-    {
-        if (slot.sequence & 1) InterlockedIncrement(&slot.sequence);
-        InterlockedIncrement(&slot.sequence);
-        slot.payload = {};
-        InterlockedIncrement(&slot.sequence);
-    }
-    bridge->version = 1;
-    bridge->size = sizeof(MeshBridgeData);
-    bridge->ownerPid = GetCurrentProcessId();
-    MemoryBarrier();
-    bridge->magic = MESH_BRIDGE_MAGIC;
-    g_meshBridgeHandle = mapping;
-    g_meshBridge.store(bridge, std::memory_order_release);
-    Wh_Log(L"External mesh bridge ready: version=1 slots=%d name=%s",
-           MAX_ANIMATION_SLOTS, MESH_BRIDGE_NAME);
-}
-
-static void CloseMeshBridge()
-{
-    auto* bridge = g_meshBridge.exchange(nullptr, std::memory_order_acq_rel);
-    if (bridge)
-    {
-        bridge->magic = 0;
-        UnmapViewOfFile(bridge);
-    }
-    if (g_meshBridgeHandle)
-    {
-        CloseHandle(g_meshBridgeHandle);
-        g_meshBridgeHandle = nullptr;
-    }
-}
-
-static void PublishMeshBridgeSnapshot()
-{
-    if (!g_meshBridgeEnabled.load(std::memory_order_acquire))
-        return;
-    auto* bridge = g_meshBridge.load(std::memory_order_acquire);
-    if (!bridge) return;
-    MeshBridgePayload snapshots[MAX_ANIMATION_SLOTS] = {};
-    ULONGLONG timestamp = GetTickCount64();
-    AcquireSRWLockShared(&g_animationSlotsLock);
-    for (int i = 0; i < MAX_ANIMATION_SLOTS; ++i)
-    {
-        const auto& slot = g_animationSlots[i];
-        auto& payload = snapshots[i];
-        if (!slot.active || !slot.hwnd || !slot.mesh.active ||
-            slot.mesh.resizing || slot.windowStateThrob ||
-            !std::isfinite(slot.mesh.width) ||
-            !std::isfinite(slot.mesh.height) ||
-            slot.mesh.width < 1.0 || slot.mesh.height < 1.0)
-            continue;
-        payload.hwnd = reinterpret_cast<UINT_PTR>(slot.hwnd);
-        payload.generation = slot.generation;
-        payload.timestamp = timestamp;
-        payload.width = static_cast<float>(slot.mesh.width);
-        payload.height = static_cast<float>(slot.mesh.height);
-        bool valid = std::isfinite(payload.width) &&
-                     std::isfinite(payload.height);
-        for (int p = 0; p < 16 && valid; ++p)
-        {
-            const auto& point = slot.mesh.points[p];
-            payload.points[p] = {
-                static_cast<float>(point.basePosition.x),
-                static_cast<float>(point.basePosition.y),
-                static_cast<float>(point.position.x),
-                static_cast<float>(point.position.y)};
-            const auto& out = payload.points[p];
-            valid = std::isfinite(out.baseX) && std::isfinite(out.baseY) &&
-                    std::isfinite(out.x) && std::isfinite(out.y);
-        }
-        payload.active = valid;
-    }
-    ReleaseSRWLockShared(&g_animationSlotsLock);
-    for (int i = 0; i < MAX_ANIMATION_SLOTS; ++i)
-    {
-        auto& slot = bridge->slots[i];
-        InterlockedIncrement(&slot.sequence);
-        slot.payload = snapshots[i];
-        MemoryBarrier();
-        InterlockedIncrement(&slot.sequence);
-    }
-}
 
 static void ReleaseAnimationSlotPinLocked(WindowAnimationSlot& slot)
 {
@@ -3128,6 +2933,15 @@ static bool InitializeDwmHooks()
            L"class CCachedVisualImageProxy>("
            L"class CCachedVisualImageProxy * *)"},
          &g_nativeProbeCreateImage, nullptr, true},
+        {{L"public: static long __cdecl CapturedWindowSWRVisual::Create("
+           L"struct HWND__ *,class CapturedWindowSWRVisual * *)"},
+         &g_nativeCapturedWindowCreate, nullptr, true},
+        {{L"const CapturedWindowSWRVisual::`vftable'{for `CBaseObject'}"},
+         &g_nativeCapturedWindowVtable, nullptr, true},
+        {{L"public: static class CDwmCS CDesktopManager::s_csDwmInstance"},
+         &g_nativeCaptureCriticalSection, nullptr, true},
+        {{L"public: virtual void __cdecl CVisual::SetOpacity(double)"},
+         &g_nativeVisualSetOpacity, nullptr, true},
         {{L"public: long __cdecl CCachedVisualImageProxy::Update("
            L"struct MilRectF const &,struct MilSizeD const &,"
            L"class CRectResourceProxy const *,"
@@ -3313,6 +3127,8 @@ static bool InitializeDwmHooks()
     keepValid(g_desktopManagerPostStartAnimations);
     keepValid(g_cBaseObjectRelease);
     keepValid(g_nativeProbeCreateImage);
+    keepValid(g_nativeCapturedWindowCreate);
+    keepValid(g_nativeVisualSetOpacity);
     keepValid(g_nativeProbeUpdateImageD);
     keepValid(g_nativeProbeUpdateImageF);
     keepValid(g_nativeProbeCreateBitmapInstruction);
@@ -3373,6 +3189,19 @@ static bool InitializeDwmHooks()
     bool hasExactMatrixProxyVtable =
         cacheVtableSymbol(g_matrixTransformProxyVtableSymbol, g_matrixTransformProxyVtable);
     cacheVtableSymbol(g_nativeProbeImageVtableSymbol, g_nativeProbeImageVtable);
+    const auto nativeBase = reinterpret_cast<uintptr_t>(g_dwmModuleLayout.imageBegin);
+    g_nativeCapturedSourceReady =
+        g_dwmModuleLayout.timeDateStamp == 0xE19C3234 && g_dwmModuleLayout.sizeOfImage == 0x16A000 &&
+        reinterpret_cast<uintptr_t>(g_nativeCapturedWindowCreate) == nativeBase + 0xD00AC &&
+        reinterpret_cast<uintptr_t>(g_nativeCapturedWindowVtable) == nativeBase + 0x117BD0 &&
+        reinterpret_cast<uintptr_t>(g_nativeCaptureCriticalSection) == nativeBase + 0x14BE80 &&
+        IsReadableMemory(g_nativeCaptureCriticalSection, sizeof(CRITICAL_SECTION)) &&
+        IsDwmImageAddress(g_nativeCapturedWindowVtable, sizeof(void*));
+    if (reinterpret_cast<uintptr_t>(g_nativeVisualSetOpacity) != nativeBase + 0x41F60)
+        g_nativeVisualSetOpacity = nullptr;
+    Wh_Log(L"NATIVE CAPTURE SOURCE: wrapper=%s hideProbe=%s",
+           g_nativeCapturedSourceReady ? L"available" : L"unavailable",
+           g_nativeCapturedSourceReady && g_nativeVisualSetOpacity ? L"available" : L"unavailable");
     Wh_Log(L"NATIVE MESH SOURCE: create=%d update=%s imageVtable=%p",
            g_nativeProbeCreateImage != nullptr,
            g_nativeProbeUpdateImageD ? L"double" :
@@ -4464,83 +4293,121 @@ static bool IsNativeMeshSourceCurrent(void* topLevelWindow, void* sourceRoot,
            g_nativeProbeGetVisualProxy(sourceRoot) == sourceProxy;
 }
 
-static void LogNativeMeshSourceTopology(HWND hwnd, void* topLevelWindow,
-                                         void* root)
+// Native capture source begin: exact 23H2 layout, independently tested below.
+class NativeCaptureGuard
 {
-    if (!IsOnDwmSceneThread() || !NativeMeshAbiVerified())
-        return;
-    ULONGLONG now = GetTickCount64();
-    if (g_nativeMeshTopologyHwnd == hwnd && g_nativeMeshTopologyRoot == root &&
-        now - g_nativeMeshTopologyAt < 10000)
-        return;
-    g_nativeMeshTopologyHwnd = hwnd;
-    g_nativeMeshTopologyRoot = root;
-    g_nativeMeshTopologyAt = now;
-    DWORD backdrop = 0;
-    long backdropResult = g_dwmGetWindowAttribute
-        ? g_dwmGetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
-                                  &backdrop, sizeof(backdrop))
-        : E_NOTIMPL;
-    Wh_Log(L"NATIVE MESH SOURCE TREE: HWND=%p root=%p TLW=%p "
-           L"backdrop=%u result=0x%08X readOnly=1",
-           hwnd, root, topLevelWindow, backdrop,
-           static_cast<unsigned>(backdropResult));
-    // The exact-build getter exposes three root types without changing the tree.
-    for (int type = 1; type <= 2; ++type)
-    {
-        void* alternate = g_topLevelWindowGetRootVisual(topLevelWindow, type);
-        void** children = nullptr;
-        unsigned int count = 0;
-        bool validChildren = ReadNativeVisualChildren(alternate, children, count);
-        Wh_Log(L"NATIVE MESH ALTERNATE ROOT: HWND=%p type=%d visual=%p "
-               L"vtableRva=0x%zx parent=%p children=%u listValid=%d",
-               hwnd, type, alternate, NativeVisualVtableRva(alternate),
-               ReadPointerMember(alternate, 0x18), count, validChildren);
-    }
-    void* visited[4] = {};
-    void* branch = nullptr;
-    void* visual = root;
-    for (unsigned int level = 0; level < ARRAYSIZE(visited); ++level)
-    {
-        size_t vtableRva = NativeVisualVtableRva(visual);
-        if (!vtableRva || std::find(visited, visited + level, visual) !=
-                              visited + level)
-            break;
-        visited[level] = visual;
-        void** children = nullptr;
-        unsigned int childCount = 0;
-        bool validChildren = ReadNativeVisualChildren(visual, children, childCount);
-        int branchIndex = -1;
-        if (validChildren && branch)
-        {
-            for (unsigned int i = 0; i < childCount; ++i)
-                if (children[i] == branch) branchIndex = static_cast<int>(i);
-        }
-        void* parent = ReadPointerMember(visual, 0x18);
-        Wh_Log(L"NATIVE MESH SOURCE NODE: HWND=%p level=%u visual=%p "
-               L"vtableRva=0x%zx parent=%p children=%u listValid=%d "
-               L"branchIndex=%d isTLW=%d",
-               hwnd, level, visual, vtableRva, parent, childCount,
-               validChildren, branchIndex, visual == topLevelWindow);
-        unsigned int sampleLimit = level == 0 ? 8 : (level == 1 ? 4 : 0);
-        if (validChildren)
-        {
-            for (unsigned int i = 0; i < std::min(childCount, sampleLimit); ++i)
-            {
-                void* child = children[i];
-                Wh_Log(L"NATIVE MESH SOURCE CHILD: HWND=%p level=%u index=%u "
-                       L"visual=%p vtableRva=0x%zx branch=%d",
-                       hwnd, level, i, child, NativeVisualVtableRva(child),
-                       child == branch);
-            }
-        }
-        branch = visual;
-        visual = parent;
-    }
+public:
+    explicit NativeCaptureGuard(bool needed)
+        : section_(needed && g_nativeCapturedSourceReady
+                       ? static_cast<CRITICAL_SECTION*>(g_nativeCaptureCriticalSection) : nullptr),
+          acquired_(!needed || (section_ && TryEnterCriticalSection(section_))) {}
+    ~NativeCaptureGuard() { if (section_ && acquired_) LeaveCriticalSection(section_); }
+    NativeCaptureGuard(const NativeCaptureGuard&) = delete;
+    NativeCaptureGuard& operator=(const NativeCaptureGuard&) = delete;
+    bool acquired() const { return acquired_; }
+private:
+    CRITICAL_SECTION* section_;
+    bool acquired_;
+};
+
+// Callers hold the production capture critical section while using this
+// borrowed root/proxy. No lock is acquired by a guessed internal ABI call.
+static void* GetNativeCapturedSource(void* capturedWindow, void** visual = nullptr)
+{
+    if (visual) *visual = nullptr;
+    if (!g_nativeCapturedSourceReady ||
+        ReadPointerMember(capturedWindow, 0) != g_nativeCapturedWindowVtable)
+        return nullptr;
+    // This is the same chain used by _GetCapturedItemRootVisual, not a cast
+    // from a dwmcore image or a guessed conversion between proxy interfaces.
+    void* representation = ReadPointerMember(capturedWindow, 0x18);
+    void* root = ReadPointerMember(representation, 0x30);
+    if (!NativeVisualVtableRva(root)) return nullptr;
+    if (visual) *visual = root;
+    void* proxy = ReadPointerMember(root, 0x10);
+    if (!IsVisualProxyPointerValid(proxy)) return nullptr;
+    return proxy;
 }
+
+static bool IsNativeCapturedSourceSeparate(void* capturedWindow, void* original)
+{
+    void* root = nullptr;
+    if (!GetNativeCapturedSource(capturedWindow, &root)) return false;
+    auto separatePath = [](void* node, void* forbidden)
+    {
+        void* visited[16] = {};
+        for (unsigned i = 0; node && i < ARRAYSIZE(visited); ++i)
+        {
+            if (node == forbidden || !NativeVisualVtableRva(node) ||
+                std::find(visited, visited + i, node) != visited + i)
+                return false;
+            visited[i] = node;
+            node = ReadPointerMember(node, 0x18);
+        }
+        return !node;
+    };
+    return separatePath(root, original) && separatePath(original, root);
+}
+
+static bool ReadNativeOpacity(void* visual, double& opacity)
+{
+    if (!visual || !NativeVisualVtableRva(visual)) return false;
+    const auto* field = static_cast<const BYTE*>(visual) + 0xC0;
+    if (!IsReadableMemory(field, sizeof(opacity))) return false;
+    std::memcpy(&opacity, field, sizeof(opacity));
+    return std::isfinite(opacity) && opacity >= 0.0 && opacity <= 1.0;
+}
+
+static void RestoreNativeOriginal(NativeMeshState& state)
+{
+    g_nativeOriginalHideWakeUntil.store(0, std::memory_order_release);
+    if (!state.originalHidden) return;
+    double current = 0.0;
+    const bool owned = ReadNativeOpacity(state.root, current) && current == 0.0;
+    if (owned && g_nativeVisualSetOpacity) g_nativeVisualSetOpacity(state.root, state.originalOpacity);
+    state.originalHidden = false;
+    state.hideUntil = 0;
+    Wh_Log(L"NATIVE ORIGINAL HIDE RESTORED: HWND=%p propertyOwned=%d",
+           state.hwnd, owned);
+}
+
+static void MaintainNativeOriginalHide(NativeMeshState& state)
+{
+    const ULONGLONG now = GetTickCount64();
+    const bool held = g_realDragging.load(std::memory_order_acquire) &&
+        g_realDraggedWindow.load(std::memory_order_acquire) == state.hwnd;
+    if (state.originalHidden)
+    {
+        if (!held || now >= state.hideUntil || !g_nativeOriginalHideProbe.load(std::memory_order_acquire))
+            RestoreNativeOriginal(state);
+        return;
+    }
+    if (!state.capturedWindow || state.hideProbeAttempted ||
+        !g_nativeOriginalHideProbe.load(std::memory_order_acquire))
+    {
+        g_nativeOriginalHideWakeUntil.store(0, std::memory_order_release);
+        return;
+    }
+    if (now - state.attachedAt < 1000) return;
+    state.hideProbeAttempted = true;
+    if (!held || !g_nativeVisualSetOpacity || !IsNativeCapturedSourceSeparate(state.capturedWindow, state.root) ||
+        !ReadNativeOpacity(state.root, state.originalOpacity) || state.originalOpacity != 1.0)
+    {
+        g_nativeOriginalHideWakeUntil.store(0, std::memory_order_release);
+        Wh_Log(L"NATIVE ORIGINAL HIDE SKIPPED: HWND=%p reason=SourceDependencyOrOpacity", state.hwnd);
+        return;
+    }
+    state.originalHidden = true;
+    state.hideUntil = now + 750;
+    g_nativeOriginalHideWakeUntil.store(state.hideUntil, std::memory_order_release);
+    g_nativeVisualSetOpacity(state.root, 0.0);
+    Wh_Log(L"NATIVE ORIGINAL HIDE ACTIVE: HWND=%p durationMs=750 source=CapturedWindowSWR", state.hwnd);
+}
+// Native capture source end.
 
 static void ReleaseNativeMeshState(NativeMeshState& state)
 {
+    RestoreNativeOriginal(state);
     ClearCoreMaterialTarget();
     if (state.visual) g_cBaseObjectRelease(state.visual);
     if (state.transform) g_cBaseObjectRelease(state.transform);
@@ -4548,6 +4415,7 @@ static void ReleaseNativeMeshState(NativeMeshState& state)
     if (state.group) g_cBaseObjectRelease(state.group);
     if (state.mesh) g_cBaseObjectRelease(state.mesh);
     if (state.image) g_cBaseObjectRelease(state.image);
+    if (state.capturedWindow) g_cBaseObjectRelease(state.capturedWindow);
     if (state.root) g_cBaseObjectRelease(state.root);
     state = {};
 }
@@ -4570,6 +4438,9 @@ static void InvalidateAnimationTransformForNativeMesh(HWND hwnd)
 static bool DetachNativeMesh(const wchar_t* reason)
 {
     auto& state = g_nativeMeshState;
+    NativeCaptureGuard captureGuard(state.capturedWindow != nullptr);
+    if (!captureGuard.acquired()) { RequestDwmScenePass(); return false; }
+    RestoreNativeOriginal(state);
     if (!state.visual)
     {
         g_nativeMeshHwnd.store(nullptr, std::memory_order_release);
@@ -4907,6 +4778,8 @@ static void MaintainNativeMesh()
         !g_nativeMeshActive.load(std::memory_order_acquire))
         return;
     auto& state = g_nativeMeshState;
+    NativeCaptureGuard captureGuard(state.capturedWindow != nullptr);
+    if (!captureGuard.acquired()) return;
     if (g_unloading.load(std::memory_order_acquire) ||
         g_nativeMeshStopRequested.load(std::memory_order_acquire))
     {
@@ -4919,6 +4792,8 @@ static void MaintainNativeMesh()
     int height = 0;
     bool sourceValid = state.root &&
         g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy;
+    if (sourceValid && state.capturedWindow)
+        sourceValid = GetNativeCapturedSource(state.capturedWindow) == state.imageSourceProxy;
     if (sourceValid && state.backdropSource)
     {
         sourceValid = ReadPointerMember(state.root, 0x18) == state.sourceOwner &&
@@ -4929,6 +4804,7 @@ static void MaintainNativeMesh()
         DetachNativeMesh(L"source-changed");
     else
     {
+        MaintainNativeOriginalHide(state);
         // A temporarily unavailable HWND rectangle is not a replaced visual.
         // Keep the validated source and retry its bounds on the next scene pass.
         if (!GetNativeMeshWindowSize(state.hwnd, width, height))
@@ -4957,7 +4833,7 @@ static void MaintainNativeMesh()
         }
         if (width != state.width || height != state.height)
         {
-            long result = UpdateNativeMeshSourceImage(state.image, state.sourceProxy,
+            long result = UpdateNativeMeshSourceImage(state.image, state.imageSourceProxy,
                                                        width, height, state.sourcePadding);
             if (result >= 0 && state.flatSourceProbe)
                 result = UpdateMatrixTransformProxy(
@@ -5004,7 +4880,8 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
                                      void* compositor,
                                      void*& image, void*& group,
                                      void*& instruction, void*& mesh,
-                                     int width, int height, int sourcePadding)
+                                     int width, int height, int sourcePadding,
+                                     void*& capturedWindow, void* imageSourceProxy)
 {
     AcquireSRWLockShared(&g_settingsLock);
     bool meshSelected = g_settings.rendererMode == RendererMode::Mesh;
@@ -5028,13 +4905,12 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
                hwnd, collection);
         return false;
     }
-    LogNativeMeshSourceTopology(hwnd, topLevelWindow,
-                                 g_topLevelWindowGetRootVisual(topLevelWindow, 0));
 
     NativeMeshState pending = {};
     pending.root = root;
     pending.hwnd = hwnd;
     pending.sourceProxy = sourceProxy;
+    pending.imageSourceProxy = imageSourceProxy;
     pending.sourceOwner = ReadPointerMember(root, 0x18);
     pending.backdropSource = backdropSource;
     pending.flatSourceProbe = flatSourceProbe;
@@ -5077,6 +4953,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
         stage = L"ValidateSibling";
         if (!IsWindow(hwnd) || !HasAttachableNativeMeshSlot(hwnd) ||
             FindNativeMeshSiblingCollection(root) != collection ||
+            (capturedWindow && GetNativeCapturedSource(capturedWindow) != imageSourceProxy) ||
             !IsNativeMeshSourceCurrent(topLevelWindow, root, sourceProxy, backdropSource))
             result = E_UNEXPECTED;
     }
@@ -5093,6 +4970,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
         stage = L"VerifySibling";
         if (ReadPointerMember(pending.visual, 0x18) !=
                 ReadPointerMember(root, 0x18) ||
+            (capturedWindow && GetNativeCapturedSource(capturedWindow) != imageSourceProxy) ||
             FindNativeMeshSiblingCollection(root) != collection)
             result = E_UNEXPECTED;
     }
@@ -5107,6 +4985,9 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     }
     if (result >= 0 && inserted)
     {
+        pending.capturedWindow = capturedWindow;
+        capturedWindow = nullptr;
+        pending.attachedAt = GetTickCount64();
         pending.image = image;
         pending.group = group;
         pending.mesh = mesh;
@@ -5115,6 +4996,11 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
         g_nativeMeshState = pending;
         g_nativeMeshHwnd.store(hwnd, std::memory_order_release);
         g_nativeMeshActive.store(true, std::memory_order_release);
+        if (pending.capturedWindow && g_nativeOriginalHideProbe.load(std::memory_order_acquire))
+        {
+            g_nativeOriginalHideWakeUntil.store(pending.attachedAt + 1000, std::memory_order_release);
+            PostThreadMessageW(g_eventThreadMessageTarget.load(std::memory_order_acquire), WM_NULL, 0, 0);
+        }
         InvalidateAnimationTransformForNativeMesh(hwnd);
         Wh_Log(L"NATIVE MESH ATTACHED: HWND=%p root=%p "
                L"visual=%p source=%s path=%s duration=until-slot-retirement snapshot=none",
@@ -5129,6 +5015,8 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
            static_cast<unsigned>(result), inserted);
     if (inserted)
     {
+        pending.capturedWindow = capturedWindow;
+        capturedWindow = nullptr;
         pending.image = image;
         pending.group = group;
         pending.mesh = mesh;
@@ -5150,7 +5038,8 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
                                       void* sourceProxy, bool backdropSource,
                                       void* compositor,
                                       void*& image, int width, int height,
-                                      bool flatSourceProbe, int sourcePadding)
+                                      bool flatSourceProbe, int sourcePadding,
+                                      void*& capturedWindow, void* imageSourceProxy)
 {
     // Exact 23H2 ABI only. The instruction stores base-object references and
     // serializes resource IDs; the core DrawMesh2D path consumes CImageSource.
@@ -5184,7 +5073,8 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
         {
             TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy,
                                 backdropSource, true, compositor, image, group,
-                                instruction, mesh, width, height, sourcePadding);
+                                instruction, mesh, width, height, sourcePadding,
+                                capturedWindow, imageSourceProxy);
         }
         if (instruction) g_cBaseObjectRelease(instruction);
         return;
@@ -5254,7 +5144,8 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
         if (TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy,
                                      backdropSource, false,
                                      compositor, image, group, instruction,
-                                     mesh, width, height, sourcePadding))
+                                     mesh, width, height, sourcePadding,
+                                     capturedWindow, imageSourceProxy))
         {
             Wh_Log(L"NATIVE VERTEX MESH: attached HWND=%p "
                    L"physicsLinked=1 liveSource=1 original=%s", hwnd,
@@ -5336,8 +5227,36 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
     }
     NativeSourceProbeMode probeMode =
         g_nativeSourceProbeMode.load(std::memory_order_acquire);
+    NativeCaptureGuard captureGuard(probeMode == NativeSourceProbeMode::CapturedFlat);
+    if (!captureGuard.acquired()) return;
     bool flatSourceProbe = probeMode != NativeSourceProbeMode::None;
     int sourcePadding = probeMode == NativeSourceProbeMode::Flat ? 0 : 64;
+    void* capturedWindow = nullptr;
+    void* imageSourceProxy = sourceVisualProxy;
+    if (probeMode == NativeSourceProbeMode::CapturedFlat)
+    {
+        if (!g_nativeCapturedSourceReady ||
+            !IsDwmObjectPointerValid(g_desktopManager.load(std::memory_order_acquire), g_desktopManagerVtable))
+        {
+            Wh_Log(L"NATIVE CAPTURE SOURCE FAILED: HWND=%p stage=Compatibility", hwnd);
+            return;
+        }
+        const long result = g_nativeCapturedWindowCreate(hwnd, &capturedWindow);
+        imageSourceProxy = result >= 0 ? GetNativeCapturedSource(capturedWindow) : nullptr;
+        void* capturedRoot = nullptr;
+        GetNativeCapturedSource(capturedWindow, &capturedRoot);
+        Wh_Log(L"NATIVE CAPTURE SOURCE CREATED: HWND=%p result=0x%08X wrapper=%p root=%p "
+               L"proxy=%p hostRoot=%p separate=%d rootVtableRva=0x%zx proxyVtableRva=0x%zx", hwnd, static_cast<unsigned>(result),
+               capturedWindow, capturedRoot, imageSourceProxy, sourceRoot,
+               capturedWindow && IsNativeCapturedSourceSeparate(capturedWindow, sourceRoot),
+               NativeVisualVtableRva(capturedRoot),
+               NativeVisualVtableRva(ReadPointerMember(capturedRoot, 0x10)));
+        if (result < 0 || !imageSourceProxy)
+        {
+            if (capturedWindow) g_cBaseObjectRelease(capturedWindow);
+            return;
+        }
+    }
     Wh_Log(L"NATIVE SOURCE RECT: HWND=%p rect=(%d,%d,%d,%d) "
            L"realization=%dx%d padding=%d", hwnd,
            -sourcePadding, -sourcePadding,
@@ -5352,8 +5271,8 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
                           *reinterpret_cast<void**>(image) == expectedVtable;
     if (createResult >= 0 && exactImageType)
     {
-        SetCoreMaterialTarget(image, sourceVisualProxy, hwnd);
-        updateResult = UpdateNativeMeshSourceImage(image, sourceVisualProxy,
+        SetCoreMaterialTarget(image, imageSourceProxy, hwnd);
+        updateResult = UpdateNativeMeshSourceImage(image, imageSourceProxy,
                                                     width, height, sourcePadding);
         if (updateResult >= 0)
             validationResult = g_nativeProbeCreateBitmapInstruction(
@@ -5390,7 +5309,7 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
         CreateVisibleNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceVisualProxy,
                                   backdropSource,
                                   compositor, image, width, height,
-                                  flatSourceProbe, sourcePadding);
+                                  flatSourceProbe, sourcePadding, capturedWindow, imageSourceProxy);
     }
     if (validationInstruction && validationResult >= 0 &&
         IsReadableMemory(validationInstruction, sizeof(void*)) &&
@@ -5404,6 +5323,7 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
         ClearCoreMaterialTarget();
         g_cBaseObjectRelease(image);
     }
+    if (capturedWindow) g_cBaseObjectRelease(capturedWindow);
 }
 
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
@@ -7626,7 +7546,6 @@ static void HandleMoveSizeStart(HWND hwnd)
     Wh_Log(L"DRAG TRACE START: HWND=%p Slot=%d Renderer=%s size=%dx%d "
            L"resizing=%d typeKnown=%d",
            hwnd, slotIndex,
-           activeSettings.rendererMode == RendererMode::ExternalGpu ? L"external-gpu" :
                activeSettings.rendererMode == RendererMode::Mesh ? L"mesh" : L"affine",
            width, height, g_realResizing, g_moveTypeKnown);
     if (physicalCoordinates)
@@ -8005,7 +7924,6 @@ static void UpdateAnimationFrame()
     FinalizeRetiringSlots();
     if (!HasAnyAnimationSlots())
     {
-        PublishMeshBridgeSnapshot();
         StopAnimationClockIfIdle();
         return;
     }
@@ -8139,7 +8057,6 @@ static void UpdateAnimationFrame()
         }
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
     }
-    PublishMeshBridgeSnapshot();
     int slotsToRetire[MAX_ANIMATION_SLOTS] = {};
     int retireCount = 0;
     for (int i = 0; i < MAX_ANIMATION_SLOTS; i++)
@@ -9582,7 +9499,8 @@ static DWORD WINAPI WindowEventThreadProc(LPVOID)
         bool frameDue = false;
         DWORD waitTimeout = INFINITE;
         if (g_nativeMeshActive.load(std::memory_order_acquire) &&
-            g_nativeMeshStopRequested.load(std::memory_order_acquire))
+            (g_nativeMeshStopRequested.load(std::memory_order_acquire) ||
+             g_nativeOriginalHideWakeUntil.load(std::memory_order_acquire)))
         {
             ULONGLONG now = GetTickCount64();
             if (!nextNativeMeshWakeAt || now >= nextNativeMeshWakeAt)
@@ -9779,22 +9697,19 @@ static void LoadSettings()
     WobblySettings settings = PHYSICS_PRESETS[wobbliness];
     auto rendererSetting = WindhawkUtils::StringSetting::make(L"Renderer");
     std::wstring_view rendererValue(rendererSetting.get());
-    NativeSourceProbeMode probeMode = rendererValue == L"mesh-flat-padded"
+    NativeSourceProbeMode probeMode = rendererValue == L"mesh-captured-source"
+        ? NativeSourceProbeMode::CapturedFlat : rendererValue == L"mesh-flat-padded"
         ? NativeSourceProbeMode::PaddedFlat
         : rendererValue == L"mesh-flat-source" ? NativeSourceProbeMode::Flat
                                              : NativeSourceProbeMode::None;
     bool flatSourceProbe = probeMode != NativeSourceProbeMode::None;
+    g_nativeOriginalHideProbe.store(Wh_GetIntSetting(L"CaptureOriginalHideProbe") != 0,
+                                   std::memory_order_release);
     bool flatSourceProbeChanged =
         g_nativeSourceProbeMode.exchange(probeMode,
                                          std::memory_order_acq_rel) != probeMode;
-    settings.rendererMode = rendererValue == L"external-gpu"
-                                ? RendererMode::ExternalGpu
-                                : (rendererValue == L"mesh" || flatSourceProbe)
-                                      ? RendererMode::Mesh
-                                      : RendererMode::Affine;
-    g_meshBridgeEnabled.store(
-        settings.rendererMode == RendererMode::ExternalGpu,
-        std::memory_order_release);
+    settings.rendererMode = rendererValue == L"mesh" || flatSourceProbe
+                                ? RendererMode::Mesh : RendererMode::Affine;
     bool advancedMode = Wh_GetIntSetting(L"AdvancedMode.enable") != 0;
     settings.resizeWobbleEnabled = Wh_GetIntSetting(L"EnableResizeWobble") != 0;
     settings.windowStateWobbleEnabled =
@@ -9830,10 +9745,10 @@ static void LoadSettings()
            L"Drag=%.2f, "
            L"MoveFactor=%.2f",
            wobbliness, advancedMode,
-           settings.rendererMode == RendererMode::ExternalGpu ? L"external-gpu" :
                 settings.rendererMode == RendererMode::Mesh
                     ? (flatSourceProbe
-                        ? (probeMode == NativeSourceProbeMode::PaddedFlat
+                        ? (probeMode == NativeSourceProbeMode::CapturedFlat ? L"captured-source-diagnostic" :
+                           probeMode == NativeSourceProbeMode::PaddedFlat
                             ? L"flat-padded-source-diagnostic" : L"flat-source-diagnostic")
                         : L"mesh") : L"affine",
            settings.resizeWobbleEnabled,
@@ -9866,1083 +9781,6 @@ static bool HasRecentDwmCrashLoop()
     return success && count >= ARRAYSIZE(warnings);
 }
 
-namespace mesh_bridge {
-using Payload = MeshBridgePayload;
-using Slot = MeshBridgeSlot;
-using Data = MeshBridgeData;
-constexpr const wchar_t* name = MESH_BRIDGE_NAME;
-constexpr DWORD magic = MESH_BRIDGE_MAGIC;
-constexpr DWORD version = 1;
-constexpr unsigned slot_count = MAX_ANIMATION_SLOTS;
-}
-using Microsoft::WRL::ComPtr;
-using namespace winrt::Windows::Graphics::Capture;
-using namespace winrt::Windows::Graphics::DirectX;
-using namespace winrt::Windows::Graphics::DirectX::Direct3D11;
-
-constexpr UINT kFrameMessage = WM_APP + 1;
-constexpr UINT kGrid = 20;
-constexpr char kShaders[] = R"(
-cbuffer Bend : register(b0) { float4 options; float4 controls[16]; };
-struct Vertex { float2 position : POSITION; float2 uv : TEXCOORD0; };
-struct Pixel { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
-Pixel VSMain(Vertex input) {
-    Pixel output;
-    float2 p = input.position;
-    float u = input.uv.x;
-    float v = input.uv.y;
-    float4 bx = float4(pow(1-u, 3), 3*u*pow(1-u, 2),
-                       3*u*u*(1-u), u*u*u);
-    float4 by = float4(pow(1-v, 3), 3*v*pow(1-v, 2),
-                       3*v*v*(1-v), v*v*v);
-    float2 displacement = 0;
-    [unroll] for (int y = 0; y < 4; ++y)
-        [unroll] for (int x = 0; x < 4; ++x)
-            displacement += controls[y * 4 + x].xy * bx[x] * by[y];
-    p += displacement;
-    output.position = float4(p * options.w, 0.0, 1.0);
-    output.uv = input.uv;
-    return output;
-}
-Texture2D windowImage : register(t0);
-SamplerState linearSampler : register(s0);
-float4 PSMain(Pixel input) : SV_TARGET {
-    return windowImage.Sample(linearSampler, input.uv);
-}
-)";
-
-struct Vertex {
-    float x, y, u, v;
-};
-
-struct Bend {
-    float options[4];
-    float controls[16][4];
-};
-
-bool ReadSlot(const mesh_bridge::Slot& slot, mesh_bridge::Payload& payload) {
-    bool consistent = false;
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        LONG before = slot.sequence;
-        if (before & 1) continue;
-        MemoryBarrier();
-        payload = slot.payload;
-        MemoryBarrier();
-        LONG after = slot.sequence;
-        if (before == after && !(after & 1)) {
-            consistent = true;
-            break;
-        }
-    }
-    if (!consistent || !payload.active || !payload.hwnd) return false;
-    ULONGLONG now = GetTickCount64();
-    return payload.timestamp <= now && now - payload.timestamp <= 500;
-}
-
-struct GpuRuntime {
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> context;
-    ComPtr<IDXGIDevice> dxgi;
-    ComPtr<IDXGIFactory2> factory;
-    ComPtr<IDCompositionDevice> compositionDevice;
-    ComPtr<ID3DBlob> vertexBlob, pixelBlob;
-    IDirect3DDevice captureDevice{nullptr};
-    winrt::com_ptr<IGraphicsCaptureItemInterop> captureInterop;
-
-    GpuRuntime() {
-        constexpr UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-        D3D_FEATURE_LEVEL level;
-        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE,
-            nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
-            &device, &level, &context);
-        if (FAILED(hr)) {
-            Wh_Log(L"GPU mesh renderer: hardware D3D11 unavailable, using WARP");
-            winrt::check_hresult(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP,
-                nullptr, flags, nullptr, 0, D3D11_SDK_VERSION,
-                &device, &level, &context));
-        }
-        winrt::check_hresult(device.As(&dxgi));
-        ComPtr<IDXGIAdapter> adapter;
-        winrt::check_hresult(dxgi->GetAdapter(&adapter));
-        winrt::check_hresult(adapter->GetParent(IID_PPV_ARGS(&factory)));
-        winrt::check_hresult(DCompositionCreateDevice(
-            dxgi.Get(), IID_PPV_ARGS(&compositionDevice)));
-
-        auto compile = [&](const char* entry, const char* profile,
-                           ID3DBlob** output) {
-            ComPtr<ID3DBlob> errors;
-            HRESULT result = D3DCompile(kShaders, sizeof(kShaders) - 1, nullptr,
-                nullptr, nullptr, entry, profile, 0, 0, output, &errors);
-            if (FAILED(result) && errors)
-                Wh_Log(L"GPU mesh shader compile failed: %S",
-                       static_cast<const char*>(errors->GetBufferPointer()));
-            winrt::check_hresult(result);
-        };
-        compile("VSMain", "vs_4_0", &vertexBlob);
-        compile("PSMain", "ps_4_0", &pixelBlob);
-
-        winrt::com_ptr<::IInspectable> inspectable;
-        winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(
-            dxgi.Get(), inspectable.put()));
-        captureDevice = inspectable.as<IDirect3DDevice>();
-        captureInterop = winrt::get_activation_factory<GraphicsCaptureItem,
-            IGraphicsCaptureItemInterop>();
-        Wh_Log(L"GPU mesh renderer: GPU and capture resources ready");
-    }
-};
-
-class Preview {
-public:
-    Preview(HWND target, GpuRuntime& runtime)
-        : target_(target), runtime_(runtime), device_(runtime.device),
-          context_(runtime.context), compositionDevice_(runtime.compositionDevice) {
-        try {
-            CreateWindowAndDevice();
-            StartCapture();
-            InvalidateRect(window_, nullptr, FALSE);
-        } catch (...) {
-            StopCapture();
-            if (window_ && IsWindow(window_)) DestroyWindow(window_);
-            throw;
-        }
-    }
-
-    ~Preview() {
-        StopCapture();
-        if (window_ && IsWindow(window_)) DestroyWindow(window_);
-        if (bridge_) UnmapViewOfFile(bridge_);
-        if (bridgeHandle_) CloseHandle(bridgeHandle_);
-    }
-
-    HWND window() const { return window_; }
-    bool failed() const { return failed_; }
-
-    void SuspendCapture() {
-        if (suspended_) return;
-        KillTimer(window_, 1);
-        if (session_) session_.Close();
-        session_ = nullptr;
-        suspended_ = true;
-        if (overlayVisible_) ShowWindow(window_, SW_HIDE);
-        overlayVisible_ = false;
-        Wh_Log(L"GPU mesh capture paused: HWND=%p", target_);
-    }
-
-    void ResumeCapture() {
-        if (!suspended_) return;
-        if (!IsWindow(target_) || !pool_ || !item_)
-            winrt::throw_hresult(E_INVALIDARG);
-        HMONITOR current = MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST);
-        if (captureMonitor_ && current != captureMonitor_) {
-            Wh_Log(L"GPU mesh cached capture monitor changed: HWND=%p from=%p to=%p",
-                   target_, captureMonitor_, current);
-            winrt::throw_hresult(E_FAIL);
-        }
-        while (auto frame = pool_.TryGetNextFrame()) frame.Close();
-        session_ = pool_.CreateCaptureSession(item_);
-        session_.IsCursorCaptureEnabled(false);
-        session_.StartCapture();
-        suspended_ = false;
-        renderedLogged_ = false;
-        SetTimer(window_, 1, 16, nullptr);
-        Wh_Log(L"GPU mesh capture resumed: HWND=%p", target_);
-    }
-
-private:
-    static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam,
-                                       LPARAM lparam) {
-        auto* self = reinterpret_cast<Preview*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-        if (message == WM_NCCREATE) {
-            auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
-            self = static_cast<Preview*>(create->lpCreateParams);
-            self->window_ = window;
-            SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-        }
-        if (self) {
-            switch (message) {
-            case kFrameMessage:
-                try { self->ReceiveFrames(); }
-                catch (winrt::hresult_error const& error) {
-                    Wh_Log(L"GPU mesh capture failed: HWND=%p HRESULT=0x%08X %s",
-                           self->target_, static_cast<unsigned>(error.code()),
-                           error.message().c_str());
-                    self->failed_ = true;
-                    self->StopCapture();
-                }
-                catch (...) {
-                    Wh_Log(L"GPU mesh capture failed: HWND=%p", self->target_);
-                    self->failed_ = true;
-                    self->StopCapture();
-                }
-                return 0;
-            case WM_PAINT: {
-                PAINTSTRUCT paint;
-                BeginPaint(window, &paint);
-                try { self->Render(); }
-                catch (winrt::hresult_error const& error) {
-                    Wh_Log(L"GPU mesh render failed: HWND=%p HRESULT=0x%08X %s",
-                           self->target_, static_cast<unsigned>(error.code()),
-                           error.message().c_str());
-                    self->failed_ = true;
-                    self->StopCapture();
-                }
-                catch (...) {
-                    Wh_Log(L"GPU mesh render failed: HWND=%p", self->target_);
-                    self->failed_ = true;
-                    self->StopCapture();
-                }
-                EndPaint(window, &paint);
-                return 0;
-            }
-            case WM_ERASEBKGND:
-                return 1;
-            case WM_NCHITTEST:
-                return HTTRANSPARENT;
-            case WM_TIMER:
-                if (wparam == 1) InvalidateRect(window, nullptr, FALSE);
-                return 0;
-            case WM_SIZE:
-                if (self->swapChain_ && LOWORD(lparam) && HIWORD(lparam))
-                    self->Resize(LOWORD(lparam), HIWORD(lparam));
-                return 0;
-            case WM_NCDESTROY:
-                SetWindowLongPtrW(window, GWLP_USERDATA, 0);
-                break;
-            }
-        }
-        return DefWindowProcW(window, message, wparam, lparam);
-    }
-
-    void CreateWindowAndDevice() {
-        WNDCLASSW windowClass{};
-        windowClass.lpfnWndProc = WindowProc;
-        windowClass.hInstance = GetModuleHandleW(nullptr);
-        windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        windowClass.lpszClassName = L"WobblyWgcMeshPreview";
-        if (!RegisterClassW(&windowClass) &&
-            GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-            winrt::throw_last_error();
-        DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
-                        WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP;
-        window_ = CreateWindowExW(exStyle, windowClass.lpszClassName,
-                                  L"Wobbly GPU mesh overlay", WS_POPUP,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 1, 1,
-                                  nullptr, nullptr, windowClass.hInstance, this);
-        if (!window_) winrt::throw_last_error();
-        if (!SetLayeredWindowAttributes(window_, 0, 255, LWA_ALPHA))
-            winrt::throw_last_error();
-
-        DXGI_SWAP_CHAIN_DESC1 description{};
-        description.Width = 1;
-        description.Height = 1;
-        description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        description.SampleDesc.Count = 1;
-        description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        description.BufferCount = 2;
-        description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        description.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-        winrt::check_hresult(runtime_.factory->CreateSwapChainForComposition(
-            device_.Get(), &description, nullptr, &swapChain_));
-        winrt::check_hresult(compositionDevice_->CreateTargetForHwnd(
-            window_, TRUE, &compositionTarget_));
-        winrt::check_hresult(compositionDevice_->CreateVisual(&compositionVisual_));
-        winrt::check_hresult(compositionVisual_->SetContent(swapChain_.Get()));
-        winrt::check_hresult(compositionTarget_->SetRoot(compositionVisual_.Get()));
-        winrt::check_hresult(compositionDevice_->Commit());
-        CreateRenderTarget();
-        CreatePipeline();
-        UpdateOverlayBounds();
-        SetTimer(window_, 1, 16, nullptr);
-    }
-
-    void CreateRenderTarget() {
-        ComPtr<ID3D11Texture2D> backBuffer;
-        winrt::check_hresult(swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer)));
-        winrt::check_hresult(device_->CreateRenderTargetView(backBuffer.Get(),
-                                                             nullptr, &renderTarget_));
-    }
-
-    void Resize(UINT width, UINT height) {
-        renderTarget_.Reset();
-        context_->OMSetRenderTargets(0, nullptr, nullptr);
-        winrt::check_hresult(swapChain_->ResizeBuffers(0, width, height,
-                                                         DXGI_FORMAT_UNKNOWN, 0));
-        CreateRenderTarget();
-    }
-
-    bool UpdateOverlayBounds(double physicsX = 0.0, double physicsY = 0.0) {
-        if (!target_ || !IsWindow(target_)) {
-            if (overlayVisible_) ShowWindow(window_, SW_HIDE);
-            overlayVisible_ = false;
-            return false;
-        }
-        DWORD cloaked = 0;
-        DwmGetWindowAttribute(target_, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-        if (!IsWindowVisible(target_) || IsIconic(target_) || cloaked) {
-            if (overlayVisible_) ShowWindow(window_, SW_HIDE);
-            overlayVisible_ = false;
-            return false;
-        }
-        RECT windowBounds{};
-        if (!ReadWindowRectForRenderer(target_, &windowBounds))
-            return false;
-        if (!haveFrameInsets_) {
-            RECT visibleBounds{};
-            if (SUCCEEDED(DwmGetWindowAttribute(target_,
-                    DWMWA_EXTENDED_FRAME_BOUNDS,
-                    &visibleBounds, sizeof(visibleBounds))) &&
-                visibleBounds.right > visibleBounds.left &&
-                visibleBounds.bottom > visibleBounds.top) {
-                frameInsets_ = {visibleBounds.left - windowBounds.left,
-                                visibleBounds.top - windowBounds.top,
-                                visibleBounds.right - windowBounds.right,
-                                visibleBounds.bottom - windowBounds.bottom};
-            }
-            haveFrameInsets_ = true;
-        }
-        RECT source{windowBounds.left + frameInsets_.left,
-                    windowBounds.top + frameInsets_.top,
-                    windowBounds.right + frameInsets_.right,
-                    windowBounds.bottom + frameInsets_.bottom};
-        const int width = source.right - source.left;
-        const int height = source.bottom - source.top;
-        if (width < 1 || height < 1 || width > 16000 || height > 16000)
-            return false;
-        const int canvasWidth = width * 5 / 4;
-        const int canvasHeight = height * 5 / 4;
-        RECT desired{source.left - (canvasWidth - width) / 2,
-                     source.top - (canvasHeight - height) / 2,
-                     source.left - (canvasWidth - width) / 2 + canvasWidth,
-                     source.top - (canvasHeight - height) / 2 + canvasHeight};
-        const LONG shiftX = static_cast<LONG>(std::lround(physicsX));
-        const LONG shiftY = static_cast<LONG>(std::lround(physicsY));
-        OffsetRect(&desired, shiftX, shiftY);
-        if (!EqualRect(&desired, &overlayBounds_)) {
-            if (!SetWindowPos(window_, nullptr, desired.left, desired.top,
-                              canvasWidth, canvasHeight,
-                              SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER))
-                return false;
-            overlayBounds_ = desired;
-        }
-        if (!overlayVisible_) {
-            ShowWindow(window_, SW_SHOWNOACTIVATE);
-            overlayVisible_ = true;
-            Wh_Log(L"GPU mesh overlay visible: HWND=%p source=%dx%d canvas=%dx%d capture=%ux%u",
-                   target_, width, height, canvasWidth, canvasHeight,
-                   textureWidth_, textureHeight_);
-        }
-        return true;
-    }
-
-    void CreatePipeline() {
-        winrt::check_hresult(device_->CreateVertexShader(
-            runtime_.vertexBlob->GetBufferPointer(),
-            runtime_.vertexBlob->GetBufferSize(), nullptr, &vertexShader_));
-        winrt::check_hresult(device_->CreatePixelShader(
-            runtime_.pixelBlob->GetBufferPointer(),
-            runtime_.pixelBlob->GetBufferSize(), nullptr, &pixelShader_));
-        const D3D11_INPUT_ELEMENT_DESC layout[] = {
-            {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
-        };
-        winrt::check_hresult(device_->CreateInputLayout(layout, 2,
-            runtime_.vertexBlob->GetBufferPointer(),
-            runtime_.vertexBlob->GetBufferSize(), &inputLayout_));
-
-        std::vector<Vertex> vertices;
-        std::vector<uint16_t> indices;
-        vertices.reserve((kGrid + 1) * (kGrid + 1));
-        indices.reserve(kGrid * kGrid * 6);
-        for (UINT y = 0; y <= kGrid; ++y)
-            for (UINT x = 0; x <= kGrid; ++x) {
-                float u = static_cast<float>(x) / kGrid;
-                float v = static_cast<float>(y) / kGrid;
-                vertices.push_back({u * 1.8f - 0.9f, 0.9f - v * 1.8f, u, v});
-            }
-        for (UINT y = 0; y < kGrid; ++y)
-            for (UINT x = 0; x < kGrid; ++x) {
-                uint16_t a = static_cast<uint16_t>(y * (kGrid + 1) + x);
-                uint16_t b = static_cast<uint16_t>(a + 1);
-                uint16_t c = static_cast<uint16_t>(a + kGrid + 1);
-                uint16_t d = static_cast<uint16_t>(c + 1);
-                indices.insert(indices.end(), {a, b, c, b, d, c});
-            }
-        indexCount_ = static_cast<UINT>(indices.size());
-        D3D11_BUFFER_DESC buffer{};
-        buffer.Usage = D3D11_USAGE_IMMUTABLE;
-        buffer.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        buffer.ByteWidth = static_cast<UINT>(vertices.size() * sizeof(Vertex));
-        D3D11_SUBRESOURCE_DATA data{vertices.data()};
-        winrt::check_hresult(device_->CreateBuffer(&buffer, &data, &vertexBuffer_));
-        buffer.BindFlags = D3D11_BIND_INDEX_BUFFER;
-        buffer.ByteWidth = static_cast<UINT>(indices.size() * sizeof(uint16_t));
-        data.pSysMem = indices.data();
-        winrt::check_hresult(device_->CreateBuffer(&buffer, &data, &indexBuffer_));
-        buffer.Usage = D3D11_USAGE_DEFAULT;
-        buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        buffer.ByteWidth = sizeof(Bend);
-        winrt::check_hresult(device_->CreateBuffer(&buffer, nullptr, &bendBuffer_));
-
-        D3D11_SAMPLER_DESC sampler{};
-        sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sampler.MaxLOD = D3D11_FLOAT32_MAX;
-        winrt::check_hresult(device_->CreateSamplerState(&sampler, &sampler_));
-        D3D11_BLEND_DESC blend{};
-        blend.RenderTarget[0].BlendEnable = TRUE;
-        blend.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
-        blend.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-        blend.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-        blend.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-        blend.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-        blend.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-        blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-        winrt::check_hresult(device_->CreateBlendState(&blend, &blendState_));
-    }
-
-    void StartCapture() {
-        winrt::check_hresult(runtime_.captureInterop->CreateForWindow(
-            target_, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item_)));
-        captureDevice_ = runtime_.captureDevice;
-        frameSize_ = item_.Size();
-        pool_ = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            captureDevice_, DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2, frameSize_);
-        frameToken_ = pool_.FrameArrived([window = window_](auto const&, auto const&) {
-            PostMessageW(window, kFrameMessage, 0, 0);
-        });
-        session_ = pool_.CreateCaptureSession(item_);
-        session_.IsCursorCaptureEnabled(false);
-        session_.StartCapture();
-        captureMonitor_ = MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST);
-        pendingMonitor_ = nullptr;
-        Wh_Log(L"GPU mesh capture started: HWND=%p size=%dx%d monitor=%p dpi=%u",
-               target_, frameSize_.Width, frameSize_.Height,
-               captureMonitor_, GetDpiForWindow(target_));
-    }
-
-    void RefreshCaptureAfterMonitorChange() {
-        if (!IsWindow(target_)) return;
-        HMONITOR current = MonitorFromWindow(target_, MONITOR_DEFAULTTONEAREST);
-        if (!current || !captureMonitor_ || current == captureMonitor_) {
-            pendingMonitor_ = nullptr;
-            return;
-        }
-        ULONGLONG now = GetTickCount64();
-        if (current != pendingMonitor_) {
-            pendingMonitor_ = current;
-            pendingMonitorSince_ = now;
-            Wh_Log(L"GPU mesh monitor transition: HWND=%p from=%p to=%p",
-                   target_, captureMonitor_, current);
-            return;
-        }
-        ULONGLONG stableSince = std::max(pendingMonitorSince_,
-                                         lastFrameSizeChangeAt_);
-        if (now - stableSince < 250) return;
-
-        HMONITOR previous = captureMonitor_;
-        if (pool_) pool_.FrameArrived(frameToken_);
-        if (session_) session_.Close();
-        if (pool_) pool_.Close();
-        session_ = nullptr;
-        pool_ = nullptr;
-        item_ = nullptr;
-        captureDevice_ = nullptr;
-        haveFrameInsets_ = false;
-        StartCapture();
-        renderedLogged_ = false;
-        Wh_Log(L"GPU mesh capture refreshed for monitor: HWND=%p from=%p to=%p "
-               L"wait=%llums",
-               target_, previous, captureMonitor_, now - pendingMonitorSince_);
-    }
-
-    void StopCapture() noexcept {
-        try {
-            if (pool_) pool_.FrameArrived(frameToken_);
-            if (session_) session_.Close();
-            if (pool_) pool_.Close();
-        } catch (...) {
-        }
-        session_ = nullptr;
-        pool_ = nullptr;
-        item_ = nullptr;
-        captureDevice_ = nullptr;
-        ID3D11ShaderResourceView* empty = nullptr;
-        if (context_) context_->PSSetShaderResources(0, 1, &empty);
-        capturedView_.Reset();
-        capturedTexture_.Reset();
-        textureWidth_ = textureHeight_ = 0;
-        haveFrameInsets_ = false;
-        overlayBounds_ = {};
-        captureMonitor_ = nullptr;
-        pendingMonitor_ = nullptr;
-        pendingMonitorSince_ = 0;
-        lastFrameSizeChangeAt_ = 0;
-        if (overlayVisible_) ShowWindow(window_, SW_HIDE);
-        overlayVisible_ = false;
-    }
-
-    void ReceiveFrames() {
-        if (!pool_) return;
-        if (suspended_) {
-            while (auto frame = pool_.TryGetNextFrame()) frame.Close();
-            return;
-        }
-        bool resize = false;
-        while (auto frame = pool_.TryGetNextFrame()) {
-            auto size = frame.ContentSize();
-            auto access = frame.Surface().as<
-                IDirect3DDxgiInterfaceAccess>();
-            ComPtr<ID3D11Texture2D> source;
-            winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(&source)));
-            D3D11_TEXTURE2D_DESC desc{};
-            source->GetDesc(&desc);
-            if (!capturedTexture_ || desc.Width != textureWidth_ ||
-                desc.Height != textureHeight_) {
-                lastFrameSizeChangeAt_ = GetTickCount64();
-                textureWidth_ = desc.Width;
-                textureHeight_ = desc.Height;
-                desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                desc.Usage = D3D11_USAGE_DEFAULT;
-                desc.CPUAccessFlags = 0;
-                desc.MiscFlags = 0;
-                capturedView_.Reset();
-                capturedTexture_.Reset();
-                winrt::check_hresult(device_->CreateTexture2D(&desc, nullptr,
-                                                               &capturedTexture_));
-                winrt::check_hresult(device_->CreateShaderResourceView(
-                    capturedTexture_.Get(), nullptr, &capturedView_));
-            }
-            context_->CopyResource(capturedTexture_.Get(), source.Get());
-            frame.Close();
-            if (size.Width > 0 && size.Height > 0 &&
-                (size.Width != frameSize_.Width || size.Height != frameSize_.Height)) {
-                lastFrameSizeChangeAt_ = GetTickCount64();
-                frameSize_ = size;
-                resize = true;
-            }
-        }
-        if (resize) pool_.Recreate(captureDevice_,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, frameSize_);
-        InvalidateRect(window_, nullptr, FALSE);
-    }
-
-    void TryOpenBridge() {
-        if (bridge_ || GetTickCount64() - lastBridgeOpenAttempt_ < 1000) return;
-        lastBridgeOpenAttempt_ = GetTickCount64();
-        HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, mesh_bridge::name);
-        if (!mapping) {
-            DWORD error = GetLastError();
-            if (error != ERROR_FILE_NOT_FOUND && error != lastBridgeOpenError_)
-                Wh_Log(L"GPU mesh bridge open failed: %u", error);
-            lastBridgeOpenError_ = error;
-            return;
-        }
-        lastBridgeOpenError_ = ERROR_SUCCESS;
-        auto* data = static_cast<const mesh_bridge::Data*>(
-            MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(mesh_bridge::Data)));
-        if (!data) {
-            CloseHandle(mapping);
-            return;
-        }
-        bridgeHandle_ = mapping;
-        bridge_ = data;
-    }
-
-    bool BridgeReady() {
-        TryOpenBridge();
-        return bridge_ && bridge_->magic == mesh_bridge::magic &&
-            bridge_->version == mesh_bridge::version &&
-            bridge_->size == sizeof(mesh_bridge::Data);
-    }
-
-    bool ReadPhysics(mesh_bridge::Payload& payload) {
-        if (!BridgeReady()) return false;
-        for (auto const& slot : bridge_->slots) {
-            mesh_bridge::Payload copy{};
-            if (!ReadSlot(slot, copy) ||
-                copy.hwnd != reinterpret_cast<UINT_PTR>(target_)) continue;
-            payload = copy;
-            return true;
-        }
-        return false;
-    }
-
-    bool MakePhysicsBend(Bend& bend, double& translationX,
-                         double& translationY) {
-        mesh_bridge::Payload snapshot{};
-        if (!ReadPhysics(snapshot)) return false;
-        if (!std::isfinite(snapshot.width) || !std::isfinite(snapshot.height) ||
-            snapshot.width < 1 || snapshot.height < 1 ||
-            snapshot.width > 20000 || snapshot.height > 20000)
-            return false;
-        double baseX = 0, baseY = 0, centerX = 0, centerY = 0;
-        for (auto const& point : snapshot.points) {
-            if (!std::isfinite(point.baseX) || !std::isfinite(point.baseY) ||
-                !std::isfinite(point.x) || !std::isfinite(point.y))
-                return false;
-            baseX += point.baseX;
-            baseY += point.baseY;
-            centerX += point.x;
-            centerY += point.y;
-        }
-        baseX /= 16; baseY /= 16;
-        centerX /= 16; centerY /= 16;
-        translationX = centerX - baseX;
-        translationY = centerY - baseY;
-        if (!std::isfinite(translationX) || !std::isfinite(translationY))
-            return false;
-        translationX = std::clamp(translationX, -4096.0, 4096.0);
-        translationY = std::clamp(translationY, -4096.0, 4096.0);
-        double denomX = 0, denomY = 0, xx = 0, xy = 0, yx = 0, yy = 0;
-        for (auto const& point : snapshot.points) {
-            double bx = point.baseX - baseX;
-            double by = point.baseY - baseY;
-            double px = point.x - centerX;
-            double py = point.y - centerY;
-            denomX += bx * bx;
-            denomY += by * by;
-            xx += bx * px;
-            xy += bx * py;
-            yx += by * px;
-            yy += by * py;
-        }
-        if (denomX < 1 || denomY < 1) return false;
-        double m11 = xx / denomX, m12 = xy / denomX;
-        double m21 = yx / denomY, m22 = yy / denomY;
-        for (int i = 0; i < 16; ++i) {
-            auto const& point = snapshot.points[i];
-            double bx = point.baseX - baseX;
-            double by = point.baseY - baseY;
-            double dx = (point.x - centerX) - m11 * bx - m21 * by;
-            double dy = (point.y - centerY) - m12 * bx - m22 * by;
-            bend.controls[i][0] = static_cast<float>(
-                std::clamp(1.8 * dx / snapshot.width, -0.25, 0.25));
-            bend.controls[i][1] = static_cast<float>(
-                std::clamp(-1.8 * dy / snapshot.height, -0.25, 0.25));
-        }
-        return true;
-    }
-
-    void Render() {
-        if (suspended_ || !renderTarget_) return;
-        RefreshCaptureAfterMonitorChange();
-        if (!capturedView_) return;
-        Bend bend{};
-        double translationX = 0.0, translationY = 0.0;
-        bend.options[3] = 8.0f / 9.0f;
-        bridgeActive_ = MakePhysicsBend(bend, translationX, translationY);
-        if (!UpdateOverlayBounds(bridgeActive_ ? translationX : 0.0,
-                                 bridgeActive_ ? translationY : 0.0))
-            return;
-        RECT rect{};
-        GetClientRect(window_, &rect);
-        if (rect.right <= 0 || rect.bottom <= 0) return;
-        context_->UpdateSubresource(bendBuffer_.Get(), 0, nullptr, &bend, 0, 0);
-        D3D11_VIEWPORT viewport{0, 0, static_cast<float>(rect.right),
-                                static_cast<float>(rect.bottom), 0, 1};
-        context_->RSSetViewports(1, &viewport);
-        const float clear[] = {0, 0, 0, 0};
-        context_->ClearRenderTargetView(renderTarget_.Get(), clear);
-        ID3D11RenderTargetView* target = renderTarget_.Get();
-        context_->OMSetRenderTargets(1, &target, nullptr);
-        context_->OMSetBlendState(blendState_.Get(), nullptr, 0xFFFFFFFF);
-        UINT stride = sizeof(Vertex), offset = 0;
-        ID3D11Buffer* vertices = vertexBuffer_.Get();
-        context_->IASetVertexBuffers(0, 1, &vertices, &stride, &offset);
-        context_->IASetIndexBuffer(indexBuffer_.Get(), DXGI_FORMAT_R16_UINT, 0);
-        context_->IASetInputLayout(inputLayout_.Get());
-        context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
-        ID3D11Buffer* constants = bendBuffer_.Get();
-        context_->VSSetConstantBuffers(0, 1, &constants);
-        context_->PSSetShader(pixelShader_.Get(), nullptr, 0);
-        ID3D11ShaderResourceView* image = capturedView_.Get();
-        context_->PSSetShaderResources(0, 1, &image);
-        ID3D11SamplerState* sampler = sampler_.Get();
-        context_->PSSetSamplers(0, 1, &sampler);
-        if (bridgeActive_) context_->DrawIndexed(indexCount_, 0, 0);
-        swapChain_->Present(1, 0);
-        if (bridgeActive_ && !renderedLogged_) {
-            renderedLogged_ = true;
-            Wh_Log(L"GPU mesh first warped frame: HWND=%p vertices=%u indices=%u",
-                   target_, (kGrid + 1) * (kGrid + 1), indexCount_);
-        }
-    }
-
-    HWND target_ = nullptr;
-    GpuRuntime& runtime_;
-    HWND window_ = nullptr;
-    bool failed_ = false;
-    bool suspended_ = false;
-    bool overlayVisible_ = false;
-    RECT overlayBounds_{};
-    RECT frameInsets_{};
-    bool haveFrameInsets_ = false;
-    bool bridgeActive_ = false;
-    bool renderedLogged_ = false;
-    HMONITOR captureMonitor_ = nullptr;
-    HMONITOR pendingMonitor_ = nullptr;
-    ULONGLONG pendingMonitorSince_ = 0;
-    ULONGLONG lastFrameSizeChangeAt_ = 0;
-    HANDLE bridgeHandle_ = nullptr;
-    const mesh_bridge::Data* bridge_ = nullptr;
-    ULONGLONG lastBridgeOpenAttempt_ = 0;
-    DWORD lastBridgeOpenError_ = ERROR_SUCCESS;
-    ComPtr<ID3D11Device> device_;
-    ComPtr<ID3D11DeviceContext> context_;
-    ComPtr<IDXGISwapChain1> swapChain_;
-    ComPtr<IDCompositionDevice> compositionDevice_;
-    ComPtr<IDCompositionTarget> compositionTarget_;
-    ComPtr<IDCompositionVisual> compositionVisual_;
-    ComPtr<ID3D11RenderTargetView> renderTarget_;
-    ComPtr<ID3D11VertexShader> vertexShader_;
-    ComPtr<ID3D11PixelShader> pixelShader_;
-    ComPtr<ID3D11InputLayout> inputLayout_;
-    ComPtr<ID3D11Buffer> vertexBuffer_, indexBuffer_, bendBuffer_;
-    ComPtr<ID3D11SamplerState> sampler_;
-    ComPtr<ID3D11BlendState> blendState_;
-    ComPtr<ID3D11Texture2D> capturedTexture_;
-    ComPtr<ID3D11ShaderResourceView> capturedView_;
-    UINT textureWidth_ = 0, textureHeight_ = 0, indexCount_ = 0;
-    GraphicsCaptureItem item_{nullptr};
-    IDirect3DDevice captureDevice_{nullptr};
-    Direct3D11CaptureFramePool pool_{nullptr};
-    GraphicsCaptureSession session_{nullptr};
-    winrt::event_token frameToken_{};
-    winrt::Windows::Graphics::SizeInt32 frameSize_{};
-};
-
-class BridgeScanner {
-public:
-    ~BridgeScanner() {
-        if (data_) UnmapViewOfFile(data_);
-        if (mapping_) CloseHandle(mapping_);
-    }
-
-    std::vector<HWND> ActiveWindows() {
-        if (!data_) {
-            ULONGLONG now = GetTickCount64();
-            if (now - lastOpenAttempt_ < 1000) return {};
-            lastOpenAttempt_ = now;
-            mapping_ = OpenFileMappingW(FILE_MAP_READ, FALSE, mesh_bridge::name);
-            if (!mapping_) return {};
-            data_ = static_cast<const mesh_bridge::Data*>(MapViewOfFile(
-                mapping_, FILE_MAP_READ, 0, 0, sizeof(mesh_bridge::Data)));
-            if (!data_) {
-                CloseHandle(mapping_);
-                mapping_ = nullptr;
-                return {};
-            }
-        }
-        if (data_->magic != mesh_bridge::magic ||
-            data_->version != mesh_bridge::version ||
-            data_->size != sizeof(mesh_bridge::Data)) return {};
-        std::vector<HWND> windows;
-        windows.reserve(mesh_bridge::slot_count);
-        for (auto const& slot : data_->slots) {
-            mesh_bridge::Payload payload{};
-            if (!ReadSlot(slot, payload)) continue;
-            HWND hwnd = reinterpret_cast<HWND>(static_cast<UINT_PTR>(payload.hwnd));
-            if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd)) continue;
-            DWORD cloaked = 0;
-            DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-            if (!cloaked && std::find(windows.begin(), windows.end(), hwnd) == windows.end())
-                windows.push_back(hwnd);
-        }
-        return windows;
-    }
-
-private:
-    HANDLE mapping_ = nullptr;
-    const mesh_bridge::Data* data_ = nullptr;
-    ULONGLONG lastOpenAttempt_ = 0;
-};
-
-struct ActiveView {
-    std::unique_ptr<Preview> preview;
-    ULONGLONG lastSeen;
-};
-
-int RunIntegrated(HANDLE stopEvent) {
-    GpuRuntime runtime;
-    BridgeScanner scanner;
-    std::unordered_map<HWND, ActiveView> views;
-    std::unordered_map<HWND, ULONGLONG> retryAfter;
-    std::unique_ptr<Preview> cached;
-    HWND cachedHwnd = nullptr;
-    DWORD cachedPid = 0, cachedThread = 0;
-    ULONGLONG cachedSince = 0;
-    HWND lastRaised = nullptr;
-    ULONGLONG lastScan = 0;
-    for (;;) {
-        DWORD wait = MsgWaitForMultipleObjectsEx(
-            1, &stopEvent, 16, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-        if (wait == WAIT_OBJECT_0) return 0;
-        if (wait == WAIT_FAILED) winrt::throw_last_error();
-        MSG msg{};
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) return 0;
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-        ULONGLONG now = GetTickCount64();
-        if (now - lastScan < 16) continue;
-        lastScan = now;
-        if (cached && (now - cachedSince > 10000 || !IsWindow(cachedHwnd)))
-            cached.reset();
-        auto active = scanner.ActiveWindows();
-        for (HWND hwnd : active) {
-            auto existing = views.find(hwnd);
-            if (existing != views.end()) {
-                existing->second.lastSeen = now;
-                continue;
-            }
-            if (now < retryAfter[hwnd]) continue;
-            try {
-                ULONGLONG setupStarted = GetTickCount64();
-                std::unique_ptr<Preview> preview;
-                bool reused = false;
-                DWORD pid = 0;
-                DWORD thread = GetWindowThreadProcessId(hwnd, &pid);
-                if (cached && cachedHwnd == hwnd && cachedPid == pid &&
-                    cachedThread == thread) {
-                    preview = std::move(cached);
-                    try {
-                        preview->ResumeCapture();
-                        reused = true;
-                    } catch (...) {
-                        Wh_Log(L"GPU mesh cached capture failed: HWND=%p; rebuilding", hwnd);
-                        preview.reset();
-                    }
-                }
-                if (!preview) preview = std::make_unique<Preview>(hwnd, runtime);
-                views.emplace(hwnd, ActiveView{std::move(preview), now});
-                retryAfter.erase(hwnd);
-                Wh_Log(L"GPU mesh following HWND=%p activeViews=%zu reused=%d setup=%llums",
-                       hwnd, views.size(), reused, GetTickCount64() - setupStarted);
-            } catch (winrt::hresult_error const& error) {
-                retryAfter[hwnd] = now + 2000;
-                Wh_Log(L"GPU mesh capture start failed HWND=%p HRESULT=0x%08X %s",
-                       hwnd, static_cast<unsigned>(error.code()),
-                       error.message().c_str());
-            } catch (...) {
-                retryAfter[hwnd] = now + 2000;
-                Wh_Log(L"GPU mesh capture start failed HWND=%p", hwnd);
-            }
-        }
-        for (auto it = views.begin(); it != views.end();) {
-            if (it->second.preview->failed() || !IsWindow(it->first)) {
-                if (it->second.preview->failed()) retryAfter[it->first] = now + 2000;
-                it = views.erase(it);
-            } else if (now - it->second.lastSeen > 750) {
-                HWND hwnd = it->first;
-                try {
-                    it->second.preview->SuspendCapture();
-                    cachedThread = GetWindowThreadProcessId(hwnd, &cachedPid);
-                    cachedHwnd = hwnd;
-                    cachedSince = now;
-                    cached = std::move(it->second.preview);
-                    Wh_Log(L"GPU mesh stopped following HWND=%p; resources cached", hwnd);
-                } catch (...) {
-                    Wh_Log(L"GPU mesh capture pause failed: HWND=%p", hwnd);
-                }
-                it = views.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        HWND foreground = GetForegroundWindow();
-        auto front = views.find(foreground);
-        if (front != views.end() && lastRaised != foreground) {
-            SetWindowPos(front->second.preview->window(), HWND_TOPMOST,
-                         0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            lastRaised = foreground;
-        } else if (front == views.end()) lastRaised = nullptr;
-    }
-}
-
-HANDLE g_gpuRendererStop = nullptr;
-HANDLE g_gpuRendererThread = nullptr;
-
-static DWORD WINAPI GpuRendererThreadProc(void*)
-{
-    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    try
-    {
-        struct Apartment {
-            Apartment() { winrt::init_apartment(winrt::apartment_type::multi_threaded); }
-            ~Apartment() { winrt::uninit_apartment(); }
-        } apartment;
-        Wh_Log(L"GPU mesh renderer: started");
-        RunIntegrated(g_gpuRendererStop);
-        Wh_Log(L"GPU mesh renderer: stopped");
-    }
-    catch (const winrt::hresult_error& error)
-    {
-        Wh_Log(L"GPU mesh renderer: failed HRESULT=0x%08X %s",
-               static_cast<unsigned int>(error.code()), error.message().c_str());
-    }
-    catch (const std::exception& error)
-    {
-        Wh_Log(L"GPU mesh renderer: failed %S", error.what());
-    }
-    catch (...)
-    {
-        Wh_Log(L"GPU mesh renderer: unexpected failure");
-    }
-    return 0;
-}
-
-static void StopGpuRenderer()
-{
-    if (g_gpuRendererStop) SetEvent(g_gpuRendererStop);
-    if (g_gpuRendererThread)
-    {
-        DWORD result = WaitForSingleObject(g_gpuRendererThread, 3000);
-        if (result == WAIT_TIMEOUT)
-        {
-            Wh_Log(L"GPU mesh renderer: stop timed out; tool process will exit");
-            return;
-        }
-        CloseHandle(g_gpuRendererThread);
-        g_gpuRendererThread = nullptr;
-    }
-    if (g_gpuRendererStop)
-    {
-        CloseHandle(g_gpuRendererStop);
-        g_gpuRendererStop = nullptr;
-    }
-}
-
-static bool GpuRendererSelected()
-{
-    auto rendererSetting = WindhawkUtils::StringSetting::make(L"Renderer");
-    return std::wcscmp(rendererSetting.get(), L"external-gpu") == 0;
-}
-
-static void UpdateGpuRenderer()
-{
-    if (!GpuRendererSelected())
-    {
-        StopGpuRenderer();
-        return;
-    }
-    if (g_gpuRendererThread &&
-        WaitForSingleObject(g_gpuRendererThread, 0) == WAIT_TIMEOUT)
-        return;
-    StopGpuRenderer();
-    g_gpuRendererStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_gpuRendererStop) return;
-    g_gpuRendererThread = CreateThread(
-        nullptr, 0, GpuRendererThreadProc, nullptr, 0, nullptr);
-    if (!g_gpuRendererThread) StopGpuRenderer();
-}
-
-enum class HostProcess { Dwm, GpuToolLauncher, GpuToolChild };
-HostProcess g_hostProcess = HostProcess::Dwm;
-HANDLE g_gpuToolMutex = nullptr;
-HANDLE g_gpuToolProcess = nullptr;
-
-static bool IsCurrentGpuToolChild(bool* isAnyToolChild)
-{
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (!argv) return false;
-    bool current = false;
-    *isAnyToolChild = false;
-    for (int i = 1; i < argc; ++i)
-    {
-        if (!_wcsicmp(argv[i], L"-service") ||
-            !_wcsicmp(argv[i], L"-service-start") ||
-            !_wcsicmp(argv[i], L"-service-stop"))
-        {
-            *isAnyToolChild = true;
-            break;
-        }
-        if (!_wcsicmp(argv[i], L"-tool-mod"))
-        {
-            *isAnyToolChild = true;
-            current = i + 1 < argc && !_wcsicmp(argv[i + 1], WH_MOD_ID);
-            break;
-        }
-    }
-    LocalFree(argv);
-    return current;
-}
-
-static void WINAPI GpuToolEntryPointHook()
-{
-    ExitThread(0);
-}
-
-static bool HookGpuToolEntryPoint()
-{
-    auto* base = reinterpret_cast<BYTE*>(GetModuleHandleW(nullptr));
-    if (!base) return false;
-    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE ||
-        !nt->OptionalHeader.AddressOfEntryPoint)
-        return false;
-    return Wh_SetFunctionHook(base + nt->OptionalHeader.AddressOfEntryPoint,
-                              reinterpret_cast<void*>(GpuToolEntryPointHook),
-                              nullptr);
-}
-
-static void StartGpuToolProcess()
-{
-    if (!GpuRendererSelected()) return;
-    if (g_gpuToolProcess)
-    {
-        if (WaitForSingleObject(g_gpuToolProcess, 0) == WAIT_TIMEOUT) return;
-        CloseHandle(g_gpuToolProcess);
-        g_gpuToolProcess = nullptr;
-    }
-    wchar_t path[MAX_PATH] = {};
-    DWORD length = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
-    if (!length || length >= ARRAYSIZE(path))
-    {
-        Wh_Log(L"GPU companion launcher: cannot find host executable");
-        return;
-    }
-    std::wstring command = L"\"";
-    command += path;
-    command += L"\" -tool-mod \"";
-    command += WH_MOD_ID;
-    command += L"\"";
-    HMODULE kernel = GetModuleHandleW(L"kernelbase.dll");
-    if (!kernel) kernel = GetModuleHandleW(L"kernel32.dll");
-    using CreateProcessInternalW_t = BOOL (WINAPI*)(
-        HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
-        LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR,
-        LPSTARTUPINFOW, LPPROCESS_INFORMATION, PHANDLE);
-    auto createProcess = kernel ? reinterpret_cast<CreateProcessInternalW_t>(
-        GetProcAddress(kernel, "CreateProcessInternalW")) : nullptr;
-    if (!createProcess)
-    {
-        Wh_Log(L"GPU companion launcher: CreateProcessInternalW unavailable");
-        return;
-    }
-    STARTUPINFOW startup = {};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_FORCEOFFFEEDBACK;
-    PROCESS_INFORMATION process = {};
-    if (!createProcess(nullptr, path, command.data(), nullptr, nullptr,
-                       FALSE, NORMAL_PRIORITY_CLASS, nullptr, nullptr,
-                       &startup, &process, nullptr))
-    {
-        Wh_Log(L"GPU companion launcher: process creation failed error=%u",
-               GetLastError());
-        return;
-    }
-    Wh_Log(L"GPU companion launcher: started PID=%u", process.dwProcessId);
-    CloseHandle(process.hThread);
-    g_gpuToolProcess = process.hProcess;
-}
-
 }  // namespace
 
 BOOL Wh_ModInit()
@@ -10954,35 +9792,6 @@ BOOL Wh_ModInit()
         return FALSE;
     const wchar_t* processName = wcsrchr(processPath, L'\\');
     processName = processName ? processName + 1 : processPath;
-    if (!_wcsicmp(processName, L"windhawk.exe"))
-    {
-        DWORD sessionId = 0;
-        if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessionId) ||
-            sessionId == 0)
-            return FALSE;
-        bool anyToolChild = false;
-        bool thisToolChild = IsCurrentGpuToolChild(&anyToolChild);
-        if (anyToolChild && !thisToolChild) return FALSE;
-        g_hostProcess = thisToolChild ? HostProcess::GpuToolChild
-                                     : HostProcess::GpuToolLauncher;
-        if (!thisToolChild) return TRUE;
-        g_gpuToolMutex = CreateMutexW(
-            nullptr, TRUE, L"Local\\Windhawk.WobblyWindows.GpuTool.v1");
-        if (!g_gpuToolMutex || GetLastError() == ERROR_ALREADY_EXISTS)
-        {
-            Wh_Log(L"GPU companion: another instance is running");
-            ExitProcess(1);
-        }
-        if (!HookGpuToolEntryPoint())
-        {
-            Wh_Log(L"GPU companion: host entry point hook failed");
-            CloseHandle(g_gpuToolMutex);
-            g_gpuToolMutex = nullptr;
-            return FALSE;
-        }
-        Wh_Log(L"GPU companion: dedicated process initialized");
-        return TRUE;
-    }
     if (_wcsicmp(processName, L"dwm.exe")) return FALSE;
     if (HasRecentDwmCrashLoop())
     {
@@ -10993,9 +9802,6 @@ BOOL Wh_ModInit()
     g_unloading.store(false, std::memory_order_release);
     g_nativeMeshLastAttemptHwnd = nullptr;
     g_nativeMeshLastAttemptAt = 0;
-    g_nativeMeshTopologyHwnd = nullptr;
-    g_nativeMeshTopologyRoot = nullptr;
-    g_nativeMeshTopologyAt = 0;
     g_nativeMeshActive.store(false, std::memory_order_release);
     g_nativeMeshStopRequested.store(false, std::memory_order_release);
     g_nativeMeshHwnd.store(nullptr, std::memory_order_release);
@@ -11041,12 +9847,10 @@ BOOL Wh_ModInit()
     Wh_Log(L"Initializing version " WH_MOD_VERSION);
     InitializeDpiSupport();
     LoadSettings();
-    InitializeMeshBridge();
     if (!InitializeDwmHooks())
     {
         Wh_Log(L"Failed to initialize DWM hooks");
         UninitializeDpiSupport();
-        CloseMeshBridge();
         return FALSE;
     }
     InitializeCoreMaterialDiagnostics();
@@ -11055,7 +9859,6 @@ BOOL Wh_ModInit()
         Wh_Log(L"Failed to initialize event thread");
         StopWindowEventThread();
         UninitializeDpiSupport();
-        CloseMeshBridge();
         return FALSE;
     }
     Wh_Log(L"Initialized successfully");
@@ -11064,16 +9867,6 @@ BOOL Wh_ModInit()
 
 void Wh_ModAfterInit()
 {
-    if (g_hostProcess == HostProcess::GpuToolLauncher)
-    {
-        StartGpuToolProcess();
-        return;
-    }
-    if (g_hostProcess == HostProcess::GpuToolChild)
-    {
-        UpdateGpuRenderer();
-        return;
-    }
     // Windhawk activates detours after Wh_ModInit returns. Queue the first
     // scene pass only now so already-open windows cannot miss the wake.
     QueueExistingWindowBackfill();
@@ -11081,55 +9874,15 @@ void Wh_ModAfterInit()
 
 void Wh_ModSettingsChanged()
 {
-    if (g_hostProcess == HostProcess::GpuToolLauncher)
-    {
-        StartGpuToolProcess();
-        return;
-    }
-    if (g_hostProcess == HostProcess::GpuToolChild)
-    {
-        UpdateGpuRenderer();
-        if (!GpuRendererSelected())
-            ExitProcess(0);
-        return;
-    }
     Wh_Log(L"Settings changed");
     LoadSettings();
-    InitializeMeshBridge();
 }
 
 void Wh_ModBeforeUninit()
 {
-    if (g_hostProcess == HostProcess::GpuToolLauncher)
-    {
-        if (g_gpuToolProcess)
-        {
-            CloseHandle(g_gpuToolProcess);
-            g_gpuToolProcess = nullptr;
-        }
-        return;
-    }
-    if (g_hostProcess == HostProcess::GpuToolChild)
-    {
-        StopGpuRenderer();
-        return;
-    }
     g_unloading.store(true, std::memory_order_release);
     Wh_Log(L"Preparing to unload");
     // Restore scene resources before Windhawk removes the hooks.
     StopWindowEventThread();
-    CloseMeshBridge();
     UninitializeDpiSupport();
 }
-
-void Wh_ModUninit()
-{
-    if (g_hostProcess != HostProcess::GpuToolChild) return;
-    if (g_gpuToolMutex)
-    {
-        CloseHandle(g_gpuToolMutex);
-        g_gpuToolMutex = nullptr;
-    }
-    ExitProcess(0);
-}
-
