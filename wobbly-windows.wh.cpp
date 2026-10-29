@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.321
+// @version         0.322
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -526,11 +526,16 @@ std::atomic_bool g_nativeMeshStopRequested = false;
 std::atomic<HWND> g_nativeMeshHwnd = nullptr;
 enum class NativeSourceProbeMode : unsigned char { None, Flat, PaddedFlat, CapturedFlat };
 std::atomic<NativeSourceProbeMode> g_nativeSourceProbeMode = NativeSourceProbeMode::None;
-using NativeCapturedWindowCreate_t = long(__cdecl*)(HWND, void**);
+using NativeCapturedRepresentationCreate_t = long(__cdecl*)(unsigned, const void*, void*, unsigned, int, void**);
+using NativeCapturedRepresentationMethod_t = long(__cdecl*)(void*);
 using NativeVisualSetOpacity_t = void(__cdecl*)(void*, double);
-NativeCapturedWindowCreate_t g_nativeCapturedWindowCreate = nullptr;
+NativeCapturedRepresentationCreate_t g_nativeCapturedRepresentationCreate = nullptr;
+NativeCapturedRepresentationMethod_t g_nativeCapturedRepresentationEnsureRoot = nullptr;
+NativeCapturedRepresentationMethod_t g_nativeCapturedRepresentationValidate = nullptr;
 NativeVisualSetOpacity_t g_nativeVisualSetOpacity = nullptr;
-void* g_nativeCapturedWindowVtable = nullptr;
+void* g_nativeCapturedRepresentationVtable = nullptr;
+// Native listener interface with three verified no-op callbacks.
+void* g_nativeCaptureListenerVtable = nullptr;
 void* g_nativeCaptureCriticalSection = nullptr;
 bool g_nativeCapturedSourceReady = false;
 std::atomic_bool g_nativeOriginalHideProbe = false;
@@ -546,7 +551,7 @@ struct NativeMeshState
     void* transform = nullptr;
     void* sourceProxy = nullptr;
     void* imageSourceProxy = nullptr;
-    void* capturedWindow = nullptr;
+    void* capturedRepresentation = nullptr;
     void* sourceOwner = nullptr;
     ULONGLONG attachedAt = 0;
     ULONGLONG hideUntil = 0;
@@ -2933,11 +2938,19 @@ static bool InitializeDwmHooks()
            L"class CCachedVisualImageProxy>("
            L"class CCachedVisualImageProxy * *)"},
          &g_nativeProbeCreateImage, nullptr, true},
-        {{L"public: static long __cdecl CapturedWindowSWRVisual::Create("
-           L"struct HWND__ *,class CapturedWindowSWRVisual * *)"},
-         &g_nativeCapturedWindowCreate, nullptr, true},
-        {{L"const CapturedWindowSWRVisual::`vftable'{for `CBaseObject'}"},
-         &g_nativeCapturedWindowVtable, nullptr, true},
+        {{L"public: static long __cdecl CSecondaryWindowRepresentation::Create("
+           L"struct TMILFlagsEnum<enum SWRUsage::FlagsEnum>,"
+           L"struct ISecondaryWindowRepresentationChangedListener *,class CWindowData *,"
+           L"unsigned int,enum DEVICE_SCALE_FACTOR,class CSecondaryWindowRepresentation * *)"},
+         &g_nativeCapturedRepresentationCreate, nullptr, true},
+        {{L"public: long __cdecl CSecondaryWindowRepresentation::EnsureOwnedWindowVisual(void)"},
+         &g_nativeCapturedRepresentationEnsureRoot, nullptr, true},
+        {{L"public: long __cdecl CSecondaryWindowRepresentation::Validate(void)"},
+         &g_nativeCapturedRepresentationValidate, nullptr, true},
+        {{L"const CSecondaryWindowRepresentation::`vftable'{for `CBaseObject'}"},
+         &g_nativeCapturedRepresentationVtable, nullptr, true},
+        {{L"const CSWRListener::`vftable'{for `ISecondaryWindowRepresentationChangedListener'}"},
+         &g_nativeCaptureListenerVtable, nullptr, true},
         {{L"public: static class CDwmCS CDesktopManager::s_csDwmInstance"},
          &g_nativeCaptureCriticalSection, nullptr, true},
         {{L"public: virtual void __cdecl CVisual::SetOpacity(double)"},
@@ -3127,7 +3140,9 @@ static bool InitializeDwmHooks()
     keepValid(g_desktopManagerPostStartAnimations);
     keepValid(g_cBaseObjectRelease);
     keepValid(g_nativeProbeCreateImage);
-    keepValid(g_nativeCapturedWindowCreate);
+    keepValid(g_nativeCapturedRepresentationCreate);
+    keepValid(g_nativeCapturedRepresentationEnsureRoot);
+    keepValid(g_nativeCapturedRepresentationValidate);
     keepValid(g_nativeVisualSetOpacity);
     keepValid(g_nativeProbeUpdateImageD);
     keepValid(g_nativeProbeUpdateImageF);
@@ -3192,14 +3207,29 @@ static bool InitializeDwmHooks()
     const auto nativeBase = reinterpret_cast<uintptr_t>(g_dwmModuleLayout.imageBegin);
     g_nativeCapturedSourceReady =
         g_dwmModuleLayout.timeDateStamp == 0xE19C3234 && g_dwmModuleLayout.sizeOfImage == 0x16A000 &&
-        reinterpret_cast<uintptr_t>(g_nativeCapturedWindowCreate) == nativeBase + 0xD00AC &&
-        reinterpret_cast<uintptr_t>(g_nativeCapturedWindowVtable) == nativeBase + 0x117BD0 &&
+        reinterpret_cast<uintptr_t>(g_nativeCapturedRepresentationCreate) == nativeBase + 0x33C30 &&
+        reinterpret_cast<uintptr_t>(g_nativeCapturedRepresentationEnsureRoot) == nativeBase + 0x4D13C &&
+        reinterpret_cast<uintptr_t>(g_nativeCapturedRepresentationValidate) == nativeBase + 0x33F2C &&
+        reinterpret_cast<uintptr_t>(g_nativeCapturedRepresentationVtable) == nativeBase + 0x113CD0 &&
+        reinterpret_cast<uintptr_t>(g_nativeCaptureListenerVtable) == nativeBase + 0x112310 &&
         reinterpret_cast<uintptr_t>(g_nativeCaptureCriticalSection) == nativeBase + 0x14BE80 &&
         IsReadableMemory(g_nativeCaptureCriticalSection, sizeof(CRITICAL_SECTION)) &&
-        IsDwmImageAddress(g_nativeCapturedWindowVtable, sizeof(void*));
+        IsDwmImageAddress(g_nativeCapturedRepresentationVtable, sizeof(void*)) &&
+        IsDwmImageAddress(g_nativeCaptureListenerVtable, sizeof(void*) * 3);
+    if (g_nativeCapturedSourceReady)
+    {
+        const uintptr_t callbacks[] = {0x59100, 0x590C0, 0x590B0};
+        for (unsigned i = 0; i < ARRAYSIZE(callbacks); ++i)
+        {
+            const auto* callback = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin) + callbacks[i];
+            if (static_cast<void**>(g_nativeCaptureListenerVtable)[i] != callback ||
+                !IsDwmImageAddress(callback, 3) || callback[0] != 0xC2 || callback[1] || callback[2])
+                g_nativeCapturedSourceReady = false;
+        }
+    }
     if (reinterpret_cast<uintptr_t>(g_nativeVisualSetOpacity) != nativeBase + 0x41F60)
         g_nativeVisualSetOpacity = nullptr;
-    Wh_Log(L"NATIVE CAPTURE SOURCE: wrapper=%s hideProbe=%s",
+    Wh_Log(L"NATIVE CAPTURE SOURCE: ownedRepresentation=%s hideProbe=%s",
            g_nativeCapturedSourceReady ? L"available" : L"unavailable",
            g_nativeCapturedSourceReady && g_nativeVisualSetOpacity ? L"available" : L"unavailable");
     Wh_Log(L"NATIVE MESH SOURCE: create=%d update=%s imageVtable=%p",
@@ -4312,16 +4342,14 @@ private:
 
 // Callers hold the production capture critical section while using this
 // borrowed root/proxy. No lock is acquired by a guessed internal ABI call.
-static void* GetNativeCapturedSource(void* capturedWindow, void** visual = nullptr)
+static void* GetNativeCapturedSource(void* capturedRepresentation, void** visual = nullptr)
 {
     if (visual) *visual = nullptr;
     if (!g_nativeCapturedSourceReady ||
-        ReadPointerMember(capturedWindow, 0) != g_nativeCapturedWindowVtable)
+        ReadPointerMember(capturedRepresentation, 0) != g_nativeCapturedRepresentationVtable ||
+        !ReadPointerMember(capturedRepresentation, 0x20))
         return nullptr;
-    // This is the same chain used by _GetCapturedItemRootVisual, not a cast
-    // from a dwmcore image or a guessed conversion between proxy interfaces.
-    void* representation = ReadPointerMember(capturedWindow, 0x18);
-    void* root = ReadPointerMember(representation, 0x30);
+    void* root = ReadPointerMember(capturedRepresentation, 0x30);
     if (!NativeVisualVtableRva(root)) return nullptr;
     if (visual) *visual = root;
     void* proxy = ReadPointerMember(root, 0x10);
@@ -4329,10 +4357,53 @@ static void* GetNativeCapturedSource(void* capturedWindow, void** visual = nullp
     return proxy;
 }
 
-static bool IsNativeCapturedSourceSeparate(void* capturedWindow, void* original)
+static void ReleaseNativeCapturedSource(void* representation)
+{
+    void* listener = ReadPointerMember(representation, 0xA8);
+    const bool ownedListener = listener &&
+        ReadPointerMember(listener, 0) == g_nativeCaptureListenerVtable;
+    const unsigned long references = g_cBaseObjectRelease(representation);
+    // Native callbacks must remain valid even if another native owner retains
+    // this experimental source. The tiny heap record never points into mod code.
+    if (ownedListener && !references) HeapFree(GetProcessHeap(), 0, listener);
+}
+
+static long CreateNativeCapturedSource(void* windowData, void** representation,
+                                      const wchar_t*& stage)
+{
+    *representation = nullptr;
+    stage = L"Compatibility";
+    if (!g_nativeCapturedSourceReady || !windowData) return E_NOTIMPL;
+    // Same usage/scale as CapturedWindowSWRVisual. Its normal-window root is
+    // initially null; explicitly build and validate the owned native subtree.
+    auto* listener = static_cast<void**>(HeapAlloc(GetProcessHeap(), 0, sizeof(void*)));
+    if (!listener) return E_OUTOFMEMORY;
+    *listener = g_nativeCaptureListenerVtable;
+    stage = L"CreateRepresentation";
+    long result = g_nativeCapturedRepresentationCreate(
+        0xA0, listener, windowData, 0, 100, representation);
+    if (result < 0 || !*representation)
+    {
+        HeapFree(GetProcessHeap(), 0, listener);
+        return result < 0 ? result : E_UNEXPECTED;
+    }
+    if (ReadPointerMember(*representation, 0) != g_nativeCapturedRepresentationVtable ||
+        ReadPointerMember(*representation, 0x20) != windowData)
+        return E_UNEXPECTED;
+    stage = L"EnsureOwnedRoot";
+    result = g_nativeCapturedRepresentationEnsureRoot(*representation);
+    if (result < 0) return result;
+    stage = L"ValidateRepresentation";
+    result = g_nativeCapturedRepresentationValidate(*representation);
+    if (result < 0) return result;
+    stage = L"ResolveSource";
+    return GetNativeCapturedSource(*representation) ? S_OK : E_NOINTERFACE;
+}
+
+static bool IsNativeCapturedSourceSeparate(void* capturedRepresentation, void* original)
 {
     void* root = nullptr;
-    if (!GetNativeCapturedSource(capturedWindow, &root)) return false;
+    if (!GetNativeCapturedSource(capturedRepresentation, &root)) return false;
     auto separatePath = [](void* node, void* forbidden)
     {
         void* visited[16] = {};
@@ -4382,7 +4453,7 @@ static void MaintainNativeOriginalHide(NativeMeshState& state)
             RestoreNativeOriginal(state);
         return;
     }
-    if (!state.capturedWindow || state.hideProbeAttempted ||
+    if (!state.capturedRepresentation || state.hideProbeAttempted ||
         !g_nativeOriginalHideProbe.load(std::memory_order_acquire))
     {
         g_nativeOriginalHideWakeUntil.store(0, std::memory_order_release);
@@ -4390,7 +4461,7 @@ static void MaintainNativeOriginalHide(NativeMeshState& state)
     }
     if (now - state.attachedAt < 1000) return;
     state.hideProbeAttempted = true;
-    if (!held || !g_nativeVisualSetOpacity || !IsNativeCapturedSourceSeparate(state.capturedWindow, state.root) ||
+    if (!held || !g_nativeVisualSetOpacity || !IsNativeCapturedSourceSeparate(state.capturedRepresentation, state.root) ||
         !ReadNativeOpacity(state.root, state.originalOpacity) || state.originalOpacity != 1.0)
     {
         g_nativeOriginalHideWakeUntil.store(0, std::memory_order_release);
@@ -4401,7 +4472,7 @@ static void MaintainNativeOriginalHide(NativeMeshState& state)
     state.hideUntil = now + 750;
     g_nativeOriginalHideWakeUntil.store(state.hideUntil, std::memory_order_release);
     g_nativeVisualSetOpacity(state.root, 0.0);
-    Wh_Log(L"NATIVE ORIGINAL HIDE ACTIVE: HWND=%p durationMs=750 source=CapturedWindowSWR", state.hwnd);
+    Wh_Log(L"NATIVE ORIGINAL HIDE ACTIVE: HWND=%p durationMs=750 source=OwnedRepresentation", state.hwnd);
 }
 // Native capture source end.
 
@@ -4415,7 +4486,7 @@ static void ReleaseNativeMeshState(NativeMeshState& state)
     if (state.group) g_cBaseObjectRelease(state.group);
     if (state.mesh) g_cBaseObjectRelease(state.mesh);
     if (state.image) g_cBaseObjectRelease(state.image);
-    if (state.capturedWindow) g_cBaseObjectRelease(state.capturedWindow);
+    if (state.capturedRepresentation) ReleaseNativeCapturedSource(state.capturedRepresentation);
     if (state.root) g_cBaseObjectRelease(state.root);
     state = {};
 }
@@ -4438,7 +4509,7 @@ static void InvalidateAnimationTransformForNativeMesh(HWND hwnd)
 static bool DetachNativeMesh(const wchar_t* reason)
 {
     auto& state = g_nativeMeshState;
-    NativeCaptureGuard captureGuard(state.capturedWindow != nullptr);
+    NativeCaptureGuard captureGuard(state.capturedRepresentation != nullptr);
     if (!captureGuard.acquired()) { RequestDwmScenePass(); return false; }
     RestoreNativeOriginal(state);
     if (!state.visual)
@@ -4778,7 +4849,7 @@ static void MaintainNativeMesh()
         !g_nativeMeshActive.load(std::memory_order_acquire))
         return;
     auto& state = g_nativeMeshState;
-    NativeCaptureGuard captureGuard(state.capturedWindow != nullptr);
+    NativeCaptureGuard captureGuard(state.capturedRepresentation != nullptr);
     if (!captureGuard.acquired()) return;
     if (g_unloading.load(std::memory_order_acquire) ||
         g_nativeMeshStopRequested.load(std::memory_order_acquire))
@@ -4792,8 +4863,23 @@ static void MaintainNativeMesh()
     int height = 0;
     bool sourceValid = state.root &&
         g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy;
-    if (sourceValid && state.capturedWindow)
-        sourceValid = GetNativeCapturedSource(state.capturedWindow) == state.imageSourceProxy;
+    if (sourceValid && state.capturedRepresentation)
+    {
+        // The native WindowData listener clears its source on destruction.
+        void* windowData = ReadPointerMember(state.capturedRepresentation, 0x20);
+        sourceValid = windowData && GetHwndFromWindowData(windowData) == state.hwnd;
+        unsigned dirty = 0;
+        const auto* flags = static_cast<const BYTE*>(state.capturedRepresentation) + 0x18;
+        if (sourceValid && IsReadableMemory(flags, sizeof(dirty)))
+        {
+            std::memcpy(&dirty, flags, sizeof(dirty));
+            if (dirty & 0x1F)
+                sourceValid = g_nativeCapturedRepresentationValidate(state.capturedRepresentation) >= 0;
+        }
+        else sourceValid = false;
+        sourceValid = sourceValid &&
+            GetNativeCapturedSource(state.capturedRepresentation) == state.imageSourceProxy;
+    }
     if (sourceValid && state.backdropSource)
     {
         sourceValid = ReadPointerMember(state.root, 0x18) == state.sourceOwner &&
@@ -4881,7 +4967,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
                                      void*& image, void*& group,
                                      void*& instruction, void*& mesh,
                                      int width, int height, int sourcePadding,
-                                     void*& capturedWindow, void* imageSourceProxy)
+                                     void*& capturedRepresentation, void* imageSourceProxy)
 {
     AcquireSRWLockShared(&g_settingsLock);
     bool meshSelected = g_settings.rendererMode == RendererMode::Mesh;
@@ -4953,7 +5039,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
         stage = L"ValidateSibling";
         if (!IsWindow(hwnd) || !HasAttachableNativeMeshSlot(hwnd) ||
             FindNativeMeshSiblingCollection(root) != collection ||
-            (capturedWindow && GetNativeCapturedSource(capturedWindow) != imageSourceProxy) ||
+            (capturedRepresentation && GetNativeCapturedSource(capturedRepresentation) != imageSourceProxy) ||
             !IsNativeMeshSourceCurrent(topLevelWindow, root, sourceProxy, backdropSource))
             result = E_UNEXPECTED;
     }
@@ -4970,7 +5056,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
         stage = L"VerifySibling";
         if (ReadPointerMember(pending.visual, 0x18) !=
                 ReadPointerMember(root, 0x18) ||
-            (capturedWindow && GetNativeCapturedSource(capturedWindow) != imageSourceProxy) ||
+            (capturedRepresentation && GetNativeCapturedSource(capturedRepresentation) != imageSourceProxy) ||
             FindNativeMeshSiblingCollection(root) != collection)
             result = E_UNEXPECTED;
     }
@@ -4985,8 +5071,8 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     }
     if (result >= 0 && inserted)
     {
-        pending.capturedWindow = capturedWindow;
-        capturedWindow = nullptr;
+        pending.capturedRepresentation = capturedRepresentation;
+        capturedRepresentation = nullptr;
         pending.attachedAt = GetTickCount64();
         pending.image = image;
         pending.group = group;
@@ -4996,7 +5082,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
         g_nativeMeshState = pending;
         g_nativeMeshHwnd.store(hwnd, std::memory_order_release);
         g_nativeMeshActive.store(true, std::memory_order_release);
-        if (pending.capturedWindow && g_nativeOriginalHideProbe.load(std::memory_order_acquire))
+        if (pending.capturedRepresentation && g_nativeOriginalHideProbe.load(std::memory_order_acquire))
         {
             g_nativeOriginalHideWakeUntil.store(pending.attachedAt + 1000, std::memory_order_release);
             PostThreadMessageW(g_eventThreadMessageTarget.load(std::memory_order_acquire), WM_NULL, 0, 0);
@@ -5015,8 +5101,8 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
            static_cast<unsigned>(result), inserted);
     if (inserted)
     {
-        pending.capturedWindow = capturedWindow;
-        capturedWindow = nullptr;
+        pending.capturedRepresentation = capturedRepresentation;
+        capturedRepresentation = nullptr;
         pending.image = image;
         pending.group = group;
         pending.mesh = mesh;
@@ -5039,7 +5125,7 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
                                       void* compositor,
                                       void*& image, int width, int height,
                                       bool flatSourceProbe, int sourcePadding,
-                                      void*& capturedWindow, void* imageSourceProxy)
+                                      void*& capturedRepresentation, void* imageSourceProxy)
 {
     // Exact 23H2 ABI only. The instruction stores base-object references and
     // serializes resource IDs; the core DrawMesh2D path consumes CImageSource.
@@ -5074,7 +5160,7 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
             TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy,
                                 backdropSource, true, compositor, image, group,
                                 instruction, mesh, width, height, sourcePadding,
-                                capturedWindow, imageSourceProxy);
+                                capturedRepresentation, imageSourceProxy);
         }
         if (instruction) g_cBaseObjectRelease(instruction);
         return;
@@ -5145,7 +5231,7 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
                                      backdropSource, false,
                                      compositor, image, group, instruction,
                                      mesh, width, height, sourcePadding,
-                                     capturedWindow, imageSourceProxy))
+                                     capturedRepresentation, imageSourceProxy))
         {
             Wh_Log(L"NATIVE VERTEX MESH: attached HWND=%p "
                    L"physicsLinked=1 liveSource=1 original=%s", hwnd,
@@ -5157,7 +5243,7 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
     if (mesh) g_cBaseObjectRelease(mesh);
 }
 
-static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
+static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWindow,
                                  void* sourceVisualProxy)
 {
     if (!IsOnDwmSceneThread() || !IsVisualProxyPointerValid(sourceVisualProxy) ||
@@ -5174,9 +5260,12 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
         return;
     if (!HasAttachableNativeMeshSlot(hwnd))
         return;
+    NativeSourceProbeMode probeMode =
+        g_nativeSourceProbeMode.load(std::memory_order_acquire);
     ULONGLONG now = GetTickCount64();
     if (g_nativeMeshLastAttemptHwnd == hwnd &&
-        now - g_nativeMeshLastAttemptAt < 250)
+        now - g_nativeMeshLastAttemptAt <
+            (probeMode == NativeSourceProbeMode::CapturedFlat ? 3000 : 250))
         return;
     g_nativeMeshLastAttemptHwnd = hwnd;
     g_nativeMeshLastAttemptAt = now;
@@ -5225,35 +5314,34 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
     {
         return;
     }
-    NativeSourceProbeMode probeMode =
-        g_nativeSourceProbeMode.load(std::memory_order_acquire);
     NativeCaptureGuard captureGuard(probeMode == NativeSourceProbeMode::CapturedFlat);
     if (!captureGuard.acquired()) return;
     bool flatSourceProbe = probeMode != NativeSourceProbeMode::None;
     int sourcePadding = probeMode == NativeSourceProbeMode::Flat ? 0 : 64;
-    void* capturedWindow = nullptr;
+    void* capturedRepresentation = nullptr;
     void* imageSourceProxy = sourceVisualProxy;
     if (probeMode == NativeSourceProbeMode::CapturedFlat)
     {
-        if (!g_nativeCapturedSourceReady ||
+        if (!g_nativeCapturedSourceReady || !windowData || GetHwndFromWindowData(windowData) != hwnd ||
             !IsDwmObjectPointerValid(g_desktopManager.load(std::memory_order_acquire), g_desktopManagerVtable))
         {
             Wh_Log(L"NATIVE CAPTURE SOURCE FAILED: HWND=%p stage=Compatibility", hwnd);
             return;
         }
-        const long result = g_nativeCapturedWindowCreate(hwnd, &capturedWindow);
-        imageSourceProxy = result >= 0 ? GetNativeCapturedSource(capturedWindow) : nullptr;
+        const wchar_t* stage = nullptr;
+        const long result = CreateNativeCapturedSource(windowData, &capturedRepresentation, stage);
+        imageSourceProxy = result >= 0 ? GetNativeCapturedSource(capturedRepresentation) : nullptr;
         void* capturedRoot = nullptr;
-        GetNativeCapturedSource(capturedWindow, &capturedRoot);
-        Wh_Log(L"NATIVE CAPTURE SOURCE CREATED: HWND=%p result=0x%08X wrapper=%p root=%p "
-               L"proxy=%p hostRoot=%p separate=%d rootVtableRva=0x%zx proxyVtableRva=0x%zx", hwnd, static_cast<unsigned>(result),
-               capturedWindow, capturedRoot, imageSourceProxy, sourceRoot,
-               capturedWindow && IsNativeCapturedSourceSeparate(capturedWindow, sourceRoot),
+        GetNativeCapturedSource(capturedRepresentation, &capturedRoot);
+        Wh_Log(L"NATIVE CAPTURE SOURCE RESULT: HWND=%p stage=%s result=0x%08X representation=%p root=%p "
+               L"proxy=%p hostRoot=%p separate=%d rootVtableRva=0x%zx proxyVtableRva=0x%zx", hwnd, stage, static_cast<unsigned>(result),
+               capturedRepresentation, capturedRoot, imageSourceProxy, sourceRoot,
+               capturedRepresentation && IsNativeCapturedSourceSeparate(capturedRepresentation, sourceRoot),
                NativeVisualVtableRva(capturedRoot),
                NativeVisualVtableRva(ReadPointerMember(capturedRoot, 0x10)));
         if (result < 0 || !imageSourceProxy)
         {
-            if (capturedWindow) g_cBaseObjectRelease(capturedWindow);
+            if (capturedRepresentation) ReleaseNativeCapturedSource(capturedRepresentation);
             return;
         }
     }
@@ -5309,7 +5397,7 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
         CreateVisibleNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceVisualProxy,
                                   backdropSource,
                                   compositor, image, width, height,
-                                  flatSourceProbe, sourcePadding, capturedWindow, imageSourceProxy);
+                                  flatSourceProbe, sourcePadding, capturedRepresentation, imageSourceProxy);
     }
     if (validationInstruction && validationResult >= 0 &&
         IsReadableMemory(validationInstruction, sizeof(void*)) &&
@@ -5323,7 +5411,7 @@ static void CreateNativeMeshSource(HWND hwnd, void* topLevelWindow,
         ClearCoreMaterialTarget();
         g_cBaseObjectRelease(image);
     }
-    if (capturedWindow) g_cBaseObjectRelease(capturedWindow);
+    if (capturedRepresentation) ReleaseNativeCapturedSource(capturedRepresentation);
 }
 
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
@@ -5436,7 +5524,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         if (topLevelVisualProxy &&
             !g_nativeMeshActive.load(std::memory_order_acquire))
         {
-            CreateNativeMeshSource(hwnd, topLevelWindow, topLevelVisualProxy);
+            CreateNativeMeshSource(hwnd, windowData, topLevelWindow, topLevelVisualProxy);
         }
         bool topLevelBindingAttempted =
             topLevelVisualProxy &&
