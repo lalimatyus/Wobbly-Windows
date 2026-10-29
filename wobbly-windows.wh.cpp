@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.324
+// @version         0.325
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3555,6 +3555,8 @@ CoreFindTreeData_t g_coreFindTreeDataFunction = nullptr;
 CoreCurrentVisual_t g_coreCurrentVisualFunction = nullptr;
 void* g_coreBackdropImageVtable = nullptr;
 bool g_coreBackdropDetailReady = false;
+void* g_coreDesktopTreeVtable = nullptr, *g_coreVisualTreeVtable = nullptr, *g_coreSubVisualTreeVtable = nullptr;
+bool g_coreBackdropSceneReady = false;
 CoreCachedTreatment_t g_coreCachedTreatmentFunction = nullptr, g_coreCachedTreatmentOriginal = nullptr;
 CoreCachedTreatment_t g_coreTreatmentFunction = nullptr;
 CoreCachedTreatment_t g_coreMaterialBitmapFunction = nullptr;
@@ -3732,6 +3734,50 @@ static long __cdecl CoreImageUpdateHook(void* image, void* table, const void* co
 
 static bool IsCoreMaterialVisual(const void* visual);
 
+struct CoreBackdropSceneSnapshot
+{
+    const wchar_t* treeKind = L"unknown";
+    void* firstVisual = nullptr;
+    void* lastVisual = nullptr;
+    void* treeRoot = nullptr;
+    bool frameKnown = false;
+    std::uint64_t currentFrame = 0, lastUsedFrame = 0, frameAge = UINT64_MAX;
+    int effectReady = -1; // Raw native CanUseAsEffectInput gate, not proof of blurred pixels.
+};
+
+static CoreBackdropSceneSnapshot ReadCoreBackdropScene(void* data, void* image,
+                                                       uintptr_t first, uintptr_t last)
+{
+    CoreBackdropSceneSnapshot scene;
+    if (!g_coreBackdropSceneReady) return scene;
+    scene.firstVisual = ReadPointerMember(reinterpret_cast<void*>(first), 0);
+    scene.lastVisual = ReadPointerMember(reinterpret_cast<void*>(last - 16), 0);
+    void* tree = ReadPointerMember(reinterpret_cast<void*>(first + 8), 0);
+    void* vtable = ReadPointerMember(tree, 0);
+    if (vtable && (vtable == g_coreDesktopTreeVtable || vtable == g_coreVisualTreeVtable ||
+                   vtable == g_coreSubVisualTreeVtable))
+    {
+        scene.treeKind = vtable == g_coreDesktopTreeVtable ? L"desktop" :
+                         vtable == g_coreSubVisualTreeVtable ? L"subtree" : L"visual";
+        scene.treeRoot = ReadPointerMember(tree, 0x40);
+    }
+    // Native GetBackdropVisualImage stamps +7C0 from CTreeData's composition
+    // frame. Read that counter here without calling the mutating getter.
+    if (IsReadableMemory(static_cast<const BYTE*>(image) + 0x7A0, 1))
+        scene.effectReady = *(static_cast<const BYTE*>(image) + 0x7A0);
+    void* composition = ReadPointerMember(ReadPointerMember(data, 0x108), 0x10);
+    if (composition && IsReadableMemory(static_cast<const BYTE*>(composition) + 0x1F0, 8) &&
+        IsReadableMemory(static_cast<const BYTE*>(image) + 0x7C0, 8))
+    {
+        std::memcpy(&scene.currentFrame, static_cast<const BYTE*>(composition) + 0x1F0, 8);
+        std::memcpy(&scene.lastUsedFrame, static_cast<const BYTE*>(image) + 0x7C0, 8);
+        scene.frameKnown = true;
+        if (scene.lastUsedFrame <= scene.currentFrame)
+            scene.frameAge = scene.currentFrame - scene.lastUsedFrame;
+    }
+    return scene;
+}
+
 struct CoreBackdropSnapshot
 {
     bool valid = false;
@@ -3743,7 +3789,11 @@ struct CoreBackdropSnapshot
     void* root = nullptr;
     unsigned tables = 0, alternateCount = 0;
     bool incomplete = false;
-    struct Alternate { void* image; void* root; void* tree; unsigned pathPairs; } alternates[4] = {};
+    CoreBackdropSceneSnapshot scene;
+    struct Alternate {
+        void* image; void* root; void* tree; unsigned pathPairs;
+        CoreBackdropSceneSnapshot scene;
+    } alternates[4] = {};
 };
 
 static bool ReadCoreBackdropRegistry(void* data, void**& images, unsigned& count)
@@ -3784,7 +3834,7 @@ static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapsho
             if (hit.alternateCount == ARRAYSIZE(hit.alternates)) { hit.incomplete = true; continue; }
             hit.alternates[hit.alternateCount++] = {
                 image, root, ReadPointerMember(reinterpret_cast<void*>(first + 8), 0),
-                static_cast<unsigned>((last - first) / 16)};
+                static_cast<unsigned>((last - first) / 16), ReadCoreBackdropScene(data, image, first, last)};
         }
     };
     collect(currentData);
@@ -3861,6 +3911,7 @@ static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context)
             continue;
         hit.image = image;
         hit.root = ReadPointerMember(image, 0x90);
+        hit.scene = ReadCoreBackdropScene(data, image, imageBegin, imageEnd);
         break;
     }
     CollectCoreBackdropAlternates(data, hit);
@@ -4102,6 +4153,19 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
                        L"pathTree=%p pathPairs=%u readOnly=1", hwnd, i, candidate.image,
                        candidate.root, candidate.tree, candidate.pathPairs);
             }
+            auto logScene = [&](int index, const CoreBackdropSceneSnapshot& scene)
+            {
+                Wh_Log(L"MESH ACRYLIC SCENE: HWND=%p index=%d treeKind=%s treeRoot=%p "
+                       L"firstVisual=%p lastVisual=%p frameKnown=%d currentFrame=%llu lastUsedFrame=%llu "
+                       L"frameAge=%llu effectReady=%d readOnly=1", hwnd, index, scene.treeKind,
+                       scene.treeRoot, scene.firstVisual, scene.lastVisual, scene.frameKnown,
+                       static_cast<unsigned long long>(scene.currentFrame),
+                       static_cast<unsigned long long>(scene.lastUsedFrame),
+                       static_cast<unsigned long long>(scene.frameAge), scene.effectReady);
+            };
+            if (observation.backdrop.image) logScene(-1, observation.backdrop.scene);
+            for (unsigned i = 0; i < observation.backdrop.alternateCount; ++i)
+                logScene(static_cast<int>(i), observation.backdrop.alternates[i].scene);
         }
     }
     return result;
@@ -4335,6 +4399,9 @@ static void InitializeCoreMaterialDiagnostics()
          &g_coreCurrentVisualFunction, nullptr, true},
         {{L"const CBackdropVisualImage::`vftable'{for `CImageSource'}"},
          &g_coreBackdropImageVtable, nullptr, true},
+        {{L"const CDesktopTree::`vftable'"}, &g_coreDesktopTreeVtable, nullptr, true},
+        {{L"const CVisualTree::`vftable'"}, &g_coreVisualTreeVtable, nullptr, true},
+        {{L"const CSubVisualTree::`vftable'"}, &g_coreSubVisualTreeVtable, nullptr, true},
         {{L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
            L"struct D2D_SIZE_F const &,struct EffectInput *)const",
           L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
@@ -4416,6 +4483,12 @@ static void InitializeCoreMaterialDiagnostics()
         IsReadableMemory(g_coreBackdropImageVtable, sizeof(void*));
     Wh_Log(L"MESH ACRYLIC INPUT OBSERVER: %s hooksAdded=0 sampleMs=1000 readOnly=1",
            g_coreBackdropDetailReady ? L"available" : L"unavailable");
+    g_coreBackdropSceneReady = g_coreBackdropDetailReady &&
+        reinterpret_cast<uintptr_t>(g_coreDesktopTreeVtable) == base + 0x2C9668 &&
+        reinterpret_cast<uintptr_t>(g_coreVisualTreeVtable) == base + 0x2C1C28 &&
+        reinterpret_cast<uintptr_t>(g_coreSubVisualTreeVtable) == base + 0x2CCA28;
+    Wh_Log(L"MESH ACRYLIC SCENE OBSERVER: %s hooksAdded=0 sampleMs=1000 readOnly=1",
+           g_coreBackdropSceneReady ? L"available" : L"unavailable");
     // Native callers retain extra volatile registers across these leaf getters/
     // setters (e.g. R10 across SetWorldTransform). Never detour them with C++.
     g_coreCachedTreatmentOriginal = g_coreCachedTreatmentFunction;
