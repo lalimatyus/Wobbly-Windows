@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.322
+// @version         0.323
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3549,6 +3549,12 @@ CoreMaterialWorld_t g_coreMaterialWorldFunction = nullptr; // Layout verificatio
 CoreMaterialInput_t g_coreMaterialInputFunction = nullptr, g_coreMaterialInputOriginal = nullptr;
 CoreMaterialInput_t g_coreWallpaperInputFunction = nullptr, g_coreWallpaperInputOriginal = nullptr;
 CoreMaterialInput_t g_coreBviValidationFunction = nullptr, g_coreBviValidationOriginal = nullptr;
+using CoreFindTreeData_t = void*(__cdecl*)(const void*, const void*);
+using CoreCurrentVisual_t = void*(__cdecl*)(const void*);
+CoreFindTreeData_t g_coreFindTreeDataFunction = nullptr;
+CoreCurrentVisual_t g_coreCurrentVisualFunction = nullptr;
+void* g_coreBackdropImageVtable = nullptr;
+bool g_coreBackdropDetailReady = false;
 CoreCachedTreatment_t g_coreCachedTreatmentFunction = nullptr, g_coreCachedTreatmentOriginal = nullptr;
 CoreCachedTreatment_t g_coreTreatmentFunction = nullptr;
 CoreCachedTreatment_t g_coreMaterialBitmapFunction = nullptr;
@@ -3724,9 +3730,66 @@ static long __cdecl CoreImageUpdateHook(void* image, void* table, const void* co
     return result;
 }
 
+static bool IsCoreMaterialVisual(const void* visual);
+
+struct CoreBackdropSnapshot
+{
+    bool valid = false;
+    unsigned pathPairs = 0, images = 0;
+    void* currentVisual = nullptr;
+    void* currentTree = nullptr;
+    void* parentContext = nullptr;
+    void* image = nullptr;
+    void* root = nullptr;
+};
+
+static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context)
+{
+    CoreBackdropSnapshot hit;
+    if (!g_coreBackdropDetailReady || !context) return hit;
+    // Exact native ValidateBVIEffectInputForRender / GetBackdropVisualImage
+    // layouts. Borrow only for this callback; never retain or transfer images.
+    void* path = ReadPointerMember(context, 0x1F90);
+    const auto begin = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 0));
+    const auto end = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 8));
+    if (!begin || end <= begin || (end - begin) % 16 || end - begin > 32 * 16 ||
+        !IsReadableMemory(reinterpret_cast<void*>(begin), end - begin)) return hit;
+    hit.pathPairs = static_cast<unsigned>((end - begin) / 16);
+    hit.currentTree = ReadPointerMember(reinterpret_cast<void*>(end - 8), 0);
+    hit.currentVisual = g_coreCurrentVisualFunction(static_cast<const BYTE*>(context) + 0x18);
+    if (!hit.currentTree || !IsCoreMaterialVisual(hit.currentVisual)) return hit;
+    void* data = g_coreFindTreeDataFunction(hit.currentVisual, hit.currentTree);
+    if (!data) return hit;
+    const auto first = reinterpret_cast<uintptr_t>(ReadPointerMember(data, 0xA8));
+    const auto last = reinterpret_cast<uintptr_t>(ReadPointerMember(data, 0xB0));
+    if (last < first || (last - first) % sizeof(void*) || last - first > 32 * sizeof(void*) ||
+        (last != first && (!first || !IsReadableMemory(reinterpret_cast<void*>(first), last - first))))
+        return hit;
+    hit.images = static_cast<unsigned>((last - first) / sizeof(void*));
+    hit.parentContext = ReadPointerMember(context, 0xD0);
+    hit.valid = true;
+    for (unsigned i = 0; i < hit.images; ++i)
+    {
+        void* image = ReadPointerMember(reinterpret_cast<void*>(first), i * sizeof(void*));
+        if (ReadPointerMember(image, 0) != g_coreBackdropImageVtable) continue;
+        const auto imageBegin = reinterpret_cast<uintptr_t>(ReadPointerMember(image, 0x700));
+        const auto imageEnd = reinterpret_cast<uintptr_t>(ReadPointerMember(image, 0x708));
+        if (!imageBegin || imageEnd < imageBegin || imageEnd - imageBegin != end - begin ||
+            !IsReadableMemory(reinterpret_cast<void*>(imageBegin), imageEnd - imageBegin) ||
+            std::memcmp(reinterpret_cast<void*>(begin), reinterpret_cast<void*>(imageBegin), end - begin))
+            continue;
+        hit.image = image;
+        hit.root = ReadPointerMember(image, 0x90);
+        break;
+    }
+    return hit;
+}
+
 struct CoreMaterialObservation
 {
     unsigned effectCalls = 0, effectFailures = 0;
+    bool collectBackdrop = false;
+    CoreBackdropSnapshot backdrop;
     unsigned precomputeCalls = 0, rootPrecomputeCalls = 0;
     unsigned wallpaperCalls = 0, wallpaperFailures = 0, bviCalls = 0, bviFailures = 0;
     void* wallpaperOutput = nullptr; // Opaque first output word, never reused/dereferenced.
@@ -3845,6 +3908,8 @@ static long __cdecl CoreBviValidationHook(void* context, const void* bounds, voi
     if (auto* observation = g_coreMaterialObservation)
     {
         ++observation->bviCalls;
+        if (observation->collectBackdrop && !observation->backdrop.valid)
+            observation->backdrop = ReadCoreBackdropSnapshot(context);
         observation->bviFailures += result < 0;
         if (result >= 0 && IsReadableMemory(flag, 1))
         {
@@ -3884,6 +3949,10 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
     const int imageMatch = currentImage
         ? (currentImage == g_coreMaterialSourceImage.load(std::memory_order_acquire) ? 1 : 0) : -1;
     CoreMaterialObservation observation;
+    const ULONGLONG previousLogAt =
+        g_coreMaterialRasterLogAt[insideRealize ? 1 : 0][imageMatch + 1].load(std::memory_order_relaxed);
+    observation.collectBackdrop = g_coreBackdropDetailReady &&
+        (!previousLogAt || GetTickCount64() - previousLogAt >= 1000);
     auto* previous = g_coreMaterialObservation;
     g_coreMaterialObservation = &observation;
     const long result = g_coreDrawVisualTreeOriginal(
@@ -3921,6 +3990,7 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
     }
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
     if (log)
+    {
         Wh_Log(L"MESH MATERIAL RASTER: HWND=%p count=%u context=%p tree=%p root=%p backdropImage=%p "
                L"insideRealize=%d image=%p imageMatch=%d clearMode=%d drawFlag=%d precompute=%u effectCalls=%u "
                L"effectFailures=%u wallpaperCalls=%u wallpaperFailures=%u wallpaperOutput=%p "
@@ -3930,6 +4000,16 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
                observation.wallpaperCalls, observation.wallpaperFailures, observation.wallpaperOutput,
                observation.bviCalls, observation.bviFailures, observation.bviFlag,
                static_cast<unsigned>(result));
+        if (observation.bviCalls && observation.collectBackdrop)
+            Wh_Log(L"MESH ACRYLIC INPUT: HWND=%p imageMatch=%d valid=%d pathPairs=%u "
+                   L"currentVisual=%p currentTree=%p parentContext=%p candidates=%u "
+                   L"matchedImage=%p backdropRoot=%p sampledRoot=%p readOnly=1", hwnd, imageMatch,
+                   observation.backdrop.valid, observation.backdrop.pathPairs,
+                   observation.backdrop.currentVisual, observation.backdrop.currentTree,
+                   observation.backdrop.parentContext, observation.backdrop.images,
+                   observation.backdrop.image, observation.backdrop.root,
+                   g_coreMaterialSourceRoot.load(std::memory_order_acquire));
+    }
     return result;
 }
 
@@ -4153,6 +4233,14 @@ static void InitializeCoreMaterialDiagnostics()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
+        {{L"public: class CTreeData * __cdecl CVisual::FindTreeData(class CVisualTree const *)const",
+          L"public: class CTreeData * __cdecl CVisual::FindTreeData(class CVisualTree const *)const "},
+         &g_coreFindTreeDataFunction, nullptr, true},
+        {{L"public: virtual class CVisual * __cdecl CDrawingContext::GetCurrentVisual(void)const",
+          L"public: virtual class CVisual * __cdecl CDrawingContext::GetCurrentVisual(void)const "},
+         &g_coreCurrentVisualFunction, nullptr, true},
+        {{L"const CBackdropVisualImage::`vftable'{for `CImageSource'}"},
+         &g_coreBackdropImageVtable, nullptr, true},
         {{L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
            L"struct D2D_SIZE_F const &,struct EffectInput *)const",
           L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
@@ -4227,6 +4315,13 @@ static void InitializeCoreMaterialDiagnostics()
         return;
     }
     g_coreMaterialModuleBase = base;
+    g_coreBackdropDetailReady =
+        reinterpret_cast<uintptr_t>(g_coreFindTreeDataFunction) == base + 0x88B84 &&
+        reinterpret_cast<uintptr_t>(g_coreCurrentVisualFunction) == base + 0xD4950 &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropImageVtable) == base + 0x2C30D8 &&
+        IsReadableMemory(g_coreBackdropImageVtable, sizeof(void*));
+    Wh_Log(L"MESH ACRYLIC INPUT OBSERVER: %s hooksAdded=0 sampleMs=1000 readOnly=1",
+           g_coreBackdropDetailReady ? L"available" : L"unavailable");
     // Native callers retain extra volatile registers across these leaf getters/
     // setters (e.g. R10 across SetWorldTransform). Never detour them with C++.
     g_coreCachedTreatmentOriginal = g_coreCachedTreatmentFunction;
