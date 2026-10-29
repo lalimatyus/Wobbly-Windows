@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.314
+// @version         0.315
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3700,6 +3700,7 @@ std::atomic<void*> g_coreMaterialSourceImage = nullptr; // Comparison only outsi
 std::atomic<void*> g_coreMaterialSourceTree = nullptr; // Comparison only outside CVI callbacks.
 std::atomic<HWND> g_coreMaterialTargetHwnd = nullptr;
 std::atomic<ULONGLONG> g_coreMaterialRealizeLogAt = 0;
+std::atomic<ULONGLONG> g_coreMaterialSourceRejectLogAt = 0;
 std::atomic<ULONGLONG> g_coreMaterialTreeProbeEpoch = 0;
 uintptr_t g_coreMaterialModuleBase = 0; // Exact-image gate, published before observer readiness.
 SRWLOCK g_coreMaterialTargetLock = SRWLOCK_INIT;
@@ -3771,6 +3772,7 @@ static void ClearCoreMaterialTarget()
     g_coreMaterialSourceRoot.store(nullptr, std::memory_order_release);
     g_coreMaterialSourceImage.store(nullptr, std::memory_order_release);
     g_coreMaterialSourceTree.store(nullptr, std::memory_order_release);
+    g_coreMaterialSourceRejectLogAt.store(0, std::memory_order_relaxed);
     ResetCoreMaterialOwnersLocked();
     g_coreMaterialTargetHwnd.store(nullptr, std::memory_order_release);
     g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
@@ -3800,15 +3802,27 @@ static long __cdecl CoreImageUpdateHook(void* image, void* table, const void* co
     const long result = g_coreImageUpdateOriginal(image, table, command);
     if (!g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) || result < 0 ||
         g_unloading.load(std::memory_order_acquire)) return result;
-    // GetDeviceTexture adjusts its CImageSource this by -0x48 in this exact core.
-    if (!g_coreCachedImageVtable || ReadPointerMember(image, 0x48) != g_coreCachedImageVtable)
-        return result;
     const std::uint64_t target = g_coreMaterialTargetKey.load(std::memory_order_acquire);
     if (!target || !IsReadableMemory(command, 0x34)) return result;
     unsigned imageId = 0, rootId = 0;
     std::memcpy(&imageId, static_cast<const BYTE*>(command) + 4, sizeof(imageId));
     std::memcpy(&rootId, static_cast<const BYTE*>(command) + 0x30, sizeof(rootId));
     if (((std::uint64_t{rootId} << 32) | imageId) != target) return result;
+    // The exact constructor installs CImageSource at +0, IBitmapRealization at
+    // +0x48. ProcessUpdate receives the primary pointer, not the bitmap interface.
+    void* imageVtable = ReadPointerMember(image, 0);
+    if (!g_coreCachedImageVtable || imageVtable != g_coreCachedImageVtable)
+    {
+        const ULONGLONG now = GetTickCount64();
+        ULONGLONG last = g_coreMaterialSourceRejectLogAt.load(std::memory_order_relaxed);
+        if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
+            now - last >= 1000 && g_coreMaterialSourceRejectLogAt.compare_exchange_strong(
+                last, now, std::memory_order_relaxed))
+            Wh_Log(L"MESH MATERIAL SOURCE REJECTED: imageId=%u rootId=%u reason=ImageType "
+                   L"actualVtable=%p expectedVtable=%p readOnly=1",
+                   imageId, rootId, imageVtable, g_coreCachedImageVtable);
+        return result;
+    }
     // This exact core method stores its validated CVisual* root at +0x90.
     // Do not dereference the remembered pointer later; compare it with a live
     // CVisual argument supplied by the precompute callback instead.
