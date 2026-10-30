@@ -1,15 +1,19 @@
-# Standalone GPU mesh experiment
+# Standalone GPU capture reference
 
-This directory contains the original Windows Graphics Capture and Direct3D 11
-test program used to develop the 20×20 mesh renderer. It remains available as
-an isolated test harness. Run `build.cmd` to rebuild it. `--demo` draws a test
-pattern, and `--self-test` checks GPU and capture support.
+This directory preserves the Windows Graphics Capture / Direct3D 11 test
+program used during the earlier mesh experiments. Its source and executable
+remain available for independent capture comparisons. `build.cmd` rebuilds
+the program, `--demo` draws the test pattern and `--self-test` checks support.
 
-Since Wobbly Windows 0.269, the experimental live mesh overlay is integrated
-into the Windhawk mod. Select **GPU mesh overlay (experimental)** under
-**Renderer**; the companion process starts automatically. The standalone
-program and its `run-*.cmd` scripts are no longer required for normal use.
+Starting with Wobbly Windows 0.321, the Windhawk mod no longer embeds this
+renderer, starts a companion process or publishes the v1 physics bridge.
+The old `run-integrated.cmd` and bridge-following scripts are historical:
+they need an older mod with that bridge enabled. They are preserved as test
+references, not required for the current native Mesh Renderer.
 
-The overlay draws a live, curved copy of the window. The original affine
-window remains visible behind it, and Windows may show a colored capture
-border. Use **Affine (stable)** when these limitations are undesirable.
+Use the native mod's **Mesh Renderer** option for current experiments.
+**Captured window source (diagnostic)** tests a separate Windows window
+representation with a small live preview. Its material behavior still needs
+validation. The standalone WGC program can provide an independent comparison
+if that source cannot reproduce Mica or acrylic; public WGC may show a colored
+capture border.
