@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.329
+// @version         0.330
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -36,12 +36,13 @@ initialize instead of using unverified addresses.
 * Change the wobbliness of the windows from 5 presets
 * Enable custom physics to change each parameter independently, instead of a preset
 * Fluid wobble animations for dragging, snapping and even resizing windows
-* Uses a 4x4 spring simulation fitted to a smooth whole-window transform
+* Uses a 4x4 spring simulation with Affine and smooth Bezier Mesh rendering
 
 **Mesh Renderer** is an experimental in-process DWM path on the validated 23H2
-build. Other builds use the Affine fallback. Its live image can render backdrop
-materials such as Mica and acrylic differently from the original window, and
-the original window remains beneath the curved layer.
+build. Other builds use the Affine fallback. It bends a live window image with
+20x20 Bezier interpolation, including its shadow, Mica and acrylic. While the
+mesh is visible, the original remains nearly transparent to keep DWM's native
+backdrop calculation active and is restored when the mesh detaches.
 Keep **Affine** selected for normal use.
 
 ## Known Issues
@@ -98,17 +99,10 @@ the combined mod is not offered under GPLv2.
 
 - Renderer: "affine"
   $name: Renderer
-  $description: Mesh Renderer bends a live DWM image on the validated 23H2 build. Diagnostic sources show a small unwarped copy for comparing materials. Unsupported builds use Affine.
+  $description: Mesh Renderer bends a live DWM window image on the validated 23H2 build. Unsupported builds use Affine.
   $options:
   - "affine": "Affine (stable)"
   - "mesh": "Mesh Renderer (experimental)"
-  - "mesh-flat-source": "Flat source image (diagnostic)"
-  - "mesh-flat-padded": "Flat source + shadow margin (diagnostic)"
-  - "mesh-captured-source": "Captured window source (diagnostic)"
-
-- CaptureOriginalHideProbe: false
-  $name: Original window isolation test
-  $description: With Captured window source selected, briefly hide the original for 750 ms after the preview warms up, then restore it. Tests whether the new source is independent.
 
 - AdvancedMode:
   - enable: false
@@ -464,55 +458,53 @@ CVisualProxySetTransform_t g_cVisualProxySetTransform = nullptr;
 using CCompositorCreateMatrixTransformProxy_t = long(__cdecl*)(void* pThis, void** transformProxy);
 CCompositorCreateMatrixTransformProxy_t g_createMatrixTransformProxy = nullptr;
 
-// Experimental one-shot source and geometry probes. No DWM visual is attached.
-struct NativeProbeRectF
+// Native mesh image and geometry types; private calls require the verified ABI.
+struct NativeMeshRectF
 {
     float left, top, right, bottom;
 };
-struct NativeProbeSizeD
+struct NativeMeshSizeD
 {
     double width, height;
 };
-struct NativeProbeSizeF
+struct NativeMeshSizeF
 {
     float width, height;
 };
-struct NativeProbePoint3F
+struct NativeMeshPoint3F
 {
     float x, y, z;
 };
-struct NativeProbePoint2D
+struct NativeMeshPoint2D
 {
     double x, y;
 };
-using NativeProbeCreateImage_t = long(__cdecl*)(void*, void**);
-using NativeProbeUpdateImageD_t = long(__cdecl*)(
-    void*, const NativeProbeRectF&, const NativeProbeSizeD&, const void*,
+using NativeMeshCreateImage_t = long(__cdecl*)(void*, void**);
+using NativeMeshUpdateImageD_t = long(__cdecl*)(
+    void*, const NativeMeshRectF&, const NativeMeshSizeD&, const void*,
     const void*, void*, int);
-using NativeProbeUpdateImageF_t = long(__cdecl*)(
-    void*, const NativeProbeRectF&, const NativeProbeSizeF&, const void*,
+using NativeMeshUpdateImageF_t = long(__cdecl*)(
+    void*, const NativeMeshRectF&, const NativeMeshSizeF&, const void*,
     const void*, void*, int);
-using NativeProbeCreateBitmapInstruction_t = long(__cdecl*)(void*, void**);
 using NativeMeshCreateVisual_t = long(__cdecl*)(void**);
 using NativeMeshAddInstruction_t = long(__cdecl*)(void*, void*);
 using NativeMeshUpdateRenderData_t = long(__cdecl*)(void*);
 using NativeMeshInsertRelative_t = long(__cdecl*)(
     void*, void*, void*, bool, bool);
 using NativeMeshRemoveFromParent_t = long(__cdecl*)(void*);
-using NativeProbeCreateMesh_t = long(__cdecl*)(void*, void**);
-using NativeProbeUpdateMesh_t = long(__cdecl*)(
-    void*, int, const NativeProbePoint3F*, const NativeProbePoint2D*,
+using NativeMeshCreateMesh_t = long(__cdecl*)(void*, void**);
+using NativeMeshUpdateMesh_t = long(__cdecl*)(
+    void*, int, const NativeMeshPoint3F*, const NativeMeshPoint2D*,
     unsigned int, const unsigned int*, unsigned int);
-using NativeProbeUpdateGroup_t = long(__cdecl*)(void*, void*);
+using NativeMeshUpdateGroup_t = long(__cdecl*)(void*, void*);
 // Its declared second argument is CBitmapSourceProxy*. The exact 23H2
 // implementation only retains the base object and serializes its resource ID;
 // the receiving core path accepts CImageSource. Other builds stay disabled.
-using NativeProbeCreateMeshInstruction_t = long(__cdecl*)(void*, void*, void**);
-using NativeProbeGetVisual_t = void*(__cdecl*)(void*);
-NativeProbeCreateImage_t g_nativeProbeCreateImage = nullptr;
-NativeProbeUpdateImageD_t g_nativeProbeUpdateImageD = nullptr;
-NativeProbeUpdateImageF_t g_nativeProbeUpdateImageF = nullptr;
-NativeProbeCreateBitmapInstruction_t g_nativeProbeCreateBitmapInstruction = nullptr;
+using NativeMeshCreateMeshInstruction_t = long(__cdecl*)(void*, void*, void**);
+using NativeMeshGetVisual_t = void*(__cdecl*)(void*);
+NativeMeshCreateImage_t g_nativeMeshCreateImage = nullptr;
+NativeMeshUpdateImageD_t g_nativeMeshUpdateImageD = nullptr;
+NativeMeshUpdateImageF_t g_nativeMeshUpdateImageF = nullptr;
 NativeMeshCreateVisual_t g_nativeMeshCreateVisual = nullptr;
 NativeMeshAddInstruction_t g_nativeMeshAddInstruction = nullptr;
 NativeMeshUpdateRenderData_t g_nativeMeshUpdateRenderData = nullptr;
@@ -524,8 +516,6 @@ void* g_nativeBackdropVisualVtable = nullptr;
 std::atomic_bool g_nativeMeshActive = false;
 std::atomic_bool g_nativeMeshStopRequested = false;
 std::atomic<HWND> g_nativeMeshHwnd = nullptr;
-enum class NativeSourceProbeMode : unsigned char { None, Flat, PaddedFlat, CapturedFlat };
-std::atomic<NativeSourceProbeMode> g_nativeSourceProbeMode = NativeSourceProbeMode::None;
 using NativeCapturedRepresentationCreate_t = long(__cdecl*)(unsigned, const void*, void*, unsigned, int, void**);
 using NativeCapturedRepresentationMethod_t = long(__cdecl*)(void*);
 using NativeVisualSetOpacity_t = void(__cdecl*)(void*, double);
@@ -538,8 +528,7 @@ void* g_nativeCapturedRepresentationVtable = nullptr;
 void* g_nativeCaptureListenerVtable = nullptr;
 void* g_nativeCaptureCriticalSection = nullptr;
 bool g_nativeCapturedSourceReady = false;
-std::atomic_bool g_nativeOriginalHideProbe = false;
-std::atomic<ULONGLONG> g_nativeOriginalHideWakeUntil = 0;
+std::atomic_bool g_nativeMeshSourcePending = false;
 struct NativeMeshState
 {
     void* root = nullptr;
@@ -554,13 +543,10 @@ struct NativeMeshState
     void* capturedRepresentation = nullptr;
     void* sourceOwner = nullptr;
     ULONGLONG attachedAt = 0;
-    ULONGLONG hideUntil = 0;
-    std::uint64_t hideBridgeStart = 0;
-    bool hideProbeAttempted = false;
+    std::uint64_t materialKey = 0;
     bool originalHidden = false;
     double originalOpacity = 1.0;
     bool backdropSource = false;
-    bool flatSourceProbe = false;
     int sourcePadding = 0;
     HWND hwnd = nullptr;
     int width = 0;
@@ -571,15 +557,15 @@ struct NativeMeshState
     unsigned int meshUpdateCount = 0;
 };
 NativeMeshState g_nativeMeshState; // DWM scene thread only.
-NativeProbeCreateMesh_t g_nativeProbeCreateMesh = nullptr;
-NativeProbeUpdateMesh_t g_nativeProbeUpdateMesh = nullptr;
-NativeProbeCreateMesh_t g_nativeProbeCreateGroup = nullptr;
-NativeProbeUpdateGroup_t g_nativeProbeUpdateGroup = nullptr;
-NativeProbeCreateMeshInstruction_t g_nativeProbeCreateMeshInstruction = nullptr;
-NativeProbeGetVisual_t g_nativeProbeGetVisualParent = nullptr;
-NativeProbeGetVisual_t g_nativeProbeGetVisualProxy = nullptr;
-void* g_nativeProbeImageVtableSymbol = nullptr;
-std::atomic<void*> g_nativeProbeImageVtable = nullptr;
+NativeMeshCreateMesh_t g_nativeMeshCreateMesh = nullptr;
+NativeMeshUpdateMesh_t g_nativeMeshUpdateMesh = nullptr;
+NativeMeshCreateMesh_t g_nativeMeshCreateGroup = nullptr;
+NativeMeshUpdateGroup_t g_nativeMeshUpdateGroup = nullptr;
+NativeMeshCreateMeshInstruction_t g_nativeMeshCreateMeshInstruction = nullptr;
+NativeMeshGetVisual_t g_nativeMeshGetVisualParent = nullptr;
+NativeMeshGetVisual_t g_nativeMeshGetVisualProxy = nullptr;
+void* g_nativeMeshImageVtableSymbol = nullptr;
+std::atomic<void*> g_nativeMeshImageVtable = nullptr;
 HWND g_nativeMeshLastAttemptHwnd = nullptr; // DWM scene thread only.
 ULONGLONG g_nativeMeshLastAttemptAt = 0;
 
@@ -2938,7 +2924,7 @@ static bool InitializeDwmHooks()
         {{L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CCachedVisualImageProxy>("
            L"class CCachedVisualImageProxy * *)"},
-         &g_nativeProbeCreateImage, nullptr, true},
+         &g_nativeMeshCreateImage, nullptr, true},
         {{L"public: static long __cdecl CSecondaryWindowRepresentation::Create("
            L"struct TMILFlagsEnum<enum SWRUsage::FlagsEnum>,"
            L"struct ISecondaryWindowRepresentationChangedListener *,class CWindowData *,"
@@ -2961,16 +2947,13 @@ static bool InitializeDwmHooks()
            L"class CRectResourceProxy const *,"
            L"class CSizeResourceProxy const *,class CVisualProxy *,"
            L"enum MilBrushMappingMode::Enum)"},
-         &g_nativeProbeUpdateImageD, nullptr, true},
+         &g_nativeMeshUpdateImageD, nullptr, true},
         {{L"public: long __cdecl CCachedVisualImageProxy::Update("
            L"struct D2D_RECT_F const &,struct D2D_SIZE_F const &,"
            L"class CRectResourceProxy const *,"
            L"class CSizeResourceProxy const *,class CVisualProxy *,"
            L"enum MilBrushMappingMode::Enum)"},
-         &g_nativeProbeUpdateImageF, nullptr, true},
-        {{L"public: static long __cdecl CDrawBitmapInstruction::Create("
-           L"class CBaseImageProxy *,class CDrawBitmapInstruction * *)"},
-         &g_nativeProbeCreateBitmapInstruction, nullptr, true},
+         &g_nativeMeshUpdateImageF, nullptr, true},
         {{L"public: static long __cdecl CRenderDataVisual::Create("
            L"class CRenderDataVisual * *)"},
          &g_nativeMeshCreateVisual, nullptr, true},
@@ -2994,33 +2977,33 @@ static bool InitializeDwmHooks()
            L"class CMeshGeometry2dProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CMeshGeometry2dProxy>(class CMeshGeometry2dProxy * *)"},
-         &g_nativeProbeCreateMesh, nullptr, true},
+         &g_nativeMeshCreateMesh, nullptr, true},
         {{L"public: long __cdecl CMeshGeometry2dProxy::Update("
            L"int,struct MilPoint3F const *,struct MilPoint2D const *,"
            L"unsigned int,unsigned int const *,unsigned int)"},
-         &g_nativeProbeUpdateMesh, nullptr, true},
+         &g_nativeMeshUpdateMesh, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateGeometry2dGroupProxy("
            L"class CGeometry2dGroupProxy * *)",
           L"protected: long __cdecl CCompositor::CreateProxy<"
            L"class CGeometry2dGroupProxy>(class CGeometry2dGroupProxy * *)"},
-         &g_nativeProbeCreateGroup, nullptr, true},
+         &g_nativeMeshCreateGroup, nullptr, true},
         {{L"public: long __cdecl CGeometry2dGroupProxy::Update("
            L"class CMeshGeometry2dProxy const *)"},
-         &g_nativeProbeUpdateGroup, nullptr, true},
+         &g_nativeMeshUpdateGroup, nullptr, true},
         {{L"public: static long __cdecl CDrawMesh2DInstruction::Create("
            L"class CGeometry2dGroupProxy *,class CBitmapSourceProxy *,"
            L"class CDrawMesh2DInstruction * *)"},
-         &g_nativeProbeCreateMeshInstruction, nullptr, true},
+         &g_nativeMeshCreateMeshInstruction, nullptr, true},
         {{L"public: virtual class CVisual * __cdecl "
            L"CVisual::GetTransformParent(void)const",
           L"public: virtual class CVisual * __cdecl "
            L"CVisual::GetTransformParent(void)const "},
-         &g_nativeProbeGetVisualParent, nullptr, true},
+         &g_nativeMeshGetVisualParent, nullptr, true},
         {{L"public: virtual class CVisualProxy * __cdecl "
            L"CVisual::GetVisualProxyForStructure(void)"},
-         &g_nativeProbeGetVisualProxy, nullptr, true},
+         &g_nativeMeshGetVisualProxy, nullptr, true},
         {{L"const CCachedVisualImageProxy::`vftable'"},
-         &g_nativeProbeImageVtableSymbol, nullptr, true},
+         &g_nativeMeshImageVtableSymbol, nullptr, true},
 
         {{L"private: static class CDesktopManager * "
            L"CDesktopManager::s_pDesktopManagerInstance"},
@@ -3140,14 +3123,13 @@ static bool InitializeDwmHooks()
     keepValid(g_topLevelWindowGetWindowData);
     keepValid(g_desktopManagerPostStartAnimations);
     keepValid(g_cBaseObjectRelease);
-    keepValid(g_nativeProbeCreateImage);
+    keepValid(g_nativeMeshCreateImage);
     keepValid(g_nativeCapturedRepresentationCreate);
     keepValid(g_nativeCapturedRepresentationEnsureRoot);
     keepValid(g_nativeCapturedRepresentationValidate);
     keepValid(g_nativeVisualSetOpacity);
-    keepValid(g_nativeProbeUpdateImageD);
-    keepValid(g_nativeProbeUpdateImageF);
-    keepValid(g_nativeProbeCreateBitmapInstruction);
+    keepValid(g_nativeMeshUpdateImageD);
+    keepValid(g_nativeMeshUpdateImageF);
     keepValid(g_nativeMeshCreateVisual);
     keepValid(g_nativeMeshAddInstruction);
     keepValid(g_nativeMeshUpdateRenderData);
@@ -3160,13 +3142,13 @@ static bool InitializeDwmHooks()
     }
     if (!IsDwmImageAddress(g_nativeBackdropVisualVtable, sizeof(void*)))
         g_nativeBackdropVisualVtable = nullptr;
-    keepValid(g_nativeProbeCreateMesh);
-    keepValid(g_nativeProbeUpdateMesh);
-    keepValid(g_nativeProbeCreateGroup);
-    keepValid(g_nativeProbeUpdateGroup);
-    keepValid(g_nativeProbeCreateMeshInstruction);
-    keepValid(g_nativeProbeGetVisualParent);
-    keepValid(g_nativeProbeGetVisualProxy);
+    keepValid(g_nativeMeshCreateMesh);
+    keepValid(g_nativeMeshUpdateMesh);
+    keepValid(g_nativeMeshCreateGroup);
+    keepValid(g_nativeMeshUpdateGroup);
+    keepValid(g_nativeMeshCreateMeshInstruction);
+    keepValid(g_nativeMeshGetVisualParent);
+    keepValid(g_nativeMeshGetVisualProxy);
     auto cacheVtableSymbol = [](void* symbol, std::atomic<void*>& target)
     {
         if (!IsDwmImageAddress(symbol, sizeof(void*) * 3))
@@ -3204,7 +3186,7 @@ static bool InitializeDwmHooks()
         hasExactVisualProxyVtable || hasExactRedirectProxyVtable || hasExactContainerProxyVtable;
     bool hasExactMatrixProxyVtable =
         cacheVtableSymbol(g_matrixTransformProxyVtableSymbol, g_matrixTransformProxyVtable);
-    cacheVtableSymbol(g_nativeProbeImageVtableSymbol, g_nativeProbeImageVtable);
+    cacheVtableSymbol(g_nativeMeshImageVtableSymbol, g_nativeMeshImageVtable);
     const auto nativeBase = reinterpret_cast<uintptr_t>(g_dwmModuleLayout.imageBegin);
     g_nativeCapturedSourceReady =
         g_dwmModuleLayout.timeDateStamp == 0xE19C3234 && g_dwmModuleLayout.sizeOfImage == 0x16A000 &&
@@ -3230,24 +3212,24 @@ static bool InitializeDwmHooks()
     }
     if (reinterpret_cast<uintptr_t>(g_nativeVisualSetOpacity) != nativeBase + 0x41F60)
         g_nativeVisualSetOpacity = nullptr;
-    Wh_Log(L"NATIVE CAPTURE SOURCE: ownedRepresentation=%s hideProbe=%s",
+    Wh_Log(L"NATIVE CAPTURE SOURCE: ownedRepresentation=%s opacityControl=%s",
            g_nativeCapturedSourceReady ? L"available" : L"unavailable",
            g_nativeCapturedSourceReady && g_nativeVisualSetOpacity ? L"available" : L"unavailable");
     Wh_Log(L"NATIVE MESH SOURCE: create=%d update=%s imageVtable=%p",
-           g_nativeProbeCreateImage != nullptr,
-           g_nativeProbeUpdateImageD ? L"double" :
-               (g_nativeProbeUpdateImageF ? L"float" : L"unavailable"),
-           g_nativeProbeImageVtable.load(std::memory_order_acquire));
+           g_nativeMeshCreateImage != nullptr,
+           g_nativeMeshUpdateImageD ? L"double" :
+               (g_nativeMeshUpdateImageF ? L"float" : L"unavailable"),
+           g_nativeMeshImageVtable.load(std::memory_order_acquire));
     Wh_Log(L"NATIVE MESH BRIDGE: mesh=%d update=%d group=%d "
            L"groupUpdate=%d meshFactory=%d cachedImageMesh=experimental "
            L"getParent=%d getProxy=%d",
-           g_nativeProbeCreateMesh != nullptr,
-           g_nativeProbeUpdateMesh != nullptr,
-           g_nativeProbeCreateGroup != nullptr,
-           g_nativeProbeUpdateGroup != nullptr,
-           g_nativeProbeCreateMeshInstruction != nullptr,
-           g_nativeProbeGetVisualParent != nullptr,
-           g_nativeProbeGetVisualProxy != nullptr);
+           g_nativeMeshCreateMesh != nullptr,
+           g_nativeMeshUpdateMesh != nullptr,
+           g_nativeMeshCreateGroup != nullptr,
+           g_nativeMeshUpdateGroup != nullptr,
+           g_nativeMeshCreateMeshInstruction != nullptr,
+           g_nativeMeshGetVisualParent != nullptr,
+           g_nativeMeshGetVisualProxy != nullptr);
     if (g_cMatrixTransformProxyUpdate && g_cMatrixTransformProxyUpdateFloat)
     {
         Wh_Log(L"DWM compatibility: ambiguous ABI variants");
@@ -3465,7 +3447,7 @@ static bool NativeMeshAbiVerified()
         !g_nativeMeshInsertRelative || !g_nativeMeshRemoveFromParent ||
         !g_nativeMeshCollectionRemove || !g_nativeMeshCollectionVtable ||
         !g_topLevelWindowGetRootVisual ||
-        !g_nativeProbeGetVisualParent || !g_nativeProbeGetVisualProxy ||
+        !g_nativeMeshGetVisualParent || !g_nativeMeshGetVisualProxy ||
         !g_createMatrixTransformProxy || !g_cVisualProxySetTransform ||
         !HasMatrixTransformUpdate() || !g_cBaseObjectRelease)
     {
@@ -3511,7 +3493,7 @@ static void* FindNativeMeshSiblingCollection(void* root)
         return nullptr;
     }
     void* parent = ReadPointerMember(root, 0x18);
-    if (!parent || parent != g_nativeProbeGetVisualParent(root) ||
+    if (!parent || parent != g_nativeMeshGetVisualParent(root) ||
         !IsReadableMemory(parent, sizeof(void*)) ||
         !IsDwmImageAddress(*reinterpret_cast<void**>(parent), sizeof(void*)))
     {
@@ -3537,122 +3519,37 @@ static void* FindNativeMeshSiblingCollection(void* root)
     return matches == 1 ? collection : nullptr;
 }
 
-// Read-only core observations, restricted to the locally verified 23H2 image.
+// Core material bridge: private layouts are gated by the exact module image.
 using CoreMaterialInput_t = long(__cdecl*)(void*, const void*, void*);
-using CoreCachedTreatment_t = void*(__cdecl*)(const void*);
 using CoreImageUpdate_t = long(__cdecl*)(void*, void*, const void*);
-using CorePrecomputeTreatment_t = long(__cdecl*)(void*, void*, bool);
 using CoreImageRealize_t = long(__cdecl*)(void*, const void*, void**);
-using CoreMaterialWorld_t = void(__cdecl*)(void*, const void*, int);
 using CoreDrawVisualTree_t = long(__cdecl*)(void*, const void*, const void*, const void*, int, bool, void*);
-CoreDrawVisualTree_t g_coreDrawVisualTreeFunction = nullptr, g_coreDrawVisualTreeOriginal = nullptr;
-CoreMaterialWorld_t g_coreMaterialWorldFunction = nullptr; // Layout verification only; never detoured.
-CoreMaterialInput_t g_coreMaterialInputFunction = nullptr, g_coreMaterialInputOriginal = nullptr;
-CoreMaterialInput_t g_coreWallpaperInputFunction = nullptr, g_coreWallpaperInputOriginal = nullptr;
-CoreMaterialInput_t g_coreBviValidationFunction = nullptr, g_coreBviValidationOriginal = nullptr;
 using CoreFindTreeData_t = void*(__cdecl*)(const void*, const void*);
 using CoreCurrentVisual_t = void*(__cdecl*)(const void*);
-CoreFindTreeData_t g_coreFindTreeDataFunction = nullptr;
-CoreCurrentVisual_t g_coreCurrentVisualFunction = nullptr;
-void* g_coreBackdropImageVtable = nullptr;
-bool g_coreBackdropDetailReady = false;
-void* g_coreDesktopTreeVtable = nullptr, *g_coreVisualTreeVtable = nullptr, *g_coreSubVisualTreeVtable = nullptr;
-bool g_coreBackdropSceneReady = false;
-void* g_coreDesktopTreeDataVtable = nullptr;
-bool g_coreBackdropDesktopReady = false;
 using CoreBackdropEffectInput_t = void*(__cdecl*)(void*, void*);
 using CoreCurrentTargetInfo_t = const void*(__cdecl*)(const void*);
 using CoreBackdropRealization_t = bool(__cdecl*)(const void*, const void*);
+CoreMaterialInput_t g_coreBviValidationFunction = nullptr, g_coreBviValidationOriginal = nullptr;
+CoreImageUpdate_t g_coreImageUpdateFunction = nullptr, g_coreImageUpdateOriginal = nullptr;
+CoreImageRealize_t g_coreImageRealizeFunction = nullptr, g_coreImageRealizeOriginal = nullptr;
+CoreDrawVisualTree_t g_coreDrawVisualTreeFunction = nullptr, g_coreDrawVisualTreeOriginal = nullptr;
+CoreFindTreeData_t g_coreFindTreeDataFunction = nullptr;
+CoreCurrentVisual_t g_coreCurrentVisualFunction = nullptr;
 CoreBackdropEffectInput_t g_coreBackdropEffectInputFunction = nullptr, g_coreBackdropEffectInputOriginal = nullptr;
 CoreCurrentTargetInfo_t g_coreCurrentTargetInfoFunction = nullptr;
 CoreBackdropRealization_t g_coreBackdropRealizationFunction = nullptr;
-std::atomic_bool g_coreBackdropBridgeReady = false;
-std::atomic<std::uint64_t> g_coreBackdropBridgeStats = 0; // Completed calls/applied, two wrapping 32-bit counters.
-std::atomic<const wchar_t*> g_coreBackdropBridgeLastMiss = L"none"; // Mod-owned literals only.
-
-static void RecordCoreBackdropBridgeInput(bool applied)
-{
-    auto previous = g_coreBackdropBridgeStats.load(std::memory_order_relaxed);
-    std::uint64_t next;
-    do
-    {
-        const auto calls = static_cast<std::uint32_t>(previous >> 32) + std::uint32_t{1};
-        const auto used = static_cast<std::uint32_t>(previous) + static_cast<std::uint32_t>(applied);
-        next = (std::uint64_t{calls} << 32) | used;
-    } while (!g_coreBackdropBridgeStats.compare_exchange_weak(previous, next,
-                 std::memory_order_release, std::memory_order_relaxed));
-}
-CoreCachedTreatment_t g_coreCachedTreatmentFunction = nullptr, g_coreCachedTreatmentOriginal = nullptr;
-CoreCachedTreatment_t g_coreTreatmentFunction = nullptr;
-CoreCachedTreatment_t g_coreMaterialBitmapFunction = nullptr;
-CoreImageUpdate_t g_coreImageUpdateFunction = nullptr, g_coreImageUpdateOriginal = nullptr;
-CorePrecomputeTreatment_t g_corePrecomputeTreatmentFunction = nullptr, g_corePrecomputeTreatmentOriginal = nullptr;
-CoreImageRealize_t g_coreImageRealizeFunction = nullptr, g_coreImageRealizeOriginal = nullptr;
-void* g_coreCachedImageVtable = nullptr;
-std::atomic_bool g_coreMaterialDiagnosticsReady = false;
-std::atomic<std::uint64_t> g_coreMaterialTargetKey = 0;
-std::atomic<void*> g_coreMaterialSourceRoot = nullptr; // Comparison only outside core callbacks.
-std::atomic<void*> g_coreMaterialSourceImage = nullptr; // Comparison only outside its callbacks.
-std::atomic<void*> g_coreMaterialSourceTree = nullptr; // Comparison only outside CVI callbacks.
-std::atomic<HWND> g_coreMaterialTargetHwnd = nullptr;
-std::atomic<ULONGLONG> g_coreMaterialRealizeLogAt = 0;
-std::atomic<ULONGLONG> g_coreMaterialSourceRejectLogAt = 0;
-std::atomic<ULONGLONG> g_coreMaterialRasterLogAt[2][3] = {};
-std::atomic_uint g_coreMaterialRasterCount = 0;
-std::atomic<ULONGLONG> g_coreMaterialTreeProbeEpoch = 0;
-uintptr_t g_coreMaterialModuleBase = 0; // Exact-image gate, published before observer readiness.
+void* g_coreBackdropImageVtable = nullptr, *g_coreCachedImageVtable = nullptr;
+void* g_coreDesktopTreeVtable = nullptr, *g_coreVisualTreeVtable = nullptr, *g_coreSubVisualTreeVtable = nullptr;
+void* g_coreDesktopTreeDataVtable = nullptr;
+uintptr_t g_coreMaterialModuleBase = 0;
+bool g_coreBackdropDetailReady = false, g_coreBackdropSceneReady = false, g_coreBackdropDesktopReady = false;
+std::atomic_bool g_coreMaterialBridgeReady = false, g_coreBackdropBridgeReady = false;
+std::atomic_bool g_coreBackdropBridgeLogged = false;
 SRWLOCK g_coreMaterialTargetLock = SRWLOCK_INIT;
+std::atomic<std::uint64_t> g_coreMaterialTargetKey = 0, g_coreMaterialReadyKey = 0;
 std::atomic<ULONGLONG> g_coreMaterialTargetEpoch = 0;
-struct CoreMaterialOwnerWatch { void* visual = nullptr; void* treatment = nullptr; };
-CoreMaterialOwnerWatch g_coreMaterialOwners[4]; // Protected by target lock; comparison only.
-std::atomic_uint g_coreMaterialOwnerCount = 0;
-std::atomic<ULONGLONG> g_coreMaterialPrecomputeLogAt[4][3] = {};
-std::atomic<ULONGLONG> g_coreMaterialWorldLogAt[4][3][2] = {};
-
-static void ResetCoreMaterialOwnersLocked(bool resetProbe = true)
-{
-    g_coreMaterialOwnerCount.store(0, std::memory_order_release);
-    if (resetProbe) g_coreMaterialTreeProbeEpoch.store(0, std::memory_order_relaxed);
-    for (unsigned i = 0; i < ARRAYSIZE(g_coreMaterialOwners); ++i)
-    {
-        g_coreMaterialOwners[i] = {};
-        for (unsigned kind = 0; kind < 3; ++kind)
-        {
-            g_coreMaterialPrecomputeLogAt[i][kind].store(0, std::memory_order_relaxed);
-            for (unsigned scope = 0; scope < 2; ++scope)
-                g_coreMaterialWorldLogAt[i][kind][scope].store(0, std::memory_order_relaxed);
-        }
-    }
-}
-
-struct CoreMaterialOwnerTarget
-{
-    HWND hwnd = nullptr;
-    ULONGLONG epoch = 0;
-    void* sourceTree = nullptr;
-    unsigned index = 0;
-};
-
-static bool MatchCoreMaterialOwner(const void* pointer, bool material, CoreMaterialOwnerTarget& target)
-{
-    if (!pointer || !g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) ||
-        g_unloading.load(std::memory_order_acquire) ||
-        !g_coreMaterialOwnerCount.load(std::memory_order_acquire)) return false;
-    bool matched = false;
-    AcquireSRWLockShared(&g_coreMaterialTargetLock);
-    if (g_coreMaterialTargetKey.load(std::memory_order_relaxed))
-        for (unsigned i = 0; i < g_coreMaterialOwnerCount.load(std::memory_order_relaxed); ++i)
-            if (pointer == (material ? g_coreMaterialOwners[i].treatment : g_coreMaterialOwners[i].visual))
-            {
-                target = {g_coreMaterialTargetHwnd.load(std::memory_order_relaxed),
-                          g_coreMaterialTargetEpoch.load(std::memory_order_relaxed),
-                          g_coreMaterialSourceTree.load(std::memory_order_relaxed), i};
-                matched = true;
-                break;
-            }
-    ReleaseSRWLockShared(&g_coreMaterialTargetLock);
-    return matched;
-}
+std::atomic<HWND> g_coreMaterialTargetHwnd = nullptr;
+std::atomic<void*> g_coreMaterialSourceRoot = nullptr, g_coreMaterialSourceImage = nullptr, g_coreMaterialSourceTree = nullptr;
 
 static unsigned int NativeProxyResourceId(void* proxy)
 {
@@ -3663,19 +3560,17 @@ static unsigned int NativeProxyResourceId(void* proxy)
     return id;
 }
 
+
 static void ClearCoreMaterialTarget()
 {
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
     g_coreMaterialTargetKey.store(0, std::memory_order_release);
+    g_coreMaterialReadyKey.store(0, std::memory_order_release);
     g_coreMaterialSourceRoot.store(nullptr, std::memory_order_release);
     g_coreMaterialSourceImage.store(nullptr, std::memory_order_release);
     g_coreMaterialSourceTree.store(nullptr, std::memory_order_release);
-    g_coreMaterialSourceRejectLogAt.store(0, std::memory_order_relaxed);
-    for (auto& scope : g_coreMaterialRasterLogAt)
-        for (auto& time : scope) time.store(0, std::memory_order_relaxed);
-    g_coreMaterialRasterCount.store(0, std::memory_order_relaxed);
-    ResetCoreMaterialOwnersLocked();
     g_coreMaterialTargetHwnd.store(nullptr, std::memory_order_release);
+    g_coreBackdropBridgeLogged.store(false, std::memory_order_relaxed);
     g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
 }
@@ -3683,77 +3578,45 @@ static void ClearCoreMaterialTarget()
 static void SetCoreMaterialTarget(void* image, void* sourceProxy, HWND hwnd)
 {
     ClearCoreMaterialTarget();
-    if (!g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire)) return;
-    const unsigned imageId = NativeProxyResourceId(image);
-    const unsigned sourceId = NativeProxyResourceId(sourceProxy);
+    if (!g_coreMaterialBridgeReady.load(std::memory_order_acquire)) return;
+    const unsigned imageId = NativeProxyResourceId(image), sourceId = NativeProxyResourceId(sourceProxy);
     if (!imageId || !sourceId) return;
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
     g_coreMaterialTargetHwnd.store(hwnd, std::memory_order_relaxed);
-    g_coreMaterialRealizeLogAt.store(0, std::memory_order_relaxed);
-    g_coreMaterialTargetKey.store((std::uint64_t{sourceId} << 32) | imageId,
-                                   std::memory_order_release);
+    g_coreMaterialTargetKey.store((std::uint64_t{sourceId} << 32) | imageId, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
-    Wh_Log(L"MESH MATERIAL TARGET: HWND=%p imageId=%u rootId=%u readOnly=1",
-           hwnd, imageId, sourceId);
 }
 
 static long __cdecl CoreImageUpdateHook(void* image, void* table, const void* command)
 {
-    const ULONGLONG epoch = g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
+    const auto epoch = g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
     const long result = g_coreImageUpdateOriginal(image, table, command);
-    if (!g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) || result < 0 ||
+    if (result < 0 || !g_coreMaterialBridgeReady.load(std::memory_order_acquire) ||
         g_unloading.load(std::memory_order_acquire)) return result;
-    const std::uint64_t target = g_coreMaterialTargetKey.load(std::memory_order_acquire);
-    if (!target || !IsReadableMemory(command, 0x34)) return result;
+    const auto key = g_coreMaterialTargetKey.load(std::memory_order_acquire);
+    if (!key || !IsReadableMemory(command, 0x34) ||
+        ReadPointerMember(image, 0) != g_coreCachedImageVtable) return result;
     unsigned imageId = 0, rootId = 0;
-    std::memcpy(&imageId, static_cast<const BYTE*>(command) + 4, sizeof(imageId));
-    std::memcpy(&rootId, static_cast<const BYTE*>(command) + 0x30, sizeof(rootId));
-    if (((std::uint64_t{rootId} << 32) | imageId) != target) return result;
-    // The exact constructor installs CImageSource at +0, IBitmapRealization at
-    // +0x48. ProcessUpdate receives the primary pointer, not the bitmap interface.
-    void* imageVtable = ReadPointerMember(image, 0);
-    if (!g_coreCachedImageVtable || imageVtable != g_coreCachedImageVtable)
-    {
-        const ULONGLONG now = GetTickCount64();
-        ULONGLONG last = g_coreMaterialSourceRejectLogAt.load(std::memory_order_relaxed);
-        if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
-            now - last >= 1000 && g_coreMaterialSourceRejectLogAt.compare_exchange_strong(
-                last, now, std::memory_order_relaxed))
-            Wh_Log(L"MESH MATERIAL SOURCE REJECTED: imageId=%u rootId=%u reason=ImageType "
-                   L"actualVtable=%p expectedVtable=%p readOnly=1",
-                   imageId, rootId, imageVtable, g_coreCachedImageVtable);
-        return result;
-    }
-    // This exact core method stores its validated CVisual* root at +0x90.
-    // Do not dereference the remembered pointer later; compare it with a live
-    // CVisual argument supplied by the precompute callback instead.
+    std::memcpy(&imageId, static_cast<const BYTE*>(command) + 4, 4);
+    std::memcpy(&rootId, static_cast<const BYTE*>(command) + 0x30, 4);
+    if (((std::uint64_t{rootId} << 32) | imageId) != key) return result;
+    // ProcessUpdate receives primary CImageSource, not IBitmapRealization (+48).
     void* root = ReadPointerMember(image, 0x90);
-    HWND hwnd = nullptr;
-    bool changed = false;
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
-    if (target == g_coreMaterialTargetKey.load(std::memory_order_acquire) && root &&
-        epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
+    if (root && key == g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
+        epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed))
     {
-        changed = root != g_coreMaterialSourceRoot.load(std::memory_order_relaxed) ||
-                  image != g_coreMaterialSourceImage.load(std::memory_order_relaxed);
-        if (changed)
+        if (root != g_coreMaterialSourceRoot.load(std::memory_order_relaxed) ||
+            image != g_coreMaterialSourceImage.load(std::memory_order_relaxed))
         {
-            ResetCoreMaterialOwnersLocked();
-            for (auto& scope : g_coreMaterialRasterLogAt)
-                for (auto& time : scope) time.store(0, std::memory_order_relaxed);
-            g_coreMaterialRasterCount.store(0, std::memory_order_relaxed);
+            g_coreMaterialReadyKey.store(0, std::memory_order_release);
             g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
         }
         g_coreMaterialSourceRoot.store(root, std::memory_order_release);
         g_coreMaterialSourceImage.store(image, std::memory_order_release);
         g_coreMaterialSourceTree.store(ReadPointerMember(image, 0xB8), std::memory_order_release);
-        hwnd = g_coreMaterialTargetHwnd.load(std::memory_order_acquire);
     }
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
-    if (changed)
-        Wh_Log(L"MESH MATERIAL SOURCE: HWND=%p imageId=%u rootId=%u coreRoot=%p "
-               L"coreTree=%p readOnly=1", hwnd, imageId, rootId, root,
-               ReadPointerMember(image, 0xB8));
     return result;
 }
 
@@ -3761,9 +3624,6 @@ static bool IsCoreMaterialVisual(const void* visual);
 
 struct CoreBackdropSceneSnapshot
 {
-    const wchar_t* treeKind = L"unknown";
-    void* firstVisual = nullptr;
-    void* lastVisual = nullptr;
     void* treeRoot = nullptr;
     bool frameKnown = false;
     std::uint64_t currentFrame = 0, lastUsedFrame = 0, frameAge = UINT64_MAX;
@@ -3771,19 +3631,15 @@ struct CoreBackdropSceneSnapshot
 };
 
 static CoreBackdropSceneSnapshot ReadCoreBackdropScene(void* data, void* image,
-                                                       uintptr_t first, uintptr_t last)
+                                                       uintptr_t first)
 {
     CoreBackdropSceneSnapshot scene;
     if (!g_coreBackdropSceneReady) return scene;
-    scene.firstVisual = ReadPointerMember(reinterpret_cast<void*>(first), 0);
-    scene.lastVisual = ReadPointerMember(reinterpret_cast<void*>(last - 16), 0);
     void* tree = ReadPointerMember(reinterpret_cast<void*>(first + 8), 0);
     void* vtable = ReadPointerMember(tree, 0);
     if (vtable && (vtable == g_coreDesktopTreeVtable || vtable == g_coreVisualTreeVtable ||
                    vtable == g_coreSubVisualTreeVtable))
     {
-        scene.treeKind = vtable == g_coreDesktopTreeVtable ? L"desktop" :
-                         vtable == g_coreSubVisualTreeVtable ? L"subtree" : L"visual";
         scene.treeRoot = ReadPointerMember(tree, 0x40);
     }
     // Native GetBackdropVisualImage stamps +7C0 from CTreeData's composition
@@ -3806,19 +3662,16 @@ static CoreBackdropSceneSnapshot ReadCoreBackdropScene(void* data, void* image,
 struct CoreBackdropSnapshot
 {
     bool valid = false;
-    unsigned pathPairs = 0, images = 0;
+    unsigned images = 0;
     void* currentVisual = nullptr;
     void* currentTree = nullptr;
-    void* parentContext = nullptr;
     void* image = nullptr;
     void* root = nullptr;
-    unsigned tables = 0, alternateCount = 0;
-    bool incomplete = false;
+    unsigned alternateCount = 0;
     bool desktopValid = false;
-    unsigned desktopImages = 0;
     CoreBackdropSceneSnapshot scene;
     struct Alternate {
-        void* image; void* root; void* tree; unsigned pathPairs;
+        void* image; void* root; void* tree;
         CoreBackdropSceneSnapshot scene;
     } alternates[4] = {};
 };
@@ -3835,15 +3688,14 @@ static bool ReadCoreBackdropRegistry(void* data, void**& images, unsigned& count
     return true;
 }
 
-static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapshot& hit, bool desktopOnly = false)
+static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapshot& hit)
 {
     auto collect = [&](void* data, bool desktop = false)
     {
         void** images = nullptr;
         unsigned count = 0;
-        if (!ReadCoreBackdropRegistry(data, images, count)) { hit.incomplete = true; return; }
-        ++hit.tables;
-        if (desktop) { hit.desktopValid = true; hit.desktopImages = count; }
+        if (!ReadCoreBackdropRegistry(data, images, count)) { return; }
+        if (desktop) { hit.desktopValid = true; }
         for (unsigned i = 0; i < count; ++i)
         {
             void* image = images[i];
@@ -3854,22 +3706,22 @@ static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapsho
             const auto last = reinterpret_cast<uintptr_t>(ReadPointerMember(image, 0x708));
             if (!first || last <= first || (last - first) % 16 || last - first > 32 * 16 ||
                 !IsReadableMemory(reinterpret_cast<void*>(first), last - first))
-                { hit.incomplete = true; continue; }
+                { continue; }
             if (desktop)
             {
                 void* tree = ReadPointerMember(reinterpret_cast<void*>(last - 8), 0);
                 if (ReadPointerMember(tree, 0) != g_coreDesktopTreeVtable ||
                     g_coreFindTreeDataFunction(hit.currentVisual, tree) != data)
-                    { hit.incomplete = true; continue; }
+                    { continue; }
             }
             bool duplicate = false;
             for (unsigned j = 0; j < hit.alternateCount; ++j)
                 duplicate |= hit.alternates[j].image == image;
             if (duplicate) continue;
-            if (hit.alternateCount == ARRAYSIZE(hit.alternates)) { hit.incomplete = true; continue; }
+            if (hit.alternateCount == ARRAYSIZE(hit.alternates)) { continue; }
             hit.alternates[hit.alternateCount++] = {
                 image, root, ReadPointerMember(reinterpret_cast<void*>(first + 8), 0),
-                static_cast<unsigned>((last - first) / 16), ReadCoreBackdropScene(data, image, first, last)};
+                ReadCoreBackdropScene(data, image, first)};
         }
     };
     // FindTreeData's IsDesktop branch uses embedded CDesktopTreeData, not the
@@ -3880,49 +3732,10 @@ static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapsho
         ReadPointerMember(desktopData, 0) == g_coreDesktopTreeDataVtable &&
         ReadPointerMember(desktopData, 0x108) == hit.currentVisual)
         collect(desktopData, true);
-    if (desktopOnly) return;
-    collect(currentData, g_coreBackdropDesktopReady && desktopData == currentData);
-    // Native FindTreeData uses tagged property 1 for its intrusive association
-    // list. Validate the entire bounded list before making another native query.
-    const auto* properties = static_cast<const BYTE*>(ReadPointerMember(hit.currentVisual, 0xE8));
-    unsigned flags = 0, count = 0;
-    if (!IsReadableMemory(properties, 8)) { hit.incomplete = true; return; }
-    std::memcpy(&flags, properties, 4);
-    std::memcpy(&count, properties + 4, 4);
-    if (!(flags & 0x80000000)) return;
-    if (count > 64 || !IsReadableMemory(properties, ((8 + count + 7) & ~size_t{7}) + count * sizeof(void*)))
-        { hit.incomplete = true; return; }
-    const auto* tag = static_cast<const BYTE*>(std::memchr(properties + 8, 1, count));
-    if (!tag) return;
-    const size_t index = static_cast<size_t>(tag - properties - 8);
-    void* head = ReadPointerMember(properties, ((8 + count + 7) & ~size_t{7}) + index * sizeof(void*));
-    if (!head) return;
-    void* nodes[32] = {}, *trees[32] = {};
-    unsigned used = 0;
-    void* node = ReadPointerMember(head, 0);
-    while (node != head)
-    {
-        if (!node || used == ARRAYSIZE(nodes) ||
-            std::find(nodes, nodes + used, node) != nodes + used || !IsReadableMemory(node, 0x28))
-            { hit.incomplete = true; return; }
-        nodes[used] = node;
-        trees[used++] = ReadPointerMember(node, 0x20);
-        node = ReadPointerMember(node, 0);
-    }
-    for (unsigned i = 0; i < used; ++i)
-    {
-        const auto address = reinterpret_cast<uintptr_t>(nodes[i]);
-        if (address < 0x168 || !trees[i]) { hit.incomplete = true; continue; }
-        void* data = reinterpret_cast<void*>(address - 0x168);
-        if (data != currentData)
-        {
-            if (g_coreFindTreeDataFunction(hit.currentVisual, trees[i]) == data) collect(data);
-            else hit.incomplete = true;
-        }
-    }
+
 }
 
-static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context, bool desktopOnly = false)
+static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context)
 {
     CoreBackdropSnapshot hit;
     if (!g_coreBackdropDetailReady || !context) return hit;
@@ -3933,7 +3746,6 @@ static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context, bool desktop
     const auto end = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 8));
     if (!begin || end <= begin || (end - begin) % 16 || end - begin > 32 * 16 ||
         !IsReadableMemory(reinterpret_cast<void*>(begin), end - begin)) return hit;
-    hit.pathPairs = static_cast<unsigned>((end - begin) / 16);
     hit.currentTree = ReadPointerMember(reinterpret_cast<void*>(end - 8), 0);
     hit.currentVisual = g_coreCurrentVisualFunction(static_cast<const BYTE*>(context) + 0x18);
     if (!hit.currentTree || !IsCoreMaterialVisual(hit.currentVisual)) return hit;
@@ -3941,7 +3753,6 @@ static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context, bool desktop
     if (!data) return hit;
     void** images = nullptr;
     if (!ReadCoreBackdropRegistry(data, images, hit.images)) return hit;
-    hit.parentContext = ReadPointerMember(context, 0xD0);
     hit.valid = true;
     for (unsigned i = 0; i < hit.images; ++i)
     {
@@ -3955,49 +3766,36 @@ static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context, bool desktop
             continue;
         hit.image = image;
         hit.root = ReadPointerMember(image, 0x90);
-        hit.scene = ReadCoreBackdropScene(data, image, imageBegin, imageEnd);
+        hit.scene = ReadCoreBackdropScene(data, image, imageBegin);
         break;
     }
-    CollectCoreBackdropAlternates(data, hit, desktopOnly);
+    CollectCoreBackdropAlternates(data, hit);
     return hit;
 }
 
 struct CoreMaterialObservation
 {
-    unsigned effectCalls = 0, effectFailures = 0;
-    bool collectBackdrop = false;
-    CoreBackdropSnapshot backdrop;
-    unsigned precomputeCalls = 0, rootPrecomputeCalls = 0;
-    unsigned wallpaperCalls = 0, wallpaperFailures = 0, bviCalls = 0, bviFailures = 0;
-    void* wallpaperOutput = nullptr; // Opaque first output word, never reused/dereferenced.
-    int bviFlag = -1;
     ULONGLONG bridgeEpoch = 0;
-    void* bridgeContext = nullptr; // Borrowed only while this native DrawVisualTree call is active.
-    unsigned bridgeAttempts = 0, bridgeApplied = 0;
-    const wchar_t* bridgeReason = L"no-input-call";
-    void* bridgeSource = nullptr; // Comparison/logging only after the input factory returns.
+    void* bridgeContext = nullptr; // Borrowed only within DrawVisualTree.
 };
 thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
 thread_local unsigned g_coreMaterialRealizeDepth = 0;
-thread_local void* g_coreMaterialCurrentImage = nullptr; // Borrowed only within its callback.
+thread_local void* g_coreMaterialCurrentImage = nullptr;
 thread_local bool g_coreBackdropBridgeInCall = false;
 
 static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
 {
     auto* observation = g_coreMaterialObservation;
     if (!g_coreBackdropBridgeReady.load(std::memory_order_acquire) ||
-        !g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) ||
+        !g_coreMaterialBridgeReady.load(std::memory_order_acquire) ||
         g_unloading.load(std::memory_order_acquire) || !output || !observation ||
         !observation->bridgeContext || g_coreBackdropBridgeInCall ||
         !g_coreMaterialCurrentImage ||
         g_coreMaterialCurrentImage != g_coreMaterialSourceImage.load(std::memory_order_acquire) ||
-        observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
-        g_nativeSourceProbeMode.load(std::memory_order_acquire) != NativeSourceProbeMode::CapturedFlat)
+        observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
         return g_coreBackdropEffectInputOriginal(image, output);
 
-    ++observation->bridgeAttempts;
-    observation->bridgeReason = L"no-current-desktop";
-    const auto hit = ReadCoreBackdropSnapshot(observation->bridgeContext, true);
+    const auto hit = ReadCoreBackdropSnapshot(observation->bridgeContext);
     void* selected = nullptr;
     if (hit.valid && hit.image == image && hit.desktopValid && hit.scene.frameKnown &&
         hit.root == g_coreMaterialSourceRoot.load(std::memory_order_acquire))
@@ -4008,14 +3806,14 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
             const auto& scene = candidate.scene;
             if (ReadPointerMember(candidate.tree, 0) != g_coreDesktopTreeVtable) continue;
             if (scene.treeRoot != candidate.root)
-                { observation->bridgeReason = L"desktop-root-changed"; continue; }
+                { continue; }
             if (!scene.frameKnown || scene.currentFrame != hit.scene.currentFrame)
-                { observation->bridgeReason = L"desktop-frame-unknown"; continue; }
+                { continue; }
             if (scene.frameAge > 1)
-                { observation->bridgeReason = L"desktop-stale"; continue; }
+                { continue; }
             if (scene.effectReady != 1)
-                { observation->bridgeReason = L"desktop-effect-inactive"; continue; }
-            if (selected) { selected = nullptr; observation->bridgeReason = L"ambiguous-desktop"; break; }
+                { continue; }
+            if (selected) { selected = nullptr; break; }
             selected = candidate.image;
         }
     }
@@ -4026,290 +3824,26 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
         if (!targetInfo || !g_coreBackdropRealizationFunction(selected, targetInfo))
         {
             selected = nullptr;
-            observation->bridgeReason = L"target-not-ready";
         }
     }
     if (observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
         g_unloading.load(std::memory_order_acquire))
     {
-        observation->bridgeReason = L"target-retired";
         selected = nullptr;
     }
-    if (!selected)
-    {
-        void* result = g_coreBackdropEffectInputOriginal(image, output);
-        g_coreBackdropBridgeLastMiss.store(observation->bridgeReason, std::memory_order_relaxed);
-        RecordCoreBackdropBridgeInput(false);
-        return result;
-    }
+    if (!selected) return g_coreBackdropEffectInputOriginal(image, output);
 
     // The native factory constructs EffectInput and owns its normal references.
     // No structure copy, context-field swap or client/server image cast occurs.
     g_coreBackdropBridgeInCall = true;
     void* result = g_coreBackdropEffectInputOriginal(selected, output);
     g_coreBackdropBridgeInCall = false;
-    ++observation->bridgeApplied;
-    observation->bridgeReason = L"desktop-input";
-    observation->bridgeSource = selected;
-    RecordCoreBackdropBridgeInput(true);
+    if (!g_coreBackdropBridgeLogged.exchange(true, std::memory_order_relaxed))
+        Wh_Log(L"MESH ACRYLIC ACTIVE: HWND=%p nativeDesktopInput=1",
+               g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
     return result;
 }
 
-struct CoreMaterialWorldSnapshot
-{
-    float matrix[16] = {};
-    int reason = 0;
-};
-
-static bool ReadCoreMaterialWorldSnapshot(const void* treatment, CoreMaterialWorldSnapshot& snapshot)
-{
-    if (!treatment) return false;
-    const auto* matrix = static_cast<const BYTE*>(treatment) + 0xA0;
-    if (!IsReadableMemory(matrix, 0x48)) return false;
-    // The exact native setter copies 16 floats + flags at A0, reason at E4.
-    std::memcpy(snapshot.matrix, matrix, sizeof(snapshot.matrix));
-    std::memcpy(&snapshot.reason, matrix + 0x44, sizeof(snapshot.reason));
-    return true;
-}
-
-static void LogCoreMaterialWorldSnapshot(HWND hwnd, ULONGLONG epoch, unsigned index,
-                                        void* treatment, bool sourceScope)
-{
-    CoreMaterialWorldSnapshot snapshot;
-    if (index >= ARRAYSIZE(g_coreMaterialOwners) ||
-        epoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
-        !ReadCoreMaterialWorldSnapshot(treatment, snapshot)) return;
-    const unsigned kind = snapshot.reason >= 0 && snapshot.reason < 2
-        ? static_cast<unsigned>(snapshot.reason) : 2U;
-    auto& logAt = g_coreMaterialWorldLogAt[index][kind][sourceScope ? 1 : 0];
-    const ULONGLONG now = GetTickCount64();
-    ULONGLONG last = logAt.load(std::memory_order_relaxed);
-    if (now - last >= 1000 && logAt.compare_exchange_strong(last, now, std::memory_order_relaxed))
-        Wh_Log(L"MESH MATERIAL WORLD SNAPSHOT: HWND=%p treatment=%p reason=%d sourceScope=%d "
-               L"basis=(%.3f,%.3f,%.3f,%.3f) origin=(%.1f,%.1f) effectBitmap=%p readOnly=1",
-               hwnd, treatment, snapshot.reason, sourceScope, snapshot.matrix[0], snapshot.matrix[1],
-               snapshot.matrix[4], snapshot.matrix[5], snapshot.matrix[12], snapshot.matrix[13],
-               g_coreMaterialBitmapFunction(treatment));
-}
-
-static long __cdecl CorePrecomputeTreatmentHook(void* context, void* visual, bool phaseFlag)
-{
-    if (auto* observation = g_coreMaterialObservation)
-    {
-        ++observation->precomputeCalls;
-        observation->rootPrecomputeCalls +=
-            visual == g_coreMaterialSourceRoot.load(std::memory_order_acquire);
-    }
-    CoreMaterialOwnerTarget target;
-    const bool observe = MatchCoreMaterialOwner(visual, false, target);
-    // The verified original uses its first walk entry's tree at +0x1B0.
-    void* walkTree = observe ? ReadPointerMember(ReadPointerMember(context, 0), 0x1B0) : nullptr;
-    void* before = observe ? g_coreCachedTreatmentOriginal(visual) : nullptr;
-    const long result = g_corePrecomputeTreatmentOriginal(context, visual, phaseFlag);
-    if (observe && target.epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
-    {
-        void* treatment = g_coreTreatmentFunction(visual);
-        AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
-        if (target.epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed) &&
-            g_coreMaterialOwners[target.index].visual == visual)
-            g_coreMaterialOwners[target.index].treatment = treatment;
-        ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
-        const unsigned kind = walkTree && target.sourceTree
-            ? (walkTree == target.sourceTree ? 0U : 1U) : 2U;
-        const ULONGLONG now = GetTickCount64();
-        auto& logAt = g_coreMaterialPrecomputeLogAt[target.index][kind];
-        ULONGLONG last = logAt.load(std::memory_order_relaxed);
-        if (now - last >= 1000 && logAt.compare_exchange_strong(
-                last, now, std::memory_order_relaxed))
-            Wh_Log(L"MESH MATERIAL OWNER PRECOMPUTE: HWND=%p visual=%p treatment=%p "
-                   L"walkTree=%p sourceTree=%p sourceMatch=%d phaseFlag=%d "
-                   L"before=%p after=%p effectBitmap=%p result=0x%08X readOnly=1",
-                   target.hwnd, visual, treatment, walkTree, target.sourceTree,
-                   kind == 0, phaseFlag, before,
-                   g_coreCachedTreatmentOriginal(visual),
-                   treatment ? g_coreMaterialBitmapFunction(treatment) : nullptr,
-                   static_cast<unsigned>(result));
-        LogCoreMaterialWorldSnapshot(target.hwnd, target.epoch, target.index,
-                                     treatment, g_coreMaterialObservation != nullptr);
-    }
-    return result;
-}
-
-static long __cdecl CoreMaterialInputHook(void* context, const void* size, void* input)
-{
-    const long result = g_coreMaterialInputOriginal(context, size, input);
-    if (auto* observation = g_coreMaterialObservation)
-    {
-        ++observation->effectCalls;
-        if (result < 0) ++observation->effectFailures;
-    }
-    return result;
-}
-
-static long __cdecl CoreWallpaperInputHook(void* context, const void* size, void* input)
-{
-    const long result = g_coreWallpaperInputOriginal(context, size, input);
-    if (auto* observation = g_coreMaterialObservation)
-    {
-        ++observation->wallpaperCalls;
-        observation->wallpaperFailures += result < 0;
-        if (result >= 0) observation->wallpaperOutput = ReadPointerMember(input, 0);
-    }
-    return result;
-}
-
-static long __cdecl CoreBviValidationHook(void* context, const void* bounds, void* flag)
-{
-    const long result = g_coreBviValidationOriginal(context, bounds, flag);
-    if (auto* observation = g_coreMaterialObservation)
-    {
-        ++observation->bviCalls;
-        if (result >= 0) observation->bridgeContext = context;
-        if (observation->collectBackdrop && !observation->backdrop.valid &&
-            g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) &&
-            !g_unloading.load(std::memory_order_acquire))
-            observation->backdrop = ReadCoreBackdropSnapshot(context);
-        observation->bviFailures += result < 0;
-        if (result >= 0 && IsReadableMemory(flag, 1))
-        {
-            BYTE value;
-            std::memcpy(&value, flag, 1);
-            observation->bviFlag = value;
-        }
-    }
-    return result;
-}
-
-static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, const void* bounds,
-                                          const void* occlusion, int clearMode, bool drawFlag, void* root)
-{
-    bool observe = tree && g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) &&
-        !g_unloading.load(std::memory_order_acquire) &&
-        tree == g_coreMaterialSourceTree.load(std::memory_order_acquire);
-    ULONGLONG epoch = 0;
-    HWND hwnd = nullptr;
-    if (observe)
-    {
-        AcquireSRWLockShared(&g_coreMaterialTargetLock);
-        observe = g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
-                  tree == g_coreMaterialSourceTree.load(std::memory_order_relaxed);
-        epoch = g_coreMaterialTargetEpoch.load(std::memory_order_relaxed);
-        hwnd = g_coreMaterialTargetHwnd.load(std::memory_order_relaxed);
-        ReleaseSRWLockShared(&g_coreMaterialTargetLock);
-    }
-    if (!observe)
-        return g_coreDrawVisualTreeOriginal(context, tree, bounds, occlusion, clearMode, drawFlag, root);
-
-    // The native backdrop-image factory installs its image at +C8. Observe
-    // this live field without transferring images or changing render options.
-    void* backdrop = ReadPointerMember(context, 0xC8);
-    const bool insideRealize = g_coreMaterialRealizeDepth != 0;
-    void* currentImage = g_coreMaterialCurrentImage;
-    const int imageMatch = currentImage
-        ? (currentImage == g_coreMaterialSourceImage.load(std::memory_order_acquire) ? 1 : 0) : -1;
-    CoreMaterialObservation observation;
-    observation.bridgeEpoch = epoch;
-    const ULONGLONG previousLogAt =
-        g_coreMaterialRasterLogAt[insideRealize ? 1 : 0][imageMatch + 1].load(std::memory_order_relaxed);
-    observation.collectBackdrop = g_coreBackdropDetailReady &&
-        (!previousLogAt || GetTickCount64() - previousLogAt >= 1000);
-    auto* previous = g_coreMaterialObservation;
-    g_coreMaterialObservation = &observation;
-    const long result = g_coreDrawVisualTreeOriginal(
-        context, tree, bounds, occlusion, clearMode, drawFlag, root);
-    g_coreMaterialObservation = previous;
-    if (previous)
-    {
-        previous->effectCalls += observation.effectCalls;
-        previous->effectFailures += observation.effectFailures;
-        previous->precomputeCalls += observation.precomputeCalls;
-        previous->rootPrecomputeCalls += observation.rootPrecomputeCalls;
-        previous->wallpaperCalls += observation.wallpaperCalls;
-        previous->wallpaperFailures += observation.wallpaperFailures;
-        previous->bviCalls += observation.bviCalls;
-        previous->bviFailures += observation.bviFailures;
-        if (observation.wallpaperCalls) previous->wallpaperOutput = observation.wallpaperOutput;
-        if (observation.bviFlag >= 0) previous->bviFlag = observation.bviFlag;
-    }
-    unsigned count = 0;
-    bool log = false;
-    AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
-    if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed) &&
-        g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
-        tree == g_coreMaterialSourceTree.load(std::memory_order_relaxed))
-    {
-        count = g_coreMaterialRasterCount.fetch_add(1, std::memory_order_relaxed) + 1;
-        const ULONGLONG now = GetTickCount64();
-        auto& logAt = g_coreMaterialRasterLogAt[insideRealize ? 1 : 0][imageMatch + 1];
-        if (!logAt.load(std::memory_order_relaxed) ||
-            now - logAt.load(std::memory_order_relaxed) >= 1000)
-        {
-            logAt.store(now, std::memory_order_relaxed);
-            log = true;
-        }
-    }
-    ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
-    if (log)
-    {
-        if (imageMatch == 1 && observation.bviCalls && g_coreBackdropBridgeReady.load(std::memory_order_acquire))
-            Wh_Log(L"MESH ACRYLIC BRIDGE: HWND=%p attempts=%u applied=%u reason=%s source=%p nativeFactory=1",
-                   hwnd, observation.bridgeAttempts, observation.bridgeApplied,
-                   observation.bridgeReason, observation.bridgeSource);
-        Wh_Log(L"MESH MATERIAL RASTER: HWND=%p count=%u context=%p tree=%p root=%p backdropImage=%p "
-               L"insideRealize=%d image=%p imageMatch=%d clearMode=%d drawFlag=%d precompute=%u effectCalls=%u "
-               L"effectFailures=%u wallpaperCalls=%u wallpaperFailures=%u wallpaperOutput=%p "
-               L"bviCalls=%u bviFailures=%u bviFlag=%d result=0x%08X readOnly=1",
-               hwnd, count, context, tree, root, backdrop, insideRealize, currentImage, imageMatch, clearMode, drawFlag,
-               observation.precomputeCalls, observation.effectCalls, observation.effectFailures,
-               observation.wallpaperCalls, observation.wallpaperFailures, observation.wallpaperOutput,
-               observation.bviCalls, observation.bviFailures, observation.bviFlag,
-               static_cast<unsigned>(result));
-        if (observation.bviCalls && observation.collectBackdrop)
-        {
-            Wh_Log(L"MESH ACRYLIC INPUT: HWND=%p imageMatch=%d valid=%d pathPairs=%u "
-                   L"currentVisual=%p currentTree=%p parentContext=%p candidates=%u "
-                   L"matchedImage=%p backdropRoot=%p sampledRoot=%p tables=%u alternates=%u incomplete=%d "
-                   L"desktopValid=%d desktopImages=%u readOnly=1", hwnd, imageMatch,
-                   observation.backdrop.valid, observation.backdrop.pathPairs,
-                   observation.backdrop.currentVisual, observation.backdrop.currentTree,
-                   observation.backdrop.parentContext, observation.backdrop.images,
-                   observation.backdrop.image, observation.backdrop.root,
-                   g_coreMaterialSourceRoot.load(std::memory_order_acquire), observation.backdrop.tables,
-                   observation.backdrop.alternateCount, observation.backdrop.incomplete,
-                   observation.backdrop.desktopValid, observation.backdrop.desktopImages);
-            for (unsigned i = 0; i < observation.backdrop.alternateCount; ++i)
-            {
-                const auto& candidate = observation.backdrop.alternates[i];
-                Wh_Log(L"MESH ACRYLIC CANDIDATE: HWND=%p index=%u image=%p backdropRoot=%p "
-                       L"pathTree=%p pathPairs=%u readOnly=1", hwnd, i, candidate.image,
-                       candidate.root, candidate.tree, candidate.pathPairs);
-            }
-            auto logScene = [&](int index, const CoreBackdropSceneSnapshot& scene)
-            {
-                Wh_Log(L"MESH ACRYLIC SCENE: HWND=%p index=%d treeKind=%s treeRoot=%p "
-                       L"firstVisual=%p lastVisual=%p frameKnown=%d currentFrame=%llu lastUsedFrame=%llu "
-                       L"frameAge=%llu effectReady=%d readOnly=1", hwnd, index, scene.treeKind,
-                       scene.treeRoot, scene.firstVisual, scene.lastVisual, scene.frameKnown,
-                       static_cast<unsigned long long>(scene.currentFrame),
-                       static_cast<unsigned long long>(scene.lastUsedFrame),
-                       static_cast<unsigned long long>(scene.frameAge), scene.effectReady);
-            };
-            if (observation.backdrop.image) logScene(-1, observation.backdrop.scene);
-            for (unsigned i = 0; i < observation.backdrop.alternateCount; ++i)
-                logScene(static_cast<int>(i), observation.backdrop.alternates[i].scene);
-        }
-    }
-    return result;
-}
-
-struct CoreMaterialTreeSnapshot
-{
-    unsigned nodes = 0, ancestors = 0, treatments = 0, caches = 0, invalid = 0;
-    bool truncated = false;
-    struct Hit { void* visual; void* treatment; void* cache; unsigned depth; bool ancestor; };
-    Hit hits[4] = {};
-    unsigned hitCount = 0;
-};
 
 static bool IsCoreMaterialVisual(const void* visual)
 {
@@ -4329,180 +3863,86 @@ static bool IsCoreMaterialVisual(const void* visual)
     return true;
 }
 
-static CoreMaterialTreeSnapshot InspectCoreMaterialTree(void* root)
+
+static long __cdecl CoreBviValidationHook(void* context, const void* bounds, void* flag)
 {
-    // CVisual parent/children and tagged collection layout are verified from
-    // this exact core's InsertChild, RemoveAllChildren and collection GetAt.
-    CoreMaterialTreeSnapshot result;
-    struct Entry { void* visual; unsigned depth; } pending[64] = {{root, 0}};
-    unsigned queued = 1;
-    auto record = [&](void* visual, unsigned depth, bool ancestor)
+    const long result = g_coreBviValidationOriginal(context, bounds, flag);
+    if (result >= 0 && g_coreMaterialObservation)
+        g_coreMaterialObservation->bridgeContext = context;
+    return result;
+}
+
+static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, const void* bounds,
+                                          const void* occlusion, int clearMode, bool drawFlag, void* root)
+{
+    bool observe = tree && g_coreMaterialBridgeReady.load(std::memory_order_acquire) &&
+        !g_unloading.load(std::memory_order_acquire) &&
+        tree == g_coreMaterialSourceTree.load(std::memory_order_acquire);
+    ULONGLONG epoch = 0;
+    if (observe)
     {
-        void* treatment = g_coreTreatmentFunction(visual);
-        void* cache = g_coreCachedTreatmentOriginal(visual);
-        result.treatments += treatment != nullptr;
-        result.caches += cache != nullptr;
-        if ((treatment || cache) && result.hitCount < ARRAYSIZE(result.hits))
-            result.hits[result.hitCount++] = {visual, treatment, cache, depth, ancestor};
-    };
-    for (unsigned cursor = 0; cursor < queued; ++cursor)
-    {
-        void* visual = pending[cursor].visual;
-        if (!IsCoreMaterialVisual(visual)) { ++result.invalid; continue; }
-        ++result.nodes;
-        record(visual, pending[cursor].depth, false);
-        uintptr_t tagged = reinterpret_cast<uintptr_t>(ReadPointerMember(visual, 0x50));
-        auto* storage = reinterpret_cast<const BYTE*>(tagged & ~uintptr_t{3});
-        size_t count = tagged & 1;
-        if (tagged & 2)
-        {
-            size_t capacity = 0;
-            if (!IsReadableMemory(storage, 16)) { ++result.invalid; continue; }
-            std::memcpy(&count, storage, sizeof(count));
-            std::memcpy(&capacity, storage + 8, sizeof(capacity));
-            if (count > 256) { result.truncated = true; continue; }
-            if (count == 1 || capacity < count ||
-                !IsReadableMemory(storage, 16 + count * sizeof(void*)))
-                { ++result.invalid; continue; }
-        }
-        else if (!count && tagged) { ++result.invalid; continue; }
-        for (size_t i = 0; i < count; ++i)
-        {
-            void* child = (tagged & 2) ? ReadPointerMember(storage, 16 + i * sizeof(void*))
-                                      : const_cast<BYTE*>(storage);
-            bool duplicate = false;
-            for (unsigned j = 0; j < queued; ++j) duplicate |= pending[j].visual == child;
-            if (duplicate || !IsCoreMaterialVisual(child) || ReadPointerMember(child, 0x58) != visual)
-                { ++result.invalid; continue; }
-            if (queued == ARRAYSIZE(pending)) { result.truncated = true; break; }
-            pending[queued++] = {child, pending[cursor].depth + 1};
-        }
+        AcquireSRWLockShared(&g_coreMaterialTargetLock);
+        observe = g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
+                  tree == g_coreMaterialSourceTree.load(std::memory_order_relaxed);
+        epoch = g_coreMaterialTargetEpoch.load(std::memory_order_relaxed);
+        ReleaseSRWLockShared(&g_coreMaterialTargetLock);
     }
-    void* visited[17] = {root};
-    void* parent = IsCoreMaterialVisual(root) ? ReadPointerMember(root, 0x58) : nullptr;
-    for (unsigned depth = 1; parent && depth < ARRAYSIZE(visited); ++depth)
-    {
-        if (!IsCoreMaterialVisual(parent) ||
-            std::find(visited, visited + depth, parent) != visited + depth)
-            { ++result.invalid; parent = nullptr; break; }
-        visited[depth] = parent;
-        ++result.ancestors;
-        record(parent, depth, true);
-        parent = ReadPointerMember(parent, 0x58);
-    }
-    result.truncated |= parent != nullptr;
+    if (!observe)
+        return g_coreDrawVisualTreeOriginal(context, tree, bounds, occlusion, clearMode, drawFlag, root);
+    CoreMaterialObservation observation;
+    observation.bridgeEpoch = epoch;
+    auto* previous = g_coreMaterialObservation;
+    g_coreMaterialObservation = &observation;
+    const long result = g_coreDrawVisualTreeOriginal(context, tree, bounds, occlusion, clearMode, drawFlag, root);
+    g_coreMaterialObservation = previous;
     return result;
 }
 
 static long __cdecl CoreImageRealizeHook(void* image, const void* targetInfo, void** bitmap)
 {
-    bool observe = g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) &&
+    bool observe = g_coreMaterialBridgeReady.load(std::memory_order_acquire) &&
         !g_unloading.load(std::memory_order_acquire) &&
         image == g_coreMaterialSourceImage.load(std::memory_order_acquire);
     ULONGLONG epoch = 0;
-    HWND hwnd = nullptr;
+    std::uint64_t key = 0;
     if (observe)
     {
         AcquireSRWLockShared(&g_coreMaterialTargetLock);
-        observe = g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
-                  image == g_coreMaterialSourceImage.load(std::memory_order_relaxed);
+        key = g_coreMaterialTargetKey.load(std::memory_order_relaxed);
+        observe = key && image == g_coreMaterialSourceImage.load(std::memory_order_relaxed);
         epoch = g_coreMaterialTargetEpoch.load(std::memory_order_relaxed);
-        hwnd = g_coreMaterialTargetHwnd.load(std::memory_order_relaxed);
         ReleaseSRWLockShared(&g_coreMaterialTargetLock);
     }
-    if (!observe)
-    {
-        if (!g_coreMaterialRealizeDepth) return g_coreImageRealizeOriginal(image, targetInfo, bitmap);
-        // A backdrop image can draw the same tree recursively. Track its live
-        // identity as well, without querying or retaining another native image.
-        void* previousImage = g_coreMaterialCurrentImage;
-        g_coreMaterialCurrentImage = image;
-        const long result = g_coreImageRealizeOriginal(image, targetInfo, bitmap);
-        g_coreMaterialCurrentImage = previousImage;
-        return result;
-    }
-
-    const ULONGLONG now = GetTickCount64();
-    ULONGLONG last = g_coreMaterialRealizeLogAt.load(std::memory_order_relaxed);
-    const bool log = now - last >= 1000 &&
-        g_coreMaterialRealizeLogAt.compare_exchange_strong(last, now, std::memory_order_relaxed);
-    // The current CVI owns this root throughout the callback. Never query a
-    // remembered CVisual from an animation/event thread.
-    void* rootBefore = log ? ReadPointerMember(image, 0x90) : nullptr;
-    void* treatment = rootBefore ? g_coreTreatmentFunction(rootBefore) : nullptr;
-    void* cachedBefore = rootBefore ? g_coreCachedTreatmentOriginal(rootBefore) : nullptr;
-    CoreMaterialObservation observation;
-    auto* previous = g_coreMaterialObservation;
-    g_coreMaterialObservation = &observation;
+    if (!observe && !g_coreMaterialRealizeDepth)
+        return g_coreImageRealizeOriginal(image, targetInfo, bitmap);
+    // Nested realizations must expose their own identity to prevent recursion.
     void* previousImage = g_coreMaterialCurrentImage;
     g_coreMaterialCurrentImage = image;
     ++g_coreMaterialRealizeDepth;
     const long result = g_coreImageRealizeOriginal(image, targetInfo, bitmap);
     --g_coreMaterialRealizeDepth;
     g_coreMaterialCurrentImage = previousImage;
-    g_coreMaterialObservation = previous;
-    if (log && epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
+    bool lostBitmap = false;
+    if (observe)
     {
-        void* rootAfter = ReadPointerMember(image, 0x90);
-        void* sourceTree = ReadPointerMember(image, 0xB8);
         AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
         if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed) &&
+            key == g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
             image == g_coreMaterialSourceImage.load(std::memory_order_relaxed))
-            g_coreMaterialSourceTree.store(sourceTree, std::memory_order_release);
-        ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
-        Wh_Log(L"MESH MATERIAL REALIZE: HWND=%p result=0x%08X rootBefore=%p rootAfter=%p treatment=%p "
-               L"cachedBefore=%p cachedAfter=%p precompute=%u rootPrecompute=%u "
-               L"effectCalls=%u effectFailures=%u wallpaperCalls=%u bviCalls=%u rasterCalls=%u readOnly=1",
-               hwnd, static_cast<unsigned>(result), rootBefore, rootAfter, treatment, cachedBefore,
-               rootAfter ? g_coreCachedTreatmentOriginal(rootAfter) : nullptr,
-               observation.precomputeCalls, observation.rootPrecomputeCalls,
-               observation.effectCalls, observation.effectFailures,
-               observation.wallpaperCalls, observation.bviCalls,
-               g_coreMaterialRasterCount.load(std::memory_order_relaxed));
-        // Sample only the current image's live tree, at most once per second.
-        if (last)
         {
-            bool changedOwners = g_coreMaterialTreeProbeEpoch.exchange(epoch, std::memory_order_relaxed) != epoch;
-            const auto tree = InspectCoreMaterialTree(rootAfter);
-            AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
-            if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed) &&
-                image == g_coreMaterialSourceImage.load(std::memory_order_relaxed) &&
-                rootAfter == g_coreMaterialSourceRoot.load(std::memory_order_relaxed))
-            {
-                changedOwners |= tree.hitCount != g_coreMaterialOwnerCount.load(std::memory_order_relaxed);
-                for (unsigned i = 0; i < tree.hitCount; ++i)
-                    changedOwners |= g_coreMaterialOwners[i].visual != tree.hits[i].visual ||
-                                     g_coreMaterialOwners[i].treatment != tree.hits[i].treatment;
-                if (changedOwners) ResetCoreMaterialOwnersLocked(false);
-                for (unsigned i = 0; i < tree.hitCount; ++i)
-                    g_coreMaterialOwners[i] = {tree.hits[i].visual, tree.hits[i].treatment};
-                g_coreMaterialOwnerCount.store(tree.hitCount, std::memory_order_release);
-            }
-            ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
-            if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
-            {
-                if (changedOwners)
-                    Wh_Log(L"MESH MATERIAL TREE: HWND=%p nodes=%u ancestors=%u treatments=%u "
-                           L"caches=%u invalid=%u truncated=%d readOnly=1",
-                           hwnd, tree.nodes, tree.ancestors, tree.treatments,
-                           tree.caches, tree.invalid, tree.truncated);
-                for (unsigned i = 0; i < tree.hitCount; ++i)
-                {
-                    const auto& hit = tree.hits[i];
-                    if (changedOwners)
-                        Wh_Log(L"MESH MATERIAL OWNER: HWND=%p visual=%p relation=%s depth=%u "
-                               L"treatment=%p cache=%p readOnly=1", hwnd, hit.visual,
-                               hit.ancestor ? L"ancestor" : L"subtree", hit.depth,
-                               hit.treatment, hit.cache);
-                    LogCoreMaterialWorldSnapshot(hwnd, epoch, i, hit.treatment, true);
-                }
-            }
+            g_coreMaterialSourceTree.store(ReadPointerMember(image, 0xB8), std::memory_order_release);
+            const bool available = result >= 0 && ReadPointerMember(bitmap, 0);
+            const auto previousReady = g_coreMaterialReadyKey.exchange(available ? key : 0,
+                                                                       std::memory_order_acq_rel);
+            lostBitmap = !available && previousReady == key;
         }
+        ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
     }
+    if (lostBitmap) RequestDwmScenePass();
     return result;
 }
 
-static void InitializeCoreMaterialDiagnostics()
+static void InitializeCoreMaterialBridge()
 {
     HMODULE core = GetModuleHandleW(L"dwmcore.dll");
     if (sizeof(void*) != 8 || !NativeMeshAbiVerified() ||
@@ -4517,7 +3957,7 @@ static void InitializeCoreMaterialDiagnostics()
         return;
     if (nt->FileHeader.TimeDateStamp != 0x610B3AB4 || nt->OptionalHeader.SizeOfImage != 0x41A000)
     {
-        Wh_Log(L"MESH MATERIAL OBSERVER: unavailable coreTimestamp=0x%08X coreSize=0x%X",
+        Wh_Log(L"MESH MATERIAL BRIDGE: unavailable coreTimestamp=0x%08X coreSize=0x%X",
                nt->FileHeader.TimeDateStamp, nt->OptionalHeader.SizeOfImage);
         return;
     }
@@ -4542,11 +3982,6 @@ static void InitializeCoreMaterialDiagnostics()
         {{L"public: bool __cdecl CBackdropVisualImage::HasValidRenderingRealization(class RenderTargetInfo const &)const",
           L"public: bool __cdecl CBackdropVisualImage::HasValidRenderingRealization(class RenderTargetInfo const &)const "},
          &g_coreBackdropRealizationFunction, nullptr, true},
-        {{L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
-           L"struct D2D_SIZE_F const &,struct EffectInput *)const",
-          L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
-           L"struct D2D_SIZE_F const &,struct EffectInput *)const "},
-         &g_coreWallpaperInputFunction, nullptr, true},
         {{L"public: long __cdecl CDrawingContext::ValidateBVIEffectInputForRender("
            L"class TMilRect_<float,struct MilRectF,struct Mil3DRectF,struct MilPointAndSizeF,"
            L"struct RectUniqueness::NotNeeded> const &,bool *)const",
@@ -4560,37 +3995,11 @@ static void InitializeCoreMaterialDiagnostics()
            L"struct Mil3DRectF,struct RectUniqueness::NotNeeded> const &,class COcclusionContext const *,"
            L"enum ClearMode::Enum,bool,class CVisual *)"},
          &g_coreDrawVisualTreeFunction, nullptr, true},
-        {{L"public: void __cdecl CWindowBackgroundTreatment::SetWorldTransform("
-           L"class CMILMatrix const &,enum WalkReason)"},
-         &g_coreMaterialWorldFunction, nullptr, true},
-        {{L"public: long __cdecl CDrawingContext::GetWindowBackgroundTreatmentEffectInput("
-           L"struct D2D_SIZE_F const &,struct EffectInput *)const",
-          L"public: long __cdecl CDrawingContext::GetWindowBackgroundTreatmentEffectInput("
-           L"struct D2D_SIZE_F const &,struct EffectInput *)const "},
-         &g_coreMaterialInputFunction, nullptr, true},
-        {{L"public: class CCachedWindowBackgroundTreatment * __cdecl "
-           L"CVisual::GetCachedWindowBackgroundTreatment(void)const",
-          L"public: class CCachedWindowBackgroundTreatment * __cdecl "
-           L"CVisual::GetCachedWindowBackgroundTreatment(void)const "},
-         &g_coreCachedTreatmentFunction, nullptr, true},
         {{L"const CCachedVisualImage::`vftable'{for `CImageSource'}"},
          &g_coreCachedImageVtable, nullptr, true},
         {{L"protected: long __cdecl CCachedVisualImage::ProcessUpdate("
            L"class CResourceTable *,struct tagMILCMD_CACHEDVISUALIMAGE const *)"},
          &g_coreImageUpdateFunction, nullptr, true},
-        {{L"private: long __cdecl CPreComputeContext::ProcessPostSubgraphWindowBackgroundTreatment("
-           L"class CVisual *,bool)"},
-         &g_corePrecomputeTreatmentFunction, nullptr, true},
-        {{L"public: class CWindowBackgroundTreatment * __cdecl "
-           L"CVisual::GetWindowBackgroundTreatmentInternal(void)const",
-          L"public: class CWindowBackgroundTreatment * __cdecl "
-           L"CVisual::GetWindowBackgroundTreatmentInternal(void)const "},
-         &g_coreTreatmentFunction, nullptr, true},
-        {{L"public: class IBitmapRealization * __cdecl "
-           L"CWindowBackgroundTreatment::GetRealizationForEffectInput(void)const",
-          L"public: class IBitmapRealization * __cdecl "
-           L"CWindowBackgroundTreatment::GetRealizationForEffectInput(void)const "},
-         &g_coreMaterialBitmapFunction, nullptr, true},
         {{L"protected: long __cdecl CCachedVisualImage::EnsureRenderTargetBitmap("
            L"class RenderTargetInfo const &,class IRenderTargetBitmap * *)"},
          &g_coreImageRealizeFunction, nullptr, true},
@@ -4600,19 +4009,12 @@ static void InitializeCoreMaterialDiagnostics()
     const auto base = reinterpret_cast<uintptr_t>(core);
     // PDB resolution plus exact-image RVAs prevent a same-name ABI mismatch.
     if (reinterpret_cast<uintptr_t>(g_coreDrawVisualTreeFunction) != base + 0x87B2C ||
-        reinterpret_cast<uintptr_t>(g_coreWallpaperInputFunction) != base + 0xB3790 ||
         reinterpret_cast<uintptr_t>(g_coreBviValidationFunction) != base + 0x8850C ||
-        reinterpret_cast<uintptr_t>(g_coreMaterialWorldFunction) != base + 0xE35EC ||
-        reinterpret_cast<uintptr_t>(g_coreMaterialInputFunction) != base + 0xA984 ||
-        reinterpret_cast<uintptr_t>(g_coreCachedTreatmentFunction) != base + 0xB148 ||
         reinterpret_cast<uintptr_t>(g_coreCachedImageVtable) != base + 0x2C4350 ||
         reinterpret_cast<uintptr_t>(g_coreImageUpdateFunction) != base + 0xA923C ||
-        reinterpret_cast<uintptr_t>(g_corePrecomputeTreatmentFunction) != base + 0xA44FC ||
-        reinterpret_cast<uintptr_t>(g_coreTreatmentFunction) != base + 0xA4BAC ||
-        reinterpret_cast<uintptr_t>(g_coreMaterialBitmapFunction) != base + 0xB1A8 ||
         reinterpret_cast<uintptr_t>(g_coreImageRealizeFunction) != base + 0x3A8B0)
     {
-        Wh_Log(L"MESH MATERIAL OBSERVER: unavailable symbol/layout mismatch");
+        Wh_Log(L"MESH MATERIAL BRIDGE: unavailable symbol/layout mismatch");
         return;
     }
     g_coreMaterialModuleBase = base;
@@ -4621,49 +4023,31 @@ static void InitializeCoreMaterialDiagnostics()
         reinterpret_cast<uintptr_t>(g_coreCurrentVisualFunction) == base + 0xD4950 &&
         reinterpret_cast<uintptr_t>(g_coreBackdropImageVtable) == base + 0x2C30D8 &&
         IsReadableMemory(g_coreBackdropImageVtable, sizeof(void*));
-    Wh_Log(L"MESH ACRYLIC INPUT OBSERVER: %s hooksAdded=0 sampleMs=1000 readOnly=1",
-           g_coreBackdropDetailReady ? L"available" : L"unavailable");
     g_coreBackdropSceneReady = g_coreBackdropDetailReady &&
         reinterpret_cast<uintptr_t>(g_coreDesktopTreeVtable) == base + 0x2C9668 &&
         reinterpret_cast<uintptr_t>(g_coreVisualTreeVtable) == base + 0x2C1C28 &&
         reinterpret_cast<uintptr_t>(g_coreSubVisualTreeVtable) == base + 0x2CCA28;
-    Wh_Log(L"MESH ACRYLIC SCENE OBSERVER: %s hooksAdded=0 sampleMs=1000 readOnly=1",
-           g_coreBackdropSceneReady ? L"available" : L"unavailable");
     g_coreBackdropDesktopReady = g_coreBackdropDetailReady &&
         reinterpret_cast<uintptr_t>(g_coreDesktopTreeVtable) == base + 0x2C9668 &&
         reinterpret_cast<uintptr_t>(g_coreDesktopTreeDataVtable) == base + 0x2C2CD8;
-    Wh_Log(L"MESH ACRYLIC DESKTOP OBSERVER: %s hooksAdded=0 sampleMs=1000 readOnly=1",
-           g_coreBackdropDesktopReady ? L"available" : L"unavailable");
-    // Native callers retain extra volatile registers across these leaf getters/
-    // setters (e.g. R10 across SetWorldTransform). Never detour them with C++.
-    g_coreCachedTreatmentOriginal = g_coreCachedTreatmentFunction;
-    const bool ready =
-        WindhawkUtils::SetFunctionHook(g_coreWallpaperInputFunction,
-            CoreWallpaperInputHook, &g_coreWallpaperInputOriginal) &&
+    // Leaf getters can carry private volatile-register state; never detour them.
+    const bool ready = g_coreBackdropDetailReady && g_coreBackdropSceneReady && g_coreBackdropDesktopReady &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropEffectInputFunction) == base + 0x3122C &&
+        reinterpret_cast<uintptr_t>(g_coreCurrentTargetInfoFunction) == base + 0x105760 &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropRealizationFunction) == base + 0x4B1E0 &&
         WindhawkUtils::SetFunctionHook(g_coreBviValidationFunction,
             CoreBviValidationHook, &g_coreBviValidationOriginal) &&
         WindhawkUtils::SetFunctionHook(g_coreDrawVisualTreeFunction,
             CoreDrawVisualTreeHook, &g_coreDrawVisualTreeOriginal) &&
-        WindhawkUtils::SetFunctionHook(g_coreMaterialInputFunction,
-            CoreMaterialInputHook, &g_coreMaterialInputOriginal) &&
         WindhawkUtils::SetFunctionHook(g_coreImageUpdateFunction,
             CoreImageUpdateHook, &g_coreImageUpdateOriginal) &&
-        WindhawkUtils::SetFunctionHook(g_corePrecomputeTreatmentFunction,
-            CorePrecomputeTreatmentHook, &g_corePrecomputeTreatmentOriginal) &&
         WindhawkUtils::SetFunctionHook(g_coreImageRealizeFunction,
-            CoreImageRealizeHook, &g_coreImageRealizeOriginal);
-    g_coreMaterialDiagnosticsReady.store(ready, std::memory_order_release);
-    const bool bridgeReady = ready && g_coreBackdropDesktopReady && g_coreBackdropSceneReady &&
-        reinterpret_cast<uintptr_t>(g_coreBackdropEffectInputFunction) == base + 0x3122C &&
-        reinterpret_cast<uintptr_t>(g_coreCurrentTargetInfoFunction) == base + 0x105760 &&
-        reinterpret_cast<uintptr_t>(g_coreBackdropRealizationFunction) == base + 0x4B1E0 &&
+            CoreImageRealizeHook, &g_coreImageRealizeOriginal) &&
         WindhawkUtils::SetFunctionHook(g_coreBackdropEffectInputFunction,
             CoreBackdropEffectInputHook, &g_coreBackdropEffectInputOriginal);
-    g_coreBackdropBridgeReady.store(bridgeReady, std::memory_order_release);
-    Wh_Log(L"MESH ACRYLIC BRIDGE: %s mode=captured-source-only hideProbe=compatible nativeFactory=1",
-           bridgeReady ? L"ready" : L"unavailable");
-    Wh_Log(L"MESH MATERIAL OBSERVER: %s coreTimestamp=0x%08X hooks=%u leafHooks=0 readOnly=%d",
-           ready ? L"ready" : L"unavailable", nt->FileHeader.TimeDateStamp, bridgeReady ? 8u : 7u, !bridgeReady);
+    g_coreMaterialBridgeReady.store(ready, std::memory_order_release);
+    g_coreBackdropBridgeReady.store(ready, std::memory_order_release);
+    Wh_Log(L"MESH MATERIAL BRIDGE: %s hooks=5 leafHooks=0", ready ? L"ready" : L"unavailable; using Affine");
 }
 
 static bool RetainNativeMeshRoot(void* root)
@@ -4736,12 +4120,12 @@ static bool IsNativeMeshSourceCurrent(void* topLevelWindow, void* sourceRoot,
                        : border != sourceRoot)
         return false;
     return sourceRoot && NativeVisualVtableRva(sourceRoot) &&
-           g_nativeProbeGetVisualProxy(sourceRoot) == sourceProxy;
+           g_nativeMeshGetVisualProxy(sourceRoot) == sourceProxy;
 }
 
 // Native capture source begin: exact 23H2 layout, independently tested below.
-// Probe whether a sub-pixel original contribution keeps native backdrop work alive.
-static constexpr double kNativeOriginalProbeOpacity = 1.0 / 65536.0;
+// A sub-pixel original contribution keeps native backdrop realization active.
+static constexpr double kNativeOriginalOpacity = 1.0 / 65536.0;
 class NativeCaptureGuard
 {
 public:
@@ -4782,7 +4166,7 @@ static void ReleaseNativeCapturedSource(void* representation)
         ReadPointerMember(listener, 0) == g_nativeCaptureListenerVtable;
     const unsigned long references = g_cBaseObjectRelease(representation);
     // Native callbacks must remain valid even if another native owner retains
-    // this experimental source. The tiny heap record never points into mod code.
+    // this captured source. The tiny heap record never points into mod code.
     if (ownedListener && !references) HeapFree(GetProcessHeap(), 0, listener);
 }
 
@@ -4849,56 +4233,36 @@ static bool ReadNativeOpacity(void* visual, double& opacity)
 
 static void RestoreNativeOriginal(NativeMeshState& state)
 {
-    g_nativeOriginalHideWakeUntil.store(0, std::memory_order_release);
+    g_nativeMeshSourcePending.store(false, std::memory_order_release);
     if (!state.originalHidden) return;
-    const auto totals = g_coreBackdropBridgeStats.load(std::memory_order_acquire);
-    const auto calls = static_cast<std::uint32_t>(totals >> 32) - static_cast<std::uint32_t>(state.hideBridgeStart >> 32);
-    const auto applied = static_cast<std::uint32_t>(totals) - static_cast<std::uint32_t>(state.hideBridgeStart);
-    const auto* miss = calls == applied ? L"none" : g_coreBackdropBridgeLastMiss.load(std::memory_order_relaxed);
     double current = 0.0;
-    const bool owned = ReadNativeOpacity(state.root, current) && current == kNativeOriginalProbeOpacity;
+    const bool owned = ReadNativeOpacity(state.root, current) && current == kNativeOriginalOpacity;
     if (owned && g_nativeVisualSetOpacity) g_nativeVisualSetOpacity(state.root, state.originalOpacity);
     state.originalHidden = false;
-    state.hideUntil = 0;
-    Wh_Log(L"NATIVE ORIGINAL HIDE RESTORED: HWND=%p propertyOwned=%d acrylicCalls=%u acrylicApplied=%u acrylicMiss=%s",
-           state.hwnd, owned, calls, applied, miss);
+    Wh_Log(L"MESH ORIGINAL RESTORED: HWND=%p propertyOwned=%d", state.hwnd, owned);
 }
 
-static void MaintainNativeOriginalHide(NativeMeshState& state)
+static bool MaintainNativeOriginalHide(NativeMeshState& state)
 {
-    const ULONGLONG now = GetTickCount64();
-    const bool held = g_realDragging.load(std::memory_order_acquire) &&
-        g_realDraggedWindow.load(std::memory_order_acquire) == state.hwnd;
+    const auto key = state.materialKey;
+    if (!key || key != g_coreMaterialTargetKey.load(std::memory_order_acquire)) return false;
+    double current = 0.0;
     if (state.originalHidden)
-    {
-        if (!held || now >= state.hideUntil || !g_nativeOriginalHideProbe.load(std::memory_order_acquire))
-            RestoreNativeOriginal(state);
-        return;
-    }
-    if (!state.capturedRepresentation || state.hideProbeAttempted ||
-        !g_nativeOriginalHideProbe.load(std::memory_order_acquire))
-    {
-        g_nativeOriginalHideWakeUntil.store(0, std::memory_order_release);
-        return;
-    }
-    if (now - state.attachedAt < 1000) return;
-    state.hideProbeAttempted = true;
-    if (!held || !g_nativeVisualSetOpacity || !IsNativeCapturedSourceSeparate(state.capturedRepresentation, state.root) ||
+        return g_coreMaterialReadyKey.load(std::memory_order_acquire) == key &&
+               ReadNativeOpacity(state.root, current) && current == kNativeOriginalOpacity;
+    if (g_coreMaterialReadyKey.load(std::memory_order_acquire) != key)
+        return GetTickCount64() - state.attachedAt < 1500;
+    if (!state.capturedRepresentation || !g_nativeVisualSetOpacity ||
+        !IsNativeCapturedSourceSeparate(state.capturedRepresentation, state.root) ||
         !ReadNativeOpacity(state.root, state.originalOpacity) || state.originalOpacity != 1.0)
-    {
-        g_nativeOriginalHideWakeUntil.store(0, std::memory_order_release);
-        Wh_Log(L"NATIVE ORIGINAL HIDE SKIPPED: HWND=%p reason=SourceDependencyOrOpacity", state.hwnd);
-        return;
-    }
-    state.hideBridgeStart = g_coreBackdropBridgeStats.load(std::memory_order_acquire);
+        return false;
     state.originalHidden = true;
-    state.hideUntil = now + 750;
-    g_nativeOriginalHideWakeUntil.store(state.hideUntil, std::memory_order_release);
-    g_nativeVisualSetOpacity(state.root, kNativeOriginalProbeOpacity);
-    Wh_Log(L"NATIVE ORIGINAL HIDE ACTIVE: HWND=%p durationMs=750 opacity=%.8f source=OwnedRepresentation",
-           state.hwnd, kNativeOriginalProbeOpacity);
-}
-// Native capture source end.
+    g_nativeVisualSetOpacity(state.root, kNativeOriginalOpacity);
+    g_nativeMeshSourcePending.store(false, std::memory_order_release);
+    Wh_Log(L"MESH ORIGINAL SUPPRESSED: HWND=%p opacity=%.8f source=OwnedRepresentation",
+           state.hwnd, kNativeOriginalOpacity);
+    return true;
+}// Native capture source end.
 
 static void ReleaseNativeMeshState(NativeMeshState& state)
 {
@@ -4933,9 +4297,10 @@ static void InvalidateAnimationTransformForNativeMesh(HWND hwnd)
 static bool DetachNativeMesh(const wchar_t* reason)
 {
     auto& state = g_nativeMeshState;
+    g_nativeMeshStopRequested.store(true, std::memory_order_release);
+    RestoreNativeOriginal(state);
     NativeCaptureGuard captureGuard(state.capturedRepresentation != nullptr);
     if (!captureGuard.acquired()) { RequestDwmScenePass(); return false; }
-    RestoreNativeOriginal(state);
     if (!state.visual)
     {
         g_nativeMeshHwnd.store(nullptr, std::memory_order_release);
@@ -4949,7 +4314,7 @@ static bool DetachNativeMesh(const wchar_t* reason)
     {
         if (!state.detachFailureLogged)
         {
-            Wh_Log(L"NATIVE RECTANGLE DETACH DEFERRED: HWND=%p reason=%s "
+            Wh_Log(L"NATIVE MESH DETACH DEFERRED: HWND=%p reason=%s "
                    L"result=0x%08X parent=%p", state.hwnd, reason,
                    static_cast<unsigned>(result), parent);
             state.detachFailureLogged = true;
@@ -5012,8 +4377,8 @@ static void CalculateNativeMeshBasis(double value, double basis[4])
 
 static bool BuildNativeMeshVertices(const Vec2 (&control)[16],
     int width, int height, int padding,
-    NativeProbePoint3F (&positions)[NATIVE_MESH_VERTEX_COUNT],
-    NativeProbePoint2D (&coordinates)[NATIVE_MESH_VERTEX_COUNT])
+    NativeMeshPoint3F (&positions)[NATIVE_MESH_VERTEX_COUNT],
+    NativeMeshPoint2D (&coordinates)[NATIVE_MESH_VERTEX_COUNT])
 {
     if (width < 1 || height < 1 || padding < 0 || padding > 64 ||
         width > 8192 - 2 * padding || height > 8192 - 2 * padding)
@@ -5073,7 +4438,7 @@ static_assert(GRID_WIDTH == 4 && GRID_HEIGHT == 4);
 
 static void UpdateNativeVertexMesh(NativeMeshState& state)
 {
-    if (!state.flatSourceProbe && (!state.mesh || !g_nativeProbeUpdateMesh))
+    if (!state.mesh || !g_nativeMeshUpdateMesh)
         return;
 
     WobbleMesh physics = {};
@@ -5107,18 +4472,12 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
         DetachNativeMesh(L"mesh-generation-changed");
         return;
     }
-    if (state.flatSourceProbe)
-    {
-        state.meshGeneration = generation;
-        state.submittedMeshRevision = revision;
-        return;
-    }
     if (state.meshGeneration == generation &&
         state.submittedMeshRevision == revision)
         return;
 
-    NativeProbePoint3F positions[NATIVE_MESH_VERTEX_COUNT] = {};
-    NativeProbePoint2D coordinates[NATIVE_MESH_VERTEX_COUNT] = {};
+    NativeMeshPoint3F positions[NATIVE_MESH_VERTEX_COUNT] = {};
+    NativeMeshPoint2D coordinates[NATIVE_MESH_VERTEX_COUNT] = {};
     unsigned int indices[NATIVE_MESH_INDEX_COUNT] = {};
     Vec2 control[GRID_POINT_COUNT] = {};
     const double scaleX = static_cast<double>(state.width) / physics.width;
@@ -5155,7 +4514,7 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
         return;
     }
     BuildNativeMeshIndices(indices);
-    long result = g_nativeProbeUpdateMesh(state.mesh, 0, positions,
+    long result = g_nativeMeshUpdateMesh(state.mesh, 0, positions,
                                            coordinates, NATIVE_MESH_VERTEX_COUNT,
                                            indices, NATIVE_MESH_INDEX_COUNT);
     if (result < 0)
@@ -5226,15 +4585,6 @@ static bool GetNativeMeshWindowSize(HWND hwnd, int& width, int& height,
     return width >= 1 && height >= 1 && width <= 8192 && height <= 8192;
 }
 
-static MilMatrix3x2D NativeMeshVisualPlacement(bool flatSourceProbe, int width, int height,
-                                              int padding)
-{
-    if (!flatSourceProbe)
-        return {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
-    double scale = std::min(0.5 * width / (width + 2.0 * padding),
-                            0.5 * height / (height + 2.0 * padding));
-    return {scale, 0.0, 0.0, scale, width * 0.4, height * 0.4};
-}
 
 static long UpdateNativeMeshSourceImage(void* image, void* sourceProxy,
                                          int width, int height, int padding)
@@ -5244,23 +4594,23 @@ static long UpdateNativeMeshSourceImage(void* image, void* sourceProxy,
     if (padding < 0 || padding > 64 || width < 1 || height < 1 ||
         width > 8192 - 2 * padding || height > 8192 - 2 * padding)
         return E_INVALIDARG;
-    NativeProbeRectF rect = {-static_cast<float>(padding), -static_cast<float>(padding),
+    NativeMeshRectF rect = {-static_cast<float>(padding), -static_cast<float>(padding),
                              static_cast<float>(width + padding),
                              static_cast<float>(height + padding)};
     constexpr int absoluteMappingMode = 0;
-    if (g_nativeProbeUpdateImageD)
+    if (g_nativeMeshUpdateImageD)
     {
-        NativeProbeSizeD size = {static_cast<double>(width + 2 * padding),
+        NativeMeshSizeD size = {static_cast<double>(width + 2 * padding),
                                  static_cast<double>(height + 2 * padding)};
-        return g_nativeProbeUpdateImageD(image, rect, size, nullptr,
+        return g_nativeMeshUpdateImageD(image, rect, size, nullptr,
                                          nullptr, sourceProxy,
                                          absoluteMappingMode);
     }
-    if (g_nativeProbeUpdateImageF)
+    if (g_nativeMeshUpdateImageF)
     {
-        NativeProbeSizeF size = {static_cast<float>(width + 2 * padding),
+        NativeMeshSizeF size = {static_cast<float>(width + 2 * padding),
                                  static_cast<float>(height + 2 * padding)};
-        return g_nativeProbeUpdateImageF(image, rect, size, nullptr,
+        return g_nativeMeshUpdateImageF(image, rect, size, nullptr,
                                          nullptr, sourceProxy,
                                          absoluteMappingMode);
     }
@@ -5286,7 +4636,7 @@ static void MaintainNativeMesh()
     int width = 0;
     int height = 0;
     bool sourceValid = state.root &&
-        g_nativeProbeGetVisualProxy(state.root) == state.sourceProxy;
+        g_nativeMeshGetVisualProxy(state.root) == state.sourceProxy;
     if (sourceValid && state.capturedRepresentation)
     {
         // The native WindowData listener clears its source on destruction.
@@ -5314,7 +4664,11 @@ static void MaintainNativeMesh()
         DetachNativeMesh(L"source-changed");
     else
     {
-        MaintainNativeOriginalHide(state);
+        if (!MaintainNativeOriginalHide(state))
+        {
+            DetachNativeMesh(L"source-not-ready-or-native-opacity");
+            return;
+        }
         // A temporarily unavailable HWND rectangle is not a replaced visual.
         // Keep the validated source and retry its bounds on the next scene pass.
         if (!GetNativeMeshWindowSize(state.hwnd, width, height))
@@ -5345,10 +4699,6 @@ static void MaintainNativeMesh()
         {
             long result = UpdateNativeMeshSourceImage(state.image, state.imageSourceProxy,
                                                        width, height, state.sourcePadding);
-            if (result >= 0 && state.flatSourceProbe)
-                result = UpdateMatrixTransformProxy(
-                    state.transform, NativeMeshVisualPlacement(true, width, height,
-                                                                state.sourcePadding));
             if (result < 0)
             {
                 Wh_Log(L"NATIVE MESH SOURCE RESIZE FAILED: HWND=%p "
@@ -5386,7 +4736,7 @@ static bool HasAttachableNativeMeshSlot(HWND hwnd)
 }
 
 static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
-                                     void* sourceProxy, bool backdropSource, bool flatSourceProbe,
+                                     void* sourceProxy, bool backdropSource,
                                      void* compositor,
                                      void*& image, void*& group,
                                      void*& instruction, void*& mesh,
@@ -5423,39 +4773,33 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     pending.imageSourceProxy = imageSourceProxy;
     pending.sourceOwner = ReadPointerMember(root, 0x18);
     pending.backdropSource = backdropSource;
-    pending.flatSourceProbe = flatSourceProbe;
+    pending.materialKey = g_coreMaterialTargetKey.load(std::memory_order_acquire);
     pending.sourcePadding = sourcePadding;
     pending.width = width;
     pending.height = height;
     const wchar_t* stage = L"CreateVisual";
-    Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
     long result = g_nativeMeshCreateVisual(&pending.visual);
     if (result >= 0 && !pending.visual) result = E_UNEXPECTED;
     if (result >= 0)
     {
         stage = L"AddInstruction";
-        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
         result = g_nativeMeshAddInstruction(pending.visual, instruction);
     }
     if (result >= 0)
     {
         stage = L"PublishRenderData";
-        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
         result = g_nativeMeshUpdateRenderData(pending.visual);
     }
     if (result >= 0)
     {
         stage = L"CreateTransform";
-        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
         result = g_createMatrixTransformProxy(compositor, &pending.transform);
         if (result >= 0 && !pending.transform) result = E_UNEXPECTED;
     }
     if (result >= 0)
     {
         stage = L"PositionShape";
-        const MilMatrix3x2D matrix = NativeMeshVisualPlacement(
-            flatSourceProbe, width, height, sourcePadding);
-        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
+        const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
         result = UpdateMatrixTransformProxy(pending.transform, matrix);
     }
     if (result >= 0)
@@ -5470,7 +4814,6 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     if (result >= 0)
     {
         stage = L"InsertSibling";
-        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
         result = g_nativeMeshInsertRelative(collection, pending.visual,
                                             root, true, false);
     }
@@ -5487,8 +4830,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     if (result >= 0 && inserted)
     {
         stage = L"BindTransform";
-        Wh_Log(L"NATIVE MESH ATTACH STAGE: %s HWND=%p", stage, hwnd);
-        void* visualProxy = g_nativeProbeGetVisualProxy(pending.visual);
+        void* visualProxy = g_nativeMeshGetVisualProxy(pending.visual);
         result = IsVisualProxyPointerValid(visualProxy)
                      ? g_cVisualProxySetTransform(visualProxy, pending.transform)
                      : E_NOINTERFACE;
@@ -5506,17 +4848,14 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
         g_nativeMeshState = pending;
         g_nativeMeshHwnd.store(hwnd, std::memory_order_release);
         g_nativeMeshActive.store(true, std::memory_order_release);
-        if (pending.capturedRepresentation && g_nativeOriginalHideProbe.load(std::memory_order_acquire))
-        {
-            g_nativeOriginalHideWakeUntil.store(pending.attachedAt + 1000, std::memory_order_release);
-            PostThreadMessageW(g_eventThreadMessageTarget.load(std::memory_order_acquire), WM_NULL, 0, 0);
-        }
+        g_nativeMeshSourcePending.store(true, std::memory_order_release);
+        PostThreadMessageW(g_eventThreadMessageTarget.load(std::memory_order_acquire), WM_NULL, 0, 0);
         InvalidateAnimationTransformForNativeMesh(hwnd);
         Wh_Log(L"NATIVE MESH ATTACHED: HWND=%p root=%p "
                L"visual=%p source=%s path=%s duration=until-slot-retirement snapshot=none",
                hwnd, root, pending.visual,
                backdropSource ? L"BackgroundTreatment" : L"WindowBorder",
-               flatSourceProbe ? L"DrawBitmap" : L"DrawMesh2D");
+               L"DrawMesh2D");
         RequestDwmScenePass();
         return true;
     }
@@ -5548,7 +4887,7 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
                                       void* sourceProxy, bool backdropSource,
                                       void* compositor,
                                       void*& image, int width, int height,
-                                      bool flatSourceProbe, int sourcePadding,
+                                      int sourcePadding,
                                       void*& capturedRepresentation, void* imageSourceProxy)
 {
     // Exact 23H2 ABI only. The instruction stores base-object references and
@@ -5556,42 +4895,17 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
     if (!IsOnDwmSceneThread() ||
         g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
-        !g_nativeProbeCreateMesh || !g_nativeProbeUpdateMesh ||
-        !g_nativeProbeCreateGroup || !g_nativeProbeUpdateGroup ||
-        !g_nativeProbeCreateMeshInstruction || !g_cBaseObjectRelease ||
+        !g_nativeMeshCreateMesh || !g_nativeMeshUpdateMesh ||
+        !g_nativeMeshCreateGroup || !g_nativeMeshUpdateGroup ||
+        !g_nativeMeshCreateMeshInstruction || !g_cBaseObjectRelease ||
         !image || width < 160 || height < 100)
     {
         Wh_Log(L"NATIVE VERTEX MESH: skipped HWND=%p", hwnd);
         return;
     }
 
-    if (flatSourceProbe)
-    {
-        void* instruction = nullptr;
-        void* group = nullptr;
-        void* mesh = nullptr;
-        long result = g_nativeProbeCreateBitmapInstruction
-            ? g_nativeProbeCreateBitmapInstruction(image, &instruction)
-            : E_NOTIMPL;
-        Wh_Log(L"NATIVE FLAT SOURCE PROBE: HWND=%p create=0x%08X "
-               L"image=%p source=%s size=%dx%d padding=%d "
-               L"position=inside-bottom-right",
-               hwnd, static_cast<unsigned>(result), image,
-               backdropSource ? L"BackgroundTreatment" : L"WindowBorder",
-               width, height, sourcePadding);
-        if (result >= 0 && instruction)
-        {
-            TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy,
-                                backdropSource, true, compositor, image, group,
-                                instruction, mesh, width, height, sourcePadding,
-                                capturedRepresentation, imageSourceProxy);
-        }
-        if (instruction) g_cBaseObjectRelease(instruction);
-        return;
-    }
-
-    NativeProbePoint3F positions[NATIVE_MESH_VERTEX_COUNT] = {};
-    NativeProbePoint2D coordinates[NATIVE_MESH_VERTEX_COUNT] = {};
+    NativeMeshPoint3F positions[NATIVE_MESH_VERTEX_COUNT] = {};
+    NativeMeshPoint2D coordinates[NATIVE_MESH_VERTEX_COUNT] = {};
     unsigned int indices[NATIVE_MESH_INDEX_COUNT] = {};
     Vec2 control[GRID_POINT_COUNT] = {};
     for (unsigned int y = 0; y < GRID_HEIGHT; ++y)
@@ -5611,35 +4925,30 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
     void* group = nullptr;
     void* instruction = nullptr;
     const wchar_t* stage = L"CreateMesh";
-    Wh_Log(L"NATIVE VERTEX MESH STAGE: %s HWND=%p", stage, hwnd);
-    long result = g_nativeProbeCreateMesh(compositor, &mesh);
+    long result = g_nativeMeshCreateMesh(compositor, &mesh);
     if (result >= 0 && !mesh) result = E_UNEXPECTED;
     if (result >= 0)
     {
         stage = L"UpdateMesh";
-        Wh_Log(L"NATIVE VERTEX MESH STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeProbeUpdateMesh(mesh, 0, positions, coordinates,
+        result = g_nativeMeshUpdateMesh(mesh, 0, positions, coordinates,
                                          NATIVE_MESH_VERTEX_COUNT, indices,
                                          NATIVE_MESH_INDEX_COUNT);
     }
     if (result >= 0)
     {
         stage = L"CreateGroup";
-        Wh_Log(L"NATIVE VERTEX MESH STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeProbeCreateGroup(compositor, &group);
+        result = g_nativeMeshCreateGroup(compositor, &group);
         if (result >= 0 && !group) result = E_UNEXPECTED;
     }
     if (result >= 0)
     {
         stage = L"UpdateGroup";
-        Wh_Log(L"NATIVE VERTEX MESH STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeProbeUpdateGroup(group, mesh);
+        result = g_nativeMeshUpdateGroup(group, mesh);
     }
     if (result >= 0)
     {
         stage = L"CreateInstruction";
-        Wh_Log(L"NATIVE VERTEX MESH STAGE: %s HWND=%p", stage, hwnd);
-        result = g_nativeProbeCreateMeshInstruction(group, image, &instruction);
+        result = g_nativeMeshCreateMeshInstruction(group, image, &instruction);
         if (result >= 0 &&
             (!instruction || ReadPointerMember(instruction, 0x10) != group ||
              ReadPointerMember(instruction, 0x18) != image))
@@ -5652,7 +4961,7 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
     if (result >= 0)
     {
         if (TryAttachNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceProxy,
-                                     backdropSource, false,
+                                     backdropSource,
                                      compositor, image, group, instruction,
                                      mesh, width, height, sourcePadding,
                                      capturedRepresentation, imageSourceProxy))
@@ -5679,28 +4988,25 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
     bool meshSelected = g_settings.rendererMode == RendererMode::Mesh;
     ReleaseSRWLockShared(&g_settingsLock);
     if (!meshSelected || !NativeMeshAbiVerified() ||
+        !g_coreMaterialBridgeReady.load(std::memory_order_acquire) ||
         g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000)
         return;
     if (!HasAttachableNativeMeshSlot(hwnd))
         return;
-    NativeSourceProbeMode probeMode =
-        g_nativeSourceProbeMode.load(std::memory_order_acquire);
     ULONGLONG now = GetTickCount64();
     if (g_nativeMeshLastAttemptHwnd == hwnd &&
-        now - g_nativeMeshLastAttemptAt <
-            (probeMode == NativeSourceProbeMode::CapturedFlat ? 3000 : 250))
+        now - g_nativeMeshLastAttemptAt < 250)
         return;
     g_nativeMeshLastAttemptHwnd = hwnd;
     g_nativeMeshLastAttemptAt = now;
     void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
     void* expectedVtable =
-        g_nativeProbeImageVtable.load(std::memory_order_acquire);
+        g_nativeMeshImageVtable.load(std::memory_order_acquire);
     if (!IsDwmObjectPointerValid(compositor, g_compositorVtable) ||
-        !expectedVtable || !g_cBaseObjectRelease || !g_nativeProbeCreateImage ||
-        !g_nativeProbeCreateBitmapInstruction ||
-        (g_nativeProbeUpdateImageD != nullptr) ==
-            (g_nativeProbeUpdateImageF != nullptr))
+        !expectedVtable || !g_cBaseObjectRelease || !g_nativeMeshCreateImage ||
+        (g_nativeMeshUpdateImageD != nullptr) ==
+            (g_nativeMeshUpdateImageF != nullptr))
     {
         return;
     }
@@ -5712,7 +5018,7 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
     bool backdropSource = false;
     if (IsNativeBackdropSourceRoot(topLevelWindow, sourceRoot, treatment))
     {
-        void* treatmentProxy = g_nativeProbeGetVisualProxy(treatment);
+        void* treatmentProxy = g_nativeMeshGetVisualProxy(treatment);
         if (IsVisualProxyPointerValid(treatmentProxy))
         {
             sourceRoot = treatment;
@@ -5724,27 +5030,17 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
            L"host=%p", hwnd,
            backdropSource ? L"BackgroundTreatment" : L"WindowBorder",
            sourceRoot, sourceVisualProxy, ReadPointerMember(sourceRoot, 0x18));
-    // CVisual::SetSize on this exact uDWM build stores SIZE at +0x80.
-    SIZE visualSize = {};
-    const auto* visualSizeAddress = static_cast<const BYTE*>(sourceRoot) + 0x80;
-    if (IsReadableMemory(visualSizeAddress, sizeof(visualSize)))
-        std::memcpy(&visualSize, visualSizeAddress, sizeof(visualSize));
-    Wh_Log(L"NATIVE SOURCE COORDINATES: HWND=%p sourceLocal=%ldx%ld readOnly=1",
-           hwnd, visualSize.cx, visualSize.cy);
-
     int width = 0;
     int height = 0;
     if (!GetNativeMeshWindowSize(hwnd, width, height, true))
     {
         return;
     }
-    NativeCaptureGuard captureGuard(probeMode == NativeSourceProbeMode::CapturedFlat);
+    NativeCaptureGuard captureGuard(true);
     if (!captureGuard.acquired()) return;
-    bool flatSourceProbe = probeMode != NativeSourceProbeMode::None;
-    int sourcePadding = probeMode == NativeSourceProbeMode::Flat ? 0 : 64;
+    constexpr int sourcePadding = 64;
     void* capturedRepresentation = nullptr;
     void* imageSourceProxy = sourceVisualProxy;
-    if (probeMode == NativeSourceProbeMode::CapturedFlat)
     {
         if (!g_nativeCapturedSourceReady || !windowData || GetHwndFromWindowData(windowData) != hwnd ||
             !IsDwmObjectPointerValid(g_desktopManager.load(std::memory_order_acquire), g_desktopManagerVtable))
@@ -5763,7 +5059,8 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
                capturedRepresentation && IsNativeCapturedSourceSeparate(capturedRepresentation, sourceRoot),
                NativeVisualVtableRva(capturedRoot),
                NativeVisualVtableRva(ReadPointerMember(capturedRoot, 0x10)));
-        if (result < 0 || !imageSourceProxy)
+        if (result < 0 || !imageSourceProxy ||
+            !IsNativeCapturedSourceSeparate(capturedRepresentation, sourceRoot))
         {
             if (capturedRepresentation) ReleaseNativeCapturedSource(capturedRepresentation);
             return;
@@ -5775,65 +5072,26 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
            width + sourcePadding, height + sourcePadding,
            width + 2 * sourcePadding, height + 2 * sourcePadding, sourcePadding);
     void* image = nullptr;
-    void* validationInstruction = nullptr;
-    long createResult = g_nativeProbeCreateImage(compositor, &image);
-    long updateResult = E_NOTIMPL;
-    long validationResult = E_NOTIMPL;
-    bool exactImageType = image && IsReadableMemory(image, sizeof(void*)) &&
-                          *reinterpret_cast<void**>(image) == expectedVtable;
+    const long createResult = g_nativeMeshCreateImage(compositor, &image);
+    const bool exactImageType = image && ReadPointerMember(image, 0) == expectedVtable;
+    long result = createResult < 0 ? createResult : E_NOINTERFACE;
     if (createResult >= 0 && exactImageType)
     {
         SetCoreMaterialTarget(image, imageSourceProxy, hwnd);
-        updateResult = UpdateNativeMeshSourceImage(image, imageSourceProxy,
-                                                    width, height, sourcePadding);
-        if (updateResult >= 0)
-            validationResult = g_nativeProbeCreateBitmapInstruction(
-                image, &validationInstruction);
+        result = g_coreMaterialTargetKey.load(std::memory_order_acquire)
+            ? UpdateNativeMeshSourceImage(image, imageSourceProxy, width, height, sourcePadding)
+            : E_NOINTERFACE;
+        if (result >= 0)
+            CreateVisibleNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceVisualProxy,
+                backdropSource, compositor, image, width, height, sourcePadding,
+                capturedRepresentation, imageSourceProxy);
     }
-
-    // The exact uDWM build was checked before entering this path.
-    // Its image resource is at +0x10 and the resource ID at +0x18.
-    unsigned int imageResourceId = 0;
-    bool resourceReadable = false;
-    if (updateResult >= 0 && exactImageType)
-    {
-        void* resource = ReadPointerMember(image, 0x10);
-        const BYTE* id = resource ? static_cast<const BYTE*>(resource) + 0x18
-                                  : nullptr;
-        if (id && IsReadableMemory(id, sizeof(imageResourceId)))
-        {
-            memcpy(&imageResourceId, id, sizeof(imageResourceId));
-            resourceReadable = true;
-        }
-    }
-    bool instructionKeepsImage = validationInstruction &&
-        ReadPointerMember(validationInstruction, 0x10) == image;
-    Wh_Log(L"NATIVE MESH SOURCE: HWND=%p create=0x%08X update=0x%08X "
-           L"validation=0x%08X exactType=%d resourceReadable=%d "
-           L"resourceId=%u retain=%d",
-           hwnd, static_cast<unsigned>(createResult),
-           static_cast<unsigned>(updateResult),
-           static_cast<unsigned>(validationResult), exactImageType,
-           resourceReadable, imageResourceId, instructionKeepsImage);
-    if (resourceReadable && imageResourceId && validationResult >= 0 &&
-        instructionKeepsImage)
-    {
-        CreateVisibleNativeMesh(hwnd, topLevelWindow, sourceRoot, sourceVisualProxy,
-                                  backdropSource,
-                                  compositor, image, width, height,
-                                  flatSourceProbe, sourcePadding, capturedRepresentation, imageSourceProxy);
-    }
-    if (validationInstruction && validationResult >= 0 &&
-        IsReadableMemory(validationInstruction, sizeof(void*)) &&
-        IsDwmImageAddress(*reinterpret_cast<void**>(validationInstruction),
-                          sizeof(void*)))
-    {
-        g_cBaseObjectRelease(validationInstruction);
-    }
-    if (image && createResult >= 0 && exactImageType)
+    if (result < 0)
+        Wh_Log(L"NATIVE MESH SOURCE FAILED: HWND=%p result=0x%08X", hwnd, static_cast<unsigned>(result));
+    if (image)
     {
         ClearCoreMaterialTarget();
-        g_cBaseObjectRelease(image);
+        if (createResult >= 0 && exactImageType) g_cBaseObjectRelease(image);
     }
     if (capturedRepresentation) ReleaseNativeCapturedSource(capturedRepresentation);
 }
@@ -8123,10 +7381,8 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         nativeMeshActive = slot.settings.rendererMode == RendererMode::Mesh &&
             g_nativeMeshActive.load(std::memory_order_acquire) &&
             g_nativeMeshHwnd.load(std::memory_order_acquire) == slot.hwnd;
-        // A treatment source includes this child transform; keep it neutral so
-        // the captured image is not translated a second time inside the mesh.
-        identityUpdate = (nativeMeshActive && (g_nativeMeshState.backdropSource ||
-                                              g_nativeMeshState.flatSourceProbe)) ||
+        // The mesh already includes lag and deformation; keep the source transform neutral.
+        identityUpdate = nativeMeshActive ||
                          slot.retiring || slot.meshIdentityPending ||
                          !slot.mesh.active ||
                          g_unloading.load(std::memory_order_acquire);
@@ -10012,7 +9268,7 @@ static DWORD WINAPI WindowEventThreadProc(LPVOID)
         DWORD waitTimeout = INFINITE;
         if (g_nativeMeshActive.load(std::memory_order_acquire) &&
             (g_nativeMeshStopRequested.load(std::memory_order_acquire) ||
-             g_nativeOriginalHideWakeUntil.load(std::memory_order_acquire)))
+             g_nativeMeshSourcePending.load(std::memory_order_acquire)))
         {
             ULONGLONG now = GetTickCount64();
             if (!nextNativeMeshWakeAt || now >= nextNativeMeshWakeAt)
@@ -10209,18 +9465,8 @@ static void LoadSettings()
     WobblySettings settings = PHYSICS_PRESETS[wobbliness];
     auto rendererSetting = WindhawkUtils::StringSetting::make(L"Renderer");
     std::wstring_view rendererValue(rendererSetting.get());
-    NativeSourceProbeMode probeMode = rendererValue == L"mesh-captured-source"
-        ? NativeSourceProbeMode::CapturedFlat : rendererValue == L"mesh-flat-padded"
-        ? NativeSourceProbeMode::PaddedFlat
-        : rendererValue == L"mesh-flat-source" ? NativeSourceProbeMode::Flat
-                                             : NativeSourceProbeMode::None;
-    bool flatSourceProbe = probeMode != NativeSourceProbeMode::None;
-    g_nativeOriginalHideProbe.store(Wh_GetIntSetting(L"CaptureOriginalHideProbe") != 0,
-                                   std::memory_order_release);
-    bool flatSourceProbeChanged =
-        g_nativeSourceProbeMode.exchange(probeMode,
-                                         std::memory_order_acq_rel) != probeMode;
-    settings.rendererMode = rendererValue == L"mesh" || flatSourceProbe
+    // Migrate saved diagnostic selections to the full Mesh Renderer.
+    settings.rendererMode = rendererValue == L"mesh" || rendererValue.starts_with(L"mesh-")
                                 ? RendererMode::Mesh : RendererMode::Affine;
     bool advancedMode = Wh_GetIntSetting(L"AdvancedMode.enable") != 0;
     settings.resizeWobbleEnabled = Wh_GetIntSetting(L"EnableResizeWobble") != 0;
@@ -10241,7 +9487,7 @@ static void LoadSettings()
     AcquireSRWLockExclusive(&g_settingsLock);
     g_settings = settings;
     ReleaseSRWLockExclusive(&g_settingsLock);
-    if ((settings.rendererMode != RendererMode::Mesh || flatSourceProbeChanged) &&
+    if (settings.rendererMode != RendererMode::Mesh &&
         g_nativeMeshActive.load(std::memory_order_acquire))
     {
         g_nativeMeshStopRequested.store(true, std::memory_order_release);
@@ -10257,12 +9503,7 @@ static void LoadSettings()
            L"Drag=%.2f, "
            L"MoveFactor=%.2f",
            wobbliness, advancedMode,
-                settings.rendererMode == RendererMode::Mesh
-                    ? (flatSourceProbe
-                        ? (probeMode == NativeSourceProbeMode::CapturedFlat ? L"captured-source-diagnostic" :
-                           probeMode == NativeSourceProbeMode::PaddedFlat
-                            ? L"flat-padded-source-diagnostic" : L"flat-source-diagnostic")
-                        : L"mesh") : L"affine",
+           settings.rendererMode == RendererMode::Mesh ? L"mesh" : L"affine",
            settings.resizeWobbleEnabled,
            settings.windowStateWobbleEnabled, settings.stiffness, settings.drag,
            settings.moveFactor);
@@ -10365,7 +9606,7 @@ BOOL Wh_ModInit()
         UninitializeDpiSupport();
         return FALSE;
     }
-    InitializeCoreMaterialDiagnostics();
+    InitializeCoreMaterialBridge();
     if (!StartWindowEventThread())
     {
         Wh_Log(L"Failed to initialize event thread");
