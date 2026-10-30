@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.326
+// @version         0.327
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3559,6 +3559,13 @@ void* g_coreDesktopTreeVtable = nullptr, *g_coreVisualTreeVtable = nullptr, *g_c
 bool g_coreBackdropSceneReady = false;
 void* g_coreDesktopTreeDataVtable = nullptr;
 bool g_coreBackdropDesktopReady = false;
+using CoreBackdropEffectInput_t = void*(__cdecl*)(void*, void*);
+using CoreCurrentTargetInfo_t = const void*(__cdecl*)(const void*);
+using CoreBackdropRealization_t = bool(__cdecl*)(const void*, const void*);
+CoreBackdropEffectInput_t g_coreBackdropEffectInputFunction = nullptr, g_coreBackdropEffectInputOriginal = nullptr;
+CoreCurrentTargetInfo_t g_coreCurrentTargetInfoFunction = nullptr;
+CoreBackdropRealization_t g_coreBackdropRealizationFunction = nullptr;
+std::atomic_bool g_coreBackdropBridgeReady = false;
 CoreCachedTreatment_t g_coreCachedTreatmentFunction = nullptr, g_coreCachedTreatmentOriginal = nullptr;
 CoreCachedTreatment_t g_coreTreatmentFunction = nullptr;
 CoreCachedTreatment_t g_coreMaterialBitmapFunction = nullptr;
@@ -3812,7 +3819,7 @@ static bool ReadCoreBackdropRegistry(void* data, void**& images, unsigned& count
     return true;
 }
 
-static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapshot& hit)
+static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapshot& hit, bool desktopOnly = false)
 {
     auto collect = [&](void* data, bool desktop = false)
     {
@@ -3857,6 +3864,7 @@ static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapsho
         ReadPointerMember(desktopData, 0) == g_coreDesktopTreeDataVtable &&
         ReadPointerMember(desktopData, 0x108) == hit.currentVisual)
         collect(desktopData, true);
+    if (desktopOnly) return;
     collect(currentData, g_coreBackdropDesktopReady && desktopData == currentData);
     // Native FindTreeData uses tagged property 1 for its intrusive association
     // list. Validate the entire bounded list before making another native query.
@@ -3898,7 +3906,7 @@ static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapsho
     }
 }
 
-static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context)
+static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context, bool desktopOnly = false)
 {
     CoreBackdropSnapshot hit;
     if (!g_coreBackdropDetailReady || !context) return hit;
@@ -3934,7 +3942,7 @@ static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context)
         hit.scene = ReadCoreBackdropScene(data, image, imageBegin, imageEnd);
         break;
     }
-    CollectCoreBackdropAlternates(data, hit);
+    CollectCoreBackdropAlternates(data, hit, desktopOnly);
     return hit;
 }
 
@@ -3947,10 +3955,75 @@ struct CoreMaterialObservation
     unsigned wallpaperCalls = 0, wallpaperFailures = 0, bviCalls = 0, bviFailures = 0;
     void* wallpaperOutput = nullptr; // Opaque first output word, never reused/dereferenced.
     int bviFlag = -1;
+    ULONGLONG bridgeEpoch = 0;
+    void* bridgeContext = nullptr; // Borrowed only while this native DrawVisualTree call is active.
+    unsigned bridgeAttempts = 0, bridgeApplied = 0;
+    const wchar_t* bridgeReason = L"no-input-call";
+    void* bridgeSource = nullptr; // Comparison/logging only after the input factory returns.
 };
 thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
 thread_local unsigned g_coreMaterialRealizeDepth = 0;
 thread_local void* g_coreMaterialCurrentImage = nullptr; // Borrowed only within its callback.
+thread_local bool g_coreBackdropBridgeInCall = false;
+
+static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
+{
+    auto* observation = g_coreMaterialObservation;
+    if (!g_coreBackdropBridgeReady.load(std::memory_order_acquire) ||
+        !g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) ||
+        g_unloading.load(std::memory_order_acquire) || !output || !observation ||
+        !observation->bridgeContext || g_coreBackdropBridgeInCall ||
+        !g_coreMaterialCurrentImage ||
+        g_coreMaterialCurrentImage != g_coreMaterialSourceImage.load(std::memory_order_acquire) ||
+        observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
+        g_nativeSourceProbeMode.load(std::memory_order_acquire) != NativeSourceProbeMode::CapturedFlat ||
+        g_nativeOriginalHideProbe.load(std::memory_order_acquire))
+        return g_coreBackdropEffectInputOriginal(image, output);
+
+    ++observation->bridgeAttempts;
+    observation->bridgeReason = L"no-current-desktop";
+    const auto hit = ReadCoreBackdropSnapshot(observation->bridgeContext, true);
+    void* selected = nullptr;
+    if (hit.valid && hit.image == image && hit.desktopValid && hit.scene.frameKnown &&
+        hit.root == g_coreMaterialSourceRoot.load(std::memory_order_acquire))
+    {
+        for (unsigned i = 0; i < hit.alternateCount; ++i)
+        {
+            const auto& candidate = hit.alternates[i];
+            const auto& scene = candidate.scene;
+            if (ReadPointerMember(candidate.tree, 0) != g_coreDesktopTreeVtable ||
+                scene.treeRoot != candidate.root || !scene.frameKnown || scene.frameAge > 1 ||
+                scene.currentFrame != hit.scene.currentFrame || scene.effectReady != 1)
+                continue;
+            if (selected) { selected = nullptr; observation->bridgeReason = L"ambiguous-desktop"; break; }
+            selected = candidate.image;
+        }
+    }
+    if (selected)
+    {
+        const void* targetInfo = g_coreCurrentTargetInfoFunction(
+            static_cast<const BYTE*>(observation->bridgeContext) + 0x18);
+        if (!targetInfo || !g_coreBackdropRealizationFunction(selected, targetInfo))
+        {
+            selected = nullptr;
+            observation->bridgeReason = L"target-not-ready";
+        }
+    }
+    if (observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
+        g_unloading.load(std::memory_order_acquire))
+        selected = nullptr;
+    if (!selected) return g_coreBackdropEffectInputOriginal(image, output);
+
+    // The native factory constructs EffectInput and owns its normal references.
+    // No structure copy, context-field swap or client/server image cast occurs.
+    g_coreBackdropBridgeInCall = true;
+    void* result = g_coreBackdropEffectInputOriginal(selected, output);
+    g_coreBackdropBridgeInCall = false;
+    ++observation->bridgeApplied;
+    observation->bridgeReason = L"desktop-input";
+    observation->bridgeSource = selected;
+    return result;
+}
 
 struct CoreMaterialWorldSnapshot
 {
@@ -4061,6 +4134,7 @@ static long __cdecl CoreBviValidationHook(void* context, const void* bounds, voi
     if (auto* observation = g_coreMaterialObservation)
     {
         ++observation->bviCalls;
+        if (result >= 0) observation->bridgeContext = context;
         if (observation->collectBackdrop && !observation->backdrop.valid &&
             g_coreMaterialDiagnosticsReady.load(std::memory_order_acquire) &&
             !g_unloading.load(std::memory_order_acquire))
@@ -4104,6 +4178,7 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
     const int imageMatch = currentImage
         ? (currentImage == g_coreMaterialSourceImage.load(std::memory_order_acquire) ? 1 : 0) : -1;
     CoreMaterialObservation observation;
+    observation.bridgeEpoch = epoch;
     const ULONGLONG previousLogAt =
         g_coreMaterialRasterLogAt[insideRealize ? 1 : 0][imageMatch + 1].load(std::memory_order_relaxed);
     observation.collectBackdrop = g_coreBackdropDetailReady &&
@@ -4146,6 +4221,10 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
     if (log)
     {
+        if (imageMatch == 1 && observation.bviCalls && g_coreBackdropBridgeReady.load(std::memory_order_acquire))
+            Wh_Log(L"MESH ACRYLIC BRIDGE: HWND=%p attempts=%u applied=%u reason=%s source=%p nativeFactory=1",
+                   hwnd, observation.bridgeAttempts, observation.bridgeApplied,
+                   observation.bridgeReason, observation.bridgeSource);
         Wh_Log(L"MESH MATERIAL RASTER: HWND=%p count=%u context=%p tree=%p root=%p backdropImage=%p "
                L"insideRealize=%d image=%p imageMatch=%d clearMode=%d drawFlag=%d precompute=%u effectCalls=%u "
                L"effectFailures=%u wallpaperCalls=%u wallpaperFailures=%u wallpaperOutput=%p "
@@ -4425,6 +4504,14 @@ static void InitializeCoreMaterialDiagnostics()
         {{L"const CVisualTree::`vftable'"}, &g_coreVisualTreeVtable, nullptr, true},
         {{L"const CSubVisualTree::`vftable'"}, &g_coreSubVisualTreeVtable, nullptr, true},
         {{L"const CDesktopTreeData::`vftable'"}, &g_coreDesktopTreeDataVtable, nullptr, true},
+        {{L"public: struct EffectInput __cdecl CBackdropVisualImage::GenerateEffectInput(void)"},
+         &g_coreBackdropEffectInputFunction, nullptr, true},
+        {{L"public: virtual class RenderTargetInfo const & __cdecl CDrawingContext::GetCurrentRenderTargetInfo(void)const",
+          L"public: virtual class RenderTargetInfo const & __cdecl CDrawingContext::GetCurrentRenderTargetInfo(void)const "},
+         &g_coreCurrentTargetInfoFunction, nullptr, true},
+        {{L"public: bool __cdecl CBackdropVisualImage::HasValidRenderingRealization(class RenderTargetInfo const &)const",
+          L"public: bool __cdecl CBackdropVisualImage::HasValidRenderingRealization(class RenderTargetInfo const &)const "},
+         &g_coreBackdropRealizationFunction, nullptr, true},
         {{L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
            L"struct D2D_SIZE_F const &,struct EffectInput *)const",
           L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
@@ -4536,8 +4623,17 @@ static void InitializeCoreMaterialDiagnostics()
         WindhawkUtils::SetFunctionHook(g_coreImageRealizeFunction,
             CoreImageRealizeHook, &g_coreImageRealizeOriginal);
     g_coreMaterialDiagnosticsReady.store(ready, std::memory_order_release);
-    Wh_Log(L"MESH MATERIAL OBSERVER: %s coreTimestamp=0x%08X hooks=7 leafHooks=0 readOnly=1",
-           ready ? L"ready" : L"unavailable", nt->FileHeader.TimeDateStamp);
+    const bool bridgeReady = ready && g_coreBackdropDesktopReady && g_coreBackdropSceneReady &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropEffectInputFunction) == base + 0x3122C &&
+        reinterpret_cast<uintptr_t>(g_coreCurrentTargetInfoFunction) == base + 0x105760 &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropRealizationFunction) == base + 0x4B1E0 &&
+        WindhawkUtils::SetFunctionHook(g_coreBackdropEffectInputFunction,
+            CoreBackdropEffectInputHook, &g_coreBackdropEffectInputOriginal);
+    g_coreBackdropBridgeReady.store(bridgeReady, std::memory_order_release);
+    Wh_Log(L"MESH ACRYLIC BRIDGE: %s mode=captured-source-only originalHide=off nativeFactory=1",
+           bridgeReady ? L"ready" : L"unavailable");
+    Wh_Log(L"MESH MATERIAL OBSERVER: %s coreTimestamp=0x%08X hooks=%u leafHooks=0 readOnly=%d",
+           ready ? L"ready" : L"unavailable", nt->FileHeader.TimeDateStamp, bridgeReady ? 8u : 7u, !bridgeReady);
 }
 
 static bool RetainNativeMeshRoot(void* root)
