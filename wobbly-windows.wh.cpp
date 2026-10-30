@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.333
+// @version         0.334
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3526,6 +3526,11 @@ static void* FindNativeMeshSiblingCollection(void* root)
 }
 
 // Core material bridge: private layouts are gated by the exact module image.
+using CoreExecuteBlur_t = long(__cdecl*)(void*, void*, const void*, const void*, void*);
+using CoreIntermediateBrush_t = long(__cdecl*)(void*, unsigned int, const void*, void**);
+CoreExecuteBlur_t g_coreExecuteBlurFunction = nullptr, g_coreExecuteBlurOriginal = nullptr;
+CoreIntermediateBrush_t g_coreIntermediateBrushFunction = nullptr, g_coreIntermediateBrushOriginal = nullptr;
+std::atomic<ULONGLONG> g_coreMaterialPipelineLogAt = 0;
 using CoreMaterialInput_t = long(__cdecl*)(void*, const void*, void*);
 using CoreImageUpdate_t = long(__cdecl*)(void*, void*, const void*);
 using CoreImageRealize_t = long(__cdecl*)(void*, const void*, void**);
@@ -3580,6 +3585,7 @@ static void ClearCoreMaterialTarget()
     g_coreBackdropBridgeLogged.store(false, std::memory_order_relaxed);
     g_coreBackdropReuseLogged.store(false, std::memory_order_relaxed);
     g_coreBackdropFallbackLogAt.store(0, std::memory_order_relaxed);
+    g_coreMaterialPipelineLogAt.store(0, std::memory_order_relaxed);
     g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
 }
@@ -3782,6 +3788,22 @@ static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context)
     return hit;
 }
 
+// Only metadata and call-scoped identities are observed. Native EffectInput
+// objects keep their original ownership; no resource or effect is substituted.
+struct CoreMaterialInputIdentity
+{
+    void* bitmap = nullptr;
+    void* brush = nullptr;
+};
+
+struct CoreMaterialInputMetadata
+{
+    bool readable = false;
+    float transform[9] = {}, bounds[4] = {};
+    unsigned flags = 0;
+    uintptr_t brushType = 0;
+};
+
 struct CoreMaterialObservation
 {
     ULONGLONG bridgeEpoch = 0;
@@ -3789,11 +3811,109 @@ struct CoreMaterialObservation
     unsigned fallbacks = 0;
     const wchar_t* fallbackReason = L"none";
     int fallbackRenderingValid = -1;
+    CoreMaterialInputIdentity materialInputs[8] = {};
+    unsigned inputCount = 0, blurCalls = 0, materialBlurCalls = 0;
+    unsigned intermediateCalls = 0, materialIntermediateCalls = 0;
+    CoreMaterialInputMetadata blurInput, blurOutput;
 };
 thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
 thread_local unsigned g_coreMaterialRealizeDepth = 0;
 thread_local void* g_coreMaterialCurrentImage = nullptr;
 thread_local bool g_coreBackdropBridgeInCall = false;
+
+static CoreMaterialObservation* CurrentCoreMaterialObservation()
+{
+    auto* observation = g_coreMaterialObservation;
+    return observation && !g_unloading.load(std::memory_order_acquire) &&
+        g_coreMaterialBridgeReady.load(std::memory_order_acquire) &&
+        g_coreMaterialCurrentImage &&
+        g_coreMaterialCurrentImage == g_coreMaterialSourceImage.load(std::memory_order_acquire) &&
+        observation->bridgeEpoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire)
+        ? observation : nullptr;
+}
+
+static CoreMaterialInputIdentity ReadCoreMaterialInputIdentity(const void* input)
+{
+    return {ReadPointerMember(input, 0), ReadPointerMember(input, 8)};
+}
+
+static bool IsCoreMaterialInput(const CoreMaterialObservation& observation,
+                                CoreMaterialInputIdentity input)
+{
+    if (!input.bitmap && !input.brush) return false;
+    for (unsigned i = 0; i < observation.inputCount; ++i)
+        if (observation.materialInputs[i].bitmap == input.bitmap &&
+            observation.materialInputs[i].brush == input.brush) return true;
+    return false;
+}
+
+static void RememberCoreMaterialInput(CoreMaterialObservation& observation,
+                                      CoreMaterialInputIdentity input)
+{
+    if ((!input.bitmap && !input.brush) || IsCoreMaterialInput(observation, input) ||
+        observation.inputCount == ARRAYSIZE(observation.materialInputs)) return;
+    observation.materialInputs[observation.inputCount++] = input;
+}
+
+static CoreMaterialInputMetadata ReadCoreMaterialInputMetadata(const void* input)
+{
+    CoreMaterialInputMetadata metadata;
+    if (!IsReadableMemory(input, 0x68)) return metadata;
+    const auto* bytes = static_cast<const BYTE*>(input);
+    // Native EffectInput copy/assignment: two managed inputs at +0/+8,
+    // 3x3 mapping at +30, bounds at +54, four property bytes at +64.
+    std::memcpy(metadata.transform, bytes + 0x30, sizeof(metadata.transform));
+    std::memcpy(metadata.bounds, bytes + 0x54, sizeof(metadata.bounds));
+    std::memcpy(&metadata.flags, bytes + 0x64, sizeof(metadata.flags));
+    const auto type = reinterpret_cast<uintptr_t>(ReadPointerMember(ReadPointerMember(input, 8), 0));
+    if (type >= g_coreMaterialModuleBase && type - g_coreMaterialModuleBase < 0x41A000)
+        metadata.brushType = type - g_coreMaterialModuleBase;
+    metadata.readable = true;
+    return metadata;
+}
+
+static long __cdecl CoreExecuteBlurHook(void* technique, void* context,
+                                       const void* input, const void* amount, void* output)
+{
+    auto* observation = CurrentCoreMaterialObservation();
+    const bool material = observation &&
+        IsCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(input));
+    // Read before forwarding: native callers may alias input and output.
+    const auto metadata = material ? ReadCoreMaterialInputMetadata(input)
+                                   : CoreMaterialInputMetadata{};
+    const long result = g_coreExecuteBlurOriginal(technique, context, input, amount, output);
+    if (observation && observation == CurrentCoreMaterialObservation())
+    {
+        ++observation->blurCalls;
+        if (material)
+        {
+            ++observation->materialBlurCalls;
+            observation->blurInput = metadata;
+            observation->blurOutput = {};
+            if (result >= 0)
+            {
+                observation->blurOutput = ReadCoreMaterialInputMetadata(output);
+                RememberCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(output));
+            }
+        }
+    }
+    return result;
+}
+
+static long __cdecl CoreIntermediateBrushHook(void* technique, unsigned int index,
+                                             const void* input, void** output)
+{
+    auto* observation = CurrentCoreMaterialObservation();
+    const bool material = observation &&
+        IsCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(input));
+    const long result = g_coreIntermediateBrushOriginal(technique, index, input, output);
+    if (observation && observation == CurrentCoreMaterialObservation())
+    {
+        ++observation->intermediateCalls;
+        if (material) ++observation->materialIntermediateCalls;
+    }
+    return result;
+}
 
 static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
 {
@@ -3875,6 +3995,8 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
     g_coreBackdropBridgeInCall = true;
     void* result = g_coreBackdropEffectInputOriginal(selected, output);
     g_coreBackdropBridgeInCall = false;
+    if (observation == CurrentCoreMaterialObservation())
+        RememberCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(result));
     if (!g_coreBackdropBridgeLogged.load(std::memory_order_relaxed) &&
         !g_coreBackdropBridgeLogged.exchange(true, std::memory_order_relaxed))
         Wh_Log(L"MESH ACRYLIC ACTIVE: HWND=%p nativeDesktopInput=1",
@@ -3938,6 +4060,34 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
     g_coreMaterialObservation = &observation;
     const long result = g_coreDrawVisualTreeOriginal(context, tree, bounds, occlusion, clearMode, drawFlag, root);
     g_coreMaterialObservation = previous;
+    if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
+        !g_unloading.load(std::memory_order_acquire) &&
+        (observation.inputCount || observation.fallbacks))
+    {
+        const auto now = GetTickCount64();
+        auto last = g_coreMaterialPipelineLogAt.load(std::memory_order_relaxed);
+        if ((!last || now - last >= 1000) &&
+            g_coreMaterialPipelineLogAt.compare_exchange_strong(last, now, std::memory_order_relaxed))
+        {
+            const auto& in = observation.blurInput;
+            const auto& out = observation.blurOutput;
+            Wh_Log(L"MESH ACRYLIC PIPELINE: HWND=%p inputs=%u blur=%u matchedBlur=%u "
+                   L"intermediate=%u matchedIntermediate=%u fallback=%u "
+                   L"inputMetadata=%d outputMetadata=%d outputBrush=0x%llX "
+                   L"inputBounds=(%.1f,%.1f,%.1f,%.1f) "
+                   L"inputMap=(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f) "
+                   L"outputFlags=0x%X readOnly=1",
+                   g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
+                   observation.inputCount, observation.blurCalls, observation.materialBlurCalls,
+                   observation.intermediateCalls, observation.materialIntermediateCalls,
+                   observation.fallbacks, in.readable, out.readable,
+                   static_cast<unsigned long long>(out.brushType),
+                   in.bounds[0], in.bounds[1], in.bounds[2], in.bounds[3],
+                   in.transform[0], in.transform[1], in.transform[2], in.transform[3],
+                   in.transform[4], in.transform[5], in.transform[6], in.transform[7], in.transform[8],
+                   out.flags);
+        }
+    }
     if (observation.fallbacks && epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
         !g_unloading.load(std::memory_order_acquire))
     {
@@ -4016,6 +4166,12 @@ static void InitializeCoreMaterialBridge()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
+        {{L"public: long __cdecl CRenderingTechnique::ExecuteBlur(class CDrawingContext *,"
+           L"struct EffectInput const &,struct D2D_VECTOR_2F const &,struct EffectInput *)"},
+         &g_coreExecuteBlurFunction, nullptr, true},
+        {{L"public: long __cdecl CRenderingTechnique::CreateSurfaceDrawListBrushForIntermediate("
+           L"unsigned int,struct EffectInput const &,class CSurfaceDrawListBrush * *)"},
+         &g_coreIntermediateBrushFunction, nullptr, true},
         {{L"public: class CTreeData * __cdecl CVisual::FindTreeData(class CVisualTree const *)const",
           L"public: class CTreeData * __cdecl CVisual::FindTreeData(class CVisualTree const *)const "},
          &g_coreFindTreeDataFunction, nullptr, true},
@@ -4101,6 +4257,25 @@ static void InitializeCoreMaterialBridge()
             CoreBackdropEffectInputHook, &g_coreBackdropEffectInputOriginal);
     g_coreMaterialBridgeReady.store(ready, std::memory_order_release);
     g_coreBackdropBridgeReady.store(ready, std::memory_order_release);
+    // Two non-leaf observers on this exact image. They always forward every
+    // argument and native result, including failures and aliased input/output.
+    const BYTE blurPrefix[] = {0x48,0x8B,0xC4,0x55,0x53,0x56,0x57,0x41,0x54,
+                              0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8D,0x68,0x88};
+    const BYTE intermediatePrefix[] = {0x48,0x8B,0xC4,0x48,0x89,0x58,0x10,
+                                      0x48,0x89,0x70,0x20,0x55,0x57,0x41,0x56};
+    const bool diagnosticAbi = ready &&
+        reinterpret_cast<uintptr_t>(g_coreExecuteBlurFunction) == base + 0x37F24 &&
+        reinterpret_cast<uintptr_t>(g_coreIntermediateBrushFunction) == base + 0x30190 &&
+        IsReadableMemory(reinterpret_cast<void*>(g_coreExecuteBlurFunction), sizeof(blurPrefix)) &&
+        IsReadableMemory(reinterpret_cast<void*>(g_coreIntermediateBrushFunction), sizeof(intermediatePrefix)) &&
+        !std::memcmp(reinterpret_cast<void*>(g_coreExecuteBlurFunction), blurPrefix, sizeof(blurPrefix)) &&
+        !std::memcmp(reinterpret_cast<void*>(g_coreIntermediateBrushFunction), intermediatePrefix, sizeof(intermediatePrefix));
+    const bool observeBlur = diagnosticAbi && WindhawkUtils::SetFunctionHook(
+        g_coreExecuteBlurFunction, CoreExecuteBlurHook, &g_coreExecuteBlurOriginal);
+    const bool observeIntermediate = diagnosticAbi && WindhawkUtils::SetFunctionHook(
+        g_coreIntermediateBrushFunction, CoreIntermediateBrushHook, &g_coreIntermediateBrushOriginal);
+    Wh_Log(L"MESH MATERIAL PIPELINE OBSERVER: blur=%d intermediate=%d readOnly=1",
+           observeBlur, observeIntermediate);
     Wh_Log(L"MESH MATERIAL BRIDGE: %s hooks=5 leafHooks=0", ready ? L"ready" : L"unavailable; using Affine");
 }
 
@@ -4180,16 +4355,6 @@ static bool IsNativeMeshSourceCurrent(void* topLevelWindow, void* sourceRoot,
 // Native capture source begin: exact 23H2 layout, independently tested below.
 // A sub-pixel original contribution keeps native backdrop realization active.
 static constexpr double kNativeOriginalOpacity = 1.0 / 65536.0;
-static constexpr double kNativeMeshPresentationOpacity = 1.0 - kNativeOriginalOpacity;
-
-static bool ConfigureNativeMeshPresentation(void* visual)
-{
-    if (!g_nativeVisualSetOpacity || !NativeVisualVtableRva(visual)) return false;
-    // Keep a blending dependency on the original scene instead of presenting
-    // the replacement as a fully opaque occluder. Only this owned visual changes.
-    g_nativeVisualSetOpacity(visual, kNativeMeshPresentationOpacity);
-    return true;
-}
 class NativeCaptureGuard
 {
 public:
@@ -4907,11 +5072,6 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     if (result >= 0 && !pending.visual) result = E_UNEXPECTED;
     if (result >= 0)
     {
-        stage = L"ConfigurePresentation";
-        if (!ConfigureNativeMeshPresentation(pending.visual)) result = E_NOINTERFACE;
-    }
-    if (result >= 0)
-    {
         stage = L"AddInstruction";
         result = g_nativeMeshAddInstruction(pending.visual, instruction);
     }
@@ -5002,8 +5162,6 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
         g_nativeMeshSourcePending.store(true, std::memory_order_release);
         PostThreadMessageW(g_eventThreadMessageTarget.load(std::memory_order_acquire), WM_NULL, 0, 0);
         InvalidateAnimationTransformForNativeMesh(hwnd);
-        Wh_Log(L"MESH BACKDROP KEEPALIVE: HWND=%p meshOpacity=%.8f originalOpacity=%.8f",
-               hwnd, kNativeMeshPresentationOpacity, kNativeOriginalOpacity);
         Wh_Log(L"MESH SOURCE MOTION: HWND=%p enabled=%d pivot=surface-center captureParentExcluded=%d",
                hwnd, pending.sourceTransform != nullptr, backdropSource);
         Wh_Log(L"NATIVE MESH ATTACHED: HWND=%p root=%p "
