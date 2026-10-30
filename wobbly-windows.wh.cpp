@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.325
+// @version         0.326
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3557,6 +3557,8 @@ void* g_coreBackdropImageVtable = nullptr;
 bool g_coreBackdropDetailReady = false;
 void* g_coreDesktopTreeVtable = nullptr, *g_coreVisualTreeVtable = nullptr, *g_coreSubVisualTreeVtable = nullptr;
 bool g_coreBackdropSceneReady = false;
+void* g_coreDesktopTreeDataVtable = nullptr;
+bool g_coreBackdropDesktopReady = false;
 CoreCachedTreatment_t g_coreCachedTreatmentFunction = nullptr, g_coreCachedTreatmentOriginal = nullptr;
 CoreCachedTreatment_t g_coreTreatmentFunction = nullptr;
 CoreCachedTreatment_t g_coreMaterialBitmapFunction = nullptr;
@@ -3789,6 +3791,8 @@ struct CoreBackdropSnapshot
     void* root = nullptr;
     unsigned tables = 0, alternateCount = 0;
     bool incomplete = false;
+    bool desktopValid = false;
+    unsigned desktopImages = 0;
     CoreBackdropSceneSnapshot scene;
     struct Alternate {
         void* image; void* root; void* tree; unsigned pathPairs;
@@ -3810,12 +3814,13 @@ static bool ReadCoreBackdropRegistry(void* data, void**& images, unsigned& count
 
 static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapshot& hit)
 {
-    auto collect = [&](void* data)
+    auto collect = [&](void* data, bool desktop = false)
     {
         void** images = nullptr;
         unsigned count = 0;
         if (!ReadCoreBackdropRegistry(data, images, count)) { hit.incomplete = true; return; }
         ++hit.tables;
+        if (desktop) { hit.desktopValid = true; hit.desktopImages = count; }
         for (unsigned i = 0; i < count; ++i)
         {
             void* image = images[i];
@@ -3827,6 +3832,13 @@ static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapsho
             if (!first || last <= first || (last - first) % 16 || last - first > 32 * 16 ||
                 !IsReadableMemory(reinterpret_cast<void*>(first), last - first))
                 { hit.incomplete = true; continue; }
+            if (desktop)
+            {
+                void* tree = ReadPointerMember(reinterpret_cast<void*>(last - 8), 0);
+                if (ReadPointerMember(tree, 0) != g_coreDesktopTreeVtable ||
+                    g_coreFindTreeDataFunction(hit.currentVisual, tree) != data)
+                    { hit.incomplete = true; continue; }
+            }
             bool duplicate = false;
             for (unsigned j = 0; j < hit.alternateCount; ++j)
                 duplicate |= hit.alternates[j].image == image;
@@ -3837,7 +3849,15 @@ static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapsho
                 static_cast<unsigned>((last - first) / 16), ReadCoreBackdropScene(data, image, first, last)};
         }
     };
-    collect(currentData);
+    // FindTreeData's IsDesktop branch uses embedded CDesktopTreeData, not the
+    // property-1 association list below. Prefer this registry over old copies.
+    void* desktopData = static_cast<BYTE*>(hit.currentVisual) + 0x150;
+    if (g_coreBackdropDesktopReady && desktopData != currentData &&
+        IsReadableMemory(desktopData, 0x110) &&
+        ReadPointerMember(desktopData, 0) == g_coreDesktopTreeDataVtable &&
+        ReadPointerMember(desktopData, 0x108) == hit.currentVisual)
+        collect(desktopData, true);
+    collect(currentData, g_coreBackdropDesktopReady && desktopData == currentData);
     // Native FindTreeData uses tagged property 1 for its intrusive association
     // list. Validate the entire bounded list before making another native query.
     const auto* properties = static_cast<const BYTE*>(ReadPointerMember(hit.currentVisual, 0xE8));
@@ -4139,13 +4159,15 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
         {
             Wh_Log(L"MESH ACRYLIC INPUT: HWND=%p imageMatch=%d valid=%d pathPairs=%u "
                    L"currentVisual=%p currentTree=%p parentContext=%p candidates=%u "
-                   L"matchedImage=%p backdropRoot=%p sampledRoot=%p tables=%u alternates=%u incomplete=%d readOnly=1", hwnd, imageMatch,
+                   L"matchedImage=%p backdropRoot=%p sampledRoot=%p tables=%u alternates=%u incomplete=%d "
+                   L"desktopValid=%d desktopImages=%u readOnly=1", hwnd, imageMatch,
                    observation.backdrop.valid, observation.backdrop.pathPairs,
                    observation.backdrop.currentVisual, observation.backdrop.currentTree,
                    observation.backdrop.parentContext, observation.backdrop.images,
                    observation.backdrop.image, observation.backdrop.root,
                    g_coreMaterialSourceRoot.load(std::memory_order_acquire), observation.backdrop.tables,
-                   observation.backdrop.alternateCount, observation.backdrop.incomplete);
+                   observation.backdrop.alternateCount, observation.backdrop.incomplete,
+                   observation.backdrop.desktopValid, observation.backdrop.desktopImages);
             for (unsigned i = 0; i < observation.backdrop.alternateCount; ++i)
             {
                 const auto& candidate = observation.backdrop.alternates[i];
@@ -4402,6 +4424,7 @@ static void InitializeCoreMaterialDiagnostics()
         {{L"const CDesktopTree::`vftable'"}, &g_coreDesktopTreeVtable, nullptr, true},
         {{L"const CVisualTree::`vftable'"}, &g_coreVisualTreeVtable, nullptr, true},
         {{L"const CSubVisualTree::`vftable'"}, &g_coreSubVisualTreeVtable, nullptr, true},
+        {{L"const CDesktopTreeData::`vftable'"}, &g_coreDesktopTreeDataVtable, nullptr, true},
         {{L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
            L"struct D2D_SIZE_F const &,struct EffectInput *)const",
           L"public: long __cdecl CDrawingContext::GetBlurredWallpaperEffectInput("
@@ -4489,6 +4512,11 @@ static void InitializeCoreMaterialDiagnostics()
         reinterpret_cast<uintptr_t>(g_coreSubVisualTreeVtable) == base + 0x2CCA28;
     Wh_Log(L"MESH ACRYLIC SCENE OBSERVER: %s hooksAdded=0 sampleMs=1000 readOnly=1",
            g_coreBackdropSceneReady ? L"available" : L"unavailable");
+    g_coreBackdropDesktopReady = g_coreBackdropDetailReady &&
+        reinterpret_cast<uintptr_t>(g_coreDesktopTreeVtable) == base + 0x2C9668 &&
+        reinterpret_cast<uintptr_t>(g_coreDesktopTreeDataVtable) == base + 0x2C2CD8;
+    Wh_Log(L"MESH ACRYLIC DESKTOP OBSERVER: %s hooksAdded=0 sampleMs=1000 readOnly=1",
+           g_coreBackdropDesktopReady ? L"available" : L"unavailable");
     // Native callers retain extra volatile registers across these leaf getters/
     // setters (e.g. R10 across SetWorldTransform). Never detour them with C++.
     g_coreCachedTreatmentOriginal = g_coreCachedTreatmentFunction;
