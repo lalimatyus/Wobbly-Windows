@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.327
+// @version         0.328
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -555,6 +555,7 @@ struct NativeMeshState
     void* sourceOwner = nullptr;
     ULONGLONG attachedAt = 0;
     ULONGLONG hideUntil = 0;
+    std::uint64_t hideBridgeStart = 0;
     bool hideProbeAttempted = false;
     bool originalHidden = false;
     double originalOpacity = 1.0;
@@ -3566,6 +3567,19 @@ CoreBackdropEffectInput_t g_coreBackdropEffectInputFunction = nullptr, g_coreBac
 CoreCurrentTargetInfo_t g_coreCurrentTargetInfoFunction = nullptr;
 CoreBackdropRealization_t g_coreBackdropRealizationFunction = nullptr;
 std::atomic_bool g_coreBackdropBridgeReady = false;
+std::atomic<std::uint64_t> g_coreBackdropBridgeStats = 0; // Completed calls/applied, two wrapping 32-bit counters.
+
+static void RecordCoreBackdropBridgeInput(bool applied)
+{
+    auto previous = g_coreBackdropBridgeStats.load(std::memory_order_relaxed);
+    std::uint64_t next;
+    do
+    {
+        const auto calls = static_cast<std::uint32_t>(previous >> 32) + std::uint32_t{1};
+        const auto used = static_cast<std::uint32_t>(previous) + static_cast<std::uint32_t>(applied);
+        next = (std::uint64_t{calls} << 32) | used;
+    } while (!g_coreBackdropBridgeStats.compare_exchange_weak(previous, next, std::memory_order_relaxed));
+}
 CoreCachedTreatment_t g_coreCachedTreatmentFunction = nullptr, g_coreCachedTreatmentOriginal = nullptr;
 CoreCachedTreatment_t g_coreTreatmentFunction = nullptr;
 CoreCachedTreatment_t g_coreMaterialBitmapFunction = nullptr;
@@ -3976,8 +3990,7 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
         !g_coreMaterialCurrentImage ||
         g_coreMaterialCurrentImage != g_coreMaterialSourceImage.load(std::memory_order_acquire) ||
         observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
-        g_nativeSourceProbeMode.load(std::memory_order_acquire) != NativeSourceProbeMode::CapturedFlat ||
-        g_nativeOriginalHideProbe.load(std::memory_order_acquire))
+        g_nativeSourceProbeMode.load(std::memory_order_acquire) != NativeSourceProbeMode::CapturedFlat)
         return g_coreBackdropEffectInputOriginal(image, output);
 
     ++observation->bridgeAttempts;
@@ -4012,7 +4025,12 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
     if (observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
         g_unloading.load(std::memory_order_acquire))
         selected = nullptr;
-    if (!selected) return g_coreBackdropEffectInputOriginal(image, output);
+    if (!selected)
+    {
+        void* result = g_coreBackdropEffectInputOriginal(image, output);
+        RecordCoreBackdropBridgeInput(false);
+        return result;
+    }
 
     // The native factory constructs EffectInput and owns its normal references.
     // No structure copy, context-field swap or client/server image cast occurs.
@@ -4022,6 +4040,7 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
     ++observation->bridgeApplied;
     observation->bridgeReason = L"desktop-input";
     observation->bridgeSource = selected;
+    RecordCoreBackdropBridgeInput(true);
     return result;
 }
 
@@ -4630,7 +4649,7 @@ static void InitializeCoreMaterialDiagnostics()
         WindhawkUtils::SetFunctionHook(g_coreBackdropEffectInputFunction,
             CoreBackdropEffectInputHook, &g_coreBackdropEffectInputOriginal);
     g_coreBackdropBridgeReady.store(bridgeReady, std::memory_order_release);
-    Wh_Log(L"MESH ACRYLIC BRIDGE: %s mode=captured-source-only originalHide=off nativeFactory=1",
+    Wh_Log(L"MESH ACRYLIC BRIDGE: %s mode=captured-source-only hideProbe=compatible nativeFactory=1",
            bridgeReady ? L"ready" : L"unavailable");
     Wh_Log(L"MESH MATERIAL OBSERVER: %s coreTimestamp=0x%08X hooks=%u leafHooks=0 readOnly=%d",
            ready ? L"ready" : L"unavailable", nt->FileHeader.TimeDateStamp, bridgeReady ? 8u : 7u, !bridgeReady);
@@ -4824,8 +4843,11 @@ static void RestoreNativeOriginal(NativeMeshState& state)
     if (owned && g_nativeVisualSetOpacity) g_nativeVisualSetOpacity(state.root, state.originalOpacity);
     state.originalHidden = false;
     state.hideUntil = 0;
-    Wh_Log(L"NATIVE ORIGINAL HIDE RESTORED: HWND=%p propertyOwned=%d",
-           state.hwnd, owned);
+    const auto totals = g_coreBackdropBridgeStats.load(std::memory_order_relaxed);
+    const auto calls = static_cast<std::uint32_t>(totals >> 32) - static_cast<std::uint32_t>(state.hideBridgeStart >> 32);
+    const auto applied = static_cast<std::uint32_t>(totals) - static_cast<std::uint32_t>(state.hideBridgeStart);
+    Wh_Log(L"NATIVE ORIGINAL HIDE RESTORED: HWND=%p propertyOwned=%d acrylicCalls=%u acrylicApplied=%u",
+           state.hwnd, owned, calls, applied);
 }
 
 static void MaintainNativeOriginalHide(NativeMeshState& state)
@@ -4854,6 +4876,7 @@ static void MaintainNativeOriginalHide(NativeMeshState& state)
         Wh_Log(L"NATIVE ORIGINAL HIDE SKIPPED: HWND=%p reason=SourceDependencyOrOpacity", state.hwnd);
         return;
     }
+    state.hideBridgeStart = g_coreBackdropBridgeStats.load(std::memory_order_relaxed);
     state.originalHidden = true;
     state.hideUntil = now + 750;
     g_nativeOriginalHideWakeUntil.store(state.hideUntil, std::memory_order_release);
