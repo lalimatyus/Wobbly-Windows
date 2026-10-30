@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.331
+// @version         0.332
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -42,7 +42,8 @@ initialize instead of using unverified addresses.
 build. Other builds use the Affine fallback. It bends a live window image with
 20x20 Bezier interpolation, including its shadow, Mica and acrylic. Backdrop
 materials are sampled for the original window and then deform with the image;
-they do not yet sample the background at each curved screen position. While the
+the original backdrop follows the mesh center, while fully nonlinear background
+sampling is still experimental. While the
 mesh is visible, the original remains nearly transparent to keep DWM's native
 backdrop calculation active and is restored when the mesh detaches.
 Keep **Affine** selected for normal use.
@@ -544,6 +545,9 @@ struct NativeMeshState
     void* imageSourceProxy = nullptr;
     void* capturedRepresentation = nullptr;
     void* sourceOwner = nullptr;
+    void* sourceTransform = nullptr;
+    bool sourceMotionApplied = false;
+    double sourceMotionX = 0.0, sourceMotionY = 0.0;
     ULONGLONG attachedAt = 0;
     std::uint64_t materialKey = 0;
     bool originalHidden = false;
@@ -3784,6 +3788,7 @@ struct CoreMaterialObservation
     void* bridgeContext = nullptr; // Borrowed only within DrawVisualTree.
     unsigned fallbacks = 0;
     const wchar_t* fallbackReason = L"none";
+    int fallbackRenderingValid = -1;
 };
 thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
 thread_local unsigned g_coreMaterialRealizeDepth = 0;
@@ -3806,6 +3811,7 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
     const wchar_t* reason = observation->bridgeContext ? L"SourcePath" : L"MissingContext";
     void* selected = nullptr;
     std::uint64_t lastUseAge = 0;
+    void* notReadySource = nullptr; // Borrowed only within this callback.
     if (hit.valid && hit.image == image && hit.desktopValid && hit.scene.frameKnown &&
         hit.root == g_coreMaterialSourceRoot.load(std::memory_order_acquire))
     {
@@ -3821,7 +3827,7 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
                 scene.lastUsedFrame > scene.currentFrame)
                 { reason = L"DesktopClock"; continue; }
             if (scene.effectReady != 1)
-                { reason = L"EffectNotReady"; continue; }
+                { reason = L"EffectNotReady"; notReadySource = candidate.image; continue; }
             if (selected) { selected = nullptr; reason = L"AmbiguousDesktop"; break; }
             selected = candidate.image;
             lastUseAge = scene.frameAge;
@@ -3848,6 +3854,17 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
     }
     if (!selected)
     {
+        observation->fallbackRenderingValid = -1;
+        const auto lastLog = g_coreBackdropFallbackLogAt.load(std::memory_order_relaxed);
+        if (notReadySource && reason == std::wstring_view(L"EffectNotReady") &&
+            (!lastLog || GetTickCount64() - lastLog >= 1000) &&
+            observation->bridgeEpoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
+        {
+            const void* targetInfo = g_coreCurrentTargetInfoFunction(
+                static_cast<const BYTE*>(observation->bridgeContext) + 0x18);
+            observation->fallbackRenderingValid = targetInfo
+                ? static_cast<int>(g_coreBackdropRealizationFunction(notReadySource, targetInfo)) : -1;
+        }
         ++observation->fallbacks;
         observation->fallbackReason = reason;
         return g_coreBackdropEffectInputOriginal(image, output);
@@ -3928,9 +3945,9 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
         auto last = g_coreBackdropFallbackLogAt.load(std::memory_order_relaxed);
         if ((!last || now - last >= 1000) &&
             g_coreBackdropFallbackLogAt.compare_exchange_strong(last, now, std::memory_order_relaxed))
-            Wh_Log(L"MESH ACRYLIC FALLBACK: HWND=%p reason=%s calls=%u",
+            Wh_Log(L"MESH ACRYLIC FALLBACK: HWND=%p reason=%s calls=%u renderingValid=%d",
                    g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
-                   observation.fallbackReason, observation.fallbacks);
+                   observation.fallbackReason, observation.fallbacks, observation.fallbackRenderingValid);
     }
     return result;
 }
@@ -4301,12 +4318,24 @@ static bool MaintainNativeOriginalHide(NativeMeshState& state)
     return true;
 }// Native capture source end.
 
+static bool ResetNativeMeshSourceMotion(NativeMeshState& state)
+{
+    if (!state.sourceTransform || !state.sourceMotionApplied) return true;
+    const MilMatrix3x2D identity = {1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+    if (UpdateMatrixTransformProxy(state.sourceTransform, identity) < 0) return false;
+    state.sourceMotionApplied = false;
+    state.sourceMotionX = state.sourceMotionY = 0.0;
+    return true;
+}
+
 static void ReleaseNativeMeshState(NativeMeshState& state)
 {
     RestoreNativeOriginal(state);
+    if (!ResetNativeMeshSourceMotion(state)) return;
     ClearCoreMaterialTarget();
     if (state.visual) g_cBaseObjectRelease(state.visual);
     if (state.transform) g_cBaseObjectRelease(state.transform);
+    if (state.sourceTransform) g_cBaseObjectRelease(state.sourceTransform);
     if (state.instruction) g_cBaseObjectRelease(state.instruction);
     if (state.group) g_cBaseObjectRelease(state.group);
     if (state.mesh) g_cBaseObjectRelease(state.mesh);
@@ -4336,6 +4365,7 @@ static bool DetachNativeMesh(const wchar_t* reason)
     auto& state = g_nativeMeshState;
     g_nativeMeshStopRequested.store(true, std::memory_order_release);
     RestoreNativeOriginal(state);
+    if (!ResetNativeMeshSourceMotion(state)) { RequestDwmScenePass(); return false; }
     NativeCaptureGuard captureGuard(state.capturedRepresentation != nullptr);
     if (!captureGuard.acquired()) { RequestDwmScenePass(); return false; }
     if (!state.visual)
@@ -4463,6 +4493,15 @@ static bool BuildNativeMeshVertices(const Vec2 (&control)[16],
     return true;
 }
 
+static bool NativeMeshSourceMotion(const NativeMeshPoint3F (&positions)[NATIVE_MESH_VERTEX_COUNT],
+                                   int width, int height, double& x, double& y)
+{
+    const auto& center = positions[(NATIVE_MESH_SIDE / 2) * NATIVE_MESH_SIDE + NATIVE_MESH_SIDE / 2];
+    x = static_cast<double>(center.x) - width * 0.5;
+    y = static_cast<double>(center.y) - height * 0.5;
+    return std::isfinite(x) && std::isfinite(y);
+}
+
 static void BuildNativeMeshIndices(unsigned int (&indices)[NATIVE_MESH_INDEX_COUNT])
 {
     unsigned int count = 0;
@@ -4560,6 +4599,31 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
         return;
     }
     BuildNativeMeshIndices(indices);
+    if (state.sourceTransform)
+    {
+        double x = 0.0, y = 0.0;
+        if (!NativeMeshSourceMotion(positions, state.width, state.height, x, y))
+        {
+            DetachNativeMesh(L"source-motion-invalid");
+            return;
+        }
+        // This parent is outside the captured border subtree and the mesh's
+        // sibling. Follow its physical center without translating either twice.
+        if (x != state.sourceMotionX || y != state.sourceMotionY)
+        {
+            const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0, x, y};
+            state.sourceMotionApplied = true; // Reset even after a partial failed update.
+            long motionResult = UpdateMatrixTransformProxy(state.sourceTransform, matrix);
+            if (motionResult < 0)
+            {
+                DetachNativeMesh(L"source-motion-update-failed");
+                return;
+            }
+            state.sourceMotionX = x;
+            state.sourceMotionY = y;
+            state.sourceMotionApplied = x != 0.0 || y != 0.0;
+        }
+    }
     long result = g_nativeMeshUpdateMesh(state.mesh, 0, positions,
                                            coordinates, NATIVE_MESH_VERTEX_COUNT,
                                            indices, NATIVE_MESH_INDEX_COUNT);
@@ -4575,8 +4639,8 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
     if (++state.meshUpdateCount == 1 || state.meshUpdateCount % 120 == 0)
     {
         Wh_Log(L"NATIVE VERTEX MESH UPDATE: HWND=%p count=%u revision=%llu "
-               L"maxDisplacement=%.1f", state.hwnd, state.meshUpdateCount,
-               revision, maximumDisplacement);
+               L"maxDisplacement=%.1f sourceOffset=(%.1f,%.1f)", state.hwnd, state.meshUpdateCount,
+               revision, maximumDisplacement, state.sourceMotionX, state.sourceMotionY);
     }
 }
 
@@ -4886,6 +4950,27 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
                      ? g_cVisualProxySetTransform(visualProxy, pending.transform)
                      : E_NOINTERFACE;
     }
+    if (result >= 0 && inserted && backdropSource)
+    {
+        stage = L"CreateSourceMotion";
+        unsigned usage = 0, representationType = 0;
+        if (IsReadableMemory(static_cast<const BYTE*>(capturedRepresentation) + 0x28, sizeof(usage)) &&
+            IsReadableMemory(static_cast<const BYTE*>(capturedRepresentation) + 0x48, sizeof(representationType)))
+        {
+            std::memcpy(&usage, static_cast<const BYTE*>(capturedRepresentation) + 0x28, sizeof(usage));
+            std::memcpy(&representationType, static_cast<const BYTE*>(capturedRepresentation) + 0x48, sizeof(representationType));
+        }
+        if (usage == 0xA0 && representationType != 3)
+        {
+            result = g_createMatrixTransformProxy(compositor, &pending.sourceTransform);
+            if (result >= 0 && !pending.sourceTransform) result = E_UNEXPECTED;
+            if (result >= 0)
+                result = UpdateMatrixTransformProxy(pending.sourceTransform,
+                                                    {1.0, 0.0, 0.0, 1.0, 0.0, 0.0});
+            if (result >= 0)
+                result = g_cVisualProxySetTransform(sourceProxy, pending.sourceTransform);
+        }
+    }
     if (result >= 0 && inserted)
     {
         pending.capturedRepresentation = capturedRepresentation;
@@ -4902,6 +4987,8 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
         g_nativeMeshSourcePending.store(true, std::memory_order_release);
         PostThreadMessageW(g_eventThreadMessageTarget.load(std::memory_order_acquire), WM_NULL, 0, 0);
         InvalidateAnimationTransformForNativeMesh(hwnd);
+        Wh_Log(L"MESH SOURCE MOTION: HWND=%p enabled=%d pivot=surface-center captureParentExcluded=%d",
+               hwnd, pending.sourceTransform != nullptr, backdropSource);
         Wh_Log(L"NATIVE MESH ATTACHED: HWND=%p root=%p "
                L"visual=%p source=%s path=%s duration=until-slot-retirement snapshot=none",
                hwnd, root, pending.visual,
@@ -5018,8 +5105,7 @@ static void CreateVisibleNativeMesh(HWND hwnd, void* topLevelWindow, void* sourc
                                      capturedRepresentation, imageSourceProxy))
         {
             Wh_Log(L"NATIVE VERTEX MESH: attached HWND=%p "
-                   L"physicsLinked=1 liveSource=1 original=%s", hwnd,
-                   backdropSource ? L"identity" : L"translation");
+                   L"physicsLinked=1 liveSource=1 original=independent-parent-motion", hwnd);
         }
     }
     if (instruction) g_cBaseObjectRelease(instruction);
