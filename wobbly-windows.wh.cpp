@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.330
+// @version         0.331
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -40,7 +40,9 @@ initialize instead of using unverified addresses.
 
 **Mesh Renderer** is an experimental in-process DWM path on the validated 23H2
 build. Other builds use the Affine fallback. It bends a live window image with
-20x20 Bezier interpolation, including its shadow, Mica and acrylic. While the
+20x20 Bezier interpolation, including its shadow, Mica and acrylic. Backdrop
+materials are sampled for the original window and then deform with the image;
+they do not yet sample the background at each curved screen position. While the
 mesh is visible, the original remains nearly transparent to keep DWM's native
 backdrop calculation active and is restored when the mesh detaches.
 Keep **Affine** selected for normal use.
@@ -3544,7 +3546,8 @@ void* g_coreDesktopTreeDataVtable = nullptr;
 uintptr_t g_coreMaterialModuleBase = 0;
 bool g_coreBackdropDetailReady = false, g_coreBackdropSceneReady = false, g_coreBackdropDesktopReady = false;
 std::atomic_bool g_coreMaterialBridgeReady = false, g_coreBackdropBridgeReady = false;
-std::atomic_bool g_coreBackdropBridgeLogged = false;
+std::atomic_bool g_coreBackdropBridgeLogged = false, g_coreBackdropReuseLogged = false;
+std::atomic<ULONGLONG> g_coreBackdropFallbackLogAt = 0;
 SRWLOCK g_coreMaterialTargetLock = SRWLOCK_INIT;
 std::atomic<std::uint64_t> g_coreMaterialTargetKey = 0, g_coreMaterialReadyKey = 0;
 std::atomic<ULONGLONG> g_coreMaterialTargetEpoch = 0;
@@ -3571,6 +3574,8 @@ static void ClearCoreMaterialTarget()
     g_coreMaterialSourceTree.store(nullptr, std::memory_order_release);
     g_coreMaterialTargetHwnd.store(nullptr, std::memory_order_release);
     g_coreBackdropBridgeLogged.store(false, std::memory_order_relaxed);
+    g_coreBackdropReuseLogged.store(false, std::memory_order_relaxed);
+    g_coreBackdropFallbackLogAt.store(0, std::memory_order_relaxed);
     g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
 }
@@ -3725,7 +3730,7 @@ static void CollectCoreBackdropAlternates(void* currentData, CoreBackdropSnapsho
         }
     };
     // FindTreeData's IsDesktop branch uses embedded CDesktopTreeData, not the
-    // property-1 association list below. Prefer this registry over old copies.
+    // property-1 association list. Prefer this registry over old copies.
     void* desktopData = static_cast<BYTE*>(hit.currentVisual) + 0x150;
     if (g_coreBackdropDesktopReady && desktopData != currentData &&
         IsReadableMemory(desktopData, 0x110) &&
@@ -3777,6 +3782,8 @@ struct CoreMaterialObservation
 {
     ULONGLONG bridgeEpoch = 0;
     void* bridgeContext = nullptr; // Borrowed only within DrawVisualTree.
+    unsigned fallbacks = 0;
+    const wchar_t* fallbackReason = L"none";
 };
 thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
 thread_local unsigned g_coreMaterialRealizeDepth = 0;
@@ -3789,58 +3796,77 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
     if (!g_coreBackdropBridgeReady.load(std::memory_order_acquire) ||
         !g_coreMaterialBridgeReady.load(std::memory_order_acquire) ||
         g_unloading.load(std::memory_order_acquire) || !output || !observation ||
-        !observation->bridgeContext || g_coreBackdropBridgeInCall ||
-        !g_coreMaterialCurrentImage ||
+        g_coreBackdropBridgeInCall || !g_coreMaterialCurrentImage ||
         g_coreMaterialCurrentImage != g_coreMaterialSourceImage.load(std::memory_order_acquire) ||
         observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
         return g_coreBackdropEffectInputOriginal(image, output);
 
-    const auto hit = ReadCoreBackdropSnapshot(observation->bridgeContext);
+    const auto hit = observation->bridgeContext
+        ? ReadCoreBackdropSnapshot(observation->bridgeContext) : CoreBackdropSnapshot{};
+    const wchar_t* reason = observation->bridgeContext ? L"SourcePath" : L"MissingContext";
     void* selected = nullptr;
+    std::uint64_t lastUseAge = 0;
     if (hit.valid && hit.image == image && hit.desktopValid && hit.scene.frameKnown &&
         hit.root == g_coreMaterialSourceRoot.load(std::memory_order_acquire))
     {
+        reason = L"DesktopUnavailable";
         for (unsigned i = 0; i < hit.alternateCount; ++i)
         {
             const auto& candidate = hit.alternates[i];
             const auto& scene = candidate.scene;
             if (ReadPointerMember(candidate.tree, 0) != g_coreDesktopTreeVtable) continue;
             if (scene.treeRoot != candidate.root)
-                { continue; }
-            if (!scene.frameKnown || scene.currentFrame != hit.scene.currentFrame)
-                { continue; }
-            if (scene.frameAge > 1)
-                { continue; }
+                { reason = L"DesktopRoot"; continue; }
+            if (!scene.frameKnown || scene.currentFrame != hit.scene.currentFrame ||
+                scene.lastUsedFrame > scene.currentFrame)
+                { reason = L"DesktopClock"; continue; }
             if (scene.effectReady != 1)
-                { continue; }
-            if (selected) { selected = nullptr; break; }
+                { reason = L"EffectNotReady"; continue; }
+            if (selected) { selected = nullptr; reason = L"AmbiguousDesktop"; break; }
             selected = candidate.image;
+            lastUseAge = scene.frameAge;
         }
     }
     if (selected)
     {
         const void* targetInfo = g_coreCurrentTargetInfoFunction(
             static_cast<const BYTE*>(observation->bridgeContext) + 0x18);
+        // +7C0 is a last-use stamp, not the age of rendered pixels. Native
+        // HasValidRenderingRealization also checks RequiresRendering, the target,
+        // device status and cache invalidation; idle caches can remain valid.
         if (!targetInfo || !g_coreBackdropRealizationFunction(selected, targetInfo))
         {
             selected = nullptr;
+            reason = L"RenderTargetNotReady";
         }
     }
     if (observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
         g_unloading.load(std::memory_order_acquire))
     {
         selected = nullptr;
+        reason = L"TargetRetired";
     }
-    if (!selected) return g_coreBackdropEffectInputOriginal(image, output);
+    if (!selected)
+    {
+        ++observation->fallbacks;
+        observation->fallbackReason = reason;
+        return g_coreBackdropEffectInputOriginal(image, output);
+    }
 
     // The native factory constructs EffectInput and owns its normal references.
     // No structure copy, context-field swap or client/server image cast occurs.
     g_coreBackdropBridgeInCall = true;
     void* result = g_coreBackdropEffectInputOriginal(selected, output);
     g_coreBackdropBridgeInCall = false;
-    if (!g_coreBackdropBridgeLogged.exchange(true, std::memory_order_relaxed))
+    if (!g_coreBackdropBridgeLogged.load(std::memory_order_relaxed) &&
+        !g_coreBackdropBridgeLogged.exchange(true, std::memory_order_relaxed))
         Wh_Log(L"MESH ACRYLIC ACTIVE: HWND=%p nativeDesktopInput=1",
                g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
+    if (lastUseAge > 1 && !g_coreBackdropReuseLogged.load(std::memory_order_relaxed) &&
+        !g_coreBackdropReuseLogged.exchange(true, std::memory_order_relaxed))
+        Wh_Log(L"MESH ACRYLIC CACHE REUSE: HWND=%p lastUseAge=%llu nativeValid=1",
+               g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
+               static_cast<unsigned long long>(lastUseAge));
     return result;
 }
 
@@ -3895,6 +3921,17 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
     g_coreMaterialObservation = &observation;
     const long result = g_coreDrawVisualTreeOriginal(context, tree, bounds, occlusion, clearMode, drawFlag, root);
     g_coreMaterialObservation = previous;
+    if (observation.fallbacks && epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
+        !g_unloading.load(std::memory_order_acquire))
+    {
+        const auto now = GetTickCount64();
+        auto last = g_coreBackdropFallbackLogAt.load(std::memory_order_relaxed);
+        if ((!last || now - last >= 1000) &&
+            g_coreBackdropFallbackLogAt.compare_exchange_strong(last, now, std::memory_order_relaxed))
+            Wh_Log(L"MESH ACRYLIC FALLBACK: HWND=%p reason=%s calls=%u",
+                   g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
+                   observation.fallbackReason, observation.fallbacks);
+    }
     return result;
 }
 
@@ -4336,6 +4373,15 @@ static bool DetachNativeMesh(const wchar_t* reason)
 static void CalculateBernsteinBasis(double value, double basis[4]);
 
 // Native mesh math begin: shared with the standalone geometry checks.
+static constexpr int NATIVE_MESH_MAX_PADDING = 256;
+
+static int NativeMeshShadowPaddingForDpi(unsigned dpi)
+{
+    // Reserve 96 DIPs around the window, rounded outward to 16 pixels.
+    dpi = std::clamp(dpi ? dpi : 96u, 96u, 384u);
+    return std::min(NATIVE_MESH_MAX_PADDING, static_cast<int>((dpi + 15u) & ~15u));
+}
+
 static constexpr unsigned int NATIVE_MESH_CELLS = 20;
 static constexpr unsigned int NATIVE_MESH_RENDER_CELLS = NATIVE_MESH_CELLS + 2;
 static constexpr unsigned int NATIVE_MESH_SIDE = NATIVE_MESH_RENDER_CELLS + 1;
@@ -4380,7 +4426,7 @@ static bool BuildNativeMeshVertices(const Vec2 (&control)[16],
     NativeMeshPoint3F (&positions)[NATIVE_MESH_VERTEX_COUNT],
     NativeMeshPoint2D (&coordinates)[NATIVE_MESH_VERTEX_COUNT])
 {
-    if (width < 1 || height < 1 || padding < 0 || padding > 64 ||
+    if (width < 1 || height < 1 || padding < 0 || padding > NATIVE_MESH_MAX_PADDING ||
         width > 8192 - 2 * padding || height > 8192 - 2 * padding)
         return false;
     for (const Vec2& point : control)
@@ -4535,7 +4581,7 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
 }
 
 static bool GetNativeMeshWindowSize(HWND hwnd, int& width, int& height,
-                                    bool logDimensions = false)
+                                    bool logDimensions = false, int* shadowPadding = nullptr)
 {
     ScopedDpiContext coordinates(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if (!coordinates.valid()) return false;
@@ -4561,6 +4607,9 @@ static bool GetNativeMeshWindowSize(HWND hwnd, int& width, int& height,
     if (!monitor || !g_getDpiForMonitor ||
         FAILED(g_getDpiForMonitor(monitor, 0, &monitorDpiX, &monitorDpiY)))
         monitorDpiX = monitorDpiY = 0;
+    if (shadowPadding)
+        *shadowPadding = NativeMeshShadowPaddingForDpi(
+            monitorDpiX && monitorDpiY ? std::max(monitorDpiX, monitorDpiY) : windowDpi);
     width = std::max(windowWidth, frameWidth);
     height = std::max(windowHeight, frameHeight);
     if (hasFrameBounds && frameWidth > windowWidth && windowDpi &&
@@ -4591,7 +4640,7 @@ static long UpdateNativeMeshSourceImage(void* image, void* sourceProxy,
 {
     if (!image || !IsVisualProxyPointerValid(sourceProxy))
         return E_NOINTERFACE;
-    if (padding < 0 || padding > 64 || width < 1 || height < 1 ||
+    if (padding < 0 || padding > NATIVE_MESH_MAX_PADDING || width < 1 || height < 1 ||
         width > 8192 - 2 * padding || height > 8192 - 2 * padding)
         return E_INVALIDARG;
     NativeMeshRectF rect = {-static_cast<float>(padding), -static_cast<float>(padding),
@@ -4671,7 +4720,8 @@ static void MaintainNativeMesh()
         }
         // A temporarily unavailable HWND rectangle is not a replaced visual.
         // Keep the validated source and retry its bounds on the next scene pass.
-        if (!GetNativeMeshWindowSize(state.hwnd, width, height))
+        int padding = state.sourcePadding;
+        if (!GetNativeMeshWindowSize(state.hwnd, width, height, false, &padding))
         {
             UpdateNativeVertexMesh(state);
             return;
@@ -4695,10 +4745,10 @@ static void MaintainNativeMesh()
                 height = state.height;
             }
         }
-        if (width != state.width || height != state.height)
+        if (width != state.width || height != state.height || padding != state.sourcePadding)
         {
             long result = UpdateNativeMeshSourceImage(state.image, state.imageSourceProxy,
-                                                       width, height, state.sourcePadding);
+                                                       width, height, padding);
             if (result < 0)
             {
                 Wh_Log(L"NATIVE MESH SOURCE RESIZE FAILED: HWND=%p "
@@ -4709,9 +4759,10 @@ static void MaintainNativeMesh()
             }
             state.width = width;
             state.height = height;
+            state.sourcePadding = padding;
             state.submittedMeshRevision = 0;
-            Wh_Log(L"NATIVE MESH SOURCE RESIZED: HWND=%p size=%dx%d",
-                   state.hwnd, width, height);
+            Wh_Log(L"NATIVE MESH SOURCE RESIZED: HWND=%p size=%dx%d padding=%d",
+                   state.hwnd, width, height, padding);
         }
         UpdateNativeVertexMesh(state);
     }
@@ -5032,13 +5083,13 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
            sourceRoot, sourceVisualProxy, ReadPointerMember(sourceRoot, 0x18));
     int width = 0;
     int height = 0;
-    if (!GetNativeMeshWindowSize(hwnd, width, height, true))
+    int sourcePadding = 0;
+    if (!GetNativeMeshWindowSize(hwnd, width, height, true, &sourcePadding))
     {
         return;
     }
     NativeCaptureGuard captureGuard(true);
     if (!captureGuard.acquired()) return;
-    constexpr int sourcePadding = 64;
     void* capturedRepresentation = nullptr;
     void* imageSourceProxy = sourceVisualProxy;
     {
