@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.332
+// @version         0.333
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4180,6 +4180,16 @@ static bool IsNativeMeshSourceCurrent(void* topLevelWindow, void* sourceRoot,
 // Native capture source begin: exact 23H2 layout, independently tested below.
 // A sub-pixel original contribution keeps native backdrop realization active.
 static constexpr double kNativeOriginalOpacity = 1.0 / 65536.0;
+static constexpr double kNativeMeshPresentationOpacity = 1.0 - kNativeOriginalOpacity;
+
+static bool ConfigureNativeMeshPresentation(void* visual)
+{
+    if (!g_nativeVisualSetOpacity || !NativeVisualVtableRva(visual)) return false;
+    // Keep a blending dependency on the original scene instead of presenting
+    // the replacement as a fully opaque occluder. Only this owned visual changes.
+    g_nativeVisualSetOpacity(visual, kNativeMeshPresentationOpacity);
+    return true;
+}
 class NativeCaptureGuard
 {
 public:
@@ -4897,6 +4907,11 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
     if (result >= 0 && !pending.visual) result = E_UNEXPECTED;
     if (result >= 0)
     {
+        stage = L"ConfigurePresentation";
+        if (!ConfigureNativeMeshPresentation(pending.visual)) result = E_NOINTERFACE;
+    }
+    if (result >= 0)
+    {
         stage = L"AddInstruction";
         result = g_nativeMeshAddInstruction(pending.visual, instruction);
     }
@@ -4987,6 +5002,8 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
         g_nativeMeshSourcePending.store(true, std::memory_order_release);
         PostThreadMessageW(g_eventThreadMessageTarget.load(std::memory_order_acquire), WM_NULL, 0, 0);
         InvalidateAnimationTransformForNativeMesh(hwnd);
+        Wh_Log(L"MESH BACKDROP KEEPALIVE: HWND=%p meshOpacity=%.8f originalOpacity=%.8f",
+               hwnd, kNativeMeshPresentationOpacity, kNativeOriginalOpacity);
         Wh_Log(L"MESH SOURCE MOTION: HWND=%p enabled=%d pivot=surface-center captureParentExcluded=%d",
                hwnd, pending.sourceTransform != nullptr, backdropSource);
         Wh_Log(L"NATIVE MESH ATTACHED: HWND=%p root=%p "
