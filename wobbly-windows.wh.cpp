@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.328
+// @version         0.329
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3568,6 +3568,7 @@ CoreCurrentTargetInfo_t g_coreCurrentTargetInfoFunction = nullptr;
 CoreBackdropRealization_t g_coreBackdropRealizationFunction = nullptr;
 std::atomic_bool g_coreBackdropBridgeReady = false;
 std::atomic<std::uint64_t> g_coreBackdropBridgeStats = 0; // Completed calls/applied, two wrapping 32-bit counters.
+std::atomic<const wchar_t*> g_coreBackdropBridgeLastMiss = L"none"; // Mod-owned literals only.
 
 static void RecordCoreBackdropBridgeInput(bool applied)
 {
@@ -3578,7 +3579,8 @@ static void RecordCoreBackdropBridgeInput(bool applied)
         const auto calls = static_cast<std::uint32_t>(previous >> 32) + std::uint32_t{1};
         const auto used = static_cast<std::uint32_t>(previous) + static_cast<std::uint32_t>(applied);
         next = (std::uint64_t{calls} << 32) | used;
-    } while (!g_coreBackdropBridgeStats.compare_exchange_weak(previous, next, std::memory_order_relaxed));
+    } while (!g_coreBackdropBridgeStats.compare_exchange_weak(previous, next,
+                 std::memory_order_release, std::memory_order_relaxed));
 }
 CoreCachedTreatment_t g_coreCachedTreatmentFunction = nullptr, g_coreCachedTreatmentOriginal = nullptr;
 CoreCachedTreatment_t g_coreTreatmentFunction = nullptr;
@@ -4004,10 +4006,15 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
         {
             const auto& candidate = hit.alternates[i];
             const auto& scene = candidate.scene;
-            if (ReadPointerMember(candidate.tree, 0) != g_coreDesktopTreeVtable ||
-                scene.treeRoot != candidate.root || !scene.frameKnown || scene.frameAge > 1 ||
-                scene.currentFrame != hit.scene.currentFrame || scene.effectReady != 1)
-                continue;
+            if (ReadPointerMember(candidate.tree, 0) != g_coreDesktopTreeVtable) continue;
+            if (scene.treeRoot != candidate.root)
+                { observation->bridgeReason = L"desktop-root-changed"; continue; }
+            if (!scene.frameKnown || scene.currentFrame != hit.scene.currentFrame)
+                { observation->bridgeReason = L"desktop-frame-unknown"; continue; }
+            if (scene.frameAge > 1)
+                { observation->bridgeReason = L"desktop-stale"; continue; }
+            if (scene.effectReady != 1)
+                { observation->bridgeReason = L"desktop-effect-inactive"; continue; }
             if (selected) { selected = nullptr; observation->bridgeReason = L"ambiguous-desktop"; break; }
             selected = candidate.image;
         }
@@ -4024,10 +4031,14 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
     }
     if (observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
         g_unloading.load(std::memory_order_acquire))
+    {
+        observation->bridgeReason = L"target-retired";
         selected = nullptr;
+    }
     if (!selected)
     {
         void* result = g_coreBackdropEffectInputOriginal(image, output);
+        g_coreBackdropBridgeLastMiss.store(observation->bridgeReason, std::memory_order_relaxed);
         RecordCoreBackdropBridgeInput(false);
         return result;
     }
@@ -4729,6 +4740,8 @@ static bool IsNativeMeshSourceCurrent(void* topLevelWindow, void* sourceRoot,
 }
 
 // Native capture source begin: exact 23H2 layout, independently tested below.
+// Probe whether a sub-pixel original contribution keeps native backdrop work alive.
+static constexpr double kNativeOriginalProbeOpacity = 1.0 / 65536.0;
 class NativeCaptureGuard
 {
 public:
@@ -4838,16 +4851,17 @@ static void RestoreNativeOriginal(NativeMeshState& state)
 {
     g_nativeOriginalHideWakeUntil.store(0, std::memory_order_release);
     if (!state.originalHidden) return;
+    const auto totals = g_coreBackdropBridgeStats.load(std::memory_order_acquire);
+    const auto calls = static_cast<std::uint32_t>(totals >> 32) - static_cast<std::uint32_t>(state.hideBridgeStart >> 32);
+    const auto applied = static_cast<std::uint32_t>(totals) - static_cast<std::uint32_t>(state.hideBridgeStart);
+    const auto* miss = calls == applied ? L"none" : g_coreBackdropBridgeLastMiss.load(std::memory_order_relaxed);
     double current = 0.0;
-    const bool owned = ReadNativeOpacity(state.root, current) && current == 0.0;
+    const bool owned = ReadNativeOpacity(state.root, current) && current == kNativeOriginalProbeOpacity;
     if (owned && g_nativeVisualSetOpacity) g_nativeVisualSetOpacity(state.root, state.originalOpacity);
     state.originalHidden = false;
     state.hideUntil = 0;
-    const auto totals = g_coreBackdropBridgeStats.load(std::memory_order_relaxed);
-    const auto calls = static_cast<std::uint32_t>(totals >> 32) - static_cast<std::uint32_t>(state.hideBridgeStart >> 32);
-    const auto applied = static_cast<std::uint32_t>(totals) - static_cast<std::uint32_t>(state.hideBridgeStart);
-    Wh_Log(L"NATIVE ORIGINAL HIDE RESTORED: HWND=%p propertyOwned=%d acrylicCalls=%u acrylicApplied=%u",
-           state.hwnd, owned, calls, applied);
+    Wh_Log(L"NATIVE ORIGINAL HIDE RESTORED: HWND=%p propertyOwned=%d acrylicCalls=%u acrylicApplied=%u acrylicMiss=%s",
+           state.hwnd, owned, calls, applied, miss);
 }
 
 static void MaintainNativeOriginalHide(NativeMeshState& state)
@@ -4876,12 +4890,13 @@ static void MaintainNativeOriginalHide(NativeMeshState& state)
         Wh_Log(L"NATIVE ORIGINAL HIDE SKIPPED: HWND=%p reason=SourceDependencyOrOpacity", state.hwnd);
         return;
     }
-    state.hideBridgeStart = g_coreBackdropBridgeStats.load(std::memory_order_relaxed);
+    state.hideBridgeStart = g_coreBackdropBridgeStats.load(std::memory_order_acquire);
     state.originalHidden = true;
     state.hideUntil = now + 750;
     g_nativeOriginalHideWakeUntil.store(state.hideUntil, std::memory_order_release);
-    g_nativeVisualSetOpacity(state.root, 0.0);
-    Wh_Log(L"NATIVE ORIGINAL HIDE ACTIVE: HWND=%p durationMs=750 source=OwnedRepresentation", state.hwnd);
+    g_nativeVisualSetOpacity(state.root, kNativeOriginalProbeOpacity);
+    Wh_Log(L"NATIVE ORIGINAL HIDE ACTIVE: HWND=%p durationMs=750 opacity=%.8f source=OwnedRepresentation",
+           state.hwnd, kNativeOriginalProbeOpacity);
 }
 // Native capture source end.
 
