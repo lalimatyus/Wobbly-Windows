@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.336
+// @version         0.337
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3820,6 +3820,7 @@ struct CoreMaterialObservation
     ULONGLONG bridgeEpoch = 0;
     void* bridgeContext = nullptr; // Borrowed only within this DrawVisualTree.
     void* drawContext = nullptr;
+    unsigned drawDepth = 0, validations = 0, contextMismatches = 0;
     unsigned fallbacks = 0;
     const wchar_t* fallbackReason = L"none";
     int fallbackRenderingValid = -1;
@@ -4188,31 +4189,37 @@ static long __cdecl CoreBviValidationHook(void* context, const void* bounds, voi
 {
     const long result = g_coreBviValidationOriginal(context, bounds, flag);
     if (result >= 0)
-        if (auto* observation = CurrentCoreMaterialObservation();
-            observation && observation->drawContext == context)
-            observation->bridgeContext = context;
+        if (auto* observation = CurrentCoreMaterialObservation())
+        {
+            ++observation->validations;
+            if (observation->drawContext == context) observation->bridgeContext = context;
+            else ++observation->contextMismatches;
+        }
     return result;
 }
 
 static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, const void* bounds,
                                           const void* occlusion, int clearMode, bool drawFlag, void* root)
 {
+    auto* parent = CurrentCoreMaterialObservation();
     bool observe = tree && g_coreMaterialBridgeReady.load(std::memory_order_acquire) &&
-        !g_unloading.load(std::memory_order_acquire) &&
-        tree == g_coreMaterialSourceTree.load(std::memory_order_acquire);
+        !g_unloading.load(std::memory_order_acquire) && g_coreMaterialCurrentImage &&
+        g_coreMaterialCurrentImage == g_coreMaterialSourceImage.load(std::memory_order_acquire) &&
+        (tree == g_coreMaterialSourceTree.load(std::memory_order_acquire) || parent);
     ULONGLONG epoch = 0;
     if (observe)
     {
         AcquireSRWLockShared(&g_coreMaterialTargetLock);
         observe = g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
-                  tree == g_coreMaterialSourceTree.load(std::memory_order_relaxed);
+                  g_coreMaterialCurrentImage == g_coreMaterialSourceImage.load(std::memory_order_relaxed) &&
+                  (tree == g_coreMaterialSourceTree.load(std::memory_order_relaxed) ||
+                   (parent && parent->bridgeEpoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed)));
         epoch = g_coreMaterialTargetEpoch.load(std::memory_order_relaxed);
         ReleaseSRWLockShared(&g_coreMaterialTargetLock);
     }
     if (!observe)
     {
-        // A nested foreign tree cannot publish its temporary context into the
-        // outer source observation, even if it reuses the same drawing object.
+        // Realizing another image cannot publish into the selected capture.
         auto* previous = g_coreMaterialObservation;
         g_coreMaterialObservation = nullptr;
         const long result = g_coreDrawVisualTreeOriginal(context, tree, bounds, occlusion, clearMode, drawFlag, root);
@@ -4222,13 +4229,15 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
     CoreMaterialObservation observation;
     observation.bridgeEpoch = epoch;
     observation.drawContext = context;
+    // Native subtrees are valid acrylic producers within this image. Keep
+    // their contexts in separate stack scopes, including reused contexts.
+    observation.drawDepth = parent ? parent->drawDepth + 1 : 1;
     auto* previous = g_coreMaterialObservation;
     g_coreMaterialObservation = &observation;
     const long result = g_coreDrawVisualTreeOriginal(context, tree, bounds, occlusion, clearMode, drawFlag, root);
     g_coreMaterialObservation = previous;
     if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
-        !g_unloading.load(std::memory_order_acquire) &&
-        (observation.inputCount || observation.fallbacks))
+        !g_unloading.load(std::memory_order_acquire))
     {
         const auto now = GetTickCount64();
         auto last = g_coreMaterialPipelineLogAt.load(std::memory_order_relaxed);
@@ -4242,7 +4251,7 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
                    L"inputMetadata=%d outputMetadata=%d outputRealization=0x%llX "
                    L"inputBounds=(%.1f,%.1f,%.1f,%.1f) "
                    L"inputMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g) "
-                   L"outputFlags=0x%X readOnly=1",
+                   L"outputFlags=0x%X drawDepth=%u validations=%u contextMismatches=%u readOnly=1",
                    g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
                    observation.inputCount, observation.blurCalls, observation.materialBlurCalls,
                    observation.intermediateCalls, observation.materialIntermediateCalls,
@@ -4251,7 +4260,7 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
                    in.bounds[0], in.bounds[1], in.bounds[2], in.bounds[3],
                    in.transform[0], in.transform[1], in.transform[2], in.transform[3],
                    in.transform[4], in.transform[5], in.transform[6], in.transform[7], in.transform[8],
-                   out.flags);
+                   out.flags, observation.drawDepth, observation.validations, observation.contextMismatches);
         }
     }
     if (observation.fallbacks && epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
