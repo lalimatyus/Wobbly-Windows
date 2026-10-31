@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.334
+// @version         0.335
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3531,6 +3531,8 @@ using CoreIntermediateBrush_t = long(__cdecl*)(void*, unsigned int, const void*,
 CoreExecuteBlur_t g_coreExecuteBlurFunction = nullptr, g_coreExecuteBlurOriginal = nullptr;
 CoreIntermediateBrush_t g_coreIntermediateBrushFunction = nullptr, g_coreIntermediateBrushOriginal = nullptr;
 std::atomic<ULONGLONG> g_coreMaterialPipelineLogAt = 0;
+std::atomic<void*> g_coreMaterialSamplingVisual = nullptr;
+std::atomic_bool g_coreMaterialPassReuseLogged = false;
 using CoreMaterialInput_t = long(__cdecl*)(void*, const void*, void*);
 using CoreImageUpdate_t = long(__cdecl*)(void*, void*, const void*);
 using CoreImageRealize_t = long(__cdecl*)(void*, const void*, void**);
@@ -3586,6 +3588,8 @@ static void ClearCoreMaterialTarget()
     g_coreBackdropReuseLogged.store(false, std::memory_order_relaxed);
     g_coreBackdropFallbackLogAt.store(0, std::memory_order_relaxed);
     g_coreMaterialPipelineLogAt.store(0, std::memory_order_relaxed);
+    g_coreMaterialSamplingVisual.store(nullptr, std::memory_order_release);
+    g_coreMaterialPassReuseLogged.store(false, std::memory_order_relaxed);
     g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
 }
@@ -3788,12 +3792,12 @@ static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context)
     return hit;
 }
 
-// Only metadata and call-scoped identities are observed. Native EffectInput
-// objects keep their original ownership; no resource or effect is substituted.
+// Native input identities and metadata. Managed blur copies live only
+// within the desktop draw pass that produced them.
 struct CoreMaterialInputIdentity
 {
     void* bitmap = nullptr;
-    void* brush = nullptr;
+    void* brush = nullptr; // Native IBitmapRealization; historical field name.
 };
 
 struct CoreMaterialInputMetadata
@@ -3814,7 +3818,10 @@ struct CoreMaterialObservation
     CoreMaterialInputIdentity materialInputs[8] = {};
     unsigned inputCount = 0, blurCalls = 0, materialBlurCalls = 0;
     unsigned intermediateCalls = 0, materialIntermediateCalls = 0;
-    CoreMaterialInputMetadata blurInput, blurOutput;
+    CoreMaterialInputMetadata blurInput, blurOutput, passInput;
+    bool passAvailable = false;
+    unsigned passPublished = 0, passReuses = 0;
+    const wchar_t* passReason = L"NotNeeded";
 };
 thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
 thread_local unsigned g_coreMaterialRealizeDepth = 0;
@@ -3858,7 +3865,7 @@ static void RememberCoreMaterialInput(CoreMaterialObservation& observation,
 static CoreMaterialInputMetadata ReadCoreMaterialInputMetadata(const void* input)
 {
     CoreMaterialInputMetadata metadata;
-    if (!IsReadableMemory(input, 0x68)) return metadata;
+    if (!IsReadableMemory(input, 0x68) || static_cast<const BYTE*>(input)[0x2C] != 1) return metadata;
     const auto* bytes = static_cast<const BYTE*>(input);
     // Native EffectInput copy/assignment: two managed inputs at +0/+8,
     // 3x3 mapping at +30, bounds at +54, four property bytes at +64.
@@ -3872,6 +3879,193 @@ static CoreMaterialInputMetadata ReadCoreMaterialInputMetadata(const void* input
     return metadata;
 }
 
+using CoreEffectInputCopy_t = void*(__cdecl*)(void*, const void*);
+using CoreEffectInputDestroy_t = void(__cdecl*)(void*);
+using CoreTargetCompatibility_t = bool(__cdecl*)(const void*, const void*);
+CoreEffectInputCopy_t g_coreEffectInputCopyFunction = nullptr, g_coreEffectInputAssignFunction = nullptr;
+CoreEffectInputDestroy_t g_coreEffectInputDestroyFunction = nullptr;
+CoreTargetCompatibility_t g_coreTargetCompatibilityFunction = nullptr;
+void* g_coreScratchRealizationVtable = nullptr;
+std::atomic_bool g_coreMaterialPassAbiReady = false;
+
+struct CoreMaterialPassSample
+{
+    alignas(16) BYTE ownedInput[0x68] = {};
+    BYTE targetInfo[0x18] = {};
+    bool constructed = false;
+    void* owner = nullptr;
+    void* technique = nullptr;
+    std::uint64_t frame = 0;
+    float amount[2] = {};
+    CoreMaterialInputMetadata input;
+
+    CoreMaterialPassSample() = default;
+    CoreMaterialPassSample(const CoreMaterialPassSample&) = delete;
+    CoreMaterialPassSample& operator=(const CoreMaterialPassSample&) = delete;
+    void Reset()
+    {
+        if (constructed) g_coreEffectInputDestroyFunction(ownedInput);
+        constructed = false;
+        owner = nullptr;
+    }
+    ~CoreMaterialPassSample() { Reset(); }
+};
+
+struct CoreMaterialDesktopPass
+{
+    ULONGLONG epoch = 0;
+    const void* tree = nullptr;
+    CoreMaterialPassSample samples[2];
+    unsigned published = 0;
+};
+thread_local CoreMaterialDesktopPass* g_coreMaterialDesktopPass = nullptr;
+
+static bool CoreMaterialPassCurrent(const CoreMaterialDesktopPass* pass)
+{
+    return pass && g_coreMaterialPassAbiReady &&
+        !g_unloading.load(std::memory_order_acquire) &&
+        g_coreMaterialBridgeReady.load(std::memory_order_acquire) &&
+        g_coreMaterialTargetKey.load(std::memory_order_acquire) &&
+        pass->epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
+}
+
+static bool CoreMaterialMapMatches(const CoreMaterialInputMetadata& a,
+                                   const CoreMaterialInputMetadata& b)
+{
+    if (!a.readable || !b.readable) return false;
+    for (unsigned i = 0; i < 4; ++i)
+        if (!std::isfinite(a.bounds[i]) || a.bounds[i] != b.bounds[i]) return false;
+    for (unsigned i = 0; i < 9; ++i)
+        if (!std::isfinite(a.transform[i]) || !std::isfinite(b.transform[i]) ||
+            a.transform[i] != b.transform[i])
+            return false;
+    return a.flags == b.flags;
+}
+
+static bool ReadCoreBlurAmount(const void* amount, float (&value)[2])
+{
+    if (!IsReadableMemory(amount, sizeof(value))) return false;
+    std::memcpy(value, amount, sizeof(value));
+    return std::isfinite(value[0]) && std::isfinite(value[1]) &&
+           value[0] >= 0 && value[1] >= 0;
+}
+
+static void* CoreBackdropResourceIdentity(void* image)
+{
+    // GenerateEffectInput (312AD): CBackdropVisualImage +40 is a vbtable;
+    // its signed +8 entry adjusts the normal IBitmapResource input.
+    const auto* table = static_cast<const BYTE*>(ReadPointerMember(image, 0x40));
+    int32_t adjustment = 0;
+    if (!IsReadableMemory(table, 12)) return nullptr;
+    std::memcpy(&adjustment, table + 8, sizeof(adjustment));
+    if (adjustment != 0x7A0) return nullptr;
+    return static_cast<BYTE*>(image) + 0x40 + adjustment;
+}
+
+static bool ReadCoreDesktopProducer(void* context, const void* input,
+                                    CoreBackdropSnapshot& snapshot)
+{
+    auto* pass = g_coreMaterialDesktopPass;
+    if (!CoreMaterialPassCurrent(pass) || CurrentCoreMaterialObservation()) return false;
+    void* owner = g_coreMaterialSamplingVisual.load(std::memory_order_acquire);
+    if (!owner) return false;
+    if (g_coreCurrentVisualFunction(static_cast<const BYTE*>(context) + 0x18) != owner) return false;
+    snapshot = ReadCoreBackdropSnapshot(context);
+    const auto identity = ReadCoreMaterialInputIdentity(input);
+    return snapshot.valid && snapshot.currentVisual == owner &&
+        snapshot.currentTree == pass->tree &&
+        ReadPointerMember(snapshot.currentTree, 0) == g_coreDesktopTreeVtable &&
+        snapshot.image && snapshot.scene.frameKnown && snapshot.scene.effectReady == 1 &&
+        snapshot.scene.treeRoot == snapshot.root &&
+        identity.bitmap == CoreBackdropResourceIdentity(snapshot.image) &&
+        identity.brush == static_cast<BYTE*>(snapshot.image) + 0x48;
+}
+
+static void RememberCoreDesktopBlur(void* technique, void* context, const void* amount, const void* output,
+                                    const CoreBackdropSnapshot& producer,
+                                    const CoreMaterialInputMetadata& input, long result)
+{
+    auto* pass = g_coreMaterialDesktopPass;
+    if (!CoreMaterialPassCurrent(pass)) return;
+    CoreMaterialPassSample* slot = nullptr;
+    for (auto& sample : pass->samples)
+        if (sample.owner == producer.currentVisual && sample.technique == technique) { slot = &sample; break; }
+    if (!slot)
+        for (auto& sample : pass->samples)
+            if (!sample.constructed) { slot = &sample; break; }
+    if (!slot) return;
+    slot->Reset();
+    float blur[2];
+    const auto nativeOutput = ReadCoreMaterialInputIdentity(output);
+    if (result < 0 || !input.readable || !IsReadableMemory(output, 0x68) ||
+        !ReadCoreBlurAmount(amount, blur) || nativeOutput.bitmap ||
+        ReadPointerMember(nativeOutput.brush, 0) != g_coreScratchRealizationVtable ||
+        static_cast<const BYTE*>(output)[0x2C] != 1) return;
+    const auto now = ReadCoreBackdropSnapshot(context);
+    const void* target = g_coreCurrentTargetInfoFunction(static_cast<const BYTE*>(context) + 0x18);
+    if (!CoreMaterialPassCurrent(pass) || now.currentVisual != producer.currentVisual ||
+        now.currentTree != pass->tree || !now.scene.frameKnown ||
+        now.scene.currentFrame != producer.scene.currentFrame || !IsReadableMemory(target, 0x18)) return;
+    g_coreEffectInputCopyFunction(slot->ownedInput, output);
+    slot->constructed = true;
+    slot->owner = producer.currentVisual;
+    slot->technique = technique;
+    slot->frame = producer.scene.currentFrame;
+    slot->input = input;
+    std::memcpy(slot->amount, blur, sizeof(blur));
+    std::memcpy(slot->targetInfo, target, sizeof(slot->targetInfo));
+    ++pass->published;
+}
+
+static bool TryReuseCoreDesktopBlur(CoreMaterialObservation& observation, void* technique, void* context,
+                                    const void* input, const void* amount, void* output)
+{
+    auto* pass = g_coreMaterialDesktopPass;
+    observation.passAvailable = CoreMaterialPassCurrent(pass);
+    observation.passPublished = observation.passAvailable ? pass->published : 0;
+    observation.passReason = L"NoDesktopPass";
+    observation.blurInput = ReadCoreMaterialInputMetadata(input);
+    if (!observation.passAvailable) return false;
+    observation.passReason = L"NoProducer";
+    const auto current = ReadCoreBackdropSnapshot(context);
+    if (!current.valid || !current.scene.frameKnown ||
+        current.root != g_coreMaterialSourceRoot.load(std::memory_order_acquire)) return false;
+    float blur[2];
+    const auto metadata = ReadCoreMaterialInputMetadata(input);
+    if (!ReadCoreBlurAmount(amount, blur) || !IsReadableMemory(input, 0x68) ||
+        static_cast<const BYTE*>(input)[0x2C] != 1 || !output) return false;
+    const void* target = g_coreCurrentTargetInfoFunction(static_cast<const BYTE*>(context) + 0x18);
+    if (!IsReadableMemory(target, 0x18)) return false;
+    for (auto& sample : pass->samples)
+    {
+        if (!sample.constructed || sample.owner != current.currentVisual) continue;
+        observation.passInput = sample.input;
+        observation.passReason = L"TechniqueMismatch";
+        if (sample.technique != technique) continue;
+        observation.passReason = L"FrameMismatch";
+        if (sample.frame != current.scene.currentFrame) continue;
+        observation.passReason = L"MapMismatch";
+        if (!CoreMaterialMapMatches(sample.input, metadata)) continue;
+        observation.passReason = L"BlurMismatch";
+        if (sample.amount[0] != blur[0] || sample.amount[1] != blur[1]) continue;
+        observation.passReason = L"TargetMismatch";
+        if (!g_coreTargetCompatibilityFunction(target, sample.targetInfo) ||
+            observation.bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
+            !CoreMaterialPassCurrent(pass)) continue;
+        // Only the completed backdrop is reused, with its normal native refs.
+        // No desktop readiness flag is changed; nothing survives this draw pass.
+        g_coreEffectInputAssignFunction(output, sample.ownedInput);
+        ++observation.passReuses;
+        observation.passReason = L"Reused";
+        if (!g_coreMaterialPassReuseLogged.exchange(true, std::memory_order_relaxed))
+            Wh_Log(L"MESH ACRYLIC SAME-PASS REUSE: HWND=%p frame=%llu",
+                   g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
+                   static_cast<unsigned long long>(sample.frame));
+        return true;
+    }
+    return false;
+}
+
 static long __cdecl CoreExecuteBlurHook(void* technique, void* context,
                                        const void* input, const void* amount, void* output)
 {
@@ -3881,11 +4075,18 @@ static long __cdecl CoreExecuteBlurHook(void* technique, void* context,
     // Read before forwarding: native callers may alias input and output.
     const auto metadata = material ? ReadCoreMaterialInputMetadata(input)
                                    : CoreMaterialInputMetadata{};
-    const long result = g_coreExecuteBlurOriginal(technique, context, input, amount, output);
+    CoreBackdropSnapshot producer;
+    const bool desktop = ReadCoreDesktopProducer(context, input, producer);
+    const auto producerInput = desktop ? ReadCoreMaterialInputMetadata(input) : CoreMaterialInputMetadata{};
+    const bool reuse = observation && !material && observation->fallbacks &&
+        observation->fallbackReason == std::wstring_view(L"EffectNotReady") &&
+        TryReuseCoreDesktopBlur(*observation, technique, context, input, amount, output);
+    const long result = reuse ? S_OK : g_coreExecuteBlurOriginal(technique, context, input, amount, output);
+    if (desktop) RememberCoreDesktopBlur(technique, context, amount, output, producer, producerInput, result);
     if (observation && observation == CurrentCoreMaterialObservation())
     {
         ++observation->blurCalls;
-        if (material)
+        if (material || reuse)
         {
             ++observation->materialBlurCalls;
             observation->blurInput = metadata;
@@ -3928,6 +4129,14 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
 
     const auto hit = observation->bridgeContext
         ? ReadCoreBackdropSnapshot(observation->bridgeContext) : CoreBackdropSnapshot{};
+    if (hit.valid && hit.currentVisual &&
+        hit.root == g_coreMaterialSourceRoot.load(std::memory_order_acquire))
+    {
+        AcquireSRWLockShared(&g_coreMaterialTargetLock);
+        if (observation->bridgeEpoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed))
+            g_coreMaterialSamplingVisual.store(hit.currentVisual, std::memory_order_release);
+        ReleaseSRWLockShared(&g_coreMaterialTargetLock);
+    }
     const wchar_t* reason = observation->bridgeContext ? L"SourcePath" : L"MissingContext";
     void* selected = nullptr;
     std::uint64_t lastUseAge = 0;
@@ -4037,7 +4246,7 @@ static long __cdecl CoreBviValidationHook(void* context, const void* bounds, voi
     return result;
 }
 
-static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, const void* bounds,
+static long CoreDrawVisualTreeObserved(void* context, const void* tree, const void* bounds,
                                           const void* occlusion, int clearMode, bool drawFlag, void* root)
 {
     bool observe = tree && g_coreMaterialBridgeReady.load(std::memory_order_acquire) &&
@@ -4073,10 +4282,10 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
             const auto& out = observation.blurOutput;
             Wh_Log(L"MESH ACRYLIC PIPELINE: HWND=%p inputs=%u blur=%u matchedBlur=%u "
                    L"intermediate=%u matchedIntermediate=%u fallback=%u "
-                   L"inputMetadata=%d outputMetadata=%d outputBrush=0x%llX "
+                   L"inputMetadata=%d outputMetadata=%d outputRealization=0x%llX "
                    L"inputBounds=(%.1f,%.1f,%.1f,%.1f) "
-                   L"inputMap=(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f) "
-                   L"outputFlags=0x%X readOnly=1",
+                   L"inputMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g) "
+                   L"outputFlags=0x%X",
                    g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
                    observation.inputCount, observation.blurCalls, observation.materialBlurCalls,
                    observation.intermediateCalls, observation.materialIntermediateCalls,
@@ -4086,6 +4295,17 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
                    in.transform[0], in.transform[1], in.transform[2], in.transform[3],
                    in.transform[4], in.transform[5], in.transform[6], in.transform[7], in.transform[8],
                    out.flags);
+            auto* pass = g_coreMaterialDesktopPass;
+            const auto& p = observation.passInput;
+            Wh_Log(L"MESH ACRYLIC PASS: HWND=%p desktopPass=%d producer=%u reused=%u reason=%s "
+                   L"producerBounds=(%.1f,%.1f,%.1f,%.1f) "
+                   L"producerMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g)",
+                   g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
+                   CoreMaterialPassCurrent(pass), CoreMaterialPassCurrent(pass) ? pass->published : 0,
+                   observation.passReuses, observation.passReason,
+                   p.bounds[0], p.bounds[1], p.bounds[2], p.bounds[3],
+                   p.transform[0], p.transform[1], p.transform[2], p.transform[3], p.transform[4],
+                   p.transform[5], p.transform[6], p.transform[7], p.transform[8]);
         }
     }
     if (observation.fallbacks && epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
@@ -4099,6 +4319,24 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
                    g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
                    observation.fallbackReason, observation.fallbacks, observation.fallbackRenderingValid);
     }
+    return result;
+}
+
+static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, const void* bounds,
+                                          const void* occlusion, int clearMode, bool drawFlag, void* root)
+{
+    if (g_coreMaterialDesktopPass || !g_coreMaterialPassAbiReady ||
+        !g_coreMaterialBridgeReady.load(std::memory_order_acquire) ||
+        g_unloading.load(std::memory_order_acquire) ||
+        !g_coreMaterialTargetKey.load(std::memory_order_acquire) ||
+        ReadPointerMember(tree, 0) != g_coreDesktopTreeVtable)
+        return CoreDrawVisualTreeObserved(context, tree, bounds, occlusion, clearMode, drawFlag, root);
+    CoreMaterialDesktopPass pass;
+    pass.epoch = g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
+    pass.tree = tree;
+    g_coreMaterialDesktopPass = &pass;
+    const long result = CoreDrawVisualTreeObserved(context, tree, bounds, occlusion, clearMode, drawFlag, root);
+    g_coreMaterialDesktopPass = nullptr;
     return result;
 }
 
@@ -4166,6 +4404,16 @@ static void InitializeCoreMaterialBridge()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
+        {{L"public: __cdecl EffectInput::EffectInput(struct EffectInput const &)"},
+         &g_coreEffectInputCopyFunction, nullptr, true},
+        {{L"public: struct EffectInput & __cdecl EffectInput::operator=(struct EffectInput const &)"},
+         &g_coreEffectInputAssignFunction, nullptr, true},
+        {{L"public: __cdecl EffectInput::~EffectInput(void)"},
+         &g_coreEffectInputDestroyFunction, nullptr, true},
+        {{L"bool __cdecl CanRenderToTargetFromSource(class RenderTargetInfo const &,class RenderTargetInfo const &)"},
+         &g_coreTargetCompatibilityFunction, nullptr, true},
+        {{L"const CScratchRenderTargetBitmap::`vftable'{for `IBitmapRealization'}"},
+         &g_coreScratchRealizationVtable, nullptr, true},
         {{L"public: long __cdecl CRenderingTechnique::ExecuteBlur(class CDrawingContext *,"
            L"struct EffectInput const &,struct D2D_VECTOR_2F const &,struct EffectInput *)"},
          &g_coreExecuteBlurFunction, nullptr, true},
@@ -4257,8 +4505,8 @@ static void InitializeCoreMaterialBridge()
             CoreBackdropEffectInputHook, &g_coreBackdropEffectInputOriginal);
     g_coreMaterialBridgeReady.store(ready, std::memory_order_release);
     g_coreBackdropBridgeReady.store(ready, std::memory_order_release);
-    // Two non-leaf observers on this exact image. They always forward every
-    // argument and native result, including failures and aliased input/output.
+    // Two non-leaf hooks on this exact image. The normal path is forwarded;
+    // optional same-pass reuse uses the verified native managed-copy routines.
     const BYTE blurPrefix[] = {0x48,0x8B,0xC4,0x55,0x53,0x56,0x57,0x41,0x54,
                               0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8D,0x68,0x88};
     const BYTE intermediatePrefix[] = {0x48,0x8B,0xC4,0x48,0x89,0x58,0x10,
@@ -4274,7 +4522,15 @@ static void InitializeCoreMaterialBridge()
         g_coreExecuteBlurFunction, CoreExecuteBlurHook, &g_coreExecuteBlurOriginal);
     const bool observeIntermediate = diagnosticAbi && WindhawkUtils::SetFunctionHook(
         g_coreIntermediateBrushFunction, CoreIntermediateBrushHook, &g_coreIntermediateBrushOriginal);
-    Wh_Log(L"MESH MATERIAL PIPELINE OBSERVER: blur=%d intermediate=%d readOnly=1",
+    g_coreMaterialPassAbiReady = observeBlur &&
+        reinterpret_cast<uintptr_t>(g_coreEffectInputCopyFunction) == base + 0x35BE0 &&
+        reinterpret_cast<uintptr_t>(g_coreEffectInputAssignFunction) == base + 0x930B8 &&
+        reinterpret_cast<uintptr_t>(g_coreEffectInputDestroyFunction) == base + 0x94170 &&
+        reinterpret_cast<uintptr_t>(g_coreTargetCompatibilityFunction) == base + 0x337E0 &&
+        reinterpret_cast<uintptr_t>(g_coreScratchRealizationVtable) == base + 0x2C1EB8;
+    Wh_Log(L"MESH ACRYLIC PASS CACHE: ready=%d lifetime=desktop-draw-pass",
+           g_coreMaterialPassAbiReady.load(std::memory_order_acquire));
+    Wh_Log(L"MESH MATERIAL PIPELINE OBSERVER: blur=%d intermediate=%d readOnly=0",
            observeBlur, observeIntermediate);
     Wh_Log(L"MESH MATERIAL BRIDGE: %s hooks=5 leafHooks=0", ready ? L"ready" : L"unavailable; using Affine");
 }
