@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.337
+// @version         0.338
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3541,6 +3541,10 @@ CoreOwnedImageRelease_t g_coreOwnedImageReleaseFunction = nullptr;
 CoreOwnedStorageDestroy_t g_coreOwnedBitmapDestroyFunction = nullptr, g_coreOwnedInputDestroyFunction = nullptr;
 std::atomic_bool g_coreOwnedBackdropProbeReady = false;
 std::atomic<ULONGLONG> g_coreOwnedBackdropProbeEpoch = UINT64_MAX;
+using CoreOwnedImageRetain_t = void(__cdecl*)(void*, void*);
+using CoreOwnedRegister_t = void(__cdecl*)(void*, const void*, void*);
+CoreOwnedImageRetain_t g_coreOwnedImageRetainFunction = nullptr;
+CoreOwnedRegister_t g_coreOwnedRegisterFunction = nullptr;
 using CoreMaterialInput_t = long(__cdecl*)(void*, const void*, void*);
 using CoreImageUpdate_t = long(__cdecl*)(void*, void*, const void*);
 using CoreImageRealize_t = long(__cdecl*)(void*, const void*, void**);
@@ -3930,23 +3934,63 @@ static long __cdecl CoreIntermediateBrushHook(void* technique, unsigned int inde
 
 static long __cdecl CoreImageRealizeHook(void*, const void*, void**);
 
+static void* FindExactCoreBackdrop(void* data, const void* path)
+{
+    const auto first = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 0));
+    const auto last = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 8));
+    if (!first || last <= first || (last - first) % 16 || last - first > 32 * 16 ||
+        !IsReadableMemory(reinterpret_cast<void*>(first), last - first)) return nullptr;
+    void** images = nullptr;
+    unsigned count = 0;
+    if (!ReadCoreBackdropRegistry(data, images, count)) return nullptr;
+    void* found = nullptr;
+    for (unsigned i = 0; i < count; ++i)
+    {
+        void* image = images[i];
+        if (ReadPointerMember(image, 0) != g_coreBackdropImageVtable) continue;
+        const auto begin = reinterpret_cast<uintptr_t>(ReadPointerMember(image, 0x700));
+        const auto end = reinterpret_cast<uintptr_t>(ReadPointerMember(image, 0x708));
+        if (!begin || end < begin || end - begin != last - first ||
+            !IsReadableMemory(reinterpret_cast<void*>(begin), end - begin) ||
+            std::memcmp(reinterpret_cast<void*>(begin), reinterpret_cast<void*>(first), last - first)) continue;
+        if (found) return nullptr;
+        found = image;
+    }
+    return found;
+}
+
 struct CoreOwnedBackdropProbeScope
 {
     CoreMaterialObservation* previous = g_coreMaterialObservation;
     void* image = nullptr;
     void* bitmap = nullptr;
+    void* original = nullptr;
+    void* treeData = nullptr;
+    const void* path = nullptr;
+    bool registered = false;
+    bool* restored = nullptr;
     alignas(16) BYTE input[0x68] = {};
     bool inputConstructed = false;
 
-    CoreOwnedBackdropProbeScope() { g_coreMaterialObservation = nullptr; }
+    explicit CoreOwnedBackdropProbeScope(bool* result) : restored(result)
+    { g_coreMaterialObservation = nullptr; }
     CoreOwnedBackdropProbeScope(const CoreOwnedBackdropProbeScope&) = delete;
     CoreOwnedBackdropProbeScope& operator=(const CoreOwnedBackdropProbeScope&) = delete;
+    bool BindingCurrent() const { return !registered || FindExactCoreBackdrop(treeData, path) == image; }
     ~CoreOwnedBackdropProbeScope()
     {
-        // These are native managed destructors, called on the producing thread.
+        // Restore before releasing the temporary source, including failures
+        // and target retirement. Never overwrite an intervening native update.
+        if (registered)
+        {
+            if (FindExactCoreBackdrop(treeData, path) == image)
+                g_coreOwnedRegisterFunction(treeData, path, original);
+            *restored = FindExactCoreBackdrop(treeData, path) == original;
+        }
         if (inputConstructed) g_coreOwnedInputDestroyFunction(input);
         if (bitmap) g_coreOwnedBitmapDestroyFunction(&bitmap);
         if (image) g_coreOwnedImageReleaseFunction(image);
+        if (original) g_coreOwnedImageReleaseFunction(original);
         g_coreMaterialObservation = previous;
     }
 };
@@ -3981,6 +4025,23 @@ static void RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
         rootType - g_coreMaterialModuleBase >= 0x41A000 ||
         !composition || composition != ReadPointerMember(root, 0x10) ||
         composition != ReadPointerMember(reinterpret_cast<void*>(g_coreMaterialModuleBase + 0x3E5930), 0)) return;
+    void* treeData = g_coreFindTreeDataFunction(owner, tree);
+    // Only replace an existing exact entry on the currently borrowed owner.
+    // No insertion, guessed owner or ambiguous path is accepted.
+    const bool ownerMatch = ReadPointerMember(candidate, 0x6F8) == owner;
+    const bool dataOwnerMatch = ReadPointerMember(treeData, 0x108) == owner;
+    const bool entryMatch = FindExactCoreBackdrop(treeData, path) == candidate;
+    if (!ownerMatch || !dataOwnerMatch || !entryMatch)
+    {
+        auto skipped = g_coreOwnedBackdropProbeEpoch.load(std::memory_order_relaxed);
+        if (skipped != observation.bridgeEpoch &&
+            g_coreOwnedBackdropProbeEpoch.compare_exchange_strong(skipped, observation.bridgeEpoch,
+                                                                  std::memory_order_relaxed))
+            Wh_Log(L"MESH OWN BACKDROP SKIPPED: reason=RegistryEligibility "
+                   L"ownerMatch=%d dataOwnerMatch=%d entryMatch=%d attached=0",
+                   ownerMatch, dataOwnerMatch, entryMatch);
+        return;
+    }
     float bounds[4];
     const auto* sourceBounds = static_cast<const BYTE*>(candidate) + 0x60;
     if (!IsReadableMemory(sourceBounds, sizeof(bounds))) return;
@@ -4003,10 +4064,11 @@ static void RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
     long result = E_FAIL;
     bool exactType = false, rootMatch = false, bitmapValid = false;
     bool comparableMapping = false;
+    bool registryBound = false, registryRestored = false;
     uintptr_t bitmapType = 0;
     CoreMaterialInputMetadata ownMetadata;
     {
-        CoreOwnedBackdropProbeScope scope;
+        CoreOwnedBackdropProbeScope scope(&registryRestored);
         Wh_Log(L"MESH OWN BACKDROP STAGE: Create HWND=%p",
                g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
         result = g_coreOwnedImageCreateFunction(composition, owner, path, nativeMode != 0, &scope.image);
@@ -4016,7 +4078,26 @@ static void RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
             exactType = ReadPointerMember(scope.image, 0) == g_coreBackdropImageVtable;
             if (!exactType) result = E_NOINTERFACE;
         }
-        if (result >= 0 && !CoreOwnedProbeCurrent(observation)) result = E_ABORT;
+        if (result >= 0 && (!CoreOwnedProbeCurrent(observation) || !scope.BindingCurrent())) result = E_ABORT;
+        if (result >= 0)
+        {
+            stage = L"Register";
+            // The native drawing cutoff compares image identity in CTreeData.
+            // A detached, unregistered duplicate fails with VIEW_E_DRAW.
+            g_coreOwnedImageRetainFunction(&scope.original, candidate);
+            if (scope.original != candidate || FindExactCoreBackdrop(treeData, path) != candidate)
+                result = E_ABORT;
+            else
+            {
+                scope.treeData = treeData;
+                scope.path = path;
+                scope.registered = true;
+                g_coreOwnedRegisterFunction(treeData, path, scope.image);
+                registryBound = FindExactCoreBackdrop(treeData, path) == scope.image;
+                if (!registryBound) result = E_UNEXPECTED;
+            }
+        }
+        if (result >= 0 && (!CoreOwnedProbeCurrent(observation) || !scope.BindingCurrent())) result = E_ABORT;
         if (result >= 0)
         {
             stage = L"Validate";
@@ -4027,7 +4108,7 @@ static void RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
             rootMatch = ReadPointerMember(scope.image, 0x90) == root;
             if (result >= 0 && !rootMatch) result = E_UNEXPECTED;
         }
-        if (result >= 0 && !CoreOwnedProbeCurrent(observation)) result = E_ABORT;
+        if (result >= 0 && (!CoreOwnedProbeCurrent(observation) || !scope.BindingCurrent())) result = E_ABORT;
         if (result >= 0)
         {
             stage = L"Realize";
@@ -4040,7 +4121,7 @@ static void RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
             if (vtable >= g_coreMaterialModuleBase && vtable - g_coreMaterialModuleBase < 0x41A000)
                 bitmapType = vtable - g_coreMaterialModuleBase;
         }
-        if (result >= 0 && !CoreOwnedProbeCurrent(observation)) result = E_ABORT;
+        if (result >= 0 && (!CoreOwnedProbeCurrent(observation) || !scope.BindingCurrent())) result = E_ABORT;
         if (result >= 0)
         {
             bitmapValid = g_coreBackdropRealizationFunction(scope.image, target);
@@ -4059,13 +4140,14 @@ static void RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
     Wh_Log(L"MESH OWN BACKDROP PROBE: HWND=%p stage=%s result=0x%08X exactType=%d "
            L"rootMatch=%d bitmapValid=%d bitmapType=0x%llX mappingMatch=%d "
            L"sourceBounds=(%.1f,%.1f,%.1f,%.1f) ownMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g) "
-           L"attached=0 renderer=unchanged",
+           L"registryBound=%d registryRestored=%d attached=0 renderer=unchanged",
            g_coreMaterialTargetHwnd.load(std::memory_order_acquire), stage, result,
            exactType, rootMatch, bitmapValid, static_cast<unsigned long long>(bitmapType), comparableMapping,
            bounds[0], bounds[1], bounds[2], bounds[3],
            ownMetadata.transform[0], ownMetadata.transform[1], ownMetadata.transform[2],
            ownMetadata.transform[3], ownMetadata.transform[4], ownMetadata.transform[5],
-           ownMetadata.transform[6], ownMetadata.transform[7], ownMetadata.transform[8]);
+           ownMetadata.transform[6], ownMetadata.transform[7], ownMetadata.transform[8],
+           registryBound, registryRestored);
 }
 
 static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
@@ -4341,6 +4423,12 @@ static void InitializeCoreMaterialBridge()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
+        {{L"public: __cdecl wil::com_ptr_t<class CBackdropVisualImage,struct wil::err_returncode_policy>::"
+           L"com_ptr_t<class CBackdropVisualImage,struct wil::err_returncode_policy>(class CBackdropVisualImage *)"},
+         &g_coreOwnedImageRetainFunction, nullptr, true},
+        {{L"protected: void __cdecl CTreeData::SetBackdropVisualImage(class CVisualTreePath const &,"
+           L"class CBackdropVisualImage *)"},
+         &g_coreOwnedRegisterFunction, nullptr, true},
         {{L"public: static long __cdecl CBackdropVisualImage::Create(class CComposition *,"
            L"class CVisual const *,class CVisualTreePath const &,bool,class CBackdropVisualImage * *)"},
          &g_coreOwnedImageCreateFunction, nullptr, true},
@@ -4464,6 +4552,8 @@ static void InitializeCoreMaterialBridge()
     const bool observeIntermediate = diagnosticAbi && WindhawkUtils::SetFunctionHook(
         g_coreIntermediateBrushFunction, CoreIntermediateBrushHook, &g_coreIntermediateBrushOriginal);
     g_coreOwnedBackdropProbeReady.store(ready &&
+        reinterpret_cast<uintptr_t>(g_coreOwnedImageRetainFunction) == base + 0xEE358 &&
+        reinterpret_cast<uintptr_t>(g_coreOwnedRegisterFunction) == base + 0xEE288 &&
         reinterpret_cast<uintptr_t>(g_coreOwnedImageCreateFunction) == base + 0xA61F4 &&
         reinterpret_cast<uintptr_t>(g_coreOwnedImageValidateFunction) == base + 0x4CA84 &&
         reinterpret_cast<uintptr_t>(g_coreOwnedImageReleaseFunction) == base + 0x78A28 &&
