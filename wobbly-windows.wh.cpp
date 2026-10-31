@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.335
+// @version         0.336
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3531,8 +3531,16 @@ using CoreIntermediateBrush_t = long(__cdecl*)(void*, unsigned int, const void*,
 CoreExecuteBlur_t g_coreExecuteBlurFunction = nullptr, g_coreExecuteBlurOriginal = nullptr;
 CoreIntermediateBrush_t g_coreIntermediateBrushFunction = nullptr, g_coreIntermediateBrushOriginal = nullptr;
 std::atomic<ULONGLONG> g_coreMaterialPipelineLogAt = 0;
-std::atomic<void*> g_coreMaterialSamplingVisual = nullptr;
-std::atomic_bool g_coreMaterialPassReuseLogged = false;
+using CoreOwnedImageCreate_t = long(__cdecl*)(void*, const void*, const void*, bool, void**);
+using CoreOwnedImageValidate_t = long(__cdecl*)(void*, void*, const void*, bool, bool*);
+using CoreOwnedImageRelease_t = unsigned long(__cdecl*)(void*);
+using CoreOwnedStorageDestroy_t = void(__cdecl*)(void*);
+CoreOwnedImageCreate_t g_coreOwnedImageCreateFunction = nullptr;
+CoreOwnedImageValidate_t g_coreOwnedImageValidateFunction = nullptr;
+CoreOwnedImageRelease_t g_coreOwnedImageReleaseFunction = nullptr;
+CoreOwnedStorageDestroy_t g_coreOwnedBitmapDestroyFunction = nullptr, g_coreOwnedInputDestroyFunction = nullptr;
+std::atomic_bool g_coreOwnedBackdropProbeReady = false;
+std::atomic<ULONGLONG> g_coreOwnedBackdropProbeEpoch = UINT64_MAX;
 using CoreMaterialInput_t = long(__cdecl*)(void*, const void*, void*);
 using CoreImageUpdate_t = long(__cdecl*)(void*, void*, const void*);
 using CoreImageRealize_t = long(__cdecl*)(void*, const void*, void**);
@@ -3588,8 +3596,7 @@ static void ClearCoreMaterialTarget()
     g_coreBackdropReuseLogged.store(false, std::memory_order_relaxed);
     g_coreBackdropFallbackLogAt.store(0, std::memory_order_relaxed);
     g_coreMaterialPipelineLogAt.store(0, std::memory_order_relaxed);
-    g_coreMaterialSamplingVisual.store(nullptr, std::memory_order_release);
-    g_coreMaterialPassReuseLogged.store(false, std::memory_order_relaxed);
+    g_coreOwnedBackdropProbeEpoch.store(UINT64_MAX, std::memory_order_relaxed);
     g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
 }
@@ -3792,12 +3799,12 @@ static CoreBackdropSnapshot ReadCoreBackdropSnapshot(void* context)
     return hit;
 }
 
-// Native input identities and metadata. Managed blur copies live only
-// within the desktop draw pass that produced them.
+// Only metadata and call-scoped identities are observed. Native EffectInput
+// objects keep their original ownership; no resource or effect is substituted.
 struct CoreMaterialInputIdentity
 {
     void* bitmap = nullptr;
-    void* brush = nullptr; // Native IBitmapRealization; historical field name.
+    void* brush = nullptr;
 };
 
 struct CoreMaterialInputMetadata
@@ -3811,17 +3818,15 @@ struct CoreMaterialInputMetadata
 struct CoreMaterialObservation
 {
     ULONGLONG bridgeEpoch = 0;
-    void* bridgeContext = nullptr; // Borrowed only within DrawVisualTree.
+    void* bridgeContext = nullptr; // Borrowed only within this DrawVisualTree.
+    void* drawContext = nullptr;
     unsigned fallbacks = 0;
     const wchar_t* fallbackReason = L"none";
     int fallbackRenderingValid = -1;
     CoreMaterialInputIdentity materialInputs[8] = {};
     unsigned inputCount = 0, blurCalls = 0, materialBlurCalls = 0;
     unsigned intermediateCalls = 0, materialIntermediateCalls = 0;
-    CoreMaterialInputMetadata blurInput, blurOutput, passInput;
-    bool passAvailable = false;
-    unsigned passPublished = 0, passReuses = 0;
-    const wchar_t* passReason = L"NotNeeded";
+    CoreMaterialInputMetadata blurInput, blurOutput;
 };
 thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
 thread_local unsigned g_coreMaterialRealizeDepth = 0;
@@ -3879,193 +3884,6 @@ static CoreMaterialInputMetadata ReadCoreMaterialInputMetadata(const void* input
     return metadata;
 }
 
-using CoreEffectInputCopy_t = void*(__cdecl*)(void*, const void*);
-using CoreEffectInputDestroy_t = void(__cdecl*)(void*);
-using CoreTargetCompatibility_t = bool(__cdecl*)(const void*, const void*);
-CoreEffectInputCopy_t g_coreEffectInputCopyFunction = nullptr, g_coreEffectInputAssignFunction = nullptr;
-CoreEffectInputDestroy_t g_coreEffectInputDestroyFunction = nullptr;
-CoreTargetCompatibility_t g_coreTargetCompatibilityFunction = nullptr;
-void* g_coreScratchRealizationVtable = nullptr;
-std::atomic_bool g_coreMaterialPassAbiReady = false;
-
-struct CoreMaterialPassSample
-{
-    alignas(16) BYTE ownedInput[0x68] = {};
-    BYTE targetInfo[0x18] = {};
-    bool constructed = false;
-    void* owner = nullptr;
-    void* technique = nullptr;
-    std::uint64_t frame = 0;
-    float amount[2] = {};
-    CoreMaterialInputMetadata input;
-
-    CoreMaterialPassSample() = default;
-    CoreMaterialPassSample(const CoreMaterialPassSample&) = delete;
-    CoreMaterialPassSample& operator=(const CoreMaterialPassSample&) = delete;
-    void Reset()
-    {
-        if (constructed) g_coreEffectInputDestroyFunction(ownedInput);
-        constructed = false;
-        owner = nullptr;
-    }
-    ~CoreMaterialPassSample() { Reset(); }
-};
-
-struct CoreMaterialDesktopPass
-{
-    ULONGLONG epoch = 0;
-    const void* tree = nullptr;
-    CoreMaterialPassSample samples[2];
-    unsigned published = 0;
-};
-thread_local CoreMaterialDesktopPass* g_coreMaterialDesktopPass = nullptr;
-
-static bool CoreMaterialPassCurrent(const CoreMaterialDesktopPass* pass)
-{
-    return pass && g_coreMaterialPassAbiReady &&
-        !g_unloading.load(std::memory_order_acquire) &&
-        g_coreMaterialBridgeReady.load(std::memory_order_acquire) &&
-        g_coreMaterialTargetKey.load(std::memory_order_acquire) &&
-        pass->epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
-}
-
-static bool CoreMaterialMapMatches(const CoreMaterialInputMetadata& a,
-                                   const CoreMaterialInputMetadata& b)
-{
-    if (!a.readable || !b.readable) return false;
-    for (unsigned i = 0; i < 4; ++i)
-        if (!std::isfinite(a.bounds[i]) || a.bounds[i] != b.bounds[i]) return false;
-    for (unsigned i = 0; i < 9; ++i)
-        if (!std::isfinite(a.transform[i]) || !std::isfinite(b.transform[i]) ||
-            a.transform[i] != b.transform[i])
-            return false;
-    return a.flags == b.flags;
-}
-
-static bool ReadCoreBlurAmount(const void* amount, float (&value)[2])
-{
-    if (!IsReadableMemory(amount, sizeof(value))) return false;
-    std::memcpy(value, amount, sizeof(value));
-    return std::isfinite(value[0]) && std::isfinite(value[1]) &&
-           value[0] >= 0 && value[1] >= 0;
-}
-
-static void* CoreBackdropResourceIdentity(void* image)
-{
-    // GenerateEffectInput (312AD): CBackdropVisualImage +40 is a vbtable;
-    // its signed +8 entry adjusts the normal IBitmapResource input.
-    const auto* table = static_cast<const BYTE*>(ReadPointerMember(image, 0x40));
-    int32_t adjustment = 0;
-    if (!IsReadableMemory(table, 12)) return nullptr;
-    std::memcpy(&adjustment, table + 8, sizeof(adjustment));
-    if (adjustment != 0x7A0) return nullptr;
-    return static_cast<BYTE*>(image) + 0x40 + adjustment;
-}
-
-static bool ReadCoreDesktopProducer(void* context, const void* input,
-                                    CoreBackdropSnapshot& snapshot)
-{
-    auto* pass = g_coreMaterialDesktopPass;
-    if (!CoreMaterialPassCurrent(pass) || CurrentCoreMaterialObservation()) return false;
-    void* owner = g_coreMaterialSamplingVisual.load(std::memory_order_acquire);
-    if (!owner) return false;
-    if (g_coreCurrentVisualFunction(static_cast<const BYTE*>(context) + 0x18) != owner) return false;
-    snapshot = ReadCoreBackdropSnapshot(context);
-    const auto identity = ReadCoreMaterialInputIdentity(input);
-    return snapshot.valid && snapshot.currentVisual == owner &&
-        snapshot.currentTree == pass->tree &&
-        ReadPointerMember(snapshot.currentTree, 0) == g_coreDesktopTreeVtable &&
-        snapshot.image && snapshot.scene.frameKnown && snapshot.scene.effectReady == 1 &&
-        snapshot.scene.treeRoot == snapshot.root &&
-        identity.bitmap == CoreBackdropResourceIdentity(snapshot.image) &&
-        identity.brush == static_cast<BYTE*>(snapshot.image) + 0x48;
-}
-
-static void RememberCoreDesktopBlur(void* technique, void* context, const void* amount, const void* output,
-                                    const CoreBackdropSnapshot& producer,
-                                    const CoreMaterialInputMetadata& input, long result)
-{
-    auto* pass = g_coreMaterialDesktopPass;
-    if (!CoreMaterialPassCurrent(pass)) return;
-    CoreMaterialPassSample* slot = nullptr;
-    for (auto& sample : pass->samples)
-        if (sample.owner == producer.currentVisual && sample.technique == technique) { slot = &sample; break; }
-    if (!slot)
-        for (auto& sample : pass->samples)
-            if (!sample.constructed) { slot = &sample; break; }
-    if (!slot) return;
-    slot->Reset();
-    float blur[2];
-    const auto nativeOutput = ReadCoreMaterialInputIdentity(output);
-    if (result < 0 || !input.readable || !IsReadableMemory(output, 0x68) ||
-        !ReadCoreBlurAmount(amount, blur) || nativeOutput.bitmap ||
-        ReadPointerMember(nativeOutput.brush, 0) != g_coreScratchRealizationVtable ||
-        static_cast<const BYTE*>(output)[0x2C] != 1) return;
-    const auto now = ReadCoreBackdropSnapshot(context);
-    const void* target = g_coreCurrentTargetInfoFunction(static_cast<const BYTE*>(context) + 0x18);
-    if (!CoreMaterialPassCurrent(pass) || now.currentVisual != producer.currentVisual ||
-        now.currentTree != pass->tree || !now.scene.frameKnown ||
-        now.scene.currentFrame != producer.scene.currentFrame || !IsReadableMemory(target, 0x18)) return;
-    g_coreEffectInputCopyFunction(slot->ownedInput, output);
-    slot->constructed = true;
-    slot->owner = producer.currentVisual;
-    slot->technique = technique;
-    slot->frame = producer.scene.currentFrame;
-    slot->input = input;
-    std::memcpy(slot->amount, blur, sizeof(blur));
-    std::memcpy(slot->targetInfo, target, sizeof(slot->targetInfo));
-    ++pass->published;
-}
-
-static bool TryReuseCoreDesktopBlur(CoreMaterialObservation& observation, void* technique, void* context,
-                                    const void* input, const void* amount, void* output)
-{
-    auto* pass = g_coreMaterialDesktopPass;
-    observation.passAvailable = CoreMaterialPassCurrent(pass);
-    observation.passPublished = observation.passAvailable ? pass->published : 0;
-    observation.passReason = L"NoDesktopPass";
-    observation.blurInput = ReadCoreMaterialInputMetadata(input);
-    if (!observation.passAvailable) return false;
-    observation.passReason = L"NoProducer";
-    const auto current = ReadCoreBackdropSnapshot(context);
-    if (!current.valid || !current.scene.frameKnown ||
-        current.root != g_coreMaterialSourceRoot.load(std::memory_order_acquire)) return false;
-    float blur[2];
-    const auto metadata = ReadCoreMaterialInputMetadata(input);
-    if (!ReadCoreBlurAmount(amount, blur) || !IsReadableMemory(input, 0x68) ||
-        static_cast<const BYTE*>(input)[0x2C] != 1 || !output) return false;
-    const void* target = g_coreCurrentTargetInfoFunction(static_cast<const BYTE*>(context) + 0x18);
-    if (!IsReadableMemory(target, 0x18)) return false;
-    for (auto& sample : pass->samples)
-    {
-        if (!sample.constructed || sample.owner != current.currentVisual) continue;
-        observation.passInput = sample.input;
-        observation.passReason = L"TechniqueMismatch";
-        if (sample.technique != technique) continue;
-        observation.passReason = L"FrameMismatch";
-        if (sample.frame != current.scene.currentFrame) continue;
-        observation.passReason = L"MapMismatch";
-        if (!CoreMaterialMapMatches(sample.input, metadata)) continue;
-        observation.passReason = L"BlurMismatch";
-        if (sample.amount[0] != blur[0] || sample.amount[1] != blur[1]) continue;
-        observation.passReason = L"TargetMismatch";
-        if (!g_coreTargetCompatibilityFunction(target, sample.targetInfo) ||
-            observation.bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
-            !CoreMaterialPassCurrent(pass)) continue;
-        // Only the completed backdrop is reused, with its normal native refs.
-        // No desktop readiness flag is changed; nothing survives this draw pass.
-        g_coreEffectInputAssignFunction(output, sample.ownedInput);
-        ++observation.passReuses;
-        observation.passReason = L"Reused";
-        if (!g_coreMaterialPassReuseLogged.exchange(true, std::memory_order_relaxed))
-            Wh_Log(L"MESH ACRYLIC SAME-PASS REUSE: HWND=%p frame=%llu",
-                   g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
-                   static_cast<unsigned long long>(sample.frame));
-        return true;
-    }
-    return false;
-}
-
 static long __cdecl CoreExecuteBlurHook(void* technique, void* context,
                                        const void* input, const void* amount, void* output)
 {
@@ -4075,18 +3893,11 @@ static long __cdecl CoreExecuteBlurHook(void* technique, void* context,
     // Read before forwarding: native callers may alias input and output.
     const auto metadata = material ? ReadCoreMaterialInputMetadata(input)
                                    : CoreMaterialInputMetadata{};
-    CoreBackdropSnapshot producer;
-    const bool desktop = ReadCoreDesktopProducer(context, input, producer);
-    const auto producerInput = desktop ? ReadCoreMaterialInputMetadata(input) : CoreMaterialInputMetadata{};
-    const bool reuse = observation && !material && observation->fallbacks &&
-        observation->fallbackReason == std::wstring_view(L"EffectNotReady") &&
-        TryReuseCoreDesktopBlur(*observation, technique, context, input, amount, output);
-    const long result = reuse ? S_OK : g_coreExecuteBlurOriginal(technique, context, input, amount, output);
-    if (desktop) RememberCoreDesktopBlur(technique, context, amount, output, producer, producerInput, result);
+    const long result = g_coreExecuteBlurOriginal(technique, context, input, amount, output);
     if (observation && observation == CurrentCoreMaterialObservation())
     {
         ++observation->blurCalls;
-        if (material || reuse)
+        if (material)
         {
             ++observation->materialBlurCalls;
             observation->blurInput = metadata;
@@ -4116,6 +3927,146 @@ static long __cdecl CoreIntermediateBrushHook(void* technique, unsigned int inde
     return result;
 }
 
+static long __cdecl CoreImageRealizeHook(void*, const void*, void**);
+
+struct CoreOwnedBackdropProbeScope
+{
+    CoreMaterialObservation* previous = g_coreMaterialObservation;
+    void* image = nullptr;
+    void* bitmap = nullptr;
+    alignas(16) BYTE input[0x68] = {};
+    bool inputConstructed = false;
+
+    CoreOwnedBackdropProbeScope() { g_coreMaterialObservation = nullptr; }
+    CoreOwnedBackdropProbeScope(const CoreOwnedBackdropProbeScope&) = delete;
+    CoreOwnedBackdropProbeScope& operator=(const CoreOwnedBackdropProbeScope&) = delete;
+    ~CoreOwnedBackdropProbeScope()
+    {
+        // These are native managed destructors, called on the producing thread.
+        if (inputConstructed) g_coreOwnedInputDestroyFunction(input);
+        if (bitmap) g_coreOwnedBitmapDestroyFunction(&bitmap);
+        if (image) g_coreOwnedImageReleaseFunction(image);
+        g_coreMaterialObservation = previous;
+    }
+};
+
+static bool CoreOwnedProbeCurrent(const CoreMaterialObservation& observation)
+{
+    return g_coreOwnedBackdropProbeReady.load(std::memory_order_acquire) &&
+        !g_unloading.load(std::memory_order_acquire) &&
+        observation.bridgeEpoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
+        g_coreMaterialCurrentImage &&
+        g_coreMaterialCurrentImage == g_coreMaterialSourceImage.load(std::memory_order_acquire);
+}
+
+static void RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
+                                      void* candidate, void* owner, const void* referenceInput)
+{
+    if (!CoreOwnedProbeCurrent(observation) || !IsCoreMaterialVisual(owner) ||
+        ReadPointerMember(candidate, 0) != g_coreBackdropImageVtable ||
+        !IsReadableMemory(static_cast<const BYTE*>(candidate) + 0x7A1, 1)) return;
+    auto* path = static_cast<BYTE*>(candidate) + 0x700;
+    const auto first = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 0));
+    const auto last = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 8));
+    const auto capacity = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 16));
+    if (!first || last <= first || capacity < last || (last - first) % 16 ||
+        last - first > 32 * 16 || !IsReadableMemory(reinterpret_cast<void*>(first), last - first)) return;
+    void* tree = ReadPointerMember(reinterpret_cast<void*>(last - 8), 0);
+    void* root = ReadPointerMember(candidate, 0x90);
+    void* composition = ReadPointerMember(owner, 0x10);
+    const auto rootType = reinterpret_cast<uintptr_t>(ReadPointerMember(root, 0));
+    if (ReadPointerMember(tree, 0) != g_coreDesktopTreeVtable ||
+        ReadPointerMember(tree, 0x40) != root || rootType < g_coreMaterialModuleBase ||
+        rootType - g_coreMaterialModuleBase >= 0x41A000 ||
+        !composition || composition != ReadPointerMember(root, 0x10) ||
+        composition != ReadPointerMember(reinterpret_cast<void*>(g_coreMaterialModuleBase + 0x3E5930), 0)) return;
+    float bounds[4];
+    const auto* sourceBounds = static_cast<const BYTE*>(candidate) + 0x60;
+    if (!IsReadableMemory(sourceBounds, sizeof(bounds))) return;
+    std::memcpy(bounds, sourceBounds, sizeof(bounds));
+    for (float value : bounds) if (!std::isfinite(value)) return;
+    const double width = static_cast<double>(bounds[2]) - bounds[0];
+    const double height = static_cast<double>(bounds[3]) - bounds[1];
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192 || width * height > 33554432) return;
+    const BYTE nativeMode = *(static_cast<const BYTE*>(candidate) + 0x7A1);
+    const void* target = g_coreCurrentTargetInfoFunction(
+        static_cast<const BYTE*>(observation.bridgeContext) + 0x18);
+    if (nativeMode > 1 || !IsReadableMemory(target, 0x18)) return;
+    auto tested = g_coreOwnedBackdropProbeEpoch.load(std::memory_order_relaxed);
+    if (tested == observation.bridgeEpoch ||
+        !g_coreOwnedBackdropProbeEpoch.compare_exchange_strong(tested, observation.bridgeEpoch,
+                                                              std::memory_order_relaxed) ||
+        !CoreOwnedProbeCurrent(observation)) return;
+
+    const wchar_t* stage = L"Create";
+    long result = E_FAIL;
+    bool exactType = false, rootMatch = false, bitmapValid = false;
+    bool comparableMapping = false;
+    uintptr_t bitmapType = 0;
+    CoreMaterialInputMetadata ownMetadata;
+    {
+        CoreOwnedBackdropProbeScope scope;
+        Wh_Log(L"MESH OWN BACKDROP STAGE: Create HWND=%p",
+               g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
+        result = g_coreOwnedImageCreateFunction(composition, owner, path, nativeMode != 0, &scope.image);
+        if (result >= 0 && !scope.image) result = E_UNEXPECTED;
+        if (result >= 0)
+        {
+            exactType = ReadPointerMember(scope.image, 0) == g_coreBackdropImageVtable;
+            if (!exactType) result = E_NOINTERFACE;
+        }
+        if (result >= 0 && !CoreOwnedProbeCurrent(observation)) result = E_ABORT;
+        if (result >= 0)
+        {
+            stage = L"Validate";
+            bool changed = false;
+            Wh_Log(L"MESH OWN BACKDROP STAGE: Validate HWND=%p",
+                   g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
+            result = g_coreOwnedImageValidateFunction(scope.image, root, bounds, false, &changed);
+            rootMatch = ReadPointerMember(scope.image, 0x90) == root;
+            if (result >= 0 && !rootMatch) result = E_UNEXPECTED;
+        }
+        if (result >= 0 && !CoreOwnedProbeCurrent(observation)) result = E_ABORT;
+        if (result >= 0)
+        {
+            stage = L"Realize";
+            Wh_Log(L"MESH OWN BACKDROP STAGE: Realize HWND=%p",
+                   g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
+            // Use the wrapper too: nested rendering must have its own identity.
+            result = CoreImageRealizeHook(scope.image, target, &scope.bitmap);
+            if (result >= 0 && !scope.bitmap) result = E_UNEXPECTED;
+            const auto vtable = reinterpret_cast<uintptr_t>(ReadPointerMember(scope.bitmap, 0));
+            if (vtable >= g_coreMaterialModuleBase && vtable - g_coreMaterialModuleBase < 0x41A000)
+                bitmapType = vtable - g_coreMaterialModuleBase;
+        }
+        if (result >= 0 && !CoreOwnedProbeCurrent(observation)) result = E_ABORT;
+        if (result >= 0)
+        {
+            bitmapValid = g_coreBackdropRealizationFunction(scope.image, target);
+            stage = L"InspectInput";
+            // Construct and inspect an unattached input. Its projection is NOT
+            // assumed ready and it is never returned to the window's renderer.
+            g_coreBackdropEffectInputOriginal(scope.image, scope.input);
+            scope.inputConstructed = true;
+            ownMetadata = ReadCoreMaterialInputMetadata(scope.input);
+            const auto reference = ReadCoreMaterialInputMetadata(referenceInput);
+            comparableMapping = ownMetadata.readable && reference.readable &&
+                !std::memcmp(ownMetadata.transform, reference.transform, sizeof(reference.transform)) &&
+                !std::memcmp(ownMetadata.bounds, reference.bounds, sizeof(reference.bounds));
+        }
+    }
+    Wh_Log(L"MESH OWN BACKDROP PROBE: HWND=%p stage=%s result=0x%08X exactType=%d "
+           L"rootMatch=%d bitmapValid=%d bitmapType=0x%llX mappingMatch=%d "
+           L"sourceBounds=(%.1f,%.1f,%.1f,%.1f) ownMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g) "
+           L"attached=0 renderer=unchanged",
+           g_coreMaterialTargetHwnd.load(std::memory_order_acquire), stage, result,
+           exactType, rootMatch, bitmapValid, static_cast<unsigned long long>(bitmapType), comparableMapping,
+           bounds[0], bounds[1], bounds[2], bounds[3],
+           ownMetadata.transform[0], ownMetadata.transform[1], ownMetadata.transform[2],
+           ownMetadata.transform[3], ownMetadata.transform[4], ownMetadata.transform[5],
+           ownMetadata.transform[6], ownMetadata.transform[7], ownMetadata.transform[8]);
+}
+
 static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
 {
     auto* observation = g_coreMaterialObservation;
@@ -4129,14 +4080,6 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
 
     const auto hit = observation->bridgeContext
         ? ReadCoreBackdropSnapshot(observation->bridgeContext) : CoreBackdropSnapshot{};
-    if (hit.valid && hit.currentVisual &&
-        hit.root == g_coreMaterialSourceRoot.load(std::memory_order_acquire))
-    {
-        AcquireSRWLockShared(&g_coreMaterialTargetLock);
-        if (observation->bridgeEpoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed))
-            g_coreMaterialSamplingVisual.store(hit.currentVisual, std::memory_order_release);
-        ReleaseSRWLockShared(&g_coreMaterialTargetLock);
-    }
     const wchar_t* reason = observation->bridgeContext ? L"SourcePath" : L"MissingContext";
     void* selected = nullptr;
     std::uint64_t lastUseAge = 0;
@@ -4196,7 +4139,10 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
         }
         ++observation->fallbacks;
         observation->fallbackReason = reason;
-        return g_coreBackdropEffectInputOriginal(image, output);
+        void* result = g_coreBackdropEffectInputOriginal(image, output);
+        if (notReadySource && reason == std::wstring_view(L"EffectNotReady"))
+            RunCoreOwnedBackdropProbe(*observation, notReadySource, hit.currentVisual, result);
+        return result;
     }
 
     // The native factory constructs EffectInput and owns its normal references.
@@ -4241,12 +4187,14 @@ static bool IsCoreMaterialVisual(const void* visual)
 static long __cdecl CoreBviValidationHook(void* context, const void* bounds, void* flag)
 {
     const long result = g_coreBviValidationOriginal(context, bounds, flag);
-    if (result >= 0 && g_coreMaterialObservation)
-        g_coreMaterialObservation->bridgeContext = context;
+    if (result >= 0)
+        if (auto* observation = CurrentCoreMaterialObservation();
+            observation && observation->drawContext == context)
+            observation->bridgeContext = context;
     return result;
 }
 
-static long CoreDrawVisualTreeObserved(void* context, const void* tree, const void* bounds,
+static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, const void* bounds,
                                           const void* occlusion, int clearMode, bool drawFlag, void* root)
 {
     bool observe = tree && g_coreMaterialBridgeReady.load(std::memory_order_acquire) &&
@@ -4262,9 +4210,18 @@ static long CoreDrawVisualTreeObserved(void* context, const void* tree, const vo
         ReleaseSRWLockShared(&g_coreMaterialTargetLock);
     }
     if (!observe)
-        return g_coreDrawVisualTreeOriginal(context, tree, bounds, occlusion, clearMode, drawFlag, root);
+    {
+        // A nested foreign tree cannot publish its temporary context into the
+        // outer source observation, even if it reuses the same drawing object.
+        auto* previous = g_coreMaterialObservation;
+        g_coreMaterialObservation = nullptr;
+        const long result = g_coreDrawVisualTreeOriginal(context, tree, bounds, occlusion, clearMode, drawFlag, root);
+        g_coreMaterialObservation = previous;
+        return result;
+    }
     CoreMaterialObservation observation;
     observation.bridgeEpoch = epoch;
+    observation.drawContext = context;
     auto* previous = g_coreMaterialObservation;
     g_coreMaterialObservation = &observation;
     const long result = g_coreDrawVisualTreeOriginal(context, tree, bounds, occlusion, clearMode, drawFlag, root);
@@ -4285,7 +4242,7 @@ static long CoreDrawVisualTreeObserved(void* context, const void* tree, const vo
                    L"inputMetadata=%d outputMetadata=%d outputRealization=0x%llX "
                    L"inputBounds=(%.1f,%.1f,%.1f,%.1f) "
                    L"inputMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g) "
-                   L"outputFlags=0x%X",
+                   L"outputFlags=0x%X readOnly=1",
                    g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
                    observation.inputCount, observation.blurCalls, observation.materialBlurCalls,
                    observation.intermediateCalls, observation.materialIntermediateCalls,
@@ -4295,17 +4252,6 @@ static long CoreDrawVisualTreeObserved(void* context, const void* tree, const vo
                    in.transform[0], in.transform[1], in.transform[2], in.transform[3],
                    in.transform[4], in.transform[5], in.transform[6], in.transform[7], in.transform[8],
                    out.flags);
-            auto* pass = g_coreMaterialDesktopPass;
-            const auto& p = observation.passInput;
-            Wh_Log(L"MESH ACRYLIC PASS: HWND=%p desktopPass=%d producer=%u reused=%u reason=%s "
-                   L"producerBounds=(%.1f,%.1f,%.1f,%.1f) "
-                   L"producerMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g)",
-                   g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
-                   CoreMaterialPassCurrent(pass), CoreMaterialPassCurrent(pass) ? pass->published : 0,
-                   observation.passReuses, observation.passReason,
-                   p.bounds[0], p.bounds[1], p.bounds[2], p.bounds[3],
-                   p.transform[0], p.transform[1], p.transform[2], p.transform[3], p.transform[4],
-                   p.transform[5], p.transform[6], p.transform[7], p.transform[8]);
         }
     }
     if (observation.fallbacks && epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
@@ -4319,24 +4265,6 @@ static long CoreDrawVisualTreeObserved(void* context, const void* tree, const vo
                    g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
                    observation.fallbackReason, observation.fallbacks, observation.fallbackRenderingValid);
     }
-    return result;
-}
-
-static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, const void* bounds,
-                                          const void* occlusion, int clearMode, bool drawFlag, void* root)
-{
-    if (g_coreMaterialDesktopPass || !g_coreMaterialPassAbiReady ||
-        !g_coreMaterialBridgeReady.load(std::memory_order_acquire) ||
-        g_unloading.load(std::memory_order_acquire) ||
-        !g_coreMaterialTargetKey.load(std::memory_order_acquire) ||
-        ReadPointerMember(tree, 0) != g_coreDesktopTreeVtable)
-        return CoreDrawVisualTreeObserved(context, tree, bounds, occlusion, clearMode, drawFlag, root);
-    CoreMaterialDesktopPass pass;
-    pass.epoch = g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
-    pass.tree = tree;
-    g_coreMaterialDesktopPass = &pass;
-    const long result = CoreDrawVisualTreeObserved(context, tree, bounds, occlusion, clearMode, drawFlag, root);
-    g_coreMaterialDesktopPass = nullptr;
     return result;
 }
 
@@ -4404,16 +4332,20 @@ static void InitializeCoreMaterialBridge()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
-        {{L"public: __cdecl EffectInput::EffectInput(struct EffectInput const &)"},
-         &g_coreEffectInputCopyFunction, nullptr, true},
-        {{L"public: struct EffectInput & __cdecl EffectInput::operator=(struct EffectInput const &)"},
-         &g_coreEffectInputAssignFunction, nullptr, true},
+        {{L"public: static long __cdecl CBackdropVisualImage::Create(class CComposition *,"
+           L"class CVisual const *,class CVisualTreePath const &,bool,class CBackdropVisualImage * *)"},
+         &g_coreOwnedImageCreateFunction, nullptr, true},
+        {{L"public: long __cdecl CBackdropVisualImage::ValidateRootAndSourceRectangle(class CVisual *,"
+           L"class TMilRect_<float,struct MilRectF,struct Mil3DRectF,struct MilPointAndSizeF,"
+           L"struct RectUniqueness::NotNeeded> const &,bool,bool *)"},
+         &g_coreOwnedImageValidateFunction, nullptr, true},
+        {{L"protected: unsigned long __cdecl CResource::InternalRelease(void)"},
+         &g_coreOwnedImageReleaseFunction, nullptr, true},
+        {{L"public: __cdecl wil::com_ptr_t<class IRenderTargetBitmap,struct wil::err_returncode_policy>::"
+           L"~com_ptr_t<class IRenderTargetBitmap,struct wil::err_returncode_policy>(void)"},
+         &g_coreOwnedBitmapDestroyFunction, nullptr, true},
         {{L"public: __cdecl EffectInput::~EffectInput(void)"},
-         &g_coreEffectInputDestroyFunction, nullptr, true},
-        {{L"bool __cdecl CanRenderToTargetFromSource(class RenderTargetInfo const &,class RenderTargetInfo const &)"},
-         &g_coreTargetCompatibilityFunction, nullptr, true},
-        {{L"const CScratchRenderTargetBitmap::`vftable'{for `IBitmapRealization'}"},
-         &g_coreScratchRealizationVtable, nullptr, true},
+         &g_coreOwnedInputDestroyFunction, nullptr, true},
         {{L"public: long __cdecl CRenderingTechnique::ExecuteBlur(class CDrawingContext *,"
            L"struct EffectInput const &,struct D2D_VECTOR_2F const &,struct EffectInput *)"},
          &g_coreExecuteBlurFunction, nullptr, true},
@@ -4505,8 +4437,8 @@ static void InitializeCoreMaterialBridge()
             CoreBackdropEffectInputHook, &g_coreBackdropEffectInputOriginal);
     g_coreMaterialBridgeReady.store(ready, std::memory_order_release);
     g_coreBackdropBridgeReady.store(ready, std::memory_order_release);
-    // Two non-leaf hooks on this exact image. The normal path is forwarded;
-    // optional same-pass reuse uses the verified native managed-copy routines.
+    // Two non-leaf observers on this exact image. They always forward every
+    // argument and native result, including failures and aliased input/output.
     const BYTE blurPrefix[] = {0x48,0x8B,0xC4,0x55,0x53,0x56,0x57,0x41,0x54,
                               0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8D,0x68,0x88};
     const BYTE intermediatePrefix[] = {0x48,0x8B,0xC4,0x48,0x89,0x58,0x10,
@@ -4522,15 +4454,16 @@ static void InitializeCoreMaterialBridge()
         g_coreExecuteBlurFunction, CoreExecuteBlurHook, &g_coreExecuteBlurOriginal);
     const bool observeIntermediate = diagnosticAbi && WindhawkUtils::SetFunctionHook(
         g_coreIntermediateBrushFunction, CoreIntermediateBrushHook, &g_coreIntermediateBrushOriginal);
-    g_coreMaterialPassAbiReady = observeBlur &&
-        reinterpret_cast<uintptr_t>(g_coreEffectInputCopyFunction) == base + 0x35BE0 &&
-        reinterpret_cast<uintptr_t>(g_coreEffectInputAssignFunction) == base + 0x930B8 &&
-        reinterpret_cast<uintptr_t>(g_coreEffectInputDestroyFunction) == base + 0x94170 &&
-        reinterpret_cast<uintptr_t>(g_coreTargetCompatibilityFunction) == base + 0x337E0 &&
-        reinterpret_cast<uintptr_t>(g_coreScratchRealizationVtable) == base + 0x2C1EB8;
-    Wh_Log(L"MESH ACRYLIC PASS CACHE: ready=%d lifetime=desktop-draw-pass",
-           g_coreMaterialPassAbiReady.load(std::memory_order_acquire));
-    Wh_Log(L"MESH MATERIAL PIPELINE OBSERVER: blur=%d intermediate=%d readOnly=0",
+    g_coreOwnedBackdropProbeReady.store(ready &&
+        reinterpret_cast<uintptr_t>(g_coreOwnedImageCreateFunction) == base + 0xA61F4 &&
+        reinterpret_cast<uintptr_t>(g_coreOwnedImageValidateFunction) == base + 0x4CA84 &&
+        reinterpret_cast<uintptr_t>(g_coreOwnedImageReleaseFunction) == base + 0x78A28 &&
+        reinterpret_cast<uintptr_t>(g_coreOwnedBitmapDestroyFunction) == base + 0x343B8 &&
+        reinterpret_cast<uintptr_t>(g_coreOwnedInputDestroyFunction) == base + 0x94170,
+        std::memory_order_release);
+    Wh_Log(L"MESH OWN BACKDROP PROBE: available=%d attached=0",
+           g_coreOwnedBackdropProbeReady.load(std::memory_order_acquire));
+    Wh_Log(L"MESH MATERIAL PIPELINE OBSERVER: blur=%d intermediate=%d readOnly=1",
            observeBlur, observeIntermediate);
     Wh_Log(L"MESH MATERIAL BRIDGE: %s hooks=5 leafHooks=0", ready ? L"ready" : L"unavailable; using Affine");
 }
