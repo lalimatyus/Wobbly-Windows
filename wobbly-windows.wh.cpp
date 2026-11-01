@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.340
+// @version         0.341
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -46,6 +46,11 @@ the original backdrop follows the mesh center, while fully nonlinear background
 sampling is still experimental. While the
 mesh is visible, the original remains nearly transparent to keep DWM's native
 backdrop calculation active and is restored when the mesh detaches.
+**Mesh foreground preview** separates the captured acrylic backdrop from the
+window foreground. It deliberately has no replacement blur yet: text, icons,
+tint and transparency can be compared with the normal Mesh Renderer. Mica
+separation is not yet implemented. The preview leaves the hidden source window
+at its native position and preserves the mesh physics and lag.
 Keep **Affine** selected for normal use.
 
 ## Known Issues
@@ -106,6 +111,7 @@ the combined mod is not offered under GPLv2.
   $options:
   - "affine": "Affine (stable)"
   - "mesh": "Mesh Renderer (experimental)"
+  - "mesh-foreground": "Mesh foreground preview (no background blur)"
 
 - AdvancedMode:
   - enable: false
@@ -3526,6 +3532,16 @@ static void* FindNativeMeshSiblingCollection(void* root)
 }
 
 // Core material bridge: private layouts are gated by the exact module image.
+struct CoreMaterialSizeF { float width, height; };
+static_assert(sizeof(CoreMaterialSizeF) == 8);
+using CoreRenderSubgraphs_t = long(__cdecl*)(void*, void*, const CoreMaterialSizeF*, const void*, unsigned int, void*);
+using CoreForegroundTransparent_t = long(__cdecl*)(const void*, const CoreMaterialSizeF*, void*);
+using CoreForegroundInputConstruct_t = void*(__cdecl*)(void*);
+CoreRenderSubgraphs_t g_coreRenderSubgraphsFunction = nullptr, g_coreRenderSubgraphsOriginal = nullptr;
+CoreForegroundTransparent_t g_coreForegroundTransparent = nullptr;
+CoreForegroundInputConstruct_t g_coreForegroundInputConstruct = nullptr;
+std::atomic_bool g_coreForegroundPreview = false, g_coreForegroundReady = false;
+std::atomic<ULONGLONG> g_coreForegroundLogAt = 0;
 using CoreExecuteBlur_t = long(__cdecl*)(void*, void*, const void*, const void*, void*);
 using CoreIntermediateBrush_t = long(__cdecl*)(void*, unsigned int, const void*, void**);
 CoreExecuteBlur_t g_coreExecuteBlurFunction = nullptr, g_coreExecuteBlurOriginal = nullptr;
@@ -4292,6 +4308,117 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
     return inputBound;
 }
 
+// The size/context belong to this graph call, never to a later frame. A nested
+// graph always shadows the outer request, including unrelated native rendering.
+struct CoreForegroundRequest
+{
+    CoreMaterialObservation* observation = nullptr;
+    void* context = nullptr;
+    void* image = nullptr;
+    ULONGLONG epoch = 0;
+    CoreMaterialSizeF size = {};
+};
+thread_local CoreForegroundRequest* g_coreForegroundRequest = nullptr;
+
+static long __cdecl CoreRenderSubgraphsHook(void* graph, void* context,
+                                          const CoreMaterialSizeF* size, const void* brush,
+                                          unsigned int index, void* cache)
+{
+    CoreForegroundRequest request;
+    if (g_coreForegroundPreview.load(std::memory_order_acquire) &&
+        g_coreForegroundReady.load(std::memory_order_acquire))
+    {
+        request.observation = CurrentCoreMaterialObservation();
+        request.context = context;
+        request.image = g_coreMaterialCurrentImage;
+        if (request.observation) request.epoch = request.observation->bridgeEpoch;
+        if (IsReadableMemory(size, sizeof(request.size)))
+            std::memcpy(&request.size, size, sizeof(request.size));
+    }
+    auto* previous = g_coreForegroundRequest;
+    g_coreForegroundRequest = &request;
+    const long result = g_coreRenderSubgraphsOriginal(graph, context, size, brush, index, cache);
+    g_coreForegroundRequest = previous;
+    return result;
+}
+
+static bool IsCurrentCoreForegroundRequest(const CoreForegroundRequest& request,
+                                          CoreMaterialObservation& observation)
+{
+    return g_coreForegroundPreview.load(std::memory_order_acquire) &&
+        g_coreForegroundReady.load(std::memory_order_acquire) &&
+        request.observation == &observation &&
+        &observation == CurrentCoreMaterialObservation() &&
+        request.epoch == observation.bridgeEpoch &&
+        request.image == g_coreMaterialCurrentImage &&
+        request.context && request.context == observation.bridgeContext &&
+        request.context == observation.drawContext &&
+        std::isfinite(request.size.width) && std::isfinite(request.size.height) &&
+        request.size.width >= 1.0f && request.size.height >= 1.0f &&
+        request.size.width <= 32768.0f && request.size.height <= 32768.0f;
+}
+
+static void LogCoreForegroundPreview(long status, bool bound, CoreMaterialSizeF size)
+{
+    const ULONGLONG now = GetTickCount64();
+    auto previous = g_coreForegroundLogAt.load(std::memory_order_relaxed);
+    if (previous && now - previous < 1000) return;
+    if (!g_coreForegroundLogAt.compare_exchange_strong(previous, now, std::memory_order_relaxed)) return;
+    Wh_Log(L"MESH FOREGROUND SPLIT: HWND=%p result=0x%08X bound=%d size=%.2fx%.2f "
+           L"background=transparent replacementBlur=0",
+           g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
+           static_cast<unsigned>(status), bound, size.width, size.height);
+}
+
+// Return true only after the normal factory has constructed the caller's output.
+// A rejected/failed transparent input leaves the established material path intact.
+static bool TryCoreForegroundInput(CoreMaterialObservation& observation,
+                                   const CoreBackdropSnapshot& hit, void* image,
+                                   void* output, void*& result)
+{
+    const auto* request = g_coreForegroundRequest;
+    if (!request || !IsCurrentCoreForegroundRequest(*request, observation) ||
+        !hit.valid || hit.image != image ||
+        hit.root != g_coreMaterialSourceRoot.load(std::memory_order_acquire)) return false;
+
+    struct InputScope
+    {
+        alignas(16) BYTE input[0x68] = {};
+        InputScope()
+        {
+            g_coreBackdropBridgeInCall = true;
+            g_coreForegroundInputConstruct(input);
+        }
+        ~InputScope()
+        {
+            g_coreOwnedInputDestroyFunction(input);
+            g_coreBackdropBridgeInCall = false;
+        }
+    } scope;
+    const long status = g_coreForegroundTransparent(request->context, &request->size, scope.input);
+    const auto identity = ReadCoreMaterialInputIdentity(scope.input);
+    if (status < 0 || (!identity.bitmap && !identity.brush) ||
+        !ReadCoreMaterialInputMetadata(scope.input).readable ||
+        !IsCurrentCoreForegroundRequest(*request, observation))
+    {
+        LogCoreForegroundPreview(status < 0 ? status : E_FAIL, false, request->size);
+        return false;
+    }
+
+    result = g_coreBackdropEffectInputOriginal(image, output);
+    const bool bound = result == output && IsCurrentCoreForegroundRequest(*request, observation);
+    if (bound)
+    {
+        // Native assignment retains the transparent bitmap and releases the old
+        // realization; destruction below only releases our temporary reference.
+        g_coreOwnedInputAssignFunction(result, scope.input);
+        RememberCoreMaterialInput(observation, ReadCoreMaterialInputIdentity(result));
+    }
+    LogCoreForegroundPreview(status, bound, request->size);
+    return true;
+}
+
+
 static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
 {
     auto* observation = g_coreMaterialObservation;
@@ -4305,6 +4432,9 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
 
     const auto hit = observation->bridgeContext
         ? ReadCoreBackdropSnapshot(observation->bridgeContext) : CoreBackdropSnapshot{};
+    void* foregroundResult = nullptr;
+    if (TryCoreForegroundInput(*observation, hit, image, output, foregroundResult))
+        return foregroundResult;
     const wchar_t* reason = observation->bridgeContext ? L"SourcePath" : L"MissingContext";
     void* selected = nullptr;
     std::uint64_t lastUseAge = 0;
@@ -4581,6 +4711,14 @@ static void InitializeCoreMaterialBridge()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
+        {{L"public: long __cdecl CBrushRenderingGraph::RenderSubgraphs(class CDrawingContext *,"
+           L"struct D2D_SIZE_F const &,class CDrawListBrush const *,unsigned int,class CDrawListCache *)"},
+         &g_coreRenderSubgraphsFunction, nullptr, true},
+        {{L"private: long __cdecl CDrawingContext::SetEffectInputToTransparentBlack("
+           L"struct D2D_SIZE_F const &,struct EffectInput *)const"},
+         &g_coreForegroundTransparent, nullptr, true},
+        {{L"public: __cdecl EffectInput::EffectInput(void)"},
+         &g_coreForegroundInputConstruct, nullptr, true},
         {{L"public: struct EffectInput & __cdecl EffectInput::operator=(struct EffectInput const &)"},
          &g_coreOwnedInputAssignFunction, nullptr, true},
         {{L"public: __cdecl wil::com_ptr_t<class CBackdropVisualImage,struct wil::err_returncode_policy>::"
@@ -4723,6 +4861,28 @@ static void InitializeCoreMaterialBridge()
         reinterpret_cast<uintptr_t>(g_coreOwnedBitmapDestroyFunction) == base + 0x343B8 &&
         reinterpret_cast<uintptr_t>(g_coreOwnedInputDestroyFunction) == base + 0x94170,
         std::memory_order_release);
+    // This six-argument non-leaf call supplies the exact native brush size.
+    // The transparent bitmap factory/constructor are resolved, never detoured.
+    const BYTE graphPrefix[] = {0x40,0x55,0x53,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57};
+    const BYTE transparentPrefix[] = {0x66,0x41,0xC7,0x40,0x2C,0x01,0x01,0x45,0x33,0xC9};
+    const BYTE inputPrefix[] = {0x33,0xC0,0x0F,0x57,0xC0,0x48,0x89,0x01,0x48,0x89,0x41,0x08};
+    const bool foregroundAbi = ready &&
+        reinterpret_cast<uintptr_t>(g_coreRenderSubgraphsFunction) == base + 0x93240 &&
+        reinterpret_cast<uintptr_t>(g_coreForegroundTransparent) == base + 0x1D6D58 &&
+        reinterpret_cast<uintptr_t>(g_coreForegroundInputConstruct) == base + 0xE4AB8 &&
+        reinterpret_cast<uintptr_t>(g_coreOwnedInputAssignFunction) == base + 0x930B8 &&
+        reinterpret_cast<uintptr_t>(g_coreOwnedInputDestroyFunction) == base + 0x94170 &&
+        IsReadableMemory(reinterpret_cast<void*>(g_coreRenderSubgraphsFunction), sizeof(graphPrefix)) &&
+        IsReadableMemory(reinterpret_cast<void*>(g_coreForegroundTransparent), sizeof(transparentPrefix)) &&
+        IsReadableMemory(reinterpret_cast<void*>(g_coreForegroundInputConstruct), sizeof(inputPrefix)) &&
+        !std::memcmp(reinterpret_cast<void*>(g_coreRenderSubgraphsFunction), graphPrefix, sizeof(graphPrefix)) &&
+        !std::memcmp(reinterpret_cast<void*>(g_coreForegroundTransparent), transparentPrefix, sizeof(transparentPrefix)) &&
+        !std::memcmp(reinterpret_cast<void*>(g_coreForegroundInputConstruct), inputPrefix, sizeof(inputPrefix));
+    g_coreForegroundReady.store(foregroundAbi && WindhawkUtils::SetFunctionHook(
+        g_coreRenderSubgraphsFunction, CoreRenderSubgraphsHook, &g_coreRenderSubgraphsOriginal),
+        std::memory_order_release);
+    Wh_Log(L"MESH FOREGROUND PREVIEW: ready=%d replacementBlur=0 lifetime=graph-call",
+           g_coreForegroundReady.load(std::memory_order_acquire));
     if (reinterpret_cast<uintptr_t>(g_coreOwnedInputAssignFunction) != base + 0x930B8)
         g_coreOwnedInputAssignFunction = nullptr;
     Wh_Log(L"MESH OWN BACKDROP STREAM: ready=%d lifetime=render-call maxAttempts=4 timing=%d",
@@ -5230,13 +5390,15 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
     if (state.sourceTransform)
     {
         double x = 0.0, y = 0.0;
-        if (!NativeMeshSourceMotion(positions, state.width, state.height, x, y))
+        const bool foregroundPreview = g_coreForegroundPreview.load(std::memory_order_acquire) &&
+                                       g_coreForegroundReady.load(std::memory_order_acquire);
+        if (!foregroundPreview && !NativeMeshSourceMotion(positions, state.width, state.height, x, y))
         {
             DetachNativeMesh(L"source-motion-invalid");
             return;
         }
-        // This parent is outside the captured border subtree and the mesh's
-        // sibling. Follow its physical center without translating either twice.
+        // The foreground preview removes source following only. Vertex motion,
+        // physical lag and the normal renderer's backdrop following stay intact.
         if (x != state.sourceMotionX || y != state.sourceMotionY)
         {
             const MilMatrix3x2D matrix = {1.0, 0.0, 0.0, 1.0, x, y};
@@ -10230,7 +10392,11 @@ static void LoadSettings()
     WobblySettings settings = PHYSICS_PRESETS[wobbliness];
     auto rendererSetting = WindhawkUtils::StringSetting::make(L"Renderer");
     std::wstring_view rendererValue(rendererSetting.get());
-    // Migrate saved diagnostic selections to the full Mesh Renderer.
+    const bool foregroundPreview = rendererValue == L"mesh-foreground";
+    const bool foregroundChanged = g_coreForegroundPreview.exchange(foregroundPreview, std::memory_order_acq_rel)
+                                   != foregroundPreview;
+    if (foregroundChanged) g_coreForegroundLogAt.store(0, std::memory_order_relaxed);
+    // Migrate earlier saved diagnostic selections to the full Mesh Renderer.
     settings.rendererMode = rendererValue == L"mesh" || rendererValue.starts_with(L"mesh-")
                                 ? RendererMode::Mesh : RendererMode::Affine;
     bool advancedMode = Wh_GetIntSetting(L"AdvancedMode.enable") != 0;
@@ -10252,7 +10418,7 @@ static void LoadSettings()
     AcquireSRWLockExclusive(&g_settingsLock);
     g_settings = settings;
     ReleaseSRWLockExclusive(&g_settingsLock);
-    if (settings.rendererMode != RendererMode::Mesh &&
+    if ((settings.rendererMode != RendererMode::Mesh || foregroundChanged) &&
         g_nativeMeshActive.load(std::memory_order_acquire))
     {
         g_nativeMeshStopRequested.store(true, std::memory_order_release);
@@ -10268,7 +10434,8 @@ static void LoadSettings()
            L"Drag=%.2f, "
            L"MoveFactor=%.2f",
            wobbliness, advancedMode,
-           settings.rendererMode == RendererMode::Mesh ? L"mesh" : L"affine",
+           foregroundPreview ? L"mesh-foreground" :
+               (settings.rendererMode == RendererMode::Mesh ? L"mesh" : L"affine"),
            settings.resizeWobbleEnabled,
            settings.windowStateWobbleEnabled, settings.stiffness, settings.drag,
            settings.moveFactor);
