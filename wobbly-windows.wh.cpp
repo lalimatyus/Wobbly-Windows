@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.341
+// @version         0.342
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4715,7 +4715,9 @@ static void InitializeCoreMaterialBridge()
            L"struct D2D_SIZE_F const &,class CDrawListBrush const *,unsigned int,class CDrawListCache *)"},
          &g_coreRenderSubgraphsFunction, nullptr, true},
         {{L"private: long __cdecl CDrawingContext::SetEffectInputToTransparentBlack("
-           L"struct D2D_SIZE_F const &,struct EffectInput *)const"},
+           L"struct D2D_SIZE_F const &,struct EffectInput *)const",
+          L"private: long __cdecl CDrawingContext::SetEffectInputToTransparentBlack("
+           L"struct D2D_SIZE_F const &,struct EffectInput *)const "},
          &g_coreForegroundTransparent, nullptr, true},
         {{L"public: __cdecl EffectInput::EffectInput(void)"},
          &g_coreForegroundInputConstruct, nullptr, true},
@@ -4881,8 +4883,11 @@ static void InitializeCoreMaterialBridge()
     g_coreForegroundReady.store(foregroundAbi && WindhawkUtils::SetFunctionHook(
         g_coreRenderSubgraphsFunction, CoreRenderSubgraphsHook, &g_coreRenderSubgraphsOriginal),
         std::memory_order_release);
-    Wh_Log(L"MESH FOREGROUND PREVIEW: ready=%d replacementBlur=0 lifetime=graph-call",
-           g_coreForegroundReady.load(std::memory_order_acquire));
+    Wh_Log(L"MESH FOREGROUND PREVIEW: ready=%d graph=%d transparent=%d constructor=%d abi=%d "
+           L"replacementBlur=0 lifetime=graph-call",
+           g_coreForegroundReady.load(std::memory_order_acquire),
+           g_coreRenderSubgraphsFunction != nullptr, g_coreForegroundTransparent != nullptr,
+           g_coreForegroundInputConstruct != nullptr, foregroundAbi);
     if (reinterpret_cast<uintptr_t>(g_coreOwnedInputAssignFunction) != base + 0x930B8)
         g_coreOwnedInputAssignFunction = nullptr;
     Wh_Log(L"MESH OWN BACKDROP STREAM: ready=%d lifetime=render-call maxAttempts=4 timing=%d",
