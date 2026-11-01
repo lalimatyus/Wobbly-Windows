@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.346
+// @version         0.347
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4451,6 +4451,23 @@ static unsigned ClaimCoreBackdropPreview(const CoreForegroundRequest& request)
     return attempt;
 }
 
+static bool PrepareCoreBackdropBitmapMetadata(void* input, const CoreMaterialSizeF& size)
+{
+    if (!IsReadableMemory(input, 0x68) || !std::isfinite(size.width) || !std::isfinite(size.height) ||
+        size.width < 1 || size.height < 1 || size.width > 64 || size.height > 64 ||
+        ReadPointerMember(input, 0) || !ReadPointerMember(input, 8)) return false;
+    auto* bytes = static_cast<BYTE*>(input);
+    if (bytes[0x10] != 0 || bytes[0x2C] != 1 || bytes[0x2D] > 1) return false;
+    // SetEffectInputToTransparentBlack advertises a constant RGBA color at +18.
+    // The new image is spatially varying: do not keep that transparent shortcut.
+    // Keep its native normalized texture map, but describe the full bitmap's
+    // pixel bounds rather than the transparent factory's 1x1 fallback bitmap.
+    const float bounds[4] = {0, 0, size.width, size.height};
+    std::memcpy(bytes + 0x54, bounds, sizeof(bounds));
+    bytes[0x2D] = 0;
+    return true;
+}
+
 // S_OK: diagnostic bitmap moved to input; S_FALSE: transparent input unchanged.
 // A rejected managed conversion returns E_FAIL so the caller uses native fallback.
 static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
@@ -4527,23 +4544,27 @@ static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
     const bool afterReadable = ReadCoreBackdropTargetState(request.context, after);
     const unsigned infoDiff = CoreBackdropTargetInfoDiff(before, after);
     const bool restored = afterReadable && CoreBackdropTargetRestored(before, after);
-    bool converted = false, conversionRejected = false;
+    bool converted = false, conversionRejected = false, metadataPrepared = false;
     if (preview && push >= 0 && created && pop >= 0 && restored && transformPopped &&
         drawing >= 0 && drawCalls == 2 && IsCurrentCoreForegroundRequest(request, observation))
     {
         // Native move converts the virtual IRenderTargetBitmap base, releases
         // the old transparent realization and clears bitmap's source storage.
-        // EffectInput's native metadata remains intact; its owner releases the
+        // Native normalized mapping is preserved; the input owner releases the
         // converted realization if this render call retires before assignment.
         void* destination = static_cast<BYTE*>(input) + 8;
         void* moved = g_coreBackdropBitmapMove(destination, &bitmap);
         converted = moved == destination && !bitmap && !ReadPointerMember(input, 0) &&
             ReadPointerMember(input, 8) && ReadCoreMaterialInputMetadata(input).readable;
-        conversionRejected = !converted;
+        if (converted) metadataPrepared = PrepareCoreBackdropBitmapMetadata(input, size);
+        conversionRejected = !converted || !metadataPrepared;
         if (report || conversionRejected)
             Wh_Log(L"MESH BACKDROP COLOR INPUT: bound=%d sourceConsumed=%d size=%.0fx%.0f "
-                   L"attempt=%u durationMs=1000 lifetime=consumer-owned replacementBlur=0",
-                   converted, bitmap == nullptr, size.width, size.height, attempt);
+                   L"attempt=%u metadataPrepared=%d constantColor=%u bounds=(0,0,%.0f,%.0f) "
+                   L"durationMs=1000 lifetime=consumer-owned replacementBlur=0",
+                   converted && metadataPrepared, bitmap == nullptr, size.width, size.height, attempt,
+                   metadataPrepared, static_cast<unsigned>(static_cast<const BYTE*>(input)[0x2D]),
+                   size.width, size.height);
     }
     if (bitmap)
     {
@@ -5185,7 +5206,7 @@ static void InitializeCoreMaterialBridge()
         IsReadableMemory(reinterpret_cast<void*>(g_coreBackdropBitmapMove), sizeof(movePrefix)) &&
         !std::memcmp(reinterpret_cast<void*>(g_coreBackdropBitmapMove), movePrefix, sizeof(movePrefix));
     g_coreBackdropPreviewReady.store(previewAbi, std::memory_order_release);
-    Wh_Log(L"MESH BACKDROP COLOR PREVIEW: ready=%d durationMs=1000 maxAttempts=240 lifetime=consumer-owned",
+    Wh_Log(L"MESH BACKDROP COLOR PREVIEW: ready=%d durationMs=1000 maxAttempts=240 bitmapMetadata=1 lifetime=consumer-owned",
            g_coreBackdropPreviewReady.load(std::memory_order_acquire));
     Wh_Log(L"MESH BACKDROP DRAW PROBE: ready=%d rectangles=2 attached=0 pixelReadback=0",
            g_coreBackdropDrawReady.load(std::memory_order_acquire));
