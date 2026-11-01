@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.349
+// @version         0.350
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3579,6 +3579,7 @@ CoreBackdropFillBitmap_t g_coreBackdropFillBitmap = nullptr;
 CoreBackdropBitmapSize_t g_coreBackdropBitmapSize = nullptr;
 std::atomic_bool g_coreBackdropLiveCopyReady = false;
 std::atomic<ULONGLONG> g_coreBackdropLiveLogEpoch = UINT64_MAX;
+std::atomic<ULONGLONG> g_coreBackdropCoordinatesLogAt = 0;
 constexpr long kCoreBackdropLiveCopy = 2;
 CoreBackdropGetTag_t g_coreBackdropGetTag = nullptr;
 CoreBackdropPushTarget_t g_coreBackdropPushTarget = nullptr;
@@ -3669,6 +3670,7 @@ static void ClearCoreMaterialTarget()
     g_coreBackdropReuseLogged.store(false, std::memory_order_relaxed);
     g_coreBackdropFallbackLogAt.store(0, std::memory_order_relaxed);
     g_coreMaterialPipelineLogAt.store(0, std::memory_order_relaxed);
+    g_coreBackdropCoordinatesLogAt.store(0, std::memory_order_relaxed);
     g_coreOwnedTraceAt.store(0, std::memory_order_relaxed);
     g_coreOwnedSummaryAt.store(0, std::memory_order_relaxed);
     g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
@@ -4582,6 +4584,7 @@ struct CoreBackdropLiveSource
     alignas(16) BYTE input[0x68] = {};
     CoreBackdropSizeU size = {};
     CoreBackdropAffine sampling = {};
+    void* realizedImage = nullptr; // Borrowed through input's native refs, this call only.
     bool initialized = false, ready = false;
     const wchar_t* stage = L"Unavailable";
     const wchar_t* acquisition = L"direct";
@@ -4660,8 +4663,92 @@ static void PrepareCoreBackdropLiveSource(CoreBackdropLiveSource& source, CoreMa
         !IsCurrentCoreForegroundRequest(request, observation)) return;
     source.stage = L"Mapping";
     if (!BuildCoreBackdropLiveSampling(metadata, source.size, request.size, target, source.sampling)) return;
+    source.realizedImage = realizedImage;
     source.ready = true;
     source.stage = L"Ready";
+}
+
+// Read only the same exact BVI layout used by native input generation.
+// These are source-tree coordinates, not assumed screen/physical coordinates.
+struct CoreBackdropCoordinates
+{
+    CoreBackdropRect bounds = {}, viewbox = {};
+    float transform[9] = {};
+};
+
+static bool ReadCoreBackdropCoordinates(const void* image, CoreBackdropCoordinates& output)
+{
+    CoreBackdropCoordinates value;
+    if (!g_coreBackdropDetailReady || !IsReadableMemory(image, 0x7A0) ||
+        ReadPointerMember(image, 0) != g_coreBackdropImageVtable) return false;
+    const auto* bytes = static_cast<const BYTE*>(image);
+    std::memcpy(&value.bounds, bytes + 0x60, sizeof(value.bounds));
+    std::memcpy(&value.viewbox, bytes + 0x738, sizeof(value.viewbox));
+    std::memcpy(value.transform, bytes + 0x77C, sizeof(value.transform));
+    for (const auto& rect : {value.bounds, value.viewbox})
+        if (!std::isfinite(rect.left) || !std::isfinite(rect.top) ||
+            !std::isfinite(rect.right) || !std::isfinite(rect.bottom) ||
+            rect.right <= rect.left || rect.bottom <= rect.top) return false;
+    for (float item : value.transform) if (!std::isfinite(item)) return false;
+    output = value;
+    return true;
+}
+
+static bool ReadCoreBackdropDrawTransform(const void* context, float (&output)[16])
+{
+    if (!g_coreBackdropDrawReady.load(std::memory_order_acquire) ||
+        !IsReadableMemory(context, 0x1A8)) return false;
+    // PushTransformInternal's matrix stack: count +190, capacity +194,
+    // data +1A0, native CMILMatrix stride 0x44. Never call or patch a leaf getter.
+    unsigned count = 0, capacity = 0;
+    const auto* bytes = static_cast<const BYTE*>(context);
+    std::memcpy(&count, bytes + 0x190, sizeof(count));
+    std::memcpy(&capacity, bytes + 0x194, sizeof(capacity));
+    const auto data = reinterpret_cast<uintptr_t>(ReadPointerMember(context, 0x1A0));
+    const size_t offset = count ? size_t{count - 1} * 0x44 : 0;
+    if (!count || count > 4096 || count > capacity || !data || data > UINTPTR_MAX - offset)
+        return false;
+    const void* matrix = reinterpret_cast<const void*>(data + offset);
+    float value[16];
+    if (!IsReadableMemory(matrix, sizeof(value))) return false;
+    std::memcpy(value, matrix, sizeof(value));
+    for (float item : value) if (!std::isfinite(item)) return false;
+    std::memcpy(output, value, sizeof(value));
+    return true;
+}
+
+static void LogCoreBackdropCoordinates(const CoreForegroundRequest& request, void* image,
+                                       const CoreBackdropLiveSource& source)
+{
+    if (!source.ready || !source.realizedImage || !request.observation ||
+        !IsCurrentCoreForegroundRequest(request, *request.observation)) return;
+    const ULONGLONG now = GetTickCount64();
+    auto last = g_coreBackdropCoordinatesLogAt.load(std::memory_order_relaxed);
+    if ((last && now - last < 250) || !g_coreBackdropCoordinatesLogAt.compare_exchange_strong(
+            last, now, std::memory_order_relaxed)) return;
+    CoreBackdropCoordinates captured, desktop;
+    float world[16] = {};
+    const bool capturedValid = ReadCoreBackdropCoordinates(image, captured);
+    const bool desktopValid = ReadCoreBackdropCoordinates(source.realizedImage, desktop);
+    const bool worldValid = ReadCoreBackdropDrawTransform(request.context, world);
+    Wh_Log(L"MESH BACKDROP COORDINATES: HWND=%p captureValid=%d sourceValid=%d worldValid=%d "
+           L"captureBounds=(%.3f,%.3f,%.3f,%.3f) sourceBounds=(%.3f,%.3f,%.3f,%.3f) "
+           L"sourceViewbox=(%.3f,%.3f,%.3f,%.3f) request=(%.3f,%.3f) bitmap=%ux%u readOnly=1 counterwarp=0",
+           g_coreMaterialTargetHwnd.load(std::memory_order_acquire), capturedValid, desktopValid, worldValid,
+           captured.bounds.left, captured.bounds.top, captured.bounds.right, captured.bounds.bottom,
+           desktop.bounds.left, desktop.bounds.top, desktop.bounds.right, desktop.bounds.bottom,
+           desktop.viewbox.left, desktop.viewbox.top, desktop.viewbox.right, desktop.viewbox.bottom,
+           request.size.width, request.size.height, source.size.width, source.size.height);
+    Wh_Log(L"MESH BACKDROP MAPPING: capture=(%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g) "
+           L"source=(%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g) "
+           L"draw=(%.6g,%.6g,%.6g,%.6g,%.6g,%.6g) projection=(%.6g,%.6g,%.6g) readOnly=1",
+           captured.transform[0], captured.transform[1], captured.transform[2],
+           captured.transform[3], captured.transform[4], captured.transform[5],
+           captured.transform[6], captured.transform[7], captured.transform[8],
+           desktop.transform[0], desktop.transform[1], desktop.transform[2],
+           desktop.transform[3], desktop.transform[4], desktop.transform[5],
+           desktop.transform[6], desktop.transform[7], desktop.transform[8],
+           world[0], world[1], world[4], world[5], world[12], world[13], world[3], world[7], world[15]);
 }
 
 // S_OK: diagnostic bitmap moved to input; S_FALSE: transparent input unchanged.
@@ -4751,6 +4838,7 @@ static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
     const bool afterReadable = ReadCoreBackdropTargetState(request.context, after);
     const unsigned infoDiff = CoreBackdropTargetInfoDiff(before, after);
     const bool restored = afterReadable && CoreBackdropTargetRestored(before, after);
+    if (liveCopied && restored) LogCoreBackdropCoordinates(request, image, live);
     auto loggedEpoch = g_coreBackdropLiveLogEpoch.load(std::memory_order_relaxed);
     if (liveCopied && loggedEpoch != request.epoch && g_coreBackdropLiveLogEpoch.compare_exchange_strong(
             loggedEpoch, request.epoch, std::memory_order_relaxed)) report = true;
