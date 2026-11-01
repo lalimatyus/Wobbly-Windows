@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.338
+// @version         0.339
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3545,6 +3545,8 @@ using CoreOwnedImageRetain_t = void(__cdecl*)(void*, void*);
 using CoreOwnedRegister_t = void(__cdecl*)(void*, const void*, void*);
 CoreOwnedImageRetain_t g_coreOwnedImageRetainFunction = nullptr;
 CoreOwnedRegister_t g_coreOwnedRegisterFunction = nullptr;
+using CoreOwnedInputAssign_t = void*(__cdecl*)(void*, const void*);
+CoreOwnedInputAssign_t g_coreOwnedInputAssignFunction = nullptr;
 using CoreMaterialInput_t = long(__cdecl*)(void*, const void*, void*);
 using CoreImageUpdate_t = long(__cdecl*)(void*, void*, const void*);
 using CoreImageRealize_t = long(__cdecl*)(void*, const void*, void**);
@@ -3934,6 +3936,28 @@ static long __cdecl CoreIntermediateBrushHook(void* technique, unsigned int inde
 
 static long __cdecl CoreImageRealizeHook(void*, const void*, void**);
 
+static bool PrepareCoreOwnedInputMapping(void* ownedInput, const void* referenceInput)
+{
+    const auto own = ReadCoreMaterialInputMetadata(ownedInput);
+    const auto reference = ReadCoreMaterialInputMetadata(referenceInput);
+    if (!own.readable || !reference.readable || own.flags != reference.flags) return false;
+    for (unsigned i = 0; i < 4; ++i)
+        if (!std::isfinite(own.bounds[i]) || !std::isfinite(reference.bounds[i]) ||
+            std::abs(own.bounds[i] - reference.bounds[i]) > 0.001f) return false;
+    if (own.bounds[2] <= own.bounds[0] || own.bounds[3] <= own.bounds[1]) return false;
+    for (const auto* map : {own.transform, reference.transform})
+    {
+        for (unsigned i = 0; i < 9; ++i) if (!std::isfinite(map[i])) return false;
+        const double determinant = static_cast<double>(map[0]) * map[4] -
+                                   static_cast<double>(map[1]) * map[3];
+        if (map[2] != 0 || map[5] != 0 || map[8] != 1 || determinant <= 1e-16) return false;
+    }
+    // Equal native viewboxes have the same normalized texture domain. Retain
+    // the current capture's local/DPI mapping on our OWN managed input only.
+    std::memcpy(static_cast<BYTE*>(ownedInput) + 0x30, reference.transform, sizeof(reference.transform));
+    return true;
+}
+
 static void* FindExactCoreBackdrop(void* data, const void* path)
 {
     const auto first = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 0));
@@ -3977,16 +4001,23 @@ struct CoreOwnedBackdropProbeScope
     CoreOwnedBackdropProbeScope(const CoreOwnedBackdropProbeScope&) = delete;
     CoreOwnedBackdropProbeScope& operator=(const CoreOwnedBackdropProbeScope&) = delete;
     bool BindingCurrent() const { return !registered || FindExactCoreBackdrop(treeData, path) == image; }
-    ~CoreOwnedBackdropProbeScope()
+    bool RestoreRegistration()
     {
-        // Restore before releasing the temporary source, including failures
-        // and target retirement. Never overwrite an intervening native update.
         if (registered)
         {
             if (FindExactCoreBackdrop(treeData, path) == image)
                 g_coreOwnedRegisterFunction(treeData, path, original);
-            *restored = FindExactCoreBackdrop(treeData, path) == original;
+            const auto current = FindExactCoreBackdrop(treeData, path);
+            *restored = current == original;
+            registered = current == image;
         }
+        return *restored;
+    }
+    ~CoreOwnedBackdropProbeScope()
+    {
+        // Restore before releasing the temporary source, including failures
+        // and target retirement. Never overwrite an intervening native update.
+        RestoreRegistration();
         if (inputConstructed) g_coreOwnedInputDestroyFunction(input);
         if (bitmap) g_coreOwnedBitmapDestroyFunction(&bitmap);
         if (image) g_coreOwnedImageReleaseFunction(image);
@@ -4004,18 +4035,18 @@ static bool CoreOwnedProbeCurrent(const CoreMaterialObservation& observation)
         g_coreMaterialCurrentImage == g_coreMaterialSourceImage.load(std::memory_order_acquire);
 }
 
-static void RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
-                                      void* candidate, void* owner, const void* referenceInput)
+static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
+                                      void* candidate, void* owner, void* referenceInput)
 {
     if (!CoreOwnedProbeCurrent(observation) || !IsCoreMaterialVisual(owner) ||
         ReadPointerMember(candidate, 0) != g_coreBackdropImageVtable ||
-        !IsReadableMemory(static_cast<const BYTE*>(candidate) + 0x7A1, 1)) return;
+        !IsReadableMemory(static_cast<const BYTE*>(candidate) + 0x7A1, 1)) return false;
     auto* path = static_cast<BYTE*>(candidate) + 0x700;
     const auto first = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 0));
     const auto last = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 8));
     const auto capacity = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 16));
     if (!first || last <= first || capacity < last || (last - first) % 16 ||
-        last - first > 32 * 16 || !IsReadableMemory(reinterpret_cast<void*>(first), last - first)) return;
+        last - first > 32 * 16 || !IsReadableMemory(reinterpret_cast<void*>(first), last - first)) return false;
     void* tree = ReadPointerMember(reinterpret_cast<void*>(last - 8), 0);
     void* root = ReadPointerMember(candidate, 0x90);
     void* composition = ReadPointerMember(owner, 0x10);
@@ -4024,7 +4055,7 @@ static void RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
         ReadPointerMember(tree, 0x40) != root || rootType < g_coreMaterialModuleBase ||
         rootType - g_coreMaterialModuleBase >= 0x41A000 ||
         !composition || composition != ReadPointerMember(root, 0x10) ||
-        composition != ReadPointerMember(reinterpret_cast<void*>(g_coreMaterialModuleBase + 0x3E5930), 0)) return;
+        composition != ReadPointerMember(reinterpret_cast<void*>(g_coreMaterialModuleBase + 0x3E5930), 0)) return false;
     void* treeData = g_coreFindTreeDataFunction(owner, tree);
     // Only replace an existing exact entry on the currently borrowed owner.
     // No insertion, guessed owner or ambiguous path is accepted.
@@ -4040,33 +4071,34 @@ static void RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
             Wh_Log(L"MESH OWN BACKDROP SKIPPED: reason=RegistryEligibility "
                    L"ownerMatch=%d dataOwnerMatch=%d entryMatch=%d attached=0",
                    ownerMatch, dataOwnerMatch, entryMatch);
-        return;
+        return false;
     }
     float bounds[4];
     const auto* sourceBounds = static_cast<const BYTE*>(candidate) + 0x60;
-    if (!IsReadableMemory(sourceBounds, sizeof(bounds))) return;
+    if (!IsReadableMemory(sourceBounds, sizeof(bounds))) return false;
     std::memcpy(bounds, sourceBounds, sizeof(bounds));
-    for (float value : bounds) if (!std::isfinite(value)) return;
+    for (float value : bounds) if (!std::isfinite(value)) return false;
     const double width = static_cast<double>(bounds[2]) - bounds[0];
     const double height = static_cast<double>(bounds[3]) - bounds[1];
-    if (width <= 0 || height <= 0 || width > 8192 || height > 8192 || width * height > 33554432) return;
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192 || width * height > 33554432) return false;
     const BYTE nativeMode = *(static_cast<const BYTE*>(candidate) + 0x7A1);
     const void* target = g_coreCurrentTargetInfoFunction(
         static_cast<const BYTE*>(observation.bridgeContext) + 0x18);
-    if (nativeMode > 1 || !IsReadableMemory(target, 0x18)) return;
+    if (nativeMode > 1 || !IsReadableMemory(target, 0x18)) return false;
     auto tested = g_coreOwnedBackdropProbeEpoch.load(std::memory_order_relaxed);
     if (tested == observation.bridgeEpoch ||
         !g_coreOwnedBackdropProbeEpoch.compare_exchange_strong(tested, observation.bridgeEpoch,
                                                               std::memory_order_relaxed) ||
-        !CoreOwnedProbeCurrent(observation)) return;
+        !CoreOwnedProbeCurrent(observation)) return false;
 
     const wchar_t* stage = L"Create";
     long result = E_FAIL;
     bool exactType = false, rootMatch = false, bitmapValid = false;
     bool comparableMapping = false;
     bool registryBound = false, registryRestored = false;
+    bool mappingPrepared = false, inputBound = false;
     uintptr_t bitmapType = 0;
-    CoreMaterialInputMetadata ownMetadata;
+    CoreMaterialInputMetadata ownMetadata, referenceMetadata;
     {
         CoreOwnedBackdropProbeScope scope(&registryRestored);
         Wh_Log(L"MESH OWN BACKDROP STAGE: Create HWND=%p",
@@ -4126,28 +4158,48 @@ static void RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
         {
             bitmapValid = g_coreBackdropRealizationFunction(scope.image, target);
             stage = L"InspectInput";
-            // Construct and inspect an unattached input. Its projection is NOT
-            // assumed ready and it is never returned to the window's renderer.
+            // Native construction retains both managed source interfaces.
             g_coreBackdropEffectInputOriginal(scope.image, scope.input);
             scope.inputConstructed = true;
             ownMetadata = ReadCoreMaterialInputMetadata(scope.input);
-            const auto reference = ReadCoreMaterialInputMetadata(referenceInput);
-            comparableMapping = ownMetadata.readable && reference.readable &&
-                !std::memcmp(ownMetadata.transform, reference.transform, sizeof(reference.transform)) &&
-                !std::memcmp(ownMetadata.bounds, reference.bounds, sizeof(reference.bounds));
+            referenceMetadata = ReadCoreMaterialInputMetadata(referenceInput);
+            comparableMapping = ownMetadata.readable && referenceMetadata.readable &&
+                !std::memcmp(ownMetadata.transform, referenceMetadata.transform, sizeof(referenceMetadata.transform)) &&
+                !std::memcmp(ownMetadata.bounds, referenceMetadata.bounds, sizeof(referenceMetadata.bounds));
+            const auto identity = ReadCoreMaterialInputIdentity(scope.input);
+            mappingPrepared = identity.bitmap == static_cast<BYTE*>(scope.image) + 0x7E0 &&
+                identity.brush == static_cast<BYTE*>(scope.image) + 0x48 &&
+                PrepareCoreOwnedInputMapping(scope.input, referenceInput);
+            // Commit only after restoration, never while the desktop registry
+            // is substituted. Native assignment transfers references safely.
+            const bool restored = scope.RestoreRegistration();
+            if (bitmapValid && mappingPrepared && restored && CoreOwnedProbeCurrent(observation) &&
+                g_coreOwnedInputAssignFunction)
+            {
+                stage = L"BindCanary";
+                g_coreOwnedInputAssignFunction(referenceInput, scope.input);
+                inputBound = true;
+            }
         }
     }
     Wh_Log(L"MESH OWN BACKDROP PROBE: HWND=%p stage=%s result=0x%08X exactType=%d "
            L"rootMatch=%d bitmapValid=%d bitmapType=0x%llX mappingMatch=%d "
            L"sourceBounds=(%.1f,%.1f,%.1f,%.1f) ownMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g) "
-           L"registryBound=%d registryRestored=%d attached=0 renderer=unchanged",
+           L"registryBound=%d registryRestored=%d mappingPrepared=%d inputBound=%d "
+           L"refMetadata=%d refBounds=(%.1f,%.1f,%.1f,%.1f) "
+           L"refMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g) oneShot=1 attached=0",
            g_coreMaterialTargetHwnd.load(std::memory_order_acquire), stage, result,
            exactType, rootMatch, bitmapValid, static_cast<unsigned long long>(bitmapType), comparableMapping,
            bounds[0], bounds[1], bounds[2], bounds[3],
            ownMetadata.transform[0], ownMetadata.transform[1], ownMetadata.transform[2],
            ownMetadata.transform[3], ownMetadata.transform[4], ownMetadata.transform[5],
            ownMetadata.transform[6], ownMetadata.transform[7], ownMetadata.transform[8],
-           registryBound, registryRestored);
+           registryBound, registryRestored, mappingPrepared, inputBound, referenceMetadata.readable,
+           referenceMetadata.bounds[0], referenceMetadata.bounds[1], referenceMetadata.bounds[2], referenceMetadata.bounds[3],
+           referenceMetadata.transform[0], referenceMetadata.transform[1], referenceMetadata.transform[2],
+           referenceMetadata.transform[3], referenceMetadata.transform[4], referenceMetadata.transform[5],
+           referenceMetadata.transform[6], referenceMetadata.transform[7], referenceMetadata.transform[8]);
+    return inputBound;
 }
 
 static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
@@ -4223,8 +4275,15 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
         ++observation->fallbacks;
         observation->fallbackReason = reason;
         void* result = g_coreBackdropEffectInputOriginal(image, output);
-        if (notReadySource && reason == std::wstring_view(L"EffectNotReady"))
-            RunCoreOwnedBackdropProbe(*observation, notReadySource, hit.currentVisual, result);
+        if (notReadySource && reason == std::wstring_view(L"EffectNotReady") &&
+            RunCoreOwnedBackdropProbe(*observation, notReadySource, hit.currentVisual, result))
+        {
+            --observation->fallbacks;
+            if (observation == CurrentCoreMaterialObservation())
+                RememberCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(result));
+            Wh_Log(L"MESH OWN BACKDROP BOUND: HWND=%p oneShot=1 nativeAssignment=1",
+                   g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
+        }
         return result;
     }
 
@@ -4423,6 +4482,8 @@ static void InitializeCoreMaterialBridge()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
+        {{L"public: struct EffectInput & __cdecl EffectInput::operator=(struct EffectInput const &)"},
+         &g_coreOwnedInputAssignFunction, nullptr, true},
         {{L"public: __cdecl wil::com_ptr_t<class CBackdropVisualImage,struct wil::err_returncode_policy>::"
            L"com_ptr_t<class CBackdropVisualImage,struct wil::err_returncode_policy>(class CBackdropVisualImage *)"},
          &g_coreOwnedImageRetainFunction, nullptr, true},
@@ -4560,6 +4621,10 @@ static void InitializeCoreMaterialBridge()
         reinterpret_cast<uintptr_t>(g_coreOwnedBitmapDestroyFunction) == base + 0x343B8 &&
         reinterpret_cast<uintptr_t>(g_coreOwnedInputDestroyFunction) == base + 0x94170,
         std::memory_order_release);
+    if (reinterpret_cast<uintptr_t>(g_coreOwnedInputAssignFunction) != base + 0x930B8)
+        g_coreOwnedInputAssignFunction = nullptr;
+    Wh_Log(L"MESH OWN BACKDROP INPUT CANARY: available=%d oneShot=1",
+           g_coreOwnedInputAssignFunction != nullptr);
     Wh_Log(L"MESH OWN BACKDROP PROBE: available=%d attached=0",
            g_coreOwnedBackdropProbeReady.load(std::memory_order_acquire));
     Wh_Log(L"MESH MATERIAL PIPELINE OBSERVER: blur=%d intermediate=%d readOnly=1",
