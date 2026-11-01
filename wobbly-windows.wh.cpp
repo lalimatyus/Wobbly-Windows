@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.348
+// @version         0.349
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4351,6 +4351,105 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
     return inputBound;
 }
 
+static void* AcquireCoreBackdropMaterialInput(CoreMaterialObservation* observation,
+                                             const CoreBackdropSnapshot& hit, void* image, void* output)
+{
+    struct RestoreBridgeFlag
+    {
+        bool previous = g_coreBackdropBridgeInCall;
+        ~RestoreBridgeFlag() { g_coreBackdropBridgeInCall = previous; }
+    } restore;
+    const wchar_t* reason = observation->bridgeContext ? L"SourcePath" : L"MissingContext";
+    void* selected = nullptr;
+    std::uint64_t lastUseAge = 0;
+    void* notReadySource = nullptr; // Borrowed only within this callback.
+    if (hit.valid && hit.image == image && hit.desktopValid && hit.scene.frameKnown &&
+        hit.root == g_coreMaterialSourceRoot.load(std::memory_order_acquire))
+    {
+        reason = L"DesktopUnavailable";
+        for (unsigned i = 0; i < hit.alternateCount; ++i)
+        {
+            const auto& candidate = hit.alternates[i];
+            const auto& scene = candidate.scene;
+            if (ReadPointerMember(candidate.tree, 0) != g_coreDesktopTreeVtable) continue;
+            if (scene.treeRoot != candidate.root)
+                { reason = L"DesktopRoot"; continue; }
+            if (!scene.frameKnown || scene.currentFrame != hit.scene.currentFrame ||
+                scene.lastUsedFrame > scene.currentFrame)
+                { reason = L"DesktopClock"; continue; }
+            if (scene.effectReady != 1)
+                { reason = L"EffectNotReady"; notReadySource = candidate.image; continue; }
+            if (selected) { selected = nullptr; reason = L"AmbiguousDesktop"; break; }
+            selected = candidate.image;
+            lastUseAge = scene.frameAge;
+        }
+    }
+    if (selected)
+    {
+        const void* targetInfo = g_coreCurrentTargetInfoFunction(
+            static_cast<const BYTE*>(observation->bridgeContext) + 0x18);
+        // +7C0 is a last-use stamp, not the age of rendered pixels. Native
+        // HasValidRenderingRealization also checks RequiresRendering, the target,
+        // device status and cache invalidation; idle caches can remain valid.
+        if (!targetInfo || !g_coreBackdropRealizationFunction(selected, targetInfo))
+        {
+            notReadySource = selected;
+            selected = nullptr;
+            reason = L"RenderTargetNotReady";
+        }
+    }
+    if (observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
+        g_unloading.load(std::memory_order_acquire))
+    {
+        selected = nullptr;
+        reason = L"TargetRetired";
+    }
+    if (!selected)
+    {
+        observation->fallbackRenderingValid = -1;
+        const auto lastLog = g_coreBackdropFallbackLogAt.load(std::memory_order_relaxed);
+        if (notReadySource && reason == std::wstring_view(L"EffectNotReady") &&
+            (!lastLog || GetTickCount64() - lastLog >= 1000) &&
+            observation->bridgeEpoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
+        {
+            const void* targetInfo = g_coreCurrentTargetInfoFunction(
+                static_cast<const BYTE*>(observation->bridgeContext) + 0x18);
+            observation->fallbackRenderingValid = targetInfo
+                ? static_cast<int>(g_coreBackdropRealizationFunction(notReadySource, targetInfo)) : -1;
+        }
+        ++observation->fallbacks;
+        observation->fallbackReason = reason;
+        void* result = g_coreBackdropEffectInputOriginal(image, output);
+        if (notReadySource && (reason == std::wstring_view(L"EffectNotReady") ||
+                               reason == std::wstring_view(L"RenderTargetNotReady")) &&
+            RunCoreOwnedBackdropProbe(*observation, notReadySource, hit.currentVisual, result))
+        {
+            --observation->fallbacks;
+            if (observation == CurrentCoreMaterialObservation())
+                RememberCoreOwnedInput(*observation, ReadCoreMaterialInputIdentity(result));
+        }
+        return result;
+    }
+
+    // The native factory constructs EffectInput and owns its normal references.
+    // No structure copy, context-field swap or client/server image cast occurs.
+    g_coreBackdropBridgeInCall = true;
+    void* result = g_coreBackdropEffectInputOriginal(selected, output);
+    g_coreBackdropBridgeInCall = restore.previous;
+    if (observation == CurrentCoreMaterialObservation())
+        RememberCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(result));
+    if (!g_coreBackdropBridgeLogged.load(std::memory_order_relaxed) &&
+        !g_coreBackdropBridgeLogged.exchange(true, std::memory_order_relaxed))
+        Wh_Log(L"MESH ACRYLIC ACTIVE: HWND=%p nativeDesktopInput=1",
+               g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
+    if (lastUseAge > 1 && !g_coreBackdropReuseLogged.load(std::memory_order_relaxed) &&
+        !g_coreBackdropReuseLogged.exchange(true, std::memory_order_relaxed))
+        Wh_Log(L"MESH ACRYLIC CACHE REUSE: HWND=%p lastUseAge=%llu nativeValid=1",
+               g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
+               static_cast<unsigned long long>(lastUseAge));
+    return result;
+}
+
 // The size/context belong to this graph call, never to a later frame. A nested
 // graph always shadows the outer request, including unrelated native rendering.
 struct CoreForegroundRequest
@@ -4485,6 +4584,9 @@ struct CoreBackdropLiveSource
     CoreBackdropAffine sampling = {};
     bool initialized = false, ready = false;
     const wchar_t* stage = L"Unavailable";
+    const wchar_t* acquisition = L"direct";
+    bool ownedBudget = false;
+    unsigned ownedAttempts = 0;
     ~CoreBackdropLiveSource() { if (initialized) g_coreOwnedInputDestroyFunction(input); }
 };
 
@@ -4517,19 +4619,42 @@ static bool BuildCoreBackdropLiveSampling(const CoreMaterialInputMetadata& metad
 
 static void PrepareCoreBackdropLiveSource(CoreBackdropLiveSource& source, CoreMaterialObservation& observation,
                                          const CoreForegroundRequest& request, void* image,
-                                         const CoreBackdropTargetState& state, CoreMaterialSizeF target)
+                                         const CoreBackdropTargetState& state, CoreMaterialSizeF target, const CoreBackdropSnapshot& hit)
 {
     if (!g_coreBackdropLiveCopyReady.load(std::memory_order_acquire)) return;
     source.stage = L"NotReady";
-    if (!IsCurrentCoreForegroundRequest(request, observation) ||
-        !g_coreBackdropRealizationFunction(image, state.targetInfo)) return;
-    source.stage = L"Input";
+    if (!IsCurrentCoreForegroundRequest(request, observation)) return;
+    const bool directReady = g_coreBackdropRealizationFunction(image, state.targetInfo);
+    source.acquisition = directReady ? L"direct" : L"material-bridge";
+    source.ownedBudget = g_coreOwnedRenderBudget != nullptr;
+    const unsigned attemptsBefore = observation.ownedAttempts;
+    source.stage = L"Acquire";
     source.initialized = true;
-    void* result = g_coreBackdropEffectInputOriginal(image, source.input);
+    void* result = directReady ? g_coreBackdropEffectInputOriginal(image, source.input)
+        : AcquireCoreBackdropMaterialInput(&observation, hit, image, source.input);
+    source.ownedAttempts = observation.ownedAttempts - attemptsBefore;
     if (result != source.input || !IsCurrentCoreForegroundRequest(request, observation)) return;
+    source.stage = L"Input";
     const auto metadata = ReadCoreMaterialInputMetadata(source.input);
     if (!metadata.readable || source.input[0x10] != 0 || source.input[0x2D] != 0 ||
         !ReadPointerMember(source.input, 8)) return;
+    void* realizedImage = image;
+    if (!directReady)
+    {
+        // Resolve only the factory's exact native BVI interface pair. The input
+        // owns both references; no guessed image scan or readiness bypass.
+        source.stage = L"Identity";
+        const auto identity = ReadCoreMaterialInputIdentity(source.input);
+        const auto realization = reinterpret_cast<uintptr_t>(identity.brush);
+        if (realization < 0x48) return;
+        realizedImage = reinterpret_cast<void*>(realization - 0x48);
+        if (!IsReadableMemory(realizedImage, 0x7E8) ||
+            ReadPointerMember(realizedImage, 0) != g_coreBackdropImageVtable ||
+            identity.bitmap != static_cast<BYTE*>(realizedImage) + 0x7E0) return;
+    }
+    source.stage = L"NotReady";
+    if (!g_coreBackdropRealizationFunction(realizedImage, state.targetInfo) ||
+        !IsCurrentCoreForegroundRequest(request, observation)) return;
     source.stage = L"Size";
     if (g_coreBackdropBitmapSize(source.input, &source.size) != &source.size ||
         !IsCurrentCoreForegroundRequest(request, observation)) return;
@@ -4542,7 +4667,7 @@ static void PrepareCoreBackdropLiveSource(CoreBackdropLiveSource& source, CoreMa
 // S_OK: diagnostic bitmap moved to input; S_FALSE: transparent input unchanged.
 // A rejected managed conversion returns E_FAIL so the caller uses native fallback.
 static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
-                                    const CoreForegroundRequest& request, void* image, void* input)
+                                    const CoreForegroundRequest& request, void* image, void* input, const CoreBackdropSnapshot& hit)
 {
     if (!g_coreBackdropTargetReady.load(std::memory_order_acquire) ||
         !IsCurrentCoreForegroundRequest(request, observation)) return S_FALSE;
@@ -4577,7 +4702,7 @@ static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
     const CoreMaterialSizeF size = {std::min(request.size.width, 64.0f),
                                    std::min(request.size.height, 64.0f)};
     CoreBackdropLiveSource live;
-    if (preview) PrepareCoreBackdropLiveSource(live, observation, request, image, before, size);
+    if (preview) PrepareCoreBackdropLiveSource(live, observation, request, image, before, size, hit);
     if (!IsCurrentCoreForegroundRequest(request, observation)) return S_FALSE;
     void* bitmap = nullptr;
     const long push = g_coreBackdropPushTarget(request.context, &tag, &size, displayId, 3, &bitmap);
@@ -4672,10 +4797,11 @@ static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
         (drawAttempted && (transform < 0 || drawing < 0)))
     {
         Wh_Log(L"MESH BACKDROP LIVE SOURCE: stage=%s ready=%d copied=%d sourceSize=%ux%u "
-               L"sampling=(%.6g,%.6g,%.6g,%.6g,%.6g,%.6g) sourceLease=render-call target=64x64",
+               L"sampling=(%.6g,%.6g,%.6g,%.6g,%.6g,%.6g) acquisition=%s ownedBudget=%d ownedAttempts=%u "
+               L"sourceLease=render-call target=64x64",
                live.stage, live.ready, liveCopied, live.size.width, live.size.height,
                live.sampling.m11, live.sampling.m12, live.sampling.m21, live.sampling.m22,
-               live.sampling.dx, live.sampling.dy);
+               live.sampling.dx, live.sampling.dy, live.acquisition, live.ownedBudget, live.ownedAttempts);
         Wh_Log(L"MESH BACKDROP DRAW: attempted=%d transform=0x%08X result=0x%08X drawCalls=%u "
                L"transformPopped=%d restored=%d attached=0 pixelReadback=0",
                drawAttempted, static_cast<unsigned>(transform), static_cast<unsigned>(drawing),
@@ -4750,7 +4876,7 @@ static bool TryCoreForegroundInput(CoreMaterialObservation& observation,
         return false;
     }
 
-    const long preview = ProbeCoreBackdropTarget(observation, *request, image, scope.input);
+    const long preview = ProbeCoreBackdropTarget(observation, *request, image, scope.input, hit);
     if (preview < 0) return false;
     if (!IsCurrentCoreForegroundRequest(*request, observation)) return false;
     result = g_coreBackdropEffectInputOriginal(image, output);
@@ -4783,95 +4909,7 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
     void* foregroundResult = nullptr;
     if (TryCoreForegroundInput(*observation, hit, image, output, foregroundResult))
         return foregroundResult;
-    const wchar_t* reason = observation->bridgeContext ? L"SourcePath" : L"MissingContext";
-    void* selected = nullptr;
-    std::uint64_t lastUseAge = 0;
-    void* notReadySource = nullptr; // Borrowed only within this callback.
-    if (hit.valid && hit.image == image && hit.desktopValid && hit.scene.frameKnown &&
-        hit.root == g_coreMaterialSourceRoot.load(std::memory_order_acquire))
-    {
-        reason = L"DesktopUnavailable";
-        for (unsigned i = 0; i < hit.alternateCount; ++i)
-        {
-            const auto& candidate = hit.alternates[i];
-            const auto& scene = candidate.scene;
-            if (ReadPointerMember(candidate.tree, 0) != g_coreDesktopTreeVtable) continue;
-            if (scene.treeRoot != candidate.root)
-                { reason = L"DesktopRoot"; continue; }
-            if (!scene.frameKnown || scene.currentFrame != hit.scene.currentFrame ||
-                scene.lastUsedFrame > scene.currentFrame)
-                { reason = L"DesktopClock"; continue; }
-            if (scene.effectReady != 1)
-                { reason = L"EffectNotReady"; notReadySource = candidate.image; continue; }
-            if (selected) { selected = nullptr; reason = L"AmbiguousDesktop"; break; }
-            selected = candidate.image;
-            lastUseAge = scene.frameAge;
-        }
-    }
-    if (selected)
-    {
-        const void* targetInfo = g_coreCurrentTargetInfoFunction(
-            static_cast<const BYTE*>(observation->bridgeContext) + 0x18);
-        // +7C0 is a last-use stamp, not the age of rendered pixels. Native
-        // HasValidRenderingRealization also checks RequiresRendering, the target,
-        // device status and cache invalidation; idle caches can remain valid.
-        if (!targetInfo || !g_coreBackdropRealizationFunction(selected, targetInfo))
-        {
-            notReadySource = selected;
-            selected = nullptr;
-            reason = L"RenderTargetNotReady";
-        }
-    }
-    if (observation->bridgeEpoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire) ||
-        g_unloading.load(std::memory_order_acquire))
-    {
-        selected = nullptr;
-        reason = L"TargetRetired";
-    }
-    if (!selected)
-    {
-        observation->fallbackRenderingValid = -1;
-        const auto lastLog = g_coreBackdropFallbackLogAt.load(std::memory_order_relaxed);
-        if (notReadySource && reason == std::wstring_view(L"EffectNotReady") &&
-            (!lastLog || GetTickCount64() - lastLog >= 1000) &&
-            observation->bridgeEpoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire))
-        {
-            const void* targetInfo = g_coreCurrentTargetInfoFunction(
-                static_cast<const BYTE*>(observation->bridgeContext) + 0x18);
-            observation->fallbackRenderingValid = targetInfo
-                ? static_cast<int>(g_coreBackdropRealizationFunction(notReadySource, targetInfo)) : -1;
-        }
-        ++observation->fallbacks;
-        observation->fallbackReason = reason;
-        void* result = g_coreBackdropEffectInputOriginal(image, output);
-        if (notReadySource && (reason == std::wstring_view(L"EffectNotReady") ||
-                               reason == std::wstring_view(L"RenderTargetNotReady")) &&
-            RunCoreOwnedBackdropProbe(*observation, notReadySource, hit.currentVisual, result))
-        {
-            --observation->fallbacks;
-            if (observation == CurrentCoreMaterialObservation())
-                RememberCoreOwnedInput(*observation, ReadCoreMaterialInputIdentity(result));
-        }
-        return result;
-    }
-
-    // The native factory constructs EffectInput and owns its normal references.
-    // No structure copy, context-field swap or client/server image cast occurs.
-    g_coreBackdropBridgeInCall = true;
-    void* result = g_coreBackdropEffectInputOriginal(selected, output);
-    g_coreBackdropBridgeInCall = false;
-    if (observation == CurrentCoreMaterialObservation())
-        RememberCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(result));
-    if (!g_coreBackdropBridgeLogged.load(std::memory_order_relaxed) &&
-        !g_coreBackdropBridgeLogged.exchange(true, std::memory_order_relaxed))
-        Wh_Log(L"MESH ACRYLIC ACTIVE: HWND=%p nativeDesktopInput=1",
-               g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
-    if (lastUseAge > 1 && !g_coreBackdropReuseLogged.load(std::memory_order_relaxed) &&
-        !g_coreBackdropReuseLogged.exchange(true, std::memory_order_relaxed))
-        Wh_Log(L"MESH ACRYLIC CACHE REUSE: HWND=%p lastUseAge=%llu nativeValid=1",
-               g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
-               static_cast<unsigned long long>(lastUseAge));
-    return result;
+    return AcquireCoreBackdropMaterialInput(observation, hit, image, output);
 }
 
 
