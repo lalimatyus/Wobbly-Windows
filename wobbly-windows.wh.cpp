@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.344
+// @version         0.345
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3549,6 +3549,21 @@ static_assert(sizeof(CoreResourceTag) == 16);
 using CoreBackdropGetTag_t = void*(__cdecl*)(const void*, CoreResourceTag*);
 using CoreBackdropPushTarget_t = long(__cdecl*)(void*, const CoreResourceTag*, const CoreMaterialSizeF*, unsigned int, int, void**);
 using CoreBackdropPopLayer_t = long(__cdecl*)(void*);
+struct CoreBackdropRect { float left, top, right, bottom; };
+struct CoreBackdropColor { float red, green, blue, alpha; };
+// Native gsl::span uses count first, unlike std::span.
+struct CoreBackdropRectSpan { size_t count; const CoreBackdropRect* data; };
+static_assert(sizeof(CoreBackdropRect) == 16 && sizeof(CoreBackdropColor) == 16);
+static_assert(offsetof(CoreBackdropColor, alpha) == 12);
+static_assert(sizeof(CoreBackdropRectSpan) == 16 && offsetof(CoreBackdropRectSpan, data) == 8);
+using CoreBackdropFill_t = long(__cdecl*)(void*, const CoreBackdropRectSpan*, const CoreBackdropColor*);
+using CoreBackdropPushTransform_t = long(__cdecl*)(void*, const void*, const void*, bool, bool);
+using CoreBackdropPopTransform_t = void(__cdecl*)(void*, bool);
+CoreBackdropFill_t g_coreBackdropFill = nullptr;
+CoreBackdropPushTransform_t g_coreBackdropPushTransform = nullptr;
+CoreBackdropPopTransform_t g_coreBackdropPopTransform = nullptr;
+void* g_coreBackdropIdentity = nullptr;
+std::atomic_bool g_coreBackdropDrawReady = false;
 CoreBackdropGetTag_t g_coreBackdropGetTag = nullptr;
 CoreBackdropPushTarget_t g_coreBackdropPushTarget = nullptr;
 CoreBackdropPopLayer_t g_coreBackdropPopLayer = nullptr;
@@ -4373,7 +4388,7 @@ static bool IsCurrentCoreForegroundRequest(const CoreForegroundRequest& request,
 struct CoreBackdropTargetState
 {
     void* deviceTarget = nullptr;
-    unsigned layerRecords = 0, layers = 0;
+    unsigned layerRecords = 0, layers = 0, transforms = 0, worldTransforms = 0;
     BYTE targetInfo[24] = {};
 };
 
@@ -4384,9 +4399,12 @@ static bool ReadCoreBackdropTargetState(void* context, CoreBackdropTargetState& 
     if (!IsReadableMemory(info, sizeof(state.targetInfo))) return false;
     state.deviceTarget = ReadPointerMember(context, 0x20);
     std::memcpy(&state.layerRecords, static_cast<const BYTE*>(context) + 0x170, sizeof(state.layerRecords));
+    std::memcpy(&state.transforms, static_cast<const BYTE*>(context) + 0x190, sizeof(state.transforms));
+    std::memcpy(&state.worldTransforms, static_cast<const BYTE*>(context) + 0x1B0, sizeof(state.worldTransforms));
     std::memcpy(&state.layers, static_cast<const BYTE*>(context) + 0x208, sizeof(state.layers));
     std::memcpy(state.targetInfo, info, sizeof(state.targetInfo));
-    return state.deviceTarget && state.layerRecords < 4096 && state.layers < 4096;
+    return state.deviceTarget && state.layerRecords < 4096 && state.layers < 4096 &&
+        state.transforms < 4096 && state.worldTransforms < 4096;
 }
 
 static unsigned CoreBackdropTargetInfoDiff(const CoreBackdropTargetState& before,
@@ -4403,9 +4421,11 @@ static bool CoreBackdropTargetRestored(const CoreBackdropTargetState& before,
 {
     // Native GetRenderTargetInfo writes bytes 0..20, ending with a bool at +14.
     // UpdateRenderTargetInfo copies all 24 bytes, including 3 undefined padding
-    // bytes. Keep exact comparisons for ALL value fields and both layer counts.
+    // bytes. Compare every value field and the layer/transform stack counts.
     return before.deviceTarget == after.deviceTarget && before.layerRecords == after.layerRecords &&
-        before.layers == after.layers && (CoreBackdropTargetInfoDiff(before, after) & 0x1FFFFFu) == 0;
+        before.layers == after.layers && before.transforms == after.transforms &&
+        before.worldTransforms == after.worldTransforms &&
+        (CoreBackdropTargetInfoDiff(before, after) & 0x1FFFFFu) == 0;
 }
 
 static void ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
@@ -4436,6 +4456,33 @@ static void ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
     void* bitmap = nullptr;
     const long push = g_coreBackdropPushTarget(request.context, &tag, &size, displayId, 3, &bitmap);
     const bool created = bitmap != nullptr;
+    long transform = S_FALSE, drawing = S_FALSE;
+    unsigned drawCalls = 0;
+    bool drawAttempted = false, transformPopped = false;
+    if (push >= 0 && created && g_coreBackdropDrawReady.load(std::memory_order_acquire) &&
+        IsCurrentCoreForegroundRequest(request, observation))
+    {
+        drawAttempted = true;
+        // Match the native offscreen caller: replace the current transform with
+        // the actual native identity object, push a record, then pop it once.
+        transform = g_coreBackdropPushTransform(request.context, nullptr, g_coreBackdropIdentity, false, true);
+        if (transform >= 0)
+        {
+            const CoreBackdropRect rectangles[] = {{0, 0, size.width * 0.5f, size.height},
+                                                   {size.width * 0.5f, 0, size.width, size.height}};
+            const CoreBackdropColor colors[] = {{0.25f, 0.5f, 0.75f, 1}, {0.25f, 0.125f, 0, 0.5f}};
+            for (unsigned i = 0; i < 2 && IsCurrentCoreForegroundRequest(request, observation); ++i)
+            {
+                const CoreBackdropRectSpan span{1, &rectangles[i]};
+                drawing = g_coreBackdropFill(request.context, &span, &colors[i]);
+                ++drawCalls;
+                if (drawing < 0) break;
+            }
+            // Retirement/unload can stop further drawing, never this cleanup.
+            g_coreBackdropPopTransform(request.context, true);
+            transformPopped = true;
+        }
+    }
     // A successful native push always owns one matching pop, even if the target
     // retires or unload starts during the call. Never retain this bitmap/frame.
     const long pop = push >= 0 ? g_coreBackdropPopLayer(request.context) : S_OK;
@@ -4449,7 +4496,16 @@ static void ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
         bitmap = nullptr; // The native destructor need not clear its stack slot.
     }
     if (pop < 0 || !restored || (push >= 0 && !created))
+    {
         g_coreBackdropTargetReady.store(false, std::memory_order_release);
+        g_coreBackdropDrawReady.store(false, std::memory_order_release);
+    }
+    if (drawAttempted && (transform < 0 || drawing < 0))
+        g_coreBackdropDrawReady.store(false, std::memory_order_release);
+    Wh_Log(L"MESH BACKDROP DRAW: attempted=%d transform=0x%08X result=0x%08X drawCalls=%u "
+           L"transformPopped=%d restored=%d attached=0 pixelReadback=0",
+           drawAttempted, static_cast<unsigned>(transform), static_cast<unsigned>(drawing),
+           drawCalls, transformPopped, restored);
     Wh_Log(L"MESH BACKDROP TARGET: stage=PushPop result=0x%08X pop=0x%08X created=%d "
            L"restored=%d released=%d size=%.0fx%.0f attached=0 replacementBlur=0",
            static_cast<unsigned>(push), static_cast<unsigned>(pop), created, restored,
@@ -4458,10 +4514,11 @@ static void ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
     std::memcpy(beforeWords, before.targetInfo, sizeof(beforeWords));
     std::memcpy(afterWords, after.targetInfo, sizeof(afterWords));
     Wh_Log(L"MESH BACKDROP TARGET STATE: readable=%d targetSame=%d records=%u/%u layers=%u/%u "
-           L"infoSame=%d paddingOnly=%d infoDiff=0x%06X "
+           L"transforms=%u/%u worldTransforms=%u/%u infoSame=%d paddingOnly=%d infoDiff=0x%06X "
            L"before=(%08X,%08X,%08X,%08X,%08X,%u) after=(%08X,%08X,%08X,%08X,%08X,%u)",
            afterReadable, before.deviceTarget == after.deviceTarget,
            before.layerRecords, after.layerRecords, before.layers, after.layers,
+           before.transforms, after.transforms, before.worldTransforms, after.worldTransforms,
            (infoDiff & 0x1FFFFFu) == 0, infoDiff != 0 && (infoDiff & 0x1FFFFFu) == 0, infoDiff,
            beforeWords[0], beforeWords[1], beforeWords[2], beforeWords[3], beforeWords[4],
            static_cast<unsigned>(before.targetInfo[0x14]),
@@ -4825,6 +4882,16 @@ static void InitializeCoreMaterialBridge()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
+        {{L"public: long __cdecl CDrawingContext::FillRectanglesWithSolidColor("
+           L"class gsl::span<struct MilRectF const ,-1> const &,struct _D3DCOLORVALUE const &)"},
+         &g_coreBackdropFill, nullptr, true},
+        {{L"protected: long __cdecl CDrawingContext::PushTransformInternal("
+           L"class CVisual const *,class CMILMatrix const *,bool,bool)"},
+         &g_coreBackdropPushTransform, nullptr, true},
+        {{L"protected: void __cdecl CDrawingContext::PopTransformInternal(bool)"},
+         &g_coreBackdropPopTransform, nullptr, true},
+        {{L"public: static class CMILMatrix_IdentityType const CMILMatrix::Identity"},
+         &g_coreBackdropIdentity, nullptr, true},
         {{L"public: long __cdecl CDrawingContext::PushOffScreenRenderingLayer(class CResourceTag const &,"
            L"struct D2D_SIZE_F const &,class DisplayId,enum CacheMode::Enum,class IRenderTargetBitmap * *)"},
          &g_coreBackdropPushTarget, nullptr, true},
@@ -5025,6 +5092,24 @@ static void InitializeCoreMaterialBridge()
         !std::memcmp(reinterpret_cast<void*>(g_coreBackdropPopLayer), popPrefix, sizeof(popPrefix)) &&
         !std::memcmp(reinterpret_cast<void*>(g_coreBackdropGetTag), tagPrefix, sizeof(tagPrefix));
     g_coreBackdropTargetReady.store(targetAbi, std::memory_order_release);
+    const BYTE fillPrefix[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x55,0x57,0x41,0x56};
+    const BYTE transformPrefix[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x48,0x89,0x7C,0x24,0x18};
+    const BYTE popTransformPrefix[] = {0x48,0x83,0xEC,0x38,0x4C,0x8B,0xC1,0x84,0xD2};
+    const bool drawAbi = targetAbi &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropFill) == base + 0x12EE9C &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropPushTransform) == base + 0x484D0 &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropPopTransform) == base + 0xE3560 &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropIdentity) == base + 0x3E4F00 &&
+        IsReadableMemory(g_coreBackdropIdentity, 0x44) &&
+        IsReadableMemory(reinterpret_cast<void*>(g_coreBackdropFill), sizeof(fillPrefix)) &&
+        IsReadableMemory(reinterpret_cast<void*>(g_coreBackdropPushTransform), sizeof(transformPrefix)) &&
+        IsReadableMemory(reinterpret_cast<void*>(g_coreBackdropPopTransform), sizeof(popTransformPrefix)) &&
+        !std::memcmp(reinterpret_cast<void*>(g_coreBackdropFill), fillPrefix, sizeof(fillPrefix)) &&
+        !std::memcmp(reinterpret_cast<void*>(g_coreBackdropPushTransform), transformPrefix, sizeof(transformPrefix)) &&
+        !std::memcmp(reinterpret_cast<void*>(g_coreBackdropPopTransform), popTransformPrefix, sizeof(popTransformPrefix));
+    g_coreBackdropDrawReady.store(drawAbi, std::memory_order_release);
+    Wh_Log(L"MESH BACKDROP DRAW PROBE: ready=%d rectangles=2 attached=0 pixelReadback=0",
+           g_coreBackdropDrawReady.load(std::memory_order_acquire));
     Wh_Log(L"MESH BACKDROP TARGET PROBE: ready=%d size=64x64 oncePerSource=1 attached=0",
            g_coreBackdropTargetReady.load(std::memory_order_acquire));
     if (reinterpret_cast<uintptr_t>(g_coreOwnedInputAssignFunction) != base + 0x930B8)
