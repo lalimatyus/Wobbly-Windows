@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.343
+// @version         0.344
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4389,6 +4389,25 @@ static bool ReadCoreBackdropTargetState(void* context, CoreBackdropTargetState& 
     return state.deviceTarget && state.layerRecords < 4096 && state.layers < 4096;
 }
 
+static unsigned CoreBackdropTargetInfoDiff(const CoreBackdropTargetState& before,
+                                           const CoreBackdropTargetState& after)
+{
+    unsigned difference = 0;
+    for (unsigned i = 0; i < sizeof(before.targetInfo); ++i)
+        if (before.targetInfo[i] != after.targetInfo[i]) difference |= 1u << i;
+    return difference;
+}
+
+static bool CoreBackdropTargetRestored(const CoreBackdropTargetState& before,
+                                       const CoreBackdropTargetState& after)
+{
+    // Native GetRenderTargetInfo writes bytes 0..20, ending with a bool at +14.
+    // UpdateRenderTargetInfo copies all 24 bytes, including 3 undefined padding
+    // bytes. Keep exact comparisons for ALL value fields and both layer counts.
+    return before.deviceTarget == after.deviceTarget && before.layerRecords == after.layerRecords &&
+        before.layers == after.layers && (CoreBackdropTargetInfoDiff(before, after) & 0x1FFFFFu) == 0;
+}
+
 static void ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
                                     const CoreForegroundRequest& request, void* image)
 {
@@ -4421,9 +4440,9 @@ static void ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
     // retires or unload starts during the call. Never retain this bitmap/frame.
     const long pop = push >= 0 ? g_coreBackdropPopLayer(request.context) : S_OK;
     CoreBackdropTargetState after;
-    const bool restored = ReadCoreBackdropTargetState(request.context, after) &&
-        before.deviceTarget == after.deviceTarget && before.layerRecords == after.layerRecords &&
-        before.layers == after.layers && !std::memcmp(before.targetInfo, after.targetInfo, sizeof(before.targetInfo));
+    const bool afterReadable = ReadCoreBackdropTargetState(request.context, after);
+    const unsigned infoDiff = CoreBackdropTargetInfoDiff(before, after);
+    const bool restored = afterReadable && CoreBackdropTargetRestored(before, after);
     if (bitmap)
     {
         g_coreOwnedBitmapDestroyFunction(&bitmap);
@@ -4435,6 +4454,19 @@ static void ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
            L"restored=%d released=%d size=%.0fx%.0f attached=0 replacementBlur=0",
            static_cast<unsigned>(push), static_cast<unsigned>(pop), created, restored,
            bitmap == nullptr, size.width, size.height);
+    unsigned beforeWords[5] = {}, afterWords[5] = {};
+    std::memcpy(beforeWords, before.targetInfo, sizeof(beforeWords));
+    std::memcpy(afterWords, after.targetInfo, sizeof(afterWords));
+    Wh_Log(L"MESH BACKDROP TARGET STATE: readable=%d targetSame=%d records=%u/%u layers=%u/%u "
+           L"infoSame=%d paddingOnly=%d infoDiff=0x%06X "
+           L"before=(%08X,%08X,%08X,%08X,%08X,%u) after=(%08X,%08X,%08X,%08X,%08X,%u)",
+           afterReadable, before.deviceTarget == after.deviceTarget,
+           before.layerRecords, after.layerRecords, before.layers, after.layers,
+           (infoDiff & 0x1FFFFFu) == 0, infoDiff != 0 && (infoDiff & 0x1FFFFFu) == 0, infoDiff,
+           beforeWords[0], beforeWords[1], beforeWords[2], beforeWords[3], beforeWords[4],
+           static_cast<unsigned>(before.targetInfo[0x14]),
+           afterWords[0], afterWords[1], afterWords[2], afterWords[3], afterWords[4],
+           static_cast<unsigned>(after.targetInfo[0x14]));
 }
 
 
