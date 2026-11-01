@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.339
+// @version         0.340
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3540,7 +3540,15 @@ CoreOwnedImageValidate_t g_coreOwnedImageValidateFunction = nullptr;
 CoreOwnedImageRelease_t g_coreOwnedImageReleaseFunction = nullptr;
 CoreOwnedStorageDestroy_t g_coreOwnedBitmapDestroyFunction = nullptr, g_coreOwnedInputDestroyFunction = nullptr;
 std::atomic_bool g_coreOwnedBackdropProbeReady = false;
-std::atomic<ULONGLONG> g_coreOwnedBackdropProbeEpoch = UINT64_MAX;
+struct CoreOwnedRenderBudget
+{
+    ULONGLONG epoch = 0;
+    unsigned attempts = 0, binds = 0, blur = 0, intermediate = 0;
+    double pixels = 0, micros = 0;
+};
+thread_local CoreOwnedRenderBudget* g_coreOwnedRenderBudget = nullptr;
+std::atomic<ULONGLONG> g_coreOwnedTraceAt = 0, g_coreOwnedSummaryAt = 0;
+LONGLONG g_coreOwnedCounterFrequency = 0;
 using CoreOwnedImageRetain_t = void(__cdecl*)(void*, void*);
 using CoreOwnedRegister_t = void(__cdecl*)(void*, const void*, void*);
 CoreOwnedImageRetain_t g_coreOwnedImageRetainFunction = nullptr;
@@ -3602,7 +3610,8 @@ static void ClearCoreMaterialTarget()
     g_coreBackdropReuseLogged.store(false, std::memory_order_relaxed);
     g_coreBackdropFallbackLogAt.store(0, std::memory_order_relaxed);
     g_coreMaterialPipelineLogAt.store(0, std::memory_order_relaxed);
-    g_coreOwnedBackdropProbeEpoch.store(UINT64_MAX, std::memory_order_relaxed);
+    g_coreOwnedTraceAt.store(0, std::memory_order_relaxed);
+    g_coreOwnedSummaryAt.store(0, std::memory_order_relaxed);
     g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
 }
@@ -3834,6 +3843,10 @@ struct CoreMaterialObservation
     unsigned inputCount = 0, blurCalls = 0, materialBlurCalls = 0;
     unsigned intermediateCalls = 0, materialIntermediateCalls = 0;
     CoreMaterialInputMetadata blurInput, blurOutput;
+    void* ownedAttemptedSources[4] = {};
+    unsigned ownedAttempts = 0, ownedInputCount = 0, ownedBlur = 0, ownedIntermediate = 0;
+    CoreMaterialInputIdentity ownedInputs[8] = {};
+    double ownedMicros = 0;
 };
 thread_local CoreMaterialObservation* g_coreMaterialObservation = nullptr;
 thread_local unsigned g_coreMaterialRealizeDepth = 0;
@@ -3891,12 +3904,30 @@ static CoreMaterialInputMetadata ReadCoreMaterialInputMetadata(const void* input
     return metadata;
 }
 
+static bool IsCoreOwnedInput(const CoreMaterialObservation& observation, CoreMaterialInputIdentity input)
+{
+    if (!input.bitmap && !input.brush) return false;
+    for (unsigned i = 0; i < observation.ownedInputCount; ++i)
+        if (observation.ownedInputs[i].bitmap == input.bitmap && observation.ownedInputs[i].brush == input.brush)
+            return true;
+    return false;
+}
+
+static void RememberCoreOwnedInput(CoreMaterialObservation& observation, CoreMaterialInputIdentity input)
+{
+    RememberCoreMaterialInput(observation, input);
+    if ((!input.bitmap && !input.brush) || IsCoreOwnedInput(observation, input) ||
+        observation.ownedInputCount == ARRAYSIZE(observation.ownedInputs)) return;
+    observation.ownedInputs[observation.ownedInputCount++] = input;
+}
+
 static long __cdecl CoreExecuteBlurHook(void* technique, void* context,
                                        const void* input, const void* amount, void* output)
 {
     auto* observation = CurrentCoreMaterialObservation();
     const bool material = observation &&
         IsCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(input));
+    const bool owned = observation && IsCoreOwnedInput(*observation, ReadCoreMaterialInputIdentity(input));
     // Read before forwarding: native callers may alias input and output.
     const auto metadata = material ? ReadCoreMaterialInputMetadata(input)
                                    : CoreMaterialInputMetadata{};
@@ -3904,6 +3935,12 @@ static long __cdecl CoreExecuteBlurHook(void* technique, void* context,
     if (observation && observation == CurrentCoreMaterialObservation())
     {
         ++observation->blurCalls;
+        if (owned && result >= 0)
+        {
+            ++observation->ownedBlur;
+            RememberCoreOwnedInput(*observation, ReadCoreMaterialInputIdentity(output));
+            if (g_coreOwnedRenderBudget) ++g_coreOwnedRenderBudget->blur;
+        }
         if (material)
         {
             ++observation->materialBlurCalls;
@@ -3925,16 +3962,64 @@ static long __cdecl CoreIntermediateBrushHook(void* technique, unsigned int inde
     auto* observation = CurrentCoreMaterialObservation();
     const bool material = observation &&
         IsCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(input));
+    const bool owned = observation && IsCoreOwnedInput(*observation, ReadCoreMaterialInputIdentity(input));
     const long result = g_coreIntermediateBrushOriginal(technique, index, input, output);
     if (observation && observation == CurrentCoreMaterialObservation())
     {
         ++observation->intermediateCalls;
         if (material) ++observation->materialIntermediateCalls;
+        if (owned && result >= 0)
+        {
+            ++observation->ownedIntermediate;
+            if (g_coreOwnedRenderBudget) ++g_coreOwnedRenderBudget->intermediate;
+        }
     }
     return result;
 }
 
 static long __cdecl CoreImageRealizeHook(void*, const void*, void**);
+
+static bool TraceCoreOwnedStream()
+{
+    const auto now = GetTickCount64();
+    auto last = g_coreOwnedTraceAt.load(std::memory_order_relaxed);
+    return (!last || now - last >= 1000) &&
+        g_coreOwnedTraceAt.compare_exchange_strong(last, now, std::memory_order_relaxed);
+}
+
+struct CoreOwnedMeasurement
+{
+    CoreMaterialObservation& observation;
+    CoreOwnedRenderBudget& budget;
+    LARGE_INTEGER start{};
+    CoreOwnedMeasurement(CoreMaterialObservation& value, CoreOwnedRenderBudget& cost)
+        : observation(value), budget(cost)
+    { if (g_coreOwnedCounterFrequency > 0) QueryPerformanceCounter(&start); }
+    ~CoreOwnedMeasurement()
+    {
+        LARGE_INTEGER end{};
+        if (start.QuadPart && QueryPerformanceCounter(&end) && end.QuadPart >= start.QuadPart)
+        {
+            const double micros = (end.QuadPart - start.QuadPart) * 1000000.0 / g_coreOwnedCounterFrequency;
+            observation.ownedMicros += micros;
+            budget.micros += micros;
+        }
+    }
+};
+
+static void LogCoreOwnedRenderBudget(const CoreOwnedRenderBudget& budget)
+{
+    if (!budget.attempts || g_unloading.load(std::memory_order_acquire) ||
+        budget.epoch != g_coreMaterialTargetEpoch.load(std::memory_order_acquire)) return;
+    const auto now = GetTickCount64();
+    auto last = g_coreOwnedSummaryAt.load(std::memory_order_relaxed);
+    if ((!last || now - last >= 1000) &&
+        g_coreOwnedSummaryAt.compare_exchange_strong(last, now, std::memory_order_relaxed))
+        Wh_Log(L"MESH OWN BACKDROP STREAM: HWND=%p attempts=%u binds=%u blur=%u intermediate=%u "
+               L"totalUs=%.1f megapixels=%.2f lifetime=render-call",
+               g_coreMaterialTargetHwnd.load(std::memory_order_acquire), budget.attempts, budget.binds,
+               budget.blur, budget.intermediate, budget.micros, budget.pixels / 1000000.0);
+}
 
 static bool PrepareCoreOwnedInputMapping(void* ownedInput, const void* referenceInput)
 {
@@ -4029,6 +4114,7 @@ struct CoreOwnedBackdropProbeScope
 static bool CoreOwnedProbeCurrent(const CoreMaterialObservation& observation)
 {
     return g_coreOwnedBackdropProbeReady.load(std::memory_order_acquire) &&
+        g_coreOwnedRenderBudget && g_coreOwnedRenderBudget->epoch == observation.bridgeEpoch &&
         !g_unloading.load(std::memory_order_acquire) &&
         observation.bridgeEpoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
         g_coreMaterialCurrentImage &&
@@ -4041,6 +4127,10 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
     if (!CoreOwnedProbeCurrent(observation) || !IsCoreMaterialVisual(owner) ||
         ReadPointerMember(candidate, 0) != g_coreBackdropImageVtable ||
         !IsReadableMemory(static_cast<const BYTE*>(candidate) + 0x7A1, 1)) return false;
+    for (unsigned i = 0; i < observation.ownedAttempts; ++i)
+        if (observation.ownedAttemptedSources[i] == candidate) return false;
+    if (observation.ownedAttempts == ARRAYSIZE(observation.ownedAttemptedSources) ||
+        g_coreOwnedRenderBudget->attempts == 4) return false;
     auto* path = static_cast<BYTE*>(candidate) + 0x700;
     const auto first = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 0));
     const auto last = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 8));
@@ -4064,10 +4154,7 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
     const bool entryMatch = FindExactCoreBackdrop(treeData, path) == candidate;
     if (!ownerMatch || !dataOwnerMatch || !entryMatch)
     {
-        auto skipped = g_coreOwnedBackdropProbeEpoch.load(std::memory_order_relaxed);
-        if (skipped != observation.bridgeEpoch &&
-            g_coreOwnedBackdropProbeEpoch.compare_exchange_strong(skipped, observation.bridgeEpoch,
-                                                                  std::memory_order_relaxed))
+        if (TraceCoreOwnedStream())
             Wh_Log(L"MESH OWN BACKDROP SKIPPED: reason=RegistryEligibility "
                    L"ownerMatch=%d dataOwnerMatch=%d entryMatch=%d attached=0",
                    ownerMatch, dataOwnerMatch, entryMatch);
@@ -4085,11 +4172,13 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
     const void* target = g_coreCurrentTargetInfoFunction(
         static_cast<const BYTE*>(observation.bridgeContext) + 0x18);
     if (nativeMode > 1 || !IsReadableMemory(target, 0x18)) return false;
-    auto tested = g_coreOwnedBackdropProbeEpoch.load(std::memory_order_relaxed);
-    if (tested == observation.bridgeEpoch ||
-        !g_coreOwnedBackdropProbeEpoch.compare_exchange_strong(tested, observation.bridgeEpoch,
-                                                              std::memory_order_relaxed) ||
-        !CoreOwnedProbeCurrent(observation)) return false;
+    auto& budget = *g_coreOwnedRenderBudget;
+    if (budget.pixels + width * height > 33554432 || !CoreOwnedProbeCurrent(observation)) return false;
+    observation.ownedAttemptedSources[observation.ownedAttempts++] = candidate;
+    ++budget.attempts;
+    budget.pixels += width * height;
+    CoreOwnedMeasurement measurement(observation, budget);
+    const bool trace = TraceCoreOwnedStream();
 
     const wchar_t* stage = L"Create";
     long result = E_FAIL;
@@ -4101,7 +4190,7 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
     CoreMaterialInputMetadata ownMetadata, referenceMetadata;
     {
         CoreOwnedBackdropProbeScope scope(&registryRestored);
-        Wh_Log(L"MESH OWN BACKDROP STAGE: Create HWND=%p",
+        if (trace) Wh_Log(L"MESH OWN BACKDROP STAGE: Create HWND=%p",
                g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
         result = g_coreOwnedImageCreateFunction(composition, owner, path, nativeMode != 0, &scope.image);
         if (result >= 0 && !scope.image) result = E_UNEXPECTED;
@@ -4134,7 +4223,7 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
         {
             stage = L"Validate";
             bool changed = false;
-            Wh_Log(L"MESH OWN BACKDROP STAGE: Validate HWND=%p",
+            if (trace) Wh_Log(L"MESH OWN BACKDROP STAGE: Validate HWND=%p",
                    g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
             result = g_coreOwnedImageValidateFunction(scope.image, root, bounds, false, &changed);
             rootMatch = ReadPointerMember(scope.image, 0x90) == root;
@@ -4144,7 +4233,7 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
         if (result >= 0)
         {
             stage = L"Realize";
-            Wh_Log(L"MESH OWN BACKDROP STAGE: Realize HWND=%p",
+            if (trace) Wh_Log(L"MESH OWN BACKDROP STAGE: Realize HWND=%p",
                    g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
             // Use the wrapper too: nested rendering must have its own identity.
             result = CoreImageRealizeHook(scope.image, target, &scope.bitmap);
@@ -4176,18 +4265,19 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
             if (bitmapValid && mappingPrepared && restored && CoreOwnedProbeCurrent(observation) &&
                 g_coreOwnedInputAssignFunction)
             {
-                stage = L"BindCanary";
+                stage = L"Bind";
                 g_coreOwnedInputAssignFunction(referenceInput, scope.input);
                 inputBound = true;
+                ++budget.binds;
             }
         }
     }
-    Wh_Log(L"MESH OWN BACKDROP PROBE: HWND=%p stage=%s result=0x%08X exactType=%d "
+    if (trace) Wh_Log(L"MESH OWN BACKDROP INPUT: HWND=%p stage=%s result=0x%08X exactType=%d "
            L"rootMatch=%d bitmapValid=%d bitmapType=0x%llX mappingMatch=%d "
            L"sourceBounds=(%.1f,%.1f,%.1f,%.1f) ownMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g) "
            L"registryBound=%d registryRestored=%d mappingPrepared=%d inputBound=%d "
            L"refMetadata=%d refBounds=(%.1f,%.1f,%.1f,%.1f) "
-           L"refMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g) oneShot=1 attached=0",
+           L"refMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g) lifetime=render-call attached=0",
            g_coreMaterialTargetHwnd.load(std::memory_order_acquire), stage, result,
            exactType, rootMatch, bitmapValid, static_cast<unsigned long long>(bitmapType), comparableMapping,
            bounds[0], bounds[1], bounds[2], bounds[3],
@@ -4249,6 +4339,7 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
         // device status and cache invalidation; idle caches can remain valid.
         if (!targetInfo || !g_coreBackdropRealizationFunction(selected, targetInfo))
         {
+            notReadySource = selected;
             selected = nullptr;
             reason = L"RenderTargetNotReady";
         }
@@ -4275,14 +4366,13 @@ static void* __cdecl CoreBackdropEffectInputHook(void* image, void* output)
         ++observation->fallbacks;
         observation->fallbackReason = reason;
         void* result = g_coreBackdropEffectInputOriginal(image, output);
-        if (notReadySource && reason == std::wstring_view(L"EffectNotReady") &&
+        if (notReadySource && (reason == std::wstring_view(L"EffectNotReady") ||
+                               reason == std::wstring_view(L"RenderTargetNotReady")) &&
             RunCoreOwnedBackdropProbe(*observation, notReadySource, hit.currentVisual, result))
         {
             --observation->fallbacks;
             if (observation == CurrentCoreMaterialObservation())
-                RememberCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(result));
-            Wh_Log(L"MESH OWN BACKDROP BOUND: HWND=%p oneShot=1 nativeAssignment=1",
-                   g_coreMaterialTargetHwnd.load(std::memory_order_acquire));
+                RememberCoreOwnedInput(*observation, ReadCoreMaterialInputIdentity(result));
         }
         return result;
     }
@@ -4392,7 +4482,8 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
                    L"inputMetadata=%d outputMetadata=%d outputRealization=0x%llX "
                    L"inputBounds=(%.1f,%.1f,%.1f,%.1f) "
                    L"inputMap=(%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g) "
-                   L"outputFlags=0x%X drawDepth=%u validations=%u contextMismatches=%u readOnly=1",
+                   L"outputFlags=0x%X drawDepth=%u validations=%u contextMismatches=%u "
+                   L"ownInputs=%u ownBlur=%u ownIntermediate=%u ownAttempts=%u ownUs=%.1f readOnly=1",
                    g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
                    observation.inputCount, observation.blurCalls, observation.materialBlurCalls,
                    observation.intermediateCalls, observation.materialIntermediateCalls,
@@ -4401,7 +4492,9 @@ static long __cdecl CoreDrawVisualTreeHook(void* context, const void* tree, cons
                    in.bounds[0], in.bounds[1], in.bounds[2], in.bounds[3],
                    in.transform[0], in.transform[1], in.transform[2], in.transform[3],
                    in.transform[4], in.transform[5], in.transform[6], in.transform[7], in.transform[8],
-                   out.flags, observation.drawDepth, observation.validations, observation.contextMismatches);
+                   out.flags, observation.drawDepth, observation.validations, observation.contextMismatches,
+                   observation.ownedInputCount, observation.ownedBlur, observation.ownedIntermediate,
+                   observation.ownedAttempts, observation.ownedMicros);
         }
     }
     if (observation.fallbacks && epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
@@ -4439,7 +4532,13 @@ static long __cdecl CoreImageRealizeHook(void* image, const void* targetInfo, vo
     void* previousImage = g_coreMaterialCurrentImage;
     g_coreMaterialCurrentImage = image;
     ++g_coreMaterialRealizeDepth;
+    CoreOwnedRenderBudget budget;
+    budget.epoch = epoch;
+    auto* previousBudget = g_coreOwnedRenderBudget;
+    g_coreOwnedRenderBudget = observe ? &budget : nullptr;
     const long result = g_coreImageRealizeOriginal(image, targetInfo, bitmap);
+    g_coreOwnedRenderBudget = previousBudget;
+    if (observe) LogCoreOwnedRenderBudget(budget);
     --g_coreMaterialRealizeDepth;
     g_coreMaterialCurrentImage = previousImage;
     bool lostBitmap = false;
@@ -4612,7 +4711,10 @@ static void InitializeCoreMaterialBridge()
         g_coreExecuteBlurFunction, CoreExecuteBlurHook, &g_coreExecuteBlurOriginal);
     const bool observeIntermediate = diagnosticAbi && WindhawkUtils::SetFunctionHook(
         g_coreIntermediateBrushFunction, CoreIntermediateBrushHook, &g_coreIntermediateBrushOriginal);
+    LARGE_INTEGER counterFrequency{};
+    if (QueryPerformanceFrequency(&counterFrequency)) g_coreOwnedCounterFrequency = counterFrequency.QuadPart;
     g_coreOwnedBackdropProbeReady.store(ready &&
+        reinterpret_cast<uintptr_t>(g_coreOwnedInputAssignFunction) == base + 0x930B8 &&
         reinterpret_cast<uintptr_t>(g_coreOwnedImageRetainFunction) == base + 0xEE358 &&
         reinterpret_cast<uintptr_t>(g_coreOwnedRegisterFunction) == base + 0xEE288 &&
         reinterpret_cast<uintptr_t>(g_coreOwnedImageCreateFunction) == base + 0xA61F4 &&
@@ -4623,10 +4725,8 @@ static void InitializeCoreMaterialBridge()
         std::memory_order_release);
     if (reinterpret_cast<uintptr_t>(g_coreOwnedInputAssignFunction) != base + 0x930B8)
         g_coreOwnedInputAssignFunction = nullptr;
-    Wh_Log(L"MESH OWN BACKDROP INPUT CANARY: available=%d oneShot=1",
-           g_coreOwnedInputAssignFunction != nullptr);
-    Wh_Log(L"MESH OWN BACKDROP PROBE: available=%d attached=0",
-           g_coreOwnedBackdropProbeReady.load(std::memory_order_acquire));
+    Wh_Log(L"MESH OWN BACKDROP STREAM: ready=%d lifetime=render-call maxAttempts=4 timing=%d",
+           g_coreOwnedBackdropProbeReady.load(std::memory_order_acquire), g_coreOwnedCounterFrequency > 0);
     Wh_Log(L"MESH MATERIAL PIPELINE OBSERVER: blur=%d intermediate=%d readOnly=1",
            observeBlur, observeIntermediate);
     Wh_Log(L"MESH MATERIAL BRIDGE: %s hooks=5 leafHooks=0", ready ? L"ready" : L"unavailable; using Affine");
