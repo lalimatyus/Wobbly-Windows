@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.345
+// @version         0.346
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3564,6 +3564,12 @@ CoreBackdropPushTransform_t g_coreBackdropPushTransform = nullptr;
 CoreBackdropPopTransform_t g_coreBackdropPopTransform = nullptr;
 void* g_coreBackdropIdentity = nullptr;
 std::atomic_bool g_coreBackdropDrawReady = false;
+using CoreBackdropBitmapMove_t = void*(__cdecl*)(void*, void**);
+CoreBackdropBitmapMove_t g_coreBackdropBitmapMove = nullptr;
+std::atomic_bool g_coreBackdropPreviewReady = false;
+// Numeric-only budget, protected by g_coreMaterialTargetLock. No native refs.
+struct CoreBackdropPreviewBudget { ULONGLONG epoch = UINT64_MAX, started = 0; unsigned attempts = 0; };
+CoreBackdropPreviewBudget g_coreBackdropPreviewBudget;
 CoreBackdropGetTag_t g_coreBackdropGetTag = nullptr;
 CoreBackdropPushTarget_t g_coreBackdropPushTarget = nullptr;
 CoreBackdropPopLayer_t g_coreBackdropPopLayer = nullptr;
@@ -4428,16 +4434,43 @@ static bool CoreBackdropTargetRestored(const CoreBackdropTargetState& before,
         (CoreBackdropTargetInfoDiff(before, after) & 0x1FFFFFu) == 0;
 }
 
-static void ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
-                                    const CoreForegroundRequest& request, void* image)
+static unsigned ClaimCoreBackdropPreview(const CoreForegroundRequest& request)
+{
+    const ULONGLONG now = GetTickCount64();
+    unsigned attempt = 0;
+    // The lock covers numeric budget bookkeeping only, never native calls.
+    AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
+    if (request.epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed) &&
+        !g_unloading.load(std::memory_order_relaxed))
+    {
+        auto& budget = g_coreBackdropPreviewBudget;
+        if (budget.epoch != request.epoch) budget = {request.epoch, now, 0};
+        if (now - budget.started < 1000 && budget.attempts < 240) attempt = ++budget.attempts;
+    }
+    ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
+    return attempt;
+}
+
+// S_OK: diagnostic bitmap moved to input; S_FALSE: transparent input unchanged.
+// A rejected managed conversion returns E_FAIL so the caller uses native fallback.
+static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
+                                    const CoreForegroundRequest& request, void* image, void* input)
 {
     if (!g_coreBackdropTargetReady.load(std::memory_order_acquire) ||
-        !IsCurrentCoreForegroundRequest(request, observation)) return;
+        !IsCurrentCoreForegroundRequest(request, observation)) return S_FALSE;
     CoreBackdropTargetState before;
-    if (!ReadCoreBackdropTargetState(request.context, before)) return;
+    if (!ReadCoreBackdropTargetState(request.context, before)) return S_FALSE;
     auto epoch = g_coreBackdropTargetProbeEpoch.load(std::memory_order_relaxed);
-    if (epoch == request.epoch || !g_coreBackdropTargetProbeEpoch.compare_exchange_strong(
-            epoch, request.epoch, std::memory_order_relaxed)) return;
+    const bool first = epoch != request.epoch && g_coreBackdropTargetProbeEpoch.compare_exchange_strong(
+            epoch, request.epoch, std::memory_order_relaxed);
+    // Native transparent EffectInput contains CDrawListBitmap at +0: null
+    // resource, owned IBitmapRealization at +8, and no external bitmap flag.
+    const bool preview = g_coreBackdropPreviewReady.load(std::memory_order_acquire) &&
+        IsReadableMemory(input, 0x68) && !ReadPointerMember(input, 0) && ReadPointerMember(input, 8) &&
+        static_cast<const BYTE*>(input)[0x10] == 0;
+    const unsigned attempt = preview ? ClaimCoreBackdropPreview(request) : 0;
+    if (preview ? !attempt : !first) return S_FALSE;
+    const bool report = preview ? attempt == 1 : first;
 
     // ResourceTag is returned into the hidden second argument on this image.
     // Native code supplies the tag and DisplayId; no fabricated resource/device.
@@ -4446,8 +4479,10 @@ static void ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
     if (tagResult != &tag || tag.name != reinterpret_cast<void*>(g_coreMaterialModuleBase + 0x357660) ||
         tag.purpose != 0x19 || !IsCurrentCoreForegroundRequest(request, observation))
     {
+        g_coreBackdropTargetReady.store(false, std::memory_order_release);
+        g_coreBackdropPreviewReady.store(false, std::memory_order_release);
         Wh_Log(L"MESH BACKDROP TARGET: stage=Tag valid=0 attached=0");
-        return;
+        return S_FALSE;
     }
     unsigned displayId = 0;
     std::memcpy(&displayId, before.targetInfo + 8, sizeof(displayId));
@@ -4468,9 +4503,11 @@ static void ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
         transform = g_coreBackdropPushTransform(request.context, nullptr, g_coreBackdropIdentity, false, true);
         if (transform >= 0)
         {
-            const CoreBackdropRect rectangles[] = {{0, 0, size.width * 0.5f, size.height},
+            // Cover the whole target opaquely before the right-hand overlay;
+            // the visible test never samples leftover scratch-surface pixels.
+            const CoreBackdropRect rectangles[] = {{0, 0, size.width, size.height},
                                                    {size.width * 0.5f, 0, size.width, size.height}};
-            const CoreBackdropColor colors[] = {{0.25f, 0.5f, 0.75f, 1}, {0.25f, 0.125f, 0, 0.5f}};
+            const CoreBackdropColor colors[] = {{0.25f, 0.5f, 0.75f, 1}, {0.75f, 0.375f, 0, 1}};
             for (unsigned i = 0; i < 2 && IsCurrentCoreForegroundRequest(request, observation); ++i)
             {
                 const CoreBackdropRectSpan span{1, &rectangles[i]};
@@ -4490,53 +4527,81 @@ static void ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
     const bool afterReadable = ReadCoreBackdropTargetState(request.context, after);
     const unsigned infoDiff = CoreBackdropTargetInfoDiff(before, after);
     const bool restored = afterReadable && CoreBackdropTargetRestored(before, after);
+    bool converted = false, conversionRejected = false;
+    if (preview && push >= 0 && created && pop >= 0 && restored && transformPopped &&
+        drawing >= 0 && drawCalls == 2 && IsCurrentCoreForegroundRequest(request, observation))
+    {
+        // Native move converts the virtual IRenderTargetBitmap base, releases
+        // the old transparent realization and clears bitmap's source storage.
+        // EffectInput's native metadata remains intact; its owner releases the
+        // converted realization if this render call retires before assignment.
+        void* destination = static_cast<BYTE*>(input) + 8;
+        void* moved = g_coreBackdropBitmapMove(destination, &bitmap);
+        converted = moved == destination && !bitmap && !ReadPointerMember(input, 0) &&
+            ReadPointerMember(input, 8) && ReadCoreMaterialInputMetadata(input).readable;
+        conversionRejected = !converted;
+        if (report || conversionRejected)
+            Wh_Log(L"MESH BACKDROP COLOR INPUT: bound=%d sourceConsumed=%d size=%.0fx%.0f "
+                   L"attempt=%u durationMs=1000 lifetime=consumer-owned replacementBlur=0",
+                   converted, bitmap == nullptr, size.width, size.height, attempt);
+    }
     if (bitmap)
     {
         g_coreOwnedBitmapDestroyFunction(&bitmap);
         bitmap = nullptr; // The native destructor need not clear its stack slot.
     }
-    if (pop < 0 || !restored || (push >= 0 && !created))
+    if (push < 0 || pop < 0 || !restored || (push >= 0 && !created))
     {
         g_coreBackdropTargetReady.store(false, std::memory_order_release);
         g_coreBackdropDrawReady.store(false, std::memory_order_release);
+        g_coreBackdropPreviewReady.store(false, std::memory_order_release);
     }
     if (drawAttempted && (transform < 0 || drawing < 0))
+    {
         g_coreBackdropDrawReady.store(false, std::memory_order_release);
-    Wh_Log(L"MESH BACKDROP DRAW: attempted=%d transform=0x%08X result=0x%08X drawCalls=%u "
-           L"transformPopped=%d restored=%d attached=0 pixelReadback=0",
-           drawAttempted, static_cast<unsigned>(transform), static_cast<unsigned>(drawing),
-           drawCalls, transformPopped, restored);
-    Wh_Log(L"MESH BACKDROP TARGET: stage=PushPop result=0x%08X pop=0x%08X created=%d "
-           L"restored=%d released=%d size=%.0fx%.0f attached=0 replacementBlur=0",
-           static_cast<unsigned>(push), static_cast<unsigned>(pop), created, restored,
-           bitmap == nullptr, size.width, size.height);
-    unsigned beforeWords[5] = {}, afterWords[5] = {};
-    std::memcpy(beforeWords, before.targetInfo, sizeof(beforeWords));
-    std::memcpy(afterWords, after.targetInfo, sizeof(afterWords));
-    Wh_Log(L"MESH BACKDROP TARGET STATE: readable=%d targetSame=%d records=%u/%u layers=%u/%u "
-           L"transforms=%u/%u worldTransforms=%u/%u infoSame=%d paddingOnly=%d infoDiff=0x%06X "
-           L"before=(%08X,%08X,%08X,%08X,%08X,%u) after=(%08X,%08X,%08X,%08X,%08X,%u)",
-           afterReadable, before.deviceTarget == after.deviceTarget,
-           before.layerRecords, after.layerRecords, before.layers, after.layers,
-           before.transforms, after.transforms, before.worldTransforms, after.worldTransforms,
-           (infoDiff & 0x1FFFFFu) == 0, infoDiff != 0 && (infoDiff & 0x1FFFFFu) == 0, infoDiff,
-           beforeWords[0], beforeWords[1], beforeWords[2], beforeWords[3], beforeWords[4],
-           static_cast<unsigned>(before.targetInfo[0x14]),
-           afterWords[0], afterWords[1], afterWords[2], afterWords[3], afterWords[4],
-           static_cast<unsigned>(after.targetInfo[0x14]));
+        g_coreBackdropPreviewReady.store(false, std::memory_order_release);
+    }
+    if (conversionRejected) g_coreBackdropPreviewReady.store(false, std::memory_order_release);
+    if (report || push < 0 || pop < 0 || !restored || conversionRejected ||
+        (drawAttempted && (transform < 0 || drawing < 0)))
+    {
+        Wh_Log(L"MESH BACKDROP DRAW: attempted=%d transform=0x%08X result=0x%08X drawCalls=%u "
+               L"transformPopped=%d restored=%d attached=0 pixelReadback=0",
+               drawAttempted, static_cast<unsigned>(transform), static_cast<unsigned>(drawing),
+               drawCalls, transformPopped, restored);
+        Wh_Log(L"MESH BACKDROP TARGET: stage=PushPop result=0x%08X pop=0x%08X created=%d "
+               L"restored=%d localReleased=%d transferred=%d size=%.0fx%.0f sceneAttachment=0 replacementBlur=0",
+               static_cast<unsigned>(push), static_cast<unsigned>(pop), created, restored,
+               bitmap == nullptr && !converted, converted, size.width, size.height);
+        unsigned beforeWords[5] = {}, afterWords[5] = {};
+        std::memcpy(beforeWords, before.targetInfo, sizeof(beforeWords));
+        std::memcpy(afterWords, after.targetInfo, sizeof(afterWords));
+        Wh_Log(L"MESH BACKDROP TARGET STATE: readable=%d targetSame=%d records=%u/%u layers=%u/%u "
+               L"transforms=%u/%u worldTransforms=%u/%u infoSame=%d paddingOnly=%d infoDiff=0x%06X "
+               L"before=(%08X,%08X,%08X,%08X,%08X,%u) after=(%08X,%08X,%08X,%08X,%08X,%u)",
+               afterReadable, before.deviceTarget == after.deviceTarget,
+               before.layerRecords, after.layerRecords, before.layers, after.layers,
+               before.transforms, after.transforms, before.worldTransforms, after.worldTransforms,
+               (infoDiff & 0x1FFFFFu) == 0, infoDiff != 0 && (infoDiff & 0x1FFFFFu) == 0, infoDiff,
+               beforeWords[0], beforeWords[1], beforeWords[2], beforeWords[3], beforeWords[4],
+               static_cast<unsigned>(before.targetInfo[0x14]),
+               afterWords[0], afterWords[1], afterWords[2], afterWords[3], afterWords[4],
+               static_cast<unsigned>(after.targetInfo[0x14]));
+    }
+    return conversionRejected ? E_FAIL : converted ? S_OK : S_FALSE;
 }
 
 
-static void LogCoreForegroundPreview(long status, bool bound, CoreMaterialSizeF size)
+static void LogCoreForegroundPreview(long status, bool bound, CoreMaterialSizeF size, bool colored = false)
 {
     const ULONGLONG now = GetTickCount64();
     auto previous = g_coreForegroundLogAt.load(std::memory_order_relaxed);
     if (previous && now - previous < 1000) return;
     if (!g_coreForegroundLogAt.compare_exchange_strong(previous, now, std::memory_order_relaxed)) return;
     Wh_Log(L"MESH FOREGROUND SPLIT: HWND=%p result=0x%08X bound=%d size=%.2fx%.2f "
-           L"background=transparent replacementBlur=0",
+           L"background=%s replacementBlur=0",
            g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
-           static_cast<unsigned>(status), bound, size.width, size.height);
+           static_cast<unsigned>(status), bound, size.width, size.height, colored ? L"two-color-test" : L"transparent");
 }
 
 // Return true only after the normal factory has constructed the caller's output.
@@ -4574,7 +4639,8 @@ static bool TryCoreForegroundInput(CoreMaterialObservation& observation,
         return false;
     }
 
-    ProbeCoreBackdropTarget(observation, *request, image);
+    const long preview = ProbeCoreBackdropTarget(observation, *request, image, scope.input);
+    if (preview < 0) return false;
     if (!IsCurrentCoreForegroundRequest(*request, observation)) return false;
     result = g_coreBackdropEffectInputOriginal(image, output);
     const bool bound = result == output && IsCurrentCoreForegroundRequest(*request, observation);
@@ -4585,7 +4651,7 @@ static bool TryCoreForegroundInput(CoreMaterialObservation& observation,
         g_coreOwnedInputAssignFunction(result, scope.input);
         RememberCoreMaterialInput(observation, ReadCoreMaterialInputIdentity(result));
     }
-    LogCoreForegroundPreview(status, bound, request->size);
+    LogCoreForegroundPreview(status, bound, request->size, preview == S_OK);
     return true;
 }
 
@@ -4882,6 +4948,11 @@ static void InitializeCoreMaterialBridge()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
+        {{L"public: class wil::com_ptr_t<class IBitmapRealization,struct wil::err_returncode_policy> & __cdecl "
+           L"wil::com_ptr_t<class IBitmapRealization,struct wil::err_returncode_policy>::"
+           L"operator=<class IRenderTargetBitmap,struct wil::err_returncode_policy,void>("
+           L"class wil::com_ptr_t<class IRenderTargetBitmap,struct wil::err_returncode_policy> &&)"},
+         &g_coreBackdropBitmapMove, nullptr, true},
         {{L"public: long __cdecl CDrawingContext::FillRectanglesWithSolidColor("
            L"class gsl::span<struct MilRectF const ,-1> const &,struct _D3DCOLORVALUE const &)"},
          &g_coreBackdropFill, nullptr, true},
@@ -5108,9 +5179,17 @@ static void InitializeCoreMaterialBridge()
         !std::memcmp(reinterpret_cast<void*>(g_coreBackdropPushTransform), transformPrefix, sizeof(transformPrefix)) &&
         !std::memcmp(reinterpret_cast<void*>(g_coreBackdropPopTransform), popTransformPrefix, sizeof(popTransformPrefix));
     g_coreBackdropDrawReady.store(drawAbi, std::memory_order_release);
+    const BYTE movePrefix[] = {0x40,0x53,0x48,0x83,0xEC,0x20,0x4C,0x8B,0x02,0x33,0xC0,0x48,0x89,0x02};
+    const bool previewAbi = drawAbi &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropBitmapMove) == base + 0x26337C &&
+        IsReadableMemory(reinterpret_cast<void*>(g_coreBackdropBitmapMove), sizeof(movePrefix)) &&
+        !std::memcmp(reinterpret_cast<void*>(g_coreBackdropBitmapMove), movePrefix, sizeof(movePrefix));
+    g_coreBackdropPreviewReady.store(previewAbi, std::memory_order_release);
+    Wh_Log(L"MESH BACKDROP COLOR PREVIEW: ready=%d durationMs=1000 maxAttempts=240 lifetime=consumer-owned",
+           g_coreBackdropPreviewReady.load(std::memory_order_acquire));
     Wh_Log(L"MESH BACKDROP DRAW PROBE: ready=%d rectangles=2 attached=0 pixelReadback=0",
            g_coreBackdropDrawReady.load(std::memory_order_acquire));
-    Wh_Log(L"MESH BACKDROP TARGET PROBE: ready=%d size=64x64 oncePerSource=1 attached=0",
+    Wh_Log(L"MESH BACKDROP TARGET PROBE: ready=%d size=64x64 boundedColorPreview=1 sceneAttachment=0",
            g_coreBackdropTargetReady.load(std::memory_order_acquire));
     if (reinterpret_cast<uintptr_t>(g_coreOwnedInputAssignFunction) != base + 0x930B8)
         g_coreOwnedInputAssignFunction = nullptr;
