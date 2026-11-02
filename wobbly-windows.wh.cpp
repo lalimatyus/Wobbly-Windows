@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.352
+// @version         0.353
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -5030,10 +5030,11 @@ struct CoreBackdropLinearScope
 struct CoreBackdropFilteredSource
 {
     alignas(16) BYTE input[0x68] = {};
-    CoreBackdropSizeU size = {};
+    CoreBackdropSizeU size = {}, requested = {};
     bool initialized = false, ready = false, poisoned = false;
     unsigned levels = 0;
-    size_t pixels = 0;
+    size_t pixels = 0, plannedPixels = 0;
+    bool sizeReturned = false;
     unsigned factorX = 1, factorY = 1;
     const wchar_t* stage = L"Unavailable";
     long status = S_FALSE;
@@ -5075,14 +5076,13 @@ static void PrefilterCoreBackdrop(CoreBackdropFilteredSource& filtered,
     if (!linear || !IsCurrentCoreForegroundRequest(request, observation)) return;
     filtered.stage = L"Plan";
     CoreBackdropSizeU sizes[8] = {};
-    const unsigned count = PlanCoreBackdropFilter(source.size, target, sizes, filtered.pixels);
+    const unsigned count = PlanCoreBackdropFilter(source.size, target, sizes, filtered.plannedPixels);
     if (!count) return;
     filtered.stage = L"Input";
     filtered.initialized = true;
     if (g_coreForegroundInputConstruct(filtered.input) != filtered.input) return;
-    filtered.status = g_coreForegroundTransparent(request.context, &request.size, filtered.input);
-    if (filtered.status < 0 || ReadPointerMember(filtered.input, 0) || !ReadPointerMember(filtered.input, 8) ||
-        filtered.input[0x10] != 0 || !IsCurrentCoreForegroundRequest(request, observation)) return;
+    if (ReadPointerMember(filtered.input, 0) || ReadPointerMember(filtered.input, 8) ||
+        !IsCurrentCoreForegroundRequest(request, observation)) return;
     const void* input = source.input;
     CoreBackdropSizeU current = source.size;
     for (unsigned level = 0; level < count; ++level)
@@ -5091,54 +5091,81 @@ static void PrefilterCoreBackdrop(CoreBackdropFilteredSource& filtered,
         CoreBackdropTargetState before;
         if (!ReadCoreBackdropTargetState(request.context, before)) return;
         void* bitmap = nullptr;
+        // This separate owner keeps the previous mip alive during the draw.
+        // The context has its own target ref; consuming the caller's returned
+        // ref does not pop or detach that target.
+        CoreBackdropFilteredSource next;
         const CoreMaterialSizeF size{static_cast<float>(sizes[level].width), static_cast<float>(sizes[level].height)};
+        filtered.requested = sizes[level];
+        filtered.size = {};
+        filtered.sizeReturned = false;
         filtered.stage = L"Push";
         const long push = g_coreBackdropPushTarget(request.context, &tag, &size, displayId, 3, &bitmap);
+        const bool created = bitmap != nullptr;
         long drawing = E_ABORT;
-        if (push >= 0 && bitmap && IsCurrentCoreForegroundRequest(request, observation))
+        if (push >= 0 && created && IsCurrentCoreForegroundRequest(request, observation))
         {
-            const long transform = g_coreBackdropPushTransform(request.context, nullptr, g_coreBackdropIdentity, false, true);
-            if (transform >= 0)
+            filtered.stage = L"Input";
+            next.initialized = true;
+            if (g_coreForegroundInputConstruct(next.input) == next.input)
             {
-                filtered.stage = L"Draw";
-                const CoreBackdropRect rectangle{0, 0, size.width, size.height};
-                const CoreBackdropRectSpan span{1, &rectangle};
-                // Exact pairs keep odd dimensions from drifting through the
-                // sampling phase. The final odd texel uses native clamping.
-                const CoreBackdropAffine sampling{sizes[level].width < current.width ? 2.0f : 1.0f,
-                    0, 0, sizes[level].height < current.height ? 2.0f : 1.0f, 0, 0};
-                // Both sources are ordinary native CDrawListBitmap prefixes.
-                // No EffectInput constant-color shortcut is consumed here.
-                drawing = g_coreBackdropFillBitmap(request.context, input, &span, &sampling);
-                g_coreBackdropPopTransform(request.context, true);
+                void* destination = next.input + 8;
+                const bool moved = g_coreBackdropBitmapMove(destination, &bitmap) == destination && !bitmap &&
+                    !ReadPointerMember(next.input, 0) && ReadPointerMember(next.input, 8) && next.input[0x10] == 0;
+                filtered.stage = L"Size";
+                if (moved)
+                    filtered.sizeReturned = g_coreBackdropBitmapSize(next.input, &filtered.size) == &filtered.size;
+                const auto actual = filtered.size;
+                // CacheMode 3 may round up to 64 pixels or reuse a larger
+                // surface. Preserve logical sample spacing, not allocation ratios.
+                const size_t area = size_t{actual.width} * actual.height;
+                const bool extent = filtered.sizeReturned && actual.width >= sizes[level].width &&
+                    actual.height >= sizes[level].height && actual.width <= 8192 && actual.height <= 8192;
+                if (extent && area <= 4194304 - filtered.pixels &&
+                    IsCurrentCoreForegroundRequest(request, observation))
+                {
+                    filtered.pixels += area;
+                    filtered.stage = L"Transform";
+                    const long transform = g_coreBackdropPushTransform(request.context, nullptr, g_coreBackdropIdentity, false, true);
+                    if (transform >= 0)
+                    {
+                        filtered.stage = L"Draw";
+                        // The native push clears the whole allocation, then
+                        // clips to the requested extent. Keep that contract:
+                        // storage padding remains clear, not stale pool pixels.
+                        const CoreBackdropRect rectangle{0, 0, size.width, size.height};
+                        const CoreBackdropRectSpan span{1, &rectangle};
+                        const CoreBackdropAffine sampling{sizes[level].width < current.width ? 2.0f : 1.0f,
+                            0, 0, sizes[level].height < current.height ? 2.0f : 1.0f, 0, 0};
+                        drawing = g_coreBackdropFillBitmap(request.context, input, &span, &sampling);
+                        g_coreBackdropPopTransform(request.context, true);
+                    }
+                    else drawing = transform;
+                }
+                else if (extent) filtered.stage = L"Budget";
             }
-            else drawing = transform;
         }
         const long pop = push >= 0 ? g_coreBackdropPopLayer(request.context) : S_OK;
         CoreBackdropTargetState after;
         const bool restored = ReadCoreBackdropTargetState(request.context, after) && CoreBackdropTargetRestored(before, after);
-        filtered.poisoned = !restored || pop < 0 || (push >= 0 && !bitmap);
+        filtered.poisoned = !restored || pop < 0 || (push >= 0 && !created);
         filtered.status = push < 0 ? push : pop < 0 ? pop : drawing;
-        const bool usable = !filtered.poisoned && push >= 0 && drawing >= 0 && bitmap &&
+        const bool usable = !filtered.poisoned && push >= 0 && drawing >= 0 &&
             IsCurrentCoreForegroundRequest(request, observation);
-        bool moved = false;
+        bool assigned = false;
         if (usable)
         {
-            void* destination = filtered.input + 8;
-            moved = g_coreBackdropBitmapMove(destination, &bitmap) == destination && !bitmap &&
-                !ReadPointerMember(filtered.input, 0) && ReadPointerMember(filtered.input, 8);
+            filtered.stage = L"Assign";
+            assigned = g_coreOwnedInputAssignFunction(filtered.input, next.input) == filtered.input &&
+                !ReadPointerMember(filtered.input, 0) &&
+                ReadPointerMember(filtered.input, 8) == ReadPointerMember(next.input, 8) && filtered.input[0x10] == 0;
         }
         if (bitmap) { g_coreOwnedBitmapDestroyFunction(&bitmap); bitmap = nullptr; }
-        if (!usable || !moved) { filtered.stage = L"Target"; return; }
-        CoreBackdropSizeU actual{};
-        filtered.stage = L"Size";
-        if (g_coreBackdropBitmapSize(filtered.input, &actual) != &actual ||
-            actual.width != sizes[level].width || actual.height != sizes[level].height) return;
-        if (actual.width < current.width) filtered.factorX *= 2;
-        if (actual.height < current.height) filtered.factorY *= 2;
-        current = actual;
+        if (!usable || !assigned) return;
+        if (sizes[level].width < current.width) filtered.factorX *= 2;
+        if (sizes[level].height < current.height) filtered.factorY *= 2;
+        current = sizes[level];
         input = filtered.input;
-        filtered.size = actual;
         ++filtered.levels;
     }
     filtered.ready = IsCurrentCoreForegroundRequest(request, observation);
@@ -5279,9 +5306,10 @@ static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
         const auto last = g_coreBackdropCoordinatesLogAt.load(std::memory_order_relaxed);
         if (!last || GetTickCount64() - last >= 250)
             Wh_Log(L"MESH BACKDROP PREFILTER: stage=%s ready=%d linear=%d levels=%u size=%ux%u pixels=%llu "
-                   L"optionsRestored=%d sourceLease=render-call boundedMs=1000",
+                   L"requested=%ux%u sizeReturned=%d factors=%ux%u plannedPixels=%llu optionsRestored=%d sourceLease=render-call boundedMs=1000",
                    filtered.stage, filtered.ready, linear, filtered.levels, filtered.size.width, filtered.size.height,
-                   static_cast<unsigned long long>(filtered.pixels), restored);
+                   static_cast<unsigned long long>(filtered.pixels), filtered.requested.width, filtered.requested.height,
+                   filtered.sizeReturned, filtered.factorX, filtered.factorY, static_cast<unsigned long long>(filtered.plannedPixels), restored);
         LogCoreBackdropCoordinates(request, image, live, &warp);
     }
     auto loggedEpoch = g_coreBackdropLiveLogEpoch.load(std::memory_order_relaxed);
@@ -5908,7 +5936,7 @@ static void InitializeCoreMaterialBridge()
         g_coreMeshDrawFunction, CoreMeshDrawHook, &g_coreMeshDrawOriginal), std::memory_order_release);
     const BYTE pushOptionsPrefix[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18};
     const BYTE popOptionsPrefix[] = {0x48,0x83,0xEC,0x48,0x4C,0x8B,0xC1,0x84,0xD2};
-    const bool prefilterAbi = liveCopyAbi &&
+    const bool prefilterAbi = liveCopyAbi && reinterpret_cast<uintptr_t>(g_coreOwnedInputAssignFunction) == base + 0x930B8 &&
         reinterpret_cast<uintptr_t>(g_coreBackdropPushOptions) == base + 0xC3D80 &&
         reinterpret_cast<uintptr_t>(g_coreBackdropPopOptions) == base + 0x1ACC0 &&
         IsReadableMemory(reinterpret_cast<void*>(g_coreBackdropPushOptions), sizeof(pushOptionsPrefix)) &&
@@ -5916,7 +5944,7 @@ static void InitializeCoreMaterialBridge()
         !std::memcmp(reinterpret_cast<void*>(g_coreBackdropPushOptions), pushOptionsPrefix, sizeof(pushOptionsPrefix)) &&
         !std::memcmp(reinterpret_cast<void*>(g_coreBackdropPopOptions), popOptionsPrefix, sizeof(popOptionsPrefix));
     g_coreBackdropPrefilterReady.store(prefilterAbi, std::memory_order_release);
-    Wh_Log(L"MESH BACKDROP PREFILTER PROBE: ready=%d maxLevels=8 maxPixels=4194304 nativeLinear=1 newHooks=0",
+    Wh_Log(L"MESH BACKDROP PREFILTER PROBE: ready=%d maxLevels=8 maxPixels=4194304 nativeLinear=1 pooledExtent=1 newHooks=0",
            prefilterAbi);
     Wh_Log(L"MESH BACKDROP MESH FRAME: ready=%d abi=%d vertices=529 indices=2904 lifetime=draw-call tiles=16",
            g_coreMeshFrameReady.load(std::memory_order_acquire), meshFrameAbi);
