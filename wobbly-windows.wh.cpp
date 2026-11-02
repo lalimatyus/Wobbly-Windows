@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.351
+// @version         0.352
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3578,6 +3578,13 @@ using CoreBackdropBitmapSize_t = void*(__cdecl*)(const void*, CoreBackdropSizeU*
 CoreBackdropFillBitmap_t g_coreBackdropFillBitmap = nullptr;
 CoreBackdropBitmapSize_t g_coreBackdropBitmapSize = nullptr;
 std::atomic_bool g_coreBackdropLiveCopyReady = false;
+struct CoreBackdropRenderOptions { unsigned flags, interpolation, unused[6]; };
+static_assert(sizeof(CoreBackdropRenderOptions) == 32 && offsetof(CoreBackdropRenderOptions, interpolation) == 4);
+using CoreBackdropPushOptions_t = long(__cdecl*)(void*, const void*, const CoreBackdropRenderOptions*, bool);
+using CoreBackdropPopOptions_t = void(__cdecl*)(void*, bool);
+CoreBackdropPushOptions_t g_coreBackdropPushOptions = nullptr;
+CoreBackdropPopOptions_t g_coreBackdropPopOptions = nullptr;
+std::atomic_bool g_coreBackdropPrefilterReady = false;
 std::atomic<ULONGLONG> g_coreBackdropLiveLogEpoch = UINT64_MAX;
 std::atomic<ULONGLONG> g_coreBackdropCoordinatesLogAt = 0;
 constexpr long kCoreBackdropLiveCopy = 2;
@@ -4652,11 +4659,12 @@ struct CoreBackdropTargetState
     void* deviceTarget = nullptr;
     unsigned layerRecords = 0, layers = 0, transforms = 0, worldTransforms = 0;
     BYTE targetInfo[24] = {};
+    unsigned optionCount = 0, options[7] = {};
 };
 
 static bool ReadCoreBackdropTargetState(void* context, CoreBackdropTargetState& state)
 {
-    if (!IsReadableMemory(context, 0x20C)) return false;
+    if (!IsReadableMemory(context, 0x364)) return false;
     const void* info = g_coreCurrentTargetInfoFunction(static_cast<const BYTE*>(context) + 0x18);
     if (!IsReadableMemory(info, sizeof(state.targetInfo))) return false;
     state.deviceTarget = ReadPointerMember(context, 0x20);
@@ -4665,8 +4673,13 @@ static bool ReadCoreBackdropTargetState(void* context, CoreBackdropTargetState& 
     std::memcpy(&state.worldTransforms, static_cast<const BYTE*>(context) + 0x1B0, sizeof(state.worldTransforms));
     std::memcpy(&state.layers, static_cast<const BYTE*>(context) + 0x208, sizeof(state.layers));
     std::memcpy(state.targetInfo, info, sizeof(state.targetInfo));
+    const size_t optionOffsets[] = {0x14C, 0x150, 0x168, 0x154, 0x158, 0x15C};
+    for (unsigned i = 0; i < 6; ++i)
+        std::memcpy(&state.options[i], static_cast<const BYTE*>(context) + optionOffsets[i], sizeof(unsigned));
+    state.options[6] = *(static_cast<const BYTE*>(context) + 0x160);
+    std::memcpy(&state.optionCount, static_cast<const BYTE*>(context) + 0x360, sizeof(unsigned));
     return state.deviceTarget && state.layerRecords < 4096 && state.layers < 4096 &&
-        state.transforms < 4096 && state.worldTransforms < 4096;
+        state.transforms < 4096 && state.worldTransforms < 4096 && state.optionCount < 4096;
 }
 
 static unsigned CoreBackdropTargetInfoDiff(const CoreBackdropTargetState& before,
@@ -4687,6 +4700,7 @@ static bool CoreBackdropTargetRestored(const CoreBackdropTargetState& before,
     return before.deviceTarget == after.deviceTarget && before.layerRecords == after.layerRecords &&
         before.layers == after.layers && before.transforms == after.transforms &&
         before.worldTransforms == after.worldTransforms &&
+        before.optionCount == after.optionCount && !std::memcmp(before.options, after.options, sizeof(before.options)) &&
         (CoreBackdropTargetInfoDiff(before, after) & 0x1FFFFFu) == 0;
 }
 
@@ -4876,7 +4890,7 @@ struct CoreBackdropWarp
 };
 
 static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreForegroundRequest& request,
-                                  void* image, const CoreBackdropLiveSource& source, CoreMaterialSizeF target)
+                                  void* image, const CoreBackdropLiveSource& source, CoreMaterialSizeF target, const CoreMaterialSizeF* sampledExtent = nullptr)
 {
     const auto* frame = g_coreMeshFrame;
     if (!source.ready || !frame || !frame->ready || frame->image != request.image ||
@@ -4913,7 +4927,9 @@ static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreForegroundRe
         std::abs(m[6] - captured.bounds.left) > 1 || std::abs(m[7] - captured.bounds.top) > 1 ||
         std::abs(draw[12] - m[6] - frame->columns[1]) > 1 ||
         std::abs(draw[13] - m[7] - frame->rows[1]) > 1) return;
-    const double scaleX = source.size.width / width, scaleY = source.size.height / height;
+    const CoreMaterialSizeF pixels = sampledExtent ? *sampledExtent : CoreMaterialSizeF{static_cast<float>(source.size.width), static_cast<float>(source.size.height)};
+    if (!pixels.width || !pixels.height) return;
+    const double scaleX = pixels.width / width, scaleY = pixels.height / height;
     const double stepU = request.size.width * draw[0] / target.width;
     const double stepV = request.size.height * draw[5] / target.height;
     warp.stage = L"TriangleMapping";
@@ -4936,7 +4952,7 @@ static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreForegroundRe
             if (std::abs(a * d - b * c) < 1.0e-12) return;
             warp.sampling[index] = {static_cast<float>(a), static_cast<float>(b), static_cast<float>(c),
                                     static_cast<float>(d), static_cast<float>(values[4]), static_cast<float>(values[5])};
-            warp.outsideSamples += px < 0 || py < 0 || px > source.size.width || py > source.size.height;
+            warp.outsideSamples += px < 0 || py < 0 || px > pixels.width || py > pixels.height;
         }
     double centerX = 0, centerY = 0, j[4] = {};
     const double u = request.size.width * draw[0] * 0.5 + draw[12];
@@ -4987,6 +5003,148 @@ static void LogCoreBackdropCoordinates(const CoreForegroundRequest& request, voi
                     warp->ready ? kCoreBackdropWarpTiles : 0, warp->centerDx, warp->centerDy, warp->outsideSamples);
 }
 
+struct CoreBackdropLinearScope
+{
+    void* context = nullptr;
+    bool pushed = false, linear = false;
+    long status = S_FALSE;
+    bool Begin(void* value)
+    {
+        if (!g_coreBackdropPrefilterReady.load(std::memory_order_acquire)) return false;
+        context = value;
+        const CoreBackdropRenderOptions options{2, 1, {}};
+        status = g_coreBackdropPushOptions(context, nullptr, &options, true);
+        pushed = status >= 0;
+        unsigned mode = 0;
+        if (pushed && IsReadableMemory(static_cast<BYTE*>(context) + 0x14C, sizeof(mode)))
+            std::memcpy(&mode, static_cast<BYTE*>(context) + 0x14C, sizeof(mode));
+        // Respect the native override lock. Never patch a context field or
+        // bypass it with the private force-interpolation bits.
+        linear = pushed && mode == 1;
+        return linear;
+    }
+    void Close() { if (pushed) { g_coreBackdropPopOptions(context, true); pushed = false; } }
+    ~CoreBackdropLinearScope() { Close(); }
+};
+
+struct CoreBackdropFilteredSource
+{
+    alignas(16) BYTE input[0x68] = {};
+    CoreBackdropSizeU size = {};
+    bool initialized = false, ready = false, poisoned = false;
+    unsigned levels = 0;
+    size_t pixels = 0;
+    unsigned factorX = 1, factorY = 1;
+    const wchar_t* stage = L"Unavailable";
+    long status = S_FALSE;
+    ~CoreBackdropFilteredSource() { if (initialized) g_coreOwnedInputDestroyFunction(input); }
+};
+
+static unsigned PlanCoreBackdropFilter(CoreBackdropSizeU source, CoreMaterialSizeF target,
+                                       CoreBackdropSizeU (&sizes)[8], size_t& pixels)
+{
+    if (!source.width || !source.height || source.width > 8192 || source.height > 8192 ||
+        !std::isfinite(target.width) || !std::isfinite(target.height) ||
+        target.width < 1 || target.height < 1 || target.width > 64 || target.height > 64) return 0;
+    CoreBackdropSizeU plan[8] = {};
+    size_t total = 0;
+    unsigned count = 0;
+    while (source.width > target.width * 2 || source.height > target.height * 2)
+    {
+        if (count == 8) return 0;
+        source.width = source.width > target.width * 2 ? (source.width + 1) / 2 : source.width;
+        source.height = source.height > target.height * 2 ? (source.height + 1) / 2 : source.height;
+        total += size_t{source.width} * source.height;
+        if (total > 4194304) return 0;
+        plan[count++] = source;
+    }
+    std::memcpy(sizes, plan, sizeof(plan));
+    pixels = total;
+    return count;
+}
+
+// Low-pass minification before warping. Each native linear pass reduces each
+// axis by at most two; a single sample never skips a 23x13 source footprint.
+static void PrefilterCoreBackdrop(CoreBackdropFilteredSource& filtered,
+                                   CoreMaterialObservation& observation, const CoreForegroundRequest& request,
+                                   const CoreBackdropLiveSource& source, const CoreResourceTag& tag,
+                                   unsigned displayId, CoreMaterialSizeF target, bool linear)
+{
+    if (!source.ready || !g_coreBackdropPrefilterReady.load(std::memory_order_acquire)) return;
+    filtered.stage = L"Interpolation";
+    if (!linear || !IsCurrentCoreForegroundRequest(request, observation)) return;
+    filtered.stage = L"Plan";
+    CoreBackdropSizeU sizes[8] = {};
+    const unsigned count = PlanCoreBackdropFilter(source.size, target, sizes, filtered.pixels);
+    if (!count) return;
+    filtered.stage = L"Input";
+    filtered.initialized = true;
+    if (g_coreForegroundInputConstruct(filtered.input) != filtered.input) return;
+    filtered.status = g_coreForegroundTransparent(request.context, &request.size, filtered.input);
+    if (filtered.status < 0 || ReadPointerMember(filtered.input, 0) || !ReadPointerMember(filtered.input, 8) ||
+        filtered.input[0x10] != 0 || !IsCurrentCoreForegroundRequest(request, observation)) return;
+    const void* input = source.input;
+    CoreBackdropSizeU current = source.size;
+    for (unsigned level = 0; level < count; ++level)
+    {
+        if (!IsCurrentCoreForegroundRequest(request, observation)) { filtered.stage = L"Retired"; return; }
+        CoreBackdropTargetState before;
+        if (!ReadCoreBackdropTargetState(request.context, before)) return;
+        void* bitmap = nullptr;
+        const CoreMaterialSizeF size{static_cast<float>(sizes[level].width), static_cast<float>(sizes[level].height)};
+        filtered.stage = L"Push";
+        const long push = g_coreBackdropPushTarget(request.context, &tag, &size, displayId, 3, &bitmap);
+        long drawing = E_ABORT;
+        if (push >= 0 && bitmap && IsCurrentCoreForegroundRequest(request, observation))
+        {
+            const long transform = g_coreBackdropPushTransform(request.context, nullptr, g_coreBackdropIdentity, false, true);
+            if (transform >= 0)
+            {
+                filtered.stage = L"Draw";
+                const CoreBackdropRect rectangle{0, 0, size.width, size.height};
+                const CoreBackdropRectSpan span{1, &rectangle};
+                // Exact pairs keep odd dimensions from drifting through the
+                // sampling phase. The final odd texel uses native clamping.
+                const CoreBackdropAffine sampling{sizes[level].width < current.width ? 2.0f : 1.0f,
+                    0, 0, sizes[level].height < current.height ? 2.0f : 1.0f, 0, 0};
+                // Both sources are ordinary native CDrawListBitmap prefixes.
+                // No EffectInput constant-color shortcut is consumed here.
+                drawing = g_coreBackdropFillBitmap(request.context, input, &span, &sampling);
+                g_coreBackdropPopTransform(request.context, true);
+            }
+            else drawing = transform;
+        }
+        const long pop = push >= 0 ? g_coreBackdropPopLayer(request.context) : S_OK;
+        CoreBackdropTargetState after;
+        const bool restored = ReadCoreBackdropTargetState(request.context, after) && CoreBackdropTargetRestored(before, after);
+        filtered.poisoned = !restored || pop < 0 || (push >= 0 && !bitmap);
+        filtered.status = push < 0 ? push : pop < 0 ? pop : drawing;
+        const bool usable = !filtered.poisoned && push >= 0 && drawing >= 0 && bitmap &&
+            IsCurrentCoreForegroundRequest(request, observation);
+        bool moved = false;
+        if (usable)
+        {
+            void* destination = filtered.input + 8;
+            moved = g_coreBackdropBitmapMove(destination, &bitmap) == destination && !bitmap &&
+                !ReadPointerMember(filtered.input, 0) && ReadPointerMember(filtered.input, 8);
+        }
+        if (bitmap) { g_coreOwnedBitmapDestroyFunction(&bitmap); bitmap = nullptr; }
+        if (!usable || !moved) { filtered.stage = L"Target"; return; }
+        CoreBackdropSizeU actual{};
+        filtered.stage = L"Size";
+        if (g_coreBackdropBitmapSize(filtered.input, &actual) != &actual ||
+            actual.width != sizes[level].width || actual.height != sizes[level].height) return;
+        if (actual.width < current.width) filtered.factorX *= 2;
+        if (actual.height < current.height) filtered.factorY *= 2;
+        current = actual;
+        input = filtered.input;
+        filtered.size = actual;
+        ++filtered.levels;
+    }
+    filtered.ready = IsCurrentCoreForegroundRequest(request, observation);
+    filtered.stage = filtered.ready ? L"Ready" : L"Retired";
+}
+
 // S_OK: diagnostic bitmap moved to input; S_FALSE: transparent input unchanged.
 // A rejected managed conversion returns E_FAIL so the caller uses native fallback.
 static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
@@ -5026,8 +5184,40 @@ static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
                                    std::min(request.size.height, 64.0f)};
     CoreBackdropLiveSource live;
     if (preview) PrepareCoreBackdropLiveSource(live, observation, request, image, before, size, hit);
+    CoreBackdropLinearScope options;
+    const bool linear = preview && live.ready && options.Begin(request.context);
+    if (options.status < 0)
+    {
+        CoreBackdropTargetState failed;
+        if (!ReadCoreBackdropTargetState(request.context, failed) || !CoreBackdropTargetRestored(before, failed))
+        {
+            g_coreBackdropTargetReady.store(false, std::memory_order_release);
+            g_coreBackdropDrawReady.store(false, std::memory_order_release);
+            g_coreBackdropPreviewReady.store(false, std::memory_order_release);
+            Wh_Log(L"MESH BACKDROP PREFILTER: stage=Options result=0x%08X restored=0 disabled=1", static_cast<unsigned>(options.status));
+            return S_FALSE;
+        }
+    }
+    CoreBackdropFilteredSource filtered;
+    if (preview && live.ready) PrefilterCoreBackdrop(filtered, observation, request, live, tag, displayId, size, linear);
+    if (filtered.poisoned)
+    {
+        g_coreBackdropTargetReady.store(false, std::memory_order_release);
+        g_coreBackdropDrawReady.store(false, std::memory_order_release);
+        g_coreBackdropPreviewReady.store(false, std::memory_order_release);
+        Wh_Log(L"MESH BACKDROP PREFILTER: stage=%s result=0x%08X restored=0 disabled=1", filtered.stage, static_cast<unsigned>(filtered.status));
+        return S_FALSE;
+    }
+    const CoreMaterialSizeF sampledExtent{static_cast<float>(live.size.width) / filtered.factorX,
+                                          static_cast<float>(live.size.height) / filtered.factorY};
+    CoreBackdropAffine sampled = live.sampling;
+    if (filtered.ready)
+    {
+        sampled.m11 /= filtered.factorX; sampled.m21 /= filtered.factorX; sampled.dx /= filtered.factorX;
+        sampled.m12 /= filtered.factorY; sampled.m22 /= filtered.factorY; sampled.dy /= filtered.factorY;
+    }
     CoreBackdropWarp warp;
-    if (preview && live.ready) BuildCoreBackdropWarp(warp, request, image, live, size);
+    if (preview && live.ready) BuildCoreBackdropWarp(warp, request, image, live, size, filtered.ready ? &sampledExtent : nullptr);
     const unsigned liveCalls = warp.ready ? kCoreBackdropWarpTiles : 1;
     if (!IsCurrentCoreForegroundRequest(request, observation)) return S_FALSE;
     void* bitmap = nullptr;
@@ -5064,8 +5254,8 @@ static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
                 for (; submitted < liveCalls && IsCurrentCoreForegroundRequest(request, observation); ++submitted)
                 {
                     const CoreBackdropRectSpan span{1, warp.ready ? &warp.rectangles[submitted] : &rectangle};
-                    drawing = g_coreBackdropFillBitmap(request.context, live.input, &span,
-                        warp.ready ? &warp.sampling[submitted] : &live.sampling);
+                    drawing = g_coreBackdropFillBitmap(request.context, filtered.ready ? filtered.input : live.input, &span,
+                        warp.ready ? &warp.sampling[submitted] : &sampled);
                     ++drawCalls;
                     if (drawing < 0) break;
                 }
@@ -5079,11 +5269,21 @@ static long ProbeCoreBackdropTarget(CoreMaterialObservation& observation,
     // A successful native push always owns one matching pop, even if the target
     // retires or unload starts during the call. Never retain this bitmap/frame.
     const long pop = push >= 0 ? g_coreBackdropPopLayer(request.context) : S_OK;
+    options.Close();
     CoreBackdropTargetState after;
     const bool afterReadable = ReadCoreBackdropTargetState(request.context, after);
     const unsigned infoDiff = CoreBackdropTargetInfoDiff(before, after);
     const bool restored = afterReadable && CoreBackdropTargetRestored(before, after);
-    if (liveCopied && restored) LogCoreBackdropCoordinates(request, image, live, &warp);
+    if (liveCopied && restored)
+    {
+        const auto last = g_coreBackdropCoordinatesLogAt.load(std::memory_order_relaxed);
+        if (!last || GetTickCount64() - last >= 250)
+            Wh_Log(L"MESH BACKDROP PREFILTER: stage=%s ready=%d linear=%d levels=%u size=%ux%u pixels=%llu "
+                   L"optionsRestored=%d sourceLease=render-call boundedMs=1000",
+                   filtered.stage, filtered.ready, linear, filtered.levels, filtered.size.width, filtered.size.height,
+                   static_cast<unsigned long long>(filtered.pixels), restored);
+        LogCoreBackdropCoordinates(request, image, live, &warp);
+    }
     auto loggedEpoch = g_coreBackdropLiveLogEpoch.load(std::memory_order_relaxed);
     if (liveCopied && loggedEpoch != request.epoch && g_coreBackdropLiveLogEpoch.compare_exchange_strong(
             loggedEpoch, request.epoch, std::memory_order_relaxed)) report = true;
@@ -5430,6 +5630,10 @@ static void InitializeCoreMaterialBridge()
         return;
     }
     WindhawkUtils::SYMBOL_HOOK dwmcoreDllHooks[] = {
+        {{L"protected: long __cdecl CDrawingContext::PushRenderOptionsInternal(class CVisual const *,struct MilRenderOptions const *,bool)"},
+         &g_coreBackdropPushOptions, nullptr, true},
+        {{L"protected: void __cdecl CDrawingContext::PopRenderOptionsInternal(bool)"},
+         &g_coreBackdropPopOptions, nullptr, true},
         {{L"public: virtual long __cdecl CGlobalDrawingContext::DrawMesh2D(class CGeometry2D *,class CImageSource *)"},
          &g_coreMeshDrawFunction, nullptr, true},
         {{L"public: long __cdecl CGeometry2D::GetMeshData(struct MilVertexXYZDUV2 const * * const,unsigned int *,unsigned int const * * const,unsigned int *)"},
@@ -5702,6 +5906,18 @@ static void InitializeCoreMaterialBridge()
         !std::memcmp(reinterpret_cast<void*>(g_coreMeshDataFunction), meshDataPrefix, sizeof(meshDataPrefix));
     g_coreMeshFrameReady.store(meshFrameAbi && WindhawkUtils::SetFunctionHook(
         g_coreMeshDrawFunction, CoreMeshDrawHook, &g_coreMeshDrawOriginal), std::memory_order_release);
+    const BYTE pushOptionsPrefix[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18};
+    const BYTE popOptionsPrefix[] = {0x48,0x83,0xEC,0x48,0x4C,0x8B,0xC1,0x84,0xD2};
+    const bool prefilterAbi = liveCopyAbi &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropPushOptions) == base + 0xC3D80 &&
+        reinterpret_cast<uintptr_t>(g_coreBackdropPopOptions) == base + 0x1ACC0 &&
+        IsReadableMemory(reinterpret_cast<void*>(g_coreBackdropPushOptions), sizeof(pushOptionsPrefix)) &&
+        IsReadableMemory(reinterpret_cast<void*>(g_coreBackdropPopOptions), sizeof(popOptionsPrefix)) &&
+        !std::memcmp(reinterpret_cast<void*>(g_coreBackdropPushOptions), pushOptionsPrefix, sizeof(pushOptionsPrefix)) &&
+        !std::memcmp(reinterpret_cast<void*>(g_coreBackdropPopOptions), popOptionsPrefix, sizeof(popOptionsPrefix));
+    g_coreBackdropPrefilterReady.store(prefilterAbi, std::memory_order_release);
+    Wh_Log(L"MESH BACKDROP PREFILTER PROBE: ready=%d maxLevels=8 maxPixels=4194304 nativeLinear=1 newHooks=0",
+           prefilterAbi);
     Wh_Log(L"MESH BACKDROP MESH FRAME: ready=%d abi=%d vertices=529 indices=2904 lifetime=draw-call tiles=16",
            g_coreMeshFrameReady.load(std::memory_order_acquire), meshFrameAbi);
     Wh_Log(L"MESH BACKDROP LIVE COPY PROBE: ready=%d target=64x64 durationMs=1000 maxAttempts=240",
