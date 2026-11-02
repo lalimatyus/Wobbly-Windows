@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.354
+// @version         0.355
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4066,6 +4066,22 @@ static void LogCoreOwnedRenderBudget(const CoreOwnedRenderBudget& budget)
                budget.blur, budget.intermediate, budget.micros, budget.pixels / 1000000.0);
 }
 
+struct CoreBackdropCaptureRegion
+{
+    CoreMaterialObservation* observation = nullptr;
+    void* capturedImage = nullptr;
+    const void* candidate = nullptr;
+    void* sourceImage = nullptr;
+    ULONGLONG epoch = 0;
+    float original[4] = {};
+    bool active = false, planned = false, applied = false;
+};
+std::atomic_bool g_coreBackdropExpansionReady = false;
+thread_local CoreBackdropCaptureRegion* g_coreBackdropCaptureRegion = nullptr;
+static bool CoreBackdropCaptureRequested(const CoreMaterialObservation&);
+static bool ExpandCoreBackdropCapture(const CoreMaterialObservation&, const void*, float (&)[4]);
+static bool PrepareExpandedCoreBackdropMapping(void*, const void*, const void*);
+
 static bool PrepareCoreOwnedInputMapping(void* ownedInput, const void* referenceInput)
 {
     const auto own = ReadCoreMaterialInputMetadata(ownedInput);
@@ -4210,6 +4226,9 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
     if (!IsReadableMemory(sourceBounds, sizeof(bounds))) return false;
     std::memcpy(bounds, sourceBounds, sizeof(bounds));
     for (float value : bounds) if (!std::isfinite(value)) return false;
+    const bool captureRequested = CoreBackdropCaptureRequested(observation);
+    const bool expandedCapture = ExpandCoreBackdropCapture(observation, candidate, bounds);
+    if (captureRequested && !expandedCapture) return false;
     const double width = static_cast<double>(bounds[2]) - bounds[0];
     const double height = static_cast<double>(bounds[3]) - bounds[1];
     if (width <= 0 || height <= 0 || width > 8192 || height > 8192 || width * height > 33554432) return false;
@@ -4303,7 +4322,8 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
             const auto identity = ReadCoreMaterialInputIdentity(scope.input);
             mappingPrepared = identity.bitmap == static_cast<BYTE*>(scope.image) + 0x7E0 &&
                 identity.brush == static_cast<BYTE*>(scope.image) + 0x48 &&
-                PrepareCoreOwnedInputMapping(scope.input, referenceInput);
+                (expandedCapture ? PrepareExpandedCoreBackdropMapping(scope.input, referenceInput, scope.image)
+                                 : PrepareCoreOwnedInputMapping(scope.input, referenceInput));
             // Commit only after restoration, never while the desktop registry
             // is substituted. Native assignment transfers references safely.
             const bool restored = scope.RestoreRegistration();
@@ -4313,6 +4333,11 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
                 stage = L"Bind";
                 g_coreOwnedInputAssignFunction(referenceInput, scope.input);
                 inputBound = true;
+                if (expandedCapture && g_coreBackdropCaptureRegion && g_coreBackdropCaptureRegion->candidate == candidate)
+                {
+                    g_coreBackdropCaptureRegion->applied = true;
+                    g_coreBackdropCaptureRegion->sourceImage = scope.image;
+                }
                 ++budget.binds;
             }
         }
@@ -4389,6 +4414,16 @@ static void* AcquireCoreBackdropMaterialInput(CoreMaterialObservation* observati
     {
         selected = nullptr;
         reason = L"TargetRetired";
+    }
+    if (selected && CoreBackdropCaptureRequested(*observation))
+    {
+        // Expanded capture is a separate native owner. Never resize or mutate
+        // the desktop image currently registered by Windows.
+        void* result = g_coreBackdropEffectInputOriginal(image, output);
+        RunCoreOwnedBackdropProbe(*observation, selected, hit.currentVisual, result);
+        if (observation == CurrentCoreMaterialObservation())
+            RememberCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(result));
+        return result;
     }
     if (!selected)
     {
@@ -4715,7 +4750,10 @@ static bool PrepareCoreBackdropBitmapMetadata(void* input, const CoreMaterialSiz
 struct CoreBackdropLiveSource
 {
     alignas(16) BYTE input[0x68] = {};
-    CoreBackdropSizeU size = {};
+    CoreBackdropSizeU size = {}, logicalSize = {};
+    CoreMaterialSizeF useful = {};
+    bool expanded = false;
+    float originalBounds[4] = {};
     CoreBackdropAffine sampling = {};
     void* realizedImage = nullptr; // Borrowed through input's native refs, this call only.
     bool initialized = false, ready = false;
@@ -4725,6 +4763,9 @@ struct CoreBackdropLiveSource
     unsigned ownedAttempts = 0;
     ~CoreBackdropLiveSource() { if (initialized) g_coreOwnedInputDestroyFunction(input); }
 };
+
+static bool ReadCoreBackdropUsefulSize(const CoreMaterialInputMetadata&, CoreBackdropSizeU,
+                                       CoreMaterialSizeF&, CoreBackdropSizeU&);
 
 static bool BuildCoreBackdropLiveSampling(const CoreMaterialInputMetadata& metadata,
                                           CoreBackdropSizeU source, CoreMaterialSizeF requested,
@@ -4760,7 +4801,17 @@ static void PrepareCoreBackdropLiveSource(CoreBackdropLiveSource& source, CoreMa
     if (!g_coreBackdropLiveCopyReady.load(std::memory_order_acquire)) return;
     source.stage = L"NotReady";
     if (!IsCurrentCoreBackdropRequest(request, observation)) return;
-    const bool directReady = g_coreBackdropRealizationFunction(image, state.targetInfo);
+    CoreBackdropCaptureRegion region;
+    region.observation = &observation; region.capturedImage = image; region.epoch = request.epoch;
+    region.active = g_coreBackdropExpansionReady.load(std::memory_order_acquire);
+    struct RestoreRegion
+    {
+        CoreBackdropCaptureRegion* previous;
+        ~RestoreRegion() { g_coreBackdropCaptureRegion = previous; }
+    } restoreRegion{g_coreBackdropCaptureRegion};
+    g_coreBackdropCaptureRegion = &region;
+    const bool directReady = !CoreBackdropCaptureRequested(observation) &&
+        g_coreBackdropRealizationFunction(image, state.targetInfo);
     source.acquisition = directReady ? L"direct" : L"material-bridge";
     source.ownedBudget = g_coreOwnedRenderBudget != nullptr;
     const unsigned attemptsBefore = observation.ownedAttempts;
@@ -4795,7 +4846,10 @@ static void PrepareCoreBackdropLiveSource(CoreBackdropLiveSource& source, CoreMa
     if (g_coreBackdropBitmapSize(source.input, &source.size) != &source.size ||
         !IsCurrentCoreBackdropRequest(request, observation)) return;
     source.stage = L"Mapping";
-    if (!BuildCoreBackdropLiveSampling(metadata, source.size, request.size, target, source.sampling)) return;
+    if (!ReadCoreBackdropUsefulSize(metadata, source.size, source.useful, source.logicalSize) ||
+        !BuildCoreBackdropLiveSampling(metadata, source.logicalSize, request.size, target, source.sampling)) return;
+    source.expanded = region.applied && region.sourceImage == realizedImage;
+    if (source.expanded) std::memcpy(source.originalBounds, region.original, sizeof(source.originalBounds));
     source.realizedImage = realizedImage;
     source.ready = true;
     source.stage = L"Ready";
@@ -4890,18 +4944,22 @@ static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreBackdropRequ
     const double height = desktop.bounds.bottom - desktop.bounds.top;
     const double capturedWidth = captured.bounds.right - captured.bounds.left;
     const double capturedHeight = captured.bounds.bottom - captured.bounds.top;
+    const double originalWidth = source.expanded ? source.originalBounds[2] - source.originalBounds[0] : width;
+    const double originalHeight = source.expanded ? source.originalBounds[3] - source.originalBounds[1] : height;
+    const double sourceOffsetX = source.expanded ? source.originalBounds[0] - desktop.bounds.left : 0;
+    const double sourceOffsetY = source.expanded ? source.originalBounds[1] - desktop.bounds.top : 0;
     if (target.width < 1 || target.height < 1 || target.width > 64 || target.height > 64 ||
         m[0] <= 0 || m[4] <= 0 || m[1] != 0 || m[2] != 0 || m[3] != 0 || m[5] != 0 || m[8] != 1 ||
         draw[1] != 0 || draw[2] != 0 || draw[3] != 0 || draw[4] != 0 || draw[6] != 0 || draw[7] != 0 ||
         draw[8] != 0 || draw[9] != 0 || draw[10] != 1 || draw[11] != 0 || draw[14] != 0 || draw[15] != 1 ||
         std::abs(draw[0] - m[0]) > 0.0001 || std::abs(draw[5] - m[4]) > 0.0001 ||
-        std::abs(capturedWidth - width) > 1 || std::abs(capturedHeight - height) > 1 ||
+        std::abs(capturedWidth - originalWidth) > 1 || std::abs(capturedHeight - originalHeight) > 1 ||
         std::abs(request.size.width * m[0] - capturedWidth) > 1 ||
         std::abs(request.size.height * m[4] - capturedHeight) > 1 ||
         std::abs(m[6] - captured.bounds.left) > 1 || std::abs(m[7] - captured.bounds.top) > 1 ||
         std::abs(draw[12] - m[6] - frame->columns[1]) > 1 ||
         std::abs(draw[13] - m[7] - frame->rows[1]) > 1) return;
-    const CoreMaterialSizeF pixels = sampledExtent ? *sampledExtent : CoreMaterialSizeF{static_cast<float>(source.size.width), static_cast<float>(source.size.height)};
+    const CoreMaterialSizeF pixels = sampledExtent ? *sampledExtent : source.useful;
     if (!pixels.width || !pixels.height) return;
     const double scaleX = pixels.width / width, scaleY = pixels.height / height;
     const double stepU = request.size.width * draw[0] / target.width;
@@ -4917,8 +4975,8 @@ static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreBackdropRequ
             const double cx = (rect.left + rect.right) * 0.5, cy = (rect.top + rect.bottom) * 0.5;
             double x = 0, y = 0, j[4] = {};
             if (!EvaluateCoreMeshFrame(*frame, cx * stepU + draw[12], cy * stepV + draw[13], x, y, j)) return;
-            const double px = (x - captured.bounds.left) * scaleX;
-            const double py = (y - captured.bounds.top) * scaleY;
+            const double px = (x - captured.bounds.left + sourceOffsetX) * scaleX;
+            const double py = (y - captured.bounds.top + sourceOffsetY) * scaleY;
             const double a = j[0] * stepU * scaleX, b = j[2] * stepU * scaleY;
             const double c = j[1] * stepV * scaleX, d = j[3] * stepV * scaleY;
             const double values[] = {a, b, c, d, px - cx * a - cy * c, py - cx * b - cy * d};
@@ -4938,6 +4996,120 @@ static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreBackdropRequ
     warp.stage = L"Ready";
 }
 
+
+static bool CoreBackdropCaptureRequested(const CoreMaterialObservation& observation)
+{
+    const auto* region = g_coreBackdropCaptureRegion;
+    const auto* request = g_coreBackdropRequest;
+    const auto* frame = g_coreMeshFrame;
+    return region && region->active && region->observation == &observation && request &&
+        IsCurrentCoreBackdropRequest(*request, const_cast<CoreMaterialObservation&>(observation)) &&
+        region->epoch == request->epoch && frame && frame->ready && frame->epoch == request->epoch &&
+        frame->image == request->image;
+}
+
+// Read the useful bitmap rectangle independently from its pooled storage size.
+// Source/prefilter padding is not another portion of the desktop.
+static bool ReadCoreBackdropUsefulSize(const CoreMaterialInputMetadata& metadata,
+                                       CoreBackdropSizeU storage, CoreMaterialSizeF& useful,
+                                       CoreBackdropSizeU& logical)
+{
+    if (!metadata.readable || metadata.bounds[0] != 0 || metadata.bounds[1] != 0) return false;
+    const float width = metadata.bounds[2], height = metadata.bounds[3];
+    if (!std::isfinite(width) || !std::isfinite(height) || width < 1 || height < 1 ||
+        width > 8192 || height > 8192 || width > storage.width || height > storage.height) return false;
+    useful = {width, height};
+    logical = {static_cast<unsigned>(std::ceil(width)), static_cast<unsigned>(std::ceil(height))};
+    return true;
+}
+
+static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation, const void* candidate,
+                                       float (&bounds)[4])
+{
+    if (!CoreBackdropCaptureRequested(observation)) return false;
+    auto& region = *g_coreBackdropCaptureRegion;
+    region.planned = region.applied = false;
+    CoreBackdropCoordinates captured;
+    float draw[16]{};
+    if (!ReadCoreBackdropCoordinates(region.capturedImage, captured) ||
+        !ReadCoreBackdropDrawTransform(observation.bridgeContext, draw)) return false;
+    const auto* request = g_coreBackdropRequest;
+    const auto& frame = *g_coreMeshFrame;
+    const auto* m = captured.transform;
+    const double width = bounds[2] - bounds[0], height = bounds[3] - bounds[1];
+    const double cw = captured.bounds.right - captured.bounds.left, ch = captured.bounds.bottom - captured.bounds.top;
+    if (m[0] <= 0 || m[4] <= 0 || m[1] || m[2] || m[3] || m[5] || m[8] != 1 ||
+        draw[1] || draw[2] || draw[3] || draw[4] || draw[6] || draw[7] ||
+        draw[8] || draw[9] || draw[11] || draw[14] || draw[10] != 1 || draw[15] != 1 ||
+        std::abs(width - cw) > 1 || std::abs(height - ch) > 1 ||
+        std::abs(request->size.width * m[0] - cw) > 1 || std::abs(request->size.height * m[4] - ch) > 1 ||
+        std::abs(draw[0] - m[0]) > 0.0001 || std::abs(draw[5] - m[4]) > 0.0001 ||
+        std::abs(draw[12] - captured.bounds.left - frame.columns[1]) > 1 ||
+        std::abs(draw[13] - captured.bounds.top - frame.rows[1]) > 1) return false;
+    double left = 0, top = 0, right = 0, bottom = 0;
+    auto include = [&](double dx, double dy)
+    {
+        left = std::min(left, dx); right = std::max(right, dx);
+        top = std::min(top, dy); bottom = std::max(bottom, dy);
+    };
+    for (const auto& v : frame.vertices)
+        include(v.x - (v.u - frame.columns[1]), v.y - (v.v - frame.rows[1]));
+    // Include the affine tile's extrapolated corners too: a derivative at its
+    // center can extend slightly beyond the exact triangle's vertex bounds.
+    const double du = request->size.width * draw[0] / kCoreBackdropWarpSide;
+    const double dv = request->size.height * draw[5] / kCoreBackdropWarpSide;
+    for (unsigned y = 0; y < kCoreBackdropWarpSide; ++y)
+        for (unsigned x = 0; x < kCoreBackdropWarpSide; ++x)
+        {
+            const double u = draw[12] + (x + 0.5) * du, v = draw[13] + (y + 0.5) * dv;
+            double px = 0, py = 0, j[4]{};
+            if (!EvaluateCoreMeshFrame(frame, u, v, px, py, j)) return false;
+            for (double a : {-0.5, 0.5}) for (double b : {-0.5, 0.5})
+                include(px + j[0]*a*du + j[1]*b*dv - (u + a*du - frame.columns[1]),
+                        py + j[2]*a*du + j[3]*b*dv - (v + b*dv - frame.rows[1]));
+        }
+    const double margin = std::max(128.0, std::max(width, height) / 32.0);
+    const double expanded[] = {std::floor(bounds[0] + left - margin), std::floor(bounds[1] + top - margin),
+                               std::ceil(bounds[2] + right + margin), std::ceil(bounds[3] + bottom + margin)};
+    for (double value : expanded) if (!std::isfinite(value) || std::abs(value) > 1048576) return false;
+    if (expanded[2] - expanded[0] > 8192 || expanded[3] - expanded[1] > 8192 ||
+        (expanded[2] - expanded[0]) * (expanded[3] - expanded[1]) > 33554432) return false;
+    std::memcpy(region.original, bounds, sizeof(region.original));
+    for (unsigned i = 0; i < 4; ++i) bounds[i] = static_cast<float>(expanded[i]);
+    region.candidate = candidate;
+    region.planned = true;
+    return true;
+}
+
+static bool PrepareExpandedCoreBackdropMapping(void* ownedInput, const void* referenceInput,
+                                                const void* image)
+{
+    auto* region = g_coreBackdropCaptureRegion;
+    // The owned-image scope deliberately suspends the outer observation while
+    // native rendering runs. Validate its retained epoch/budget, not that TLS slot.
+    if (!region || !region->planned || !region->observation ||
+        !CoreOwnedProbeCurrent(*region->observation)) return false;
+    CoreBackdropCoordinates actual;
+    const auto own = ReadCoreMaterialInputMetadata(ownedInput), reference = ReadCoreMaterialInputMetadata(referenceInput);
+    if (!ReadCoreBackdropCoordinates(image, actual) || !own.readable || !reference.readable || own.flags != reference.flags ||
+        own.bounds[0] != 0 || own.bounds[1] != 0 || reference.bounds[0] != 0 || reference.bounds[1] != 0) return false;
+    const double width = actual.bounds.right - actual.bounds.left, height = actual.bounds.bottom - actual.bounds.top;
+    const double oldWidth = region->original[2] - region->original[0], oldHeight = region->original[3] - region->original[1];
+    if (std::abs(own.bounds[2] - width) > 1 || std::abs(own.bounds[3] - height) > 1 ||
+        std::abs(reference.bounds[2] - oldWidth) > 1 || std::abs(reference.bounds[3] - oldHeight) > 1 ||
+        actual.bounds.left > region->original[0] + 1 || actual.bounds.top > region->original[1] + 1 ||
+        actual.bounds.right < region->original[2] - 1 || actual.bounds.bottom < region->original[3] - 1) return false;
+    float map[9];std::memcpy(map, reference.transform, sizeof(map));
+    for (float value : map) if (!std::isfinite(value)) return false;
+    if (map[2] || map[5] || map[8] != 1 || double{map[0]}*map[4] - double{map[1]}*map[3] <= 1e-16) return false;
+    for (unsigned i : {0u,3u,6u}) map[i] *= static_cast<float>(oldWidth / width);
+    for (unsigned i : {1u,4u,7u}) map[i] *= static_cast<float>(oldHeight / height);
+    map[6] += static_cast<float>((region->original[0] - actual.bounds.left) / width);
+    map[7] += static_cast<float>((region->original[1] - actual.bounds.top) / height);
+    for (float value : map) if (!std::isfinite(value)) return false;
+    std::memcpy(static_cast<BYTE*>(ownedInput) + 0x30, map, sizeof(map));
+    return true;
+}
 
 struct CoreBackdropLinearScope
 {
@@ -5012,7 +5184,7 @@ static void PrefilterCoreBackdrop(CoreBackdropFilteredSource& filtered,
     if (!linear || !IsCurrentCoreBackdropRequest(request, observation)) return;
     filtered.stage = L"Plan";
     CoreBackdropSizeU sizes[8] = {};
-    const unsigned count = PlanCoreBackdropFilter(source.size, target, sizes, filtered.plannedPixels);
+    const unsigned count = PlanCoreBackdropFilter(source.logicalSize, target, sizes, filtered.plannedPixels);
     if (!count) return;
     filtered.stage = L"Input";
     filtered.initialized = true;
@@ -5020,7 +5192,7 @@ static void PrefilterCoreBackdrop(CoreBackdropFilteredSource& filtered,
     if (ReadPointerMember(filtered.input, 0) || ReadPointerMember(filtered.input, 8) ||
         !IsCurrentCoreBackdropRequest(request, observation)) return;
     const void* input = source.input;
-    CoreBackdropSizeU current = source.size;
+    CoreBackdropSizeU current = source.logicalSize;
     for (unsigned level = 0; level < count; ++level)
     {
         if (!IsCurrentCoreBackdropRequest(request, observation)) { filtered.stage = L"Retired"; return; }
@@ -5144,9 +5316,8 @@ static bool RenderCoreMeshBackdrop(CoreMaterialObservation& observation,
     // A failed filter must not silently reintroduce point-minification shimmer.
     // Tiny sources need no half-scale pass; all larger ones must finish the plan.
     if (!linear || (!filtered.ready &&
-        (live.size.width > size.width * 2 || live.size.height > size.height * 2))) return false;
-    const CoreMaterialSizeF sampledExtent{static_cast<float>(live.size.width) / filtered.factorX,
-                                          static_cast<float>(live.size.height) / filtered.factorY};
+        (live.logicalSize.width > size.width * 2 || live.logicalSize.height > size.height * 2))) return false;
+    const CoreMaterialSizeF sampledExtent{live.useful.width / filtered.factorX, live.useful.height / filtered.factorY};
     CoreBackdropAffine sampling = live.sampling;
     if (filtered.ready)
     {
@@ -5204,9 +5375,11 @@ static bool RenderCoreMeshBackdrop(CoreMaterialObservation& observation,
     if ((!last || now - last >= 1000) &&
         g_coreBackdropCoordinatesLogAt.compare_exchange_strong(last, now, std::memory_order_relaxed))
         Wh_Log(L"MESH BACKDROP RENDER: bound=%d linear=%d filtered=%d levels=%u tiles=%u "
-               L"storage=%ux%u filterStorage=%ux%u pixels=%llu restored=%d persistent=1",
+               L"storage=%ux%u filterStorage=%ux%u pixels=%llu restored=%d persistent=1 "
+               L"sourceStorage=%ux%u sourceUseful=%.1fx%.1f expanded=%d outside=%u warpStage=%s",
                bound, linear, filtered.ready, filtered.levels, submitted, allocated.width, allocated.height,
-               filtered.size.width, filtered.size.height, static_cast<unsigned long long>(filtered.pixels), restored);
+               filtered.size.width, filtered.size.height, static_cast<unsigned long long>(filtered.pixels), restored,
+               live.size.width, live.size.height, live.useful.width, live.useful.height, live.expanded, warp.outsideSamples, warp.stage);
     return bound && IsCurrentCoreBackdropRequest(request, observation);
 }
 
@@ -5721,7 +5894,8 @@ static void InitializeCoreMaterialBridge()
     g_coreBackdropPrefilterReady.store(prefilterAbi, std::memory_order_release);
     const bool renderReady = prefilterAbi && g_coreMeshFrameReady.load(std::memory_order_acquire);
     g_coreBackdropRenderReady.store(renderReady, std::memory_order_release);
-    Wh_Log(L"MESH BACKDROP RENDERER: ready=%d persistent=1 filtered=1 tiles=16 maxPasses=8 maxPixels=4194304",
+    g_coreBackdropExpansionReady.store(renderReady && g_coreOwnedBackdropProbeReady.load(std::memory_order_acquire), std::memory_order_release);
+    Wh_Log(L"MESH BACKDROP RENDERER: ready=%d persistent=1 filtered=1 tiles=16 maxPasses=8 maxPixels=4194304 expandedCapture=1",
            renderReady);
     if (reinterpret_cast<uintptr_t>(g_coreOwnedInputAssignFunction) != base + 0x930B8)
         g_coreOwnedInputAssignFunction = nullptr;
