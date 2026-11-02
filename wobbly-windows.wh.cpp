@@ -27,7 +27,7 @@ Since this mod runs in `dwm.exe`, add `dwm.exe` to Windhawk's
 ![Tutorial](https://raw.githubusercontent.com/lalimatyus/Wobbly-Windows/refs/heads/main/dwm.gif)
 
 This mod runs inside `dwm.exe` and has been tested on Windows 11 `23H2`, `24H2`, `25H2`
-and `Insider Preview 26H2`. If the required private
+and `26H2`. If the required private
 uDWM symbols or validated object layouts aren't available, the mod refuses to
 initialize instead of using unverified addresses.
 
