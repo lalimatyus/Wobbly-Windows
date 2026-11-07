@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.357
+// @version         0.358
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -40,9 +40,9 @@ initialize instead of using unverified addresses.
 
 **Mesh Renderer** is an experimental in-process DWM path on the validated 23H2
 build. Other builds use the Affine fallback. It bends a live window image with
-20x20 Bezier interpolation, including its shadow and Mica. Snap, maximize and
-restore move four corner springs to the committed window rectangle while the interior
-mesh follows. Acrylic backdrop
+20x20 Bezier interpolation, including its shadow and Mica. Snap, maximize,
+restore and edge resize use corner springs to pull the mesh toward the new
+window bounds. Acrylic backdrop
 sampling follows the deformed mesh, with filtered background sampling to reduce
 shimmer. The desktop crop and local sampling approximation can still limit large
 deformations. While the mesh is visible, the original stays at its native position
@@ -266,6 +266,7 @@ struct WobbleMesh
     bool active;
     bool dragging;
     bool resizing;
+    bool geometrySprings;
     bool canWobbleTop;
     bool canWobbleLeft;
     bool canWobbleRight;
@@ -573,7 +574,7 @@ NativeMeshGetVisual_t g_nativeMeshGetVisualProxy = nullptr;
 void* g_nativeMeshImageVtableSymbol = nullptr;
 std::atomic<void*> g_nativeMeshImageVtable = nullptr;
 HWND g_nativeMeshLastAttemptHwnd = nullptr; // DWM scene thread only.
-ULONGLONG g_nativeMeshLastAttemptAt = 0;
+ULONGLONG g_nativeMeshRetryAt = 0;
 
 using CBaseObjectRelease_t = unsigned long(__cdecl*)(void* pThis);
 CBaseObjectRelease_t g_cBaseObjectRelease = nullptr;
@@ -1216,11 +1217,10 @@ static bool ValidMeshWindowRect(const RECT& rect)
         std::abs(static_cast<double>(rect.right)) <= 1048576 && std::abs(static_cast<double>(rect.bottom)) <= 1048576;
 }
 
-static bool NativeMeshWindowStateOffset(HWND hwnd, const RECT& physicsRect, int width, int height,
+static bool NativeMeshGeometryOffset(const RECT& current, const RECT& physicsRect, int width, int height,
                                          Vec2& offset)
 {
-    RECT current = {};
-    if (!ValidMeshWindowRect(physicsRect) || !ReadWindowRectForRenderer(hwnd, &current) ||
+    if (!ValidMeshWindowRect(physicsRect) ||
         !ValidMeshWindowRect(current) || current.right - current.left != width ||
         current.bottom - current.top != height) return false;
     offset = {static_cast<double>(physicsRect.left) - current.left,
@@ -4099,13 +4099,15 @@ struct CoreBackdropCaptureRegion
     void* sourceImage = nullptr;
     ULONGLONG epoch = 0;
     float original[4] = {};
+    float scaleX = 0, scaleY = 0;
     bool active = false, planned = false, applied = false;
 };
 std::atomic_bool g_coreBackdropExpansionReady = false;
 thread_local CoreBackdropCaptureRegion* g_coreBackdropCaptureRegion = nullptr;
 static bool CoreBackdropCaptureRequested(const CoreMaterialObservation&);
 static bool ExpandCoreBackdropCapture(const CoreMaterialObservation&, const void*, float (&)[4]);
-static bool PrepareExpandedCoreBackdropMapping(void*, const void*, const void*);
+static bool PrepareOwnedBackdropMapping(void*, const void*, const void*, const void*,
+                                        const void*, const float (&)[4]);
 
 static bool PrepareCoreOwnedInputMapping(void* ownedInput, const void* referenceInput)
 {
@@ -4208,7 +4210,8 @@ static bool CoreOwnedProbeCurrent(const CoreMaterialObservation& observation)
 }
 
 static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
-                                      void* candidate, void* owner, void* referenceInput)
+                                      void* candidate, void* owner, void* referenceInput,
+                                      const void* capturedImage = nullptr)
 {
     if (!CoreOwnedProbeCurrent(observation) || !IsCoreMaterialVisual(owner) ||
         ReadPointerMember(candidate, 0) != g_coreBackdropImageVtable ||
@@ -4347,8 +4350,8 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
             const auto identity = ReadCoreMaterialInputIdentity(scope.input);
             mappingPrepared = identity.bitmap == static_cast<BYTE*>(scope.image) + 0x7E0 &&
                 identity.brush == static_cast<BYTE*>(scope.image) + 0x48 &&
-                (expandedCapture ? PrepareExpandedCoreBackdropMapping(scope.input, referenceInput, scope.image)
-                                 : PrepareCoreOwnedInputMapping(scope.input, referenceInput));
+                PrepareOwnedBackdropMapping(scope.input, referenceInput, scope.image,
+                                            capturedImage, observation.bridgeContext, bounds);
             // Commit only after restoration, never while the desktop registry
             // is substituted. Native assignment transfers references safely.
             const bool restored = scope.RestoreRegistration();
@@ -4445,7 +4448,7 @@ static void* AcquireCoreBackdropMaterialInput(CoreMaterialObservation* observati
         // Expanded capture is a separate native owner. Never resize or mutate
         // the desktop image currently registered by Windows.
         void* result = g_coreBackdropEffectInputOriginal(image, output);
-        RunCoreOwnedBackdropProbe(*observation, selected, hit.currentVisual, result);
+        RunCoreOwnedBackdropProbe(*observation, selected, hit.currentVisual, result, image);
         if (observation == CurrentCoreMaterialObservation())
             RememberCoreMaterialInput(*observation, ReadCoreMaterialInputIdentity(result));
         return result;
@@ -4468,7 +4471,7 @@ static void* AcquireCoreBackdropMaterialInput(CoreMaterialObservation* observati
         void* result = g_coreBackdropEffectInputOriginal(image, output);
         if (notReadySource && (reason == std::wstring_view(L"EffectNotReady") ||
                                reason == std::wstring_view(L"RenderTargetNotReady")) &&
-            RunCoreOwnedBackdropProbe(*observation, notReadySource, hit.currentVisual, result))
+            RunCoreOwnedBackdropProbe(*observation, notReadySource, hit.currentVisual, result, image))
         {
             --observation->fallbacks;
             if (observation == CurrentCoreMaterialObservation())
@@ -5102,38 +5105,75 @@ static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation
     std::memcpy(region.original, bounds, sizeof(region.original));
     for (unsigned i = 0; i < 4; ++i) bounds[i] = static_cast<float>(expanded[i]);
     region.candidate = candidate;
+    region.scaleX = draw[0];
+    region.scaleY = draw[5];
     region.planned = true;
     return true;
 }
 
-static bool PrepareExpandedCoreBackdropMapping(void* ownedInput, const void* referenceInput,
-                                                const void* image)
+static bool PrepareBackdropRegionMapping(void* input, const CoreMaterialInputMetadata& own,
+                                         const CoreMaterialInputMetadata& reference, const void* image,
+                                         const float (&original)[4], float scaleX, float scaleY)
 {
-    auto* region = g_coreBackdropCaptureRegion;
-    // The owned-image scope deliberately suspends the outer observation while
-    // native rendering runs. Validate its retained epoch/budget, not that TLS slot.
-    if (!region || !region->planned || !region->observation ||
-        !CoreOwnedProbeCurrent(*region->observation)) return false;
     CoreBackdropCoordinates actual;
-    const auto own = ReadCoreMaterialInputMetadata(ownedInput), reference = ReadCoreMaterialInputMetadata(referenceInput);
-    if (!ReadCoreBackdropCoordinates(image, actual) || !own.readable || !reference.readable || own.flags != reference.flags ||
-        own.bounds[0] != 0 || own.bounds[1] != 0 || reference.bounds[0] != 0 || reference.bounds[1] != 0) return false;
+    if (!ReadCoreBackdropCoordinates(image, actual) || !own.readable || !reference.readable ||
+        own.flags != reference.flags || own.bounds[0] != 0 || own.bounds[1] != 0 ||
+        reference.bounds[0] < 0 || reference.bounds[1] < 0 ||
+        reference.bounds[2] > 8192 || reference.bounds[3] > 8192) return false;
+    for (float value : own.bounds) if (!std::isfinite(value)) return false;
+    for (float value : reference.bounds) if (!std::isfinite(value)) return false;
+    for (float value : reference.transform) if (!std::isfinite(value)) return false;
+    const auto* ref = reference.transform;
+    if (ref[2] || ref[5] || ref[8] != 1 ||
+        static_cast<double>(ref[0]) * ref[4] - static_cast<double>(ref[1]) * ref[3] <= 1e-16) return false;
     const double width = actual.bounds.right - actual.bounds.left, height = actual.bounds.bottom - actual.bounds.top;
-    const double oldWidth = region->original[2] - region->original[0], oldHeight = region->original[3] - region->original[1];
+    const double oldWidth = original[2] - original[0], oldHeight = original[3] - original[1];
     if (std::abs(own.bounds[2] - width) > 1 || std::abs(own.bounds[3] - height) > 1 ||
-        std::abs(reference.bounds[2] - oldWidth) > 1 || std::abs(reference.bounds[3] - oldHeight) > 1 ||
-        actual.bounds.left > region->original[0] + 1 || actual.bounds.top > region->original[1] + 1 ||
-        actual.bounds.right < region->original[2] - 1 || actual.bounds.bottom < region->original[3] - 1) return false;
-    float map[9];std::memcpy(map, reference.transform, sizeof(map));
+        std::abs(reference.bounds[2] - reference.bounds[0] - oldWidth) > 1 ||
+        std::abs(reference.bounds[3] - reference.bounds[1] - oldHeight) > 1 ||
+        actual.bounds.left > original[0] + 1 || actual.bounds.top > original[1] + 1 ||
+        actual.bounds.right < original[2] - 1 || actual.bounds.bottom < original[3] - 1) return false;
+    const float map[9] = {
+        static_cast<float>(scaleX / width), 0, 0,
+        0, static_cast<float>(scaleY / height), 0,
+        static_cast<float>((original[0] - actual.bounds.left) / width),
+        static_cast<float>((original[1] - actual.bounds.top) / height), 1,
+    };
     for (float value : map) if (!std::isfinite(value)) return false;
-    if (map[2] || map[5] || map[8] != 1 || double{map[0]}*map[4] - double{map[1]}*map[3] <= 1e-16) return false;
-    for (unsigned i : {0u,3u,6u}) map[i] *= static_cast<float>(oldWidth / width);
-    for (unsigned i : {1u,4u,7u}) map[i] *= static_cast<float>(oldHeight / height);
-    map[6] += static_cast<float>((region->original[0] - actual.bounds.left) / width);
-    map[7] += static_cast<float>((region->original[1] - actual.bounds.top) / height);
-    for (float value : map) if (!std::isfinite(value)) return false;
-    std::memcpy(static_cast<BYTE*>(ownedInput) + 0x30, map, sizeof(map));
+    std::memcpy(static_cast<BYTE*>(input) + 0x30, map, sizeof(map));
     return true;
+}
+
+static bool PrepareOwnedBackdropMapping(void* input, const void* referenceInput, const void* image,
+                                        const void* capturedImage, const void* drawContext,
+                                        const float (&bounds)[4])
+{
+    const auto own = ReadCoreMaterialInputMetadata(input);
+    const auto reference = ReadCoreMaterialInputMetadata(referenceInput);
+    const auto* region = g_coreBackdropCaptureRegion;
+    if (region && region->planned)
+    {
+        // The owned scope suspends TLS observation while native rendering runs.
+        return region->observation && CoreOwnedProbeCurrent(*region->observation) &&
+            PrepareBackdropRegionMapping(input, own, reference, image, region->original, region->scaleX, region->scaleY);
+    }
+    if (PrepareCoreOwnedInputMapping(input, referenceInput)) return true;
+    if (!reference.readable || (reference.bounds[0] == 0 && reference.bounds[1] == 0)) return false;
+
+    // The cropped reference must come from the current capture, and the
+    // current native draw must still use a positive, axis-aligned DPI scale.
+    CoreBackdropCoordinates captured;
+    float draw[16]{};
+    if (!ReadCoreBackdropCoordinates(capturedImage, captured) ||
+        !ReadCoreBackdropDrawTransform(drawContext, draw) ||
+        draw[0] <= 0 || draw[5] <= 0 || draw[1] || draw[2] || draw[3] ||
+        draw[4] || draw[6] || draw[7] || draw[8] || draw[9] || draw[11] || draw[14] ||
+        draw[10] != 1 || draw[15] != 1) return false;
+    const float view[] = {captured.viewbox.left, captured.viewbox.top,
+                          captured.viewbox.right, captured.viewbox.bottom};
+    for (unsigned i = 0; i < 4; ++i)
+        if (std::abs(view[i] - reference.bounds[i]) > 0.001f) return false;
+    return PrepareBackdropRegionMapping(input, own, reference, image, bounds, draw[0], draw[5]);
 }
 
 struct CoreBackdropLinearScope
@@ -6329,14 +6369,14 @@ static void BuildNativeMeshIndices(unsigned int (&indices)[NATIVE_MESH_INDEX_COU
 static_assert(GRID_WIDTH == 4 && GRID_HEIGHT == 4);
 static_assert(NATIVE_MESH_SIDE == kCoreMeshSide && NATIVE_MESH_VERTEX_COUNT == kCoreMeshVertices && NATIVE_MESH_INDEX_COUNT == kCoreMeshIndices);
 
-static void UpdateNativeVertexMesh(NativeMeshState& state)
+static void UpdateNativeVertexMesh(NativeMeshState& state, const RECT* sourceBounds)
 {
     if (!state.mesh || !g_nativeMeshUpdateMesh)
         return;
 
     WobbleMesh physics = {};
     RECT physicsRect = {};
-    bool meshStateTransition = false;
+    bool geometrySprings = false;
     ULONGLONG generation = 0;
     ULONGLONG revision = 0;
     bool found = false;
@@ -6347,7 +6387,7 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
         {
             physics = slot.mesh;
             physicsRect = slot.meshWindowRect;
-            meshStateTransition = slot.meshWindowState;
+            geometrySprings = slot.mesh.geometrySprings;
             generation = slot.generation;
             revision = slot.meshRevision;
             found = true;
@@ -6378,10 +6418,10 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
     unsigned int indices[NATIVE_MESH_INDEX_COUNT] = {};
     Vec2 control[GRID_POINT_COUNT] = {};
     Vec2 windowOffset = {};
-    if (meshStateTransition && !NativeMeshWindowStateOffset(state.hwnd, physicsRect, state.width, state.height, windowOffset))
+    if (geometrySprings && (!sourceBounds || !NativeMeshGeometryOffset(*sourceBounds, physicsRect, state.width, state.height, windowOffset)))
         return;
-    const double scaleX = meshStateTransition ? 1.0 : static_cast<double>(state.width) / physics.width;
-    const double scaleY = meshStateTransition ? 1.0 : static_cast<double>(state.height) / physics.height;
+    const double scaleX = geometrySprings ? 1.0 : static_cast<double>(state.width) / physics.width;
+    const double scaleY = geometrySprings ? 1.0 : static_cast<double>(state.height) / physics.height;
     double maximumDisplacement = 0.0;
     for (unsigned int i = 0; i < GRID_POINT_COUNT; ++i)
     {
@@ -6435,13 +6475,15 @@ static void UpdateNativeVertexMesh(NativeMeshState& state)
 }
 
 static bool GetNativeMeshWindowSize(HWND hwnd, int& width, int& height,
-                                    bool logDimensions = false, int* shadowPadding = nullptr)
+                                    int* shadowPadding,
+                                    RECT* sourceBounds = nullptr)
 {
     ScopedDpiContext coordinates(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if (!coordinates.valid()) return false;
     RECT windowBounds = {};
     if (!ReadWindowRectForRenderer(hwnd, &windowBounds))
         return false;
+    if (sourceBounds) *sourceBounds = windowBounds;
     const int windowWidth = windowBounds.right - windowBounds.left;
     const int windowHeight = windowBounds.bottom - windowBounds.top;
     RECT frameBounds = {};
@@ -6477,13 +6519,6 @@ static bool GetNativeMeshWindowSize(HWND hwnd, int& width, int& height,
     {
         height = std::max(height, static_cast<int>(std::lround(
             static_cast<double>(windowHeight) * monitorDpiY / windowDpi)));
-    }
-    if (logDimensions)
-    {
-        Wh_Log(L"NATIVE MESH BOUNDS: HWND=%p window=%dx%d frame=%dx%d "
-               L"selected=%dx%d windowDpi=%u monitorDpi=%ux%u",
-               hwnd, windowWidth, windowHeight, frameWidth, frameHeight,
-               width, height, windowDpi, monitorDpiX, monitorDpiY);
     }
     return width >= 1 && height >= 1 && width <= 8192 && height <= 8192;
 }
@@ -6575,9 +6610,10 @@ static void MaintainNativeMesh()
         // A temporarily unavailable HWND rectangle is not a replaced visual.
         // Keep the validated source and retry its bounds on the next scene pass.
         int padding = state.sourcePadding;
-        if (!GetNativeMeshWindowSize(state.hwnd, width, height, false, &padding))
+        RECT sourceBounds = {};
+        if (!GetNativeMeshWindowSize(state.hwnd, width, height, &padding, &sourceBounds))
         {
-            UpdateNativeVertexMesh(state);
+            UpdateNativeVertexMesh(state, nullptr);
             return;
         }
         if ((width != state.width || height != state.height) &&
@@ -6618,7 +6654,7 @@ static void MaintainNativeMesh()
             Wh_Log(L"NATIVE MESH SOURCE RESIZED: HWND=%p size=%dx%d padding=%d",
                    state.hwnd, width, height, padding);
         }
-        UpdateNativeVertexMesh(state);
+        UpdateNativeVertexMesh(state, &sourceBounds);
     }
 }
 
@@ -6899,10 +6935,10 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
         return;
     ULONGLONG now = GetTickCount64();
     if (g_nativeMeshLastAttemptHwnd == hwnd &&
-        now - g_nativeMeshLastAttemptAt < 250)
+        now < g_nativeMeshRetryAt)
         return;
     g_nativeMeshLastAttemptHwnd = hwnd;
-    g_nativeMeshLastAttemptAt = now;
+    g_nativeMeshRetryAt = now + 8;
     void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
     void* expectedVtable =
         g_nativeMeshImageVtable.load(std::memory_order_acquire);
@@ -6929,19 +6965,20 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
             backdropSource = true;
         }
     }
-    Wh_Log(L"NATIVE MESH SOURCE CHOICE: HWND=%p source=%s visual=%p proxy=%p "
-           L"host=%p", hwnd,
-           backdropSource ? L"BackgroundTreatment" : L"WindowBorder",
-           sourceRoot, sourceVisualProxy, ReadPointerMember(sourceRoot, 0x18));
     int width = 0;
     int height = 0;
     int sourcePadding = 0;
-    if (!GetNativeMeshWindowSize(hwnd, width, height, true, &sourcePadding))
+    if (!GetNativeMeshWindowSize(hwnd, width, height, &sourcePadding))
     {
         return;
     }
     NativeCaptureGuard captureGuard(true);
     if (!captureGuard.acquired()) return;
+    g_nativeMeshRetryAt = now + 120;
+    Wh_Log(L"NATIVE MESH SOURCE CHOICE: HWND=%p source=%s visual=%p proxy=%p "
+           L"host=%p", hwnd,
+           backdropSource ? L"BackgroundTreatment" : L"WindowBorder",
+           sourceRoot, sourceVisualProxy, ReadPointerMember(sourceRoot, 0x18));
     void* capturedRepresentation = nullptr;
     void* imageSourceProxy = sourceVisualProxy;
     {
@@ -7038,14 +7075,18 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         AcquireSRWLockExclusive(&g_animationSlotsLock);
         WindowAnimationSlot& slot = g_animationSlots[i];
         const bool affineStateThrob = slot.windowStateThrob && !slot.meshWindowState;
+        const bool capturePending = (slot.dragging || slot.mesh.geometrySprings) &&
+            slot.settings.rendererMode == RendererMode::Mesh &&
+            g_meshWindowTransitionsReady.load(std::memory_order_acquire) &&
+            !g_nativeMeshActive.load(std::memory_order_acquire) &&
+            (slot.hwnd != g_nativeMeshLastAttemptHwnd || now >= g_nativeMeshRetryAt);
         bindingPending = !slot.transformAttached ||
-                         (slot.meshWindowState && !g_nativeMeshActive.load(std::memory_order_acquire)) ||
                          (affineStateThrob && !slot.transitionTransformAttached) ||
                          slot.transformRebindRevision != slot.submittedTransformRebindRevision;
         bool periodicValidation = validateCurrentVisuals && now >= slot.nextVisualValidation;
         bool forceNativeTransitionRebind = validateCurrentVisuals && affineStateThrob;
         if (slot.active && slot.hwnd && slot.matrixTransformProxy &&
-            (bindingPending || periodicValidation || forceNativeTransitionRebind))
+            (bindingPending || capturePending || periodicValidation || forceNativeTransitionRebind))
         {
             slot.hookUsers++;
             slot.nextVisualValidation = now + 250;
@@ -7569,6 +7610,7 @@ static void InitializeMesh(WobbleMesh& mesh, double width, double height)
     mesh.active = false;
     mesh.dragging = false;
     mesh.resizing = false;
+    mesh.geometrySprings = false;
     mesh.canWobbleTop = true;
     mesh.canWobbleLeft = true;
     mesh.canWobbleRight = true;
@@ -7652,9 +7694,10 @@ static void ContinuePhysicalMeshDrag(WobbleMesh& mesh, double width, double heig
     UpdateMeshDragOffset(mesh, localMouse);
 }
 
-static void SetMeshResizeMode(WobbleMesh& mesh, bool resizing)
+static void SetMeshResizeMode(WobbleMesh& mesh, bool resizing, bool nativeGeometry = false)
 {
     mesh.resizing = resizing;
+    mesh.geometrySprings = resizing && nativeGeometry;
     // Lock all resize edges; UpdateResizeEdges unlocks the moving ones.
     mesh.canWobbleTop = !resizing;
     mesh.canWobbleLeft = !resizing;
@@ -7697,14 +7740,21 @@ static void ApplyResizeConstraints(WobbleMesh& mesh)
         for (int x = 0; x < GRID_WIDTH; x++)
         {
             WobblePoint& point = mesh.points[GetPointIndex(x, y)];
-            // Match KWin's edge-locking rules.
-            if ((!mesh.canWobbleLeft && x < GRID_WIDTH - 1) || (!mesh.canWobbleRight && x > 0))
+            // Geometry springs support only the stationary boundary. The
+            // legacy affine resize keeps its stronger interior constraints.
+            const bool lockLeft = mesh.geometrySprings ? x == 0 : x < GRID_WIDTH - 1;
+            const bool lockRight = mesh.geometrySprings ? x == GRID_WIDTH - 1 : x > 0;
+            const bool lockTop = mesh.geometrySprings ? y == 0 : y < GRID_HEIGHT - 1;
+            const bool lockBottom = mesh.geometrySprings ? y == GRID_HEIGHT - 1 : y > 0;
+            if ((!mesh.canWobbleLeft && lockLeft) || (!mesh.canWobbleRight && lockRight))
             {
                 point.position.x = point.basePosition.x;
+                if (mesh.geometrySprings) point.velocity.x = 0.0;
             }
-            if ((!mesh.canWobbleTop && y < GRID_HEIGHT - 1) || (!mesh.canWobbleBottom && y > 0))
+            if ((!mesh.canWobbleTop && lockTop) || (!mesh.canWobbleBottom && lockBottom))
             {
                 point.position.y = point.basePosition.y;
+                if (mesh.geometrySprings) point.velocity.y = 0.0;
             }
         }
     }
@@ -7858,7 +7908,7 @@ static void CalculateMeshForces(WobbleMesh& mesh, const WobblySettings& settings
         {
             int index = GetPointIndex(x, y);
             WobblePoint& point = mesh.points[index];
-            if (point.fixed)
+            if (point.fixed && !mesh.geometrySprings)
             {
                 point.force = {(point.basePosition.x - point.position.x) * stiffness,
                                (point.basePosition.y - point.position.y) * stiffness};
@@ -7882,12 +7932,17 @@ static void CalculateMeshForces(WobbleMesh& mesh, const WobblySettings& settings
                                (neighbor.basePosition.y - point.basePosition.y);
                 neighborCount++;
             }
-            double forceScale =
-                neighborCount > 0 ? stiffness / static_cast<double>(neighborCount) : 0.0;
+            // Corner anchors add a restoring force to the symmetric grid.
+            double forceScale = stiffness / (mesh.geometrySprings ? 4 : std::max(neighborCount, 1));
             point.force = {springSum.x * forceScale, springSum.y * forceScale};
+            if (point.fixed)
+            {
+                point.force.x += (point.basePosition.x - point.position.x) * stiffness;
+                point.force.y += (point.basePosition.y - point.position.y) * stiffness;
+            }
         }
     }
-    SmoothMeshField(mesh, false);
+    if (!mesh.geometrySprings) SmoothMeshField(mesh, false);
 }
 
 static void SimulateMeshSubstep(WobbleMesh& mesh, const WobblySettings& settings,
@@ -7904,7 +7959,7 @@ static void SimulateMeshSubstep(WobbleMesh& mesh, const WobblySettings& settings
         point.velocity.x = acceleration.x * deltaTimeMilliseconds + point.velocity.x * drag;
         point.velocity.y = acceleration.y * deltaTimeMilliseconds + point.velocity.y * drag;
     }
-    SmoothMeshField(mesh, true);
+    if (!mesh.geometrySprings) SmoothMeshField(mesh, true);
     double moveFactor = std::clamp(settings.moveFactor / 100.0, 0.01, 0.25);
     double velocitySum = 0.0;
     for (int i = 0; i < GRID_POINT_COUNT; i++)
@@ -7924,16 +7979,24 @@ static void SimulateMeshSubstep(WobbleMesh& mesh, const WobblySettings& settings
         }
     }
     ApplyResizeConstraints(mesh);
-    mesh.active = !(accelerationSum < 0.5 && velocitySum < 0.5);
+    const bool displaced = mesh.geometrySprings &&
+        std::any_of(std::begin(mesh.points), std::end(mesh.points), [](const WobblePoint& point)
+        {
+            const double dx = point.position.x - point.basePosition.x;
+            const double dy = point.position.y - point.basePosition.y;
+            return dx * dx + dy * dy > 0.25;
+        });
+    mesh.active = displaced || !(accelerationSum < 0.5 && velocitySum < 0.5);
 }
 
-static double GetMaximumPhysicsStep(const WobblySettings& settings)
+static double GetMaximumPhysicsStep(const WobblySettings& settings, bool geometrySprings)
 {
     double stiffness = std::clamp(settings.stiffness / 100.0, 0.01, 1.0);
     double moveFactor = std::clamp(settings.moveFactor / 100.0, 0.01, 0.25);
     double drag = std::clamp(settings.drag / 100.0, 0.01, MAX_VELOCITY_RETENTION);
     // Conservative spring-step bound; all five presets retain the legacy step.
-    return std::min(MAX_PHYSICS_STEP_MS, std::sqrt(0.9 * (1.0 + drag) / (stiffness * moveFactor)));
+    const double stability = geometrySprings ? 0.5 : 0.9;
+    return std::min(MAX_PHYSICS_STEP_MS, std::sqrt(stability * (1.0 + drag) / (stiffness * moveFactor)));
 }
 
 static bool SimulateMeshStep(WobbleMesh& mesh, const WobblySettings& settings, double deltaTime)
@@ -7943,7 +8006,7 @@ static bool SimulateMeshStep(WobbleMesh& mesh, const WobblySettings& settings, d
         return mesh.active;
     }
     double milliseconds = std::min(deltaTime * 1000.0, MAX_PHYSICS_STEP_MS);
-    int substeps = static_cast<int>(std::ceil(milliseconds / GetMaximumPhysicsStep(settings)));
+    int substeps = static_cast<int>(std::ceil(milliseconds / GetMaximumPhysicsStep(settings, mesh.geometrySprings)));
     double drag = std::clamp(settings.drag / 100.0, 0.01, MAX_VELOCITY_RETENTION);
     if (substeps > 1)
     {
@@ -7959,6 +8022,7 @@ static bool SimulateMeshStep(WobbleMesh& mesh, const WobblySettings& settings, d
 
 static void BeginDrag(WobbleMesh& mesh, const Vec2& mousePosition)
 {
+    mesh.geometrySprings = false;
     // Replace the release anchor without discarding the remaining motion.
     for (WobblePoint& point : mesh.points)
     {
@@ -7977,7 +8041,7 @@ static void BeginDrag(WobbleMesh& mesh, const Vec2& mousePosition)
 
 static void EndDrag(WobbleMesh& mesh)
 {
-    if (!mesh.dragging || mesh.dragPointIndex < 0)
+    if (!mesh.dragging || (mesh.dragPointIndex < 0 && !mesh.geometrySprings))
     {
         return;
     }
@@ -8018,7 +8082,7 @@ static bool PrepareMeshForGrab(WobbleMesh& mesh, double width, double height,
 // their four corner springs target the destination window rectangle.
 
 
-static bool CommitMeshWindowStateGeometry(WindowAnimationSlot& slot, const RECT& current)
+static bool CommitMeshWindowStateGeometry(WindowAnimationSlot& slot, const RECT& current, bool resizing = false)
 {
     if (!ValidMeshWindowRect(current) || !ValidMeshWindowRect(slot.meshWindowRect)) return false;
     auto& mesh = slot.mesh;
@@ -8029,10 +8093,14 @@ static bool CommitMeshWindowStateGeometry(WindowAnimationSlot& slot, const RECT&
         for (int x = 0; x < GRID_WIDTH; ++x)
             mesh.points[GetPointIndex(x,y)].fixed = (x == 0 || x == GRID_WIDTH - 1) &&
                                                    (y == 0 || y == GRID_HEIGHT - 1);
-    mesh.dragging = mesh.resizing = false;
+    mesh.geometrySprings = true;
+    mesh.resizing = resizing;
+    mesh.dragging = resizing && slot.dragging;
     mesh.dragPointIndex = -1;
     mesh.dragOffset = {};
-    mesh.canWobbleTop = mesh.canWobbleLeft = mesh.canWobbleRight = mesh.canWobbleBottom = true;
+    if (!resizing)
+        mesh.canWobbleTop = mesh.canWobbleLeft = mesh.canWobbleRight = mesh.canWobbleBottom = true;
+    ApplyResizeConstraints(mesh);
     mesh.active = true;
     slot.meshWindowRect = current;
     slot.freeStepPending = true;
@@ -8070,61 +8138,6 @@ static void ResumeMeshWindowDrag(WindowAnimationSlot& slot, const Vec2& mouse)
     slot.windowStateThrob = false;
     slot.meshWindowState = false;
 }
-
-static bool SimulateMeshWindowStateStep(WobbleMesh& mesh, const WobblySettings& settings, double deltaTime)
-{
-    if (!std::isfinite(deltaTime) || deltaTime <= 0) return mesh.active;
-    const double stiffness = std::clamp(settings.stiffness / 100.0, 0.01, 1.0);
-    const double move = std::clamp(settings.moveFactor / 100.0, 0.01, 0.25);
-    const double drag = std::clamp(settings.drag / 100.0, 0.01, MAX_VELOCITY_RETENTION);
-    const double milliseconds = std::min(deltaTime * 1000.0, MAX_PHYSICS_STEP_MS);
-    const unsigned steps = static_cast<unsigned>(std::ceil(milliseconds /
-        std::min(MAX_PHYSICS_STEP_MS, std::sqrt((1.0 + drag) / (2.0 * stiffness * move)))));
-    const double dt = milliseconds / steps, damping = std::pow(drag, 1.0 / steps);
-    for (unsigned step = 0; step < steps; ++step)
-    {
-        // Symmetric edge springs plus four corner anchors. Replacing a corner's
-        // neighbor force with an anchor can destabilize this four-anchor case.
-        for (int y = 0; y < GRID_HEIGHT; ++y)
-            for (int x = 0; x < GRID_WIDTH; ++x)
-            {
-                auto& point = mesh.points[GetPointIndex(x, y)];
-                Vec2 force = point.fixed ? Vec2{point.basePosition.x - point.position.x,
-                                                point.basePosition.y - point.position.y} : Vec2{};
-                for (const auto& offset : {Vec2{-1,0}, Vec2{1,0}, Vec2{0,-1}, Vec2{0,1}})
-                {
-                    const int nx = x + static_cast<int>(offset.x), ny = y + static_cast<int>(offset.y);
-                    if (nx < 0 || nx >= GRID_WIDTH || ny < 0 || ny >= GRID_HEIGHT) continue;
-                    const auto& neighbor = mesh.points[GetPointIndex(nx, ny)];
-                    force.x += ((neighbor.position.x - point.position.x) -
-                                (neighbor.basePosition.x - point.basePosition.x)) * 0.25;
-                    force.y += ((neighbor.position.y - point.position.y) -
-                                (neighbor.basePosition.y - point.basePosition.y)) * 0.25;
-                }
-                point.force = {force.x * stiffness, force.y * stiffness};
-            }
-        double acceleration = 0, velocity = 0, displacement = 0;
-        for (auto& point : mesh.points)
-        {
-            const Vec2 force = {std::clamp(point.force.x, -1000.0, 1000.0),
-                                std::clamp(point.force.y, -1000.0, 1000.0)};
-            point.velocity.x = std::clamp(point.velocity.x * damping + force.x * dt, -1000.0, 1000.0);
-            point.velocity.y = std::clamp(point.velocity.y * damping + force.y * dt, -1000.0, 1000.0);
-            point.position.x += point.velocity.x * dt * move;
-            point.position.y += point.velocity.y * dt * move;
-            acceleration += std::abs(force.x) + std::abs(force.y);
-            velocity += std::abs(point.velocity.x) + std::abs(point.velocity.y);
-            displacement = std::max(displacement, std::hypot(point.position.x - point.basePosition.x,
-                                                             point.position.y - point.basePosition.y));
-            if (!std::isfinite(point.position.x) || !std::isfinite(point.position.y) ||
-                !std::isfinite(point.velocity.x) || !std::isfinite(point.velocity.y))
-            { point.position = point.basePosition; point.velocity = point.force = {}; }
-        }
-        mesh.active = acceleration >= 0.5 || velocity >= 0.5 || displacement > 0.5;
-    }
-    return mesh.active;
-}
-
 
 static bool ReplaceAnimationWithStateThrob(WindowAnimationSlot& slot, int width, int height,
                                            bool maximizing, Vec2 direction)
@@ -9091,6 +9104,32 @@ static double GetResizeVisualCoordinateScale(HWND hwnd, const RECT& windowRect)
                       2.00);
 }
 
+static bool PrepareAnimationSlotGrab(WindowAnimationSlot& slot, const WobblySettings& settings,
+                                     double width, double height, const Vec2& mouse)
+{
+    const bool physical = settings.rendererMode == RendererMode::Mesh;
+    const bool preserveGeometry = physical && slot.mesh.geometrySprings;
+    const bool hadStateThrob = slot.windowStateThrob;
+    const bool reset = PrepareMeshForGrab(slot.mesh, width, height, mouse,
+        !preserveGeometry && (hadStateThrob || (slot.mesh.resizing && !slot.dragging)), physical);
+    slot.settings = settings;
+    slot.windowStateThrob = slot.meshWindowState = false;
+    if (hadStateThrob)
+    {
+        slot.boundTransitionVisualProxy = nullptr;
+        slot.transitionTransformAttached = false;
+    }
+    slot.dragging = true;
+    slot.freeStepPending = false;
+    slot.nextWindowValidation = GetTickCount64() + 250;
+    slot.nextVisualValidation = 0;
+    slot.lastBindFailureLog = 0;
+    slot.order = ++g_animationOrderCounter;
+    slot.identityApplied = slot.meshIdentityPending = false;
+    ++slot.meshRevision;
+    return reset;
+}
+
 static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, double width,
                                 double height, const Vec2& mousePosition, bool* meshReset = nullptr)
 {
@@ -9107,31 +9146,8 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
         bool reused = slot.active && slot.hwnd == hwnd;
         if (reused)
         {
-            slot.settings = settings;
-            bool resetStateThrob = slot.windowStateThrob;
-            bool resetResizeDecay = slot.mesh.resizing && !slot.dragging;
-            const bool reset = PrepareMeshForGrab(slot.mesh, width, height, mousePosition,
-                resetStateThrob || resetResizeDecay, settings.rendererMode == RendererMode::Mesh);
+            const bool reset = PrepareAnimationSlotGrab(slot, settings, width, height, mousePosition);
             if (meshReset) *meshReset = reset;
-            if (reset)
-            {
-                slot.windowStateThrob = false;
-                slot.meshWindowState = false;
-                if (resetStateThrob)
-                {
-                    slot.boundTransitionVisualProxy = nullptr;
-                    slot.transitionTransformAttached = false;
-                }
-            }
-            slot.dragging = true;
-            slot.freeStepPending = false;
-            slot.nextWindowValidation = GetTickCount64() + 250;
-            slot.nextVisualValidation = 0;
-            slot.lastBindFailureLog = 0;
-            slot.order = ++g_animationOrderCounter;
-            slot.identityApplied = false;
-            slot.meshIdentityPending = false;
-            slot.meshRevision++;
         }
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
         if (reused)
@@ -9150,33 +9166,16 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
         }
         slot.active = true;
         slot.retiring = false;
-        slot.dragging = true;
-        slot.freeStepPending = false;
-        slot.generation++;
-        slot.settings = settings;
-        bool resetStateThrob = slot.windowStateThrob;
-        const bool reset = PrepareMeshForGrab(slot.mesh, width, height, mousePosition,
-            resetStateThrob || slot.mesh.resizing, settings.rendererMode == RendererMode::Mesh);
+        ++slot.generation;
+        const bool reset = PrepareAnimationSlotGrab(slot, settings, width, height, mousePosition);
         if (meshReset) *meshReset = reset;
-        if (reset)
-        {
-            slot.windowStateThrob = false;
-            slot.meshWindowState = false;
-        }
         slot.transformAttached = false;
         slot.transitionTransformAttached = false;
         slot.boundTopLevelVisualProxy = nullptr;
         slot.boundTransitionVisualProxy = nullptr;
         slot.transformRebindRevision++;
         slot.submittedTransformRebindRevision = 0;
-        slot.meshIdentityPending = false;
         slot.proxyCreationPending = slot.matrixTransformProxy == nullptr;
-        slot.identityApplied = false;
-        slot.nextWindowValidation = GetTickCount64() + 250;
-        slot.nextVisualValidation = 0;
-        slot.lastBindFailureLog = 0;
-        slot.order = ++g_animationOrderCounter;
-        slot.meshRevision++;
         slotIndex = i;
         break;
     }
@@ -9367,7 +9366,8 @@ static void HandleMoveSizeStart(HWND hwnd)
     if (dragSlot.active && dragSlot.hwnd == hwnd)
     {
         dragSlot.meshWindowRect = rect;
-        SetMeshResizeMode(dragSlot.mesh, operationTypeKnown && operationResizing);
+        SetMeshResizeMode(dragSlot.mesh, operationTypeKnown && operationResizing,
+                          g_meshWindowTransitionsReady.load(std::memory_order_acquire) && physicalCoordinates);
         // A new move loop may replace the visual transform.
         dragSlot.transformRebindRevision++;
         dragSlot.meshRevision++;
@@ -9471,7 +9471,7 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
             g_nativeMeshActive.load(std::memory_order_acquire) &&
             g_nativeMeshHwnd.load(std::memory_order_acquire) == slot.hwnd;
         // The mesh already includes lag and deformation; keep the source transform neutral.
-        identityUpdate = nativeMeshActive || slot.meshWindowState ||
+        identityUpdate = nativeMeshActive || slot.mesh.geometrySprings ||
                          slot.retiring || slot.meshIdentityPending ||
                          !slot.mesh.active ||
                          g_unloading.load(std::memory_order_acquire);
@@ -9813,7 +9813,6 @@ static void UpdateAnimationFrame()
             bool dragging;
             bool freeStepPending;
             bool identityApplied;
-            bool meshStateTransition;
             ULONGLONG generation;
             HWND hwnd;
             WobblySettings settings;
@@ -9830,7 +9829,6 @@ static void UpdateAnimationFrame()
             snapshot.generation = slot.generation;
             snapshot.hwnd = slot.hwnd;
             snapshot.settings = slot.settings;
-            snapshot.meshStateTransition = slot.meshWindowState;
             snapshot.mesh = slot.mesh;
         }
         ReleaseSRWLockShared(&g_animationSlotsLock);
@@ -9849,10 +9847,7 @@ static void UpdateAnimationFrame()
                (snapshot.dragging || simulatedMesh.active || freeStepPending))
         {
             double stepMilliseconds = std::min(remainingMilliseconds, MAX_PHYSICS_STEP_MS);
-            bool wobbling =
-                snapshot.meshStateTransition
-                    ? SimulateMeshWindowStateStep(simulatedMesh, snapshot.settings, stepMilliseconds / 1000.0)
-                    : SimulateMeshStep(simulatedMesh, snapshot.settings, stepMilliseconds / 1000.0);
+            const bool wobbling = SimulateMeshStep(simulatedMesh, snapshot.settings, stepMilliseconds / 1000.0);
             simulated = true;
             freeStepPending = false;
             remainingMilliseconds -= stepMilliseconds;
@@ -10196,7 +10191,10 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
         return;
     }
-    if (!slot.transformAttached && !slot.meshWindowState)
+    const bool nativeGeometry = g_dragUsesPhysicalCoordinates &&
+        g_meshWindowTransitionsReady.load(std::memory_order_acquire);
+    if (!slot.transformAttached && !slot.meshWindowState &&
+        !(nativeGeometry && (g_realResizing || meshCommittedStateChange)))
     {
         slot.meshWindowRect = rect;
         // Don't accumulate invisible deformation while an existing window's
@@ -10257,7 +10255,7 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
                                          g_moveTypeKnown && !g_realResizing &&
                                          (!g_waitingForInitialRestore || nativeMaximizeIntent ||
                                           nativeSnapIntent);
-    if (g_dragUsesPhysicalCoordinates && g_meshWindowTransitionsReady.load(std::memory_order_acquire) && !g_realResizing &&
+    if (nativeGeometry && !g_realResizing &&
         (slot.meshWindowState || (slot.settings.windowStateWobbleEnabled &&
                                   meshCommittedStateChange)))
     {
@@ -10280,6 +10278,12 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         g_waitingForInitialRestore = false;
         startInteractiveStateThrob(InteractiveStateThrobKind::Snap, true,
                                    snapIntentDirection);
+    }
+    else if (g_realResizing && nativeGeometry)
+    {
+        if (!slot.mesh.resizing) SetMeshResizeMode(slot.mesh, true, true);
+        UpdateResizeEdges(slot.mesh, g_realDraggedWindowRect, rect);
+        if (rectChanged) CommitMeshWindowStateGeometry(slot, rect, true);
     }
     else if (g_realResizing)
     {
@@ -10361,6 +10365,8 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     slot.meshRevision++;
     slot.meshWindowRect = rect;
     const Vec2 frameMeshSize = {slot.mesh.width, slot.mesh.height};
+    const bool transformAttached = slot.transformAttached;
+    const bool geometrySprings = slot.mesh.geometrySprings;
     const int framePin = slot.mesh.dragPointIndex;
     const Vec2 framePinBase = framePin >= 0 && framePin < GRID_POINT_COUNT
         ? slot.mesh.points[framePin].basePosition : Vec2{};
@@ -10370,10 +10376,10 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     ReleaseSRWLockExclusive(&g_animationSlotsLock);
     if (ShouldEmitTimedTrace(g_nextDragTraceAt))
     {
-        Wh_Log(L"DRAG TRACE LOCATION: HWND=%p Slot=%d transformAttached=1 "
-               L"delta=(%.1f,%.1f) resizing=%d rebase=%d",
-               hwnd, slotIndex, windowDeltaX, windowDeltaY,
-               g_realResizing, rebaseMonitorTransition);
+        Wh_Log(L"DRAG TRACE LOCATION: HWND=%p Slot=%d transformAttached=%d "
+               L"delta=(%.1f,%.1f) resizing=%d geometrySprings=%d rebase=%d",
+               hwnd, slotIndex, transformAttached, windowDeltaX, windowDeltaY,
+               g_realResizing, geometrySprings, rebaseMonitorTransition);
         if (g_dragUsesPhysicalCoordinates)
             Wh_Log(L"MESH DRAG FRAME: HWND=%p rectSize=%dx%d mesh=(%.1f,%.1f) "
                    L"local=(%.1f,%.1f) pin=%d base=(%.1f,%.1f) point=(%.1f,%.1f) offset=(%.1f,%.1f)",
@@ -11682,7 +11688,7 @@ BOOL Wh_ModInit()
     }
     g_unloading.store(false, std::memory_order_release);
     g_nativeMeshLastAttemptHwnd = nullptr;
-    g_nativeMeshLastAttemptAt = 0;
+    g_nativeMeshRetryAt = 0;
     g_nativeMeshActive.store(false, std::memory_order_release);
     g_nativeMeshStopRequested.store(false, std::memory_order_release);
     g_nativeMeshHwnd.store(nullptr, std::memory_order_release);
