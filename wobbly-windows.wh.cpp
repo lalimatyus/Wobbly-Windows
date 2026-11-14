@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.362
+// @version         0.363
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -6108,6 +6108,99 @@ static bool ReadNativeVisualChildren(void* visual, void**& entries,
     return true;
 }
 
+using StartTransitionSnapshot_t = void(__cdecl*)(void*, int, int);
+using RemoveTransitionSnapshot_t = void(__cdecl*)(void*);
+StartTransitionSnapshot_t g_startTransitionSnapshotOriginal = nullptr;
+RemoveTransitionSnapshot_t g_removeTransitionSnapshotOriginal = nullptr;
+constexpr int kMaximizeSnapSnapshotAnimation = 0x68;
+
+static void LogTransitionSnapshot(void* wrapper, const wchar_t* phase, int animationType)
+{
+    if (animationType != kMaximizeSnapSnapshotAnimation || g_unloading.load(std::memory_order_acquire) ||
+        !g_meshWindowTransitionsReady.load(std::memory_order_acquire)) return;
+    const auto settings = GetSettingsSnapshot();
+    if (settings.rendererMode != RendererMode::Mesh || !settings.windowStateWobbleEnabled) return;
+
+    const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
+    if (ReadPointerMember(wrapper, 0) != base + 0x1199D0) return;
+    void* owner = ReadPointerMember(wrapper, 0x30);
+    if (!IsDwmObjectPointerValid(owner, g_topLevelWindow3DVtable)) return;
+    HWND hwnd = GetHwndFromWindowData(ReadPointerMember(owner, g_topLevelWindow3DWindowDataOffset));
+    if (!hwnd) return;
+
+    auto* snapshot = static_cast<BYTE*>(ReadPointerMember(wrapper, 0x28));
+    if (!snapshot || ReadPointerMember(snapshot, 0) != base + 0x115028 ||
+        ReadPointerMember(snapshot, 8) != base + 0x114F50) return;
+    auto* visual = snapshot + 8;
+    if (ReadPointerMember(visual, 0x18) != owner) return;
+
+    void** children = nullptr;
+    unsigned int childCount = 0;
+    const bool haveChildren = ReadNativeVisualChildren(visual, children, childCount);
+    unsigned int instructionCount = 0;
+    size_t firstInstructionType = 0;
+    if (IsReadableMemory(visual + 0x118, sizeof(instructionCount)))
+    {
+        std::memcpy(&instructionCount, visual + 0x118, sizeof(instructionCount));
+        if (instructionCount > 0 && instructionCount <= 256)
+            firstInstructionType = NativeVisualVtableRva(ReadPointerMember(ReadPointerMember(visual, 0x100), 0));
+    }
+    Wh_Log(L"MESH NATIVE SNAPSHOT: phase=%s HWND=%p snapshot=%p proxy=%p children=%d "
+           L"firstChildType=0x%zx instructions=%u firstInstructionType=0x%zx meshActive=%d sceneThread=%d",
+           phase, hwnd, visual, ReadPointerMember(visual, 0x10),
+           haveChildren ? static_cast<int>(childCount) : -1,
+           haveChildren && childCount ? NativeVisualVtableRva(children[0]) : 0,
+           instructionCount, firstInstructionType,
+           g_nativeMeshHwnd.load(std::memory_order_acquire) == hwnd, IsOnDwmSceneThread());
+}
+
+static void __cdecl StartTransitionSnapshotHook(void* wrapper, int animationType, int flags)
+{
+    LogTransitionSnapshot(wrapper, L"start", animationType);
+    g_startTransitionSnapshotOriginal(wrapper, animationType, flags);
+}
+
+static void __cdecl RemoveTransitionSnapshotHook(void* wrapper)
+{
+    int animationType = 0;
+    const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
+    if (!g_unloading.load(std::memory_order_acquire) && ReadPointerMember(wrapper, 0) == base + 0x1199D0)
+    {
+        const auto* snapshot = static_cast<const BYTE*>(ReadPointerMember(wrapper, 0x28));
+        const auto* attached = static_cast<const BYTE*>(wrapper) + 0x3C;
+        if (IsReadableMemory(attached, 1) && *attached && snapshot &&
+            ReadPointerMember(snapshot, 0) == base + 0x115028 &&
+            IsReadableMemory(snapshot + 0x2E0, sizeof(animationType)))
+        {
+            std::memcpy(&animationType, snapshot + 0x2E0, sizeof(animationType));
+            LogTransitionSnapshot(wrapper, L"remove", animationType);
+        }
+    }
+    g_removeTransitionSnapshotOriginal(wrapper);
+}
+
+static void InitializeTransitionSnapshotDiagnostics()
+{
+    if (!g_meshWindowTransitionsReady.load(std::memory_order_acquire) ||
+        g_dwmModuleLayout.timeDateStamp != 0xE19C3234 || g_dwmModuleLayout.sizeOfImage != 0x16A000) return;
+    const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
+    auto* start = const_cast<BYTE*>(base + 0xEE138);
+    auto* remove = const_cast<BYTE*>(base + 0xEDFF0);
+    constexpr BYTE startPrefix[] = {0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,
+                                    0x57,0x48,0x83,0xEC,0x50,0x41,0x8B,0xF8,0x8B,0xDA};
+    constexpr BYTE removePrefix[] = {0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x79,0x3C,0x00,
+                                     0x48,0x8B,0xD9,0x74,0x45};
+    const bool startReady = IsDwmExecutableAddress(start) && IsReadableMemory(start, sizeof(startPrefix)) &&
+        !std::memcmp(start, startPrefix, sizeof(startPrefix)) &&
+        WindhawkUtils::SetFunctionHook(reinterpret_cast<StartTransitionSnapshot_t>(start),
+                                      StartTransitionSnapshotHook, &g_startTransitionSnapshotOriginal);
+    const bool removeReady = startReady && IsDwmExecutableAddress(remove) &&
+        IsReadableMemory(remove, sizeof(removePrefix)) && !std::memcmp(remove, removePrefix, sizeof(removePrefix)) &&
+        WindhawkUtils::SetFunctionHook(reinterpret_cast<RemoveTransitionSnapshot_t>(remove),
+                                      RemoveTransitionSnapshotHook, &g_removeTransitionSnapshotOriginal);
+    Wh_Log(L"MESH NATIVE SNAPSHOT PROBE: start=%d remove=%d readOnly=1", startReady, removeReady);
+}
+
 static bool IsNativeBackdropSourceRoot(void* topLevelWindow, void* border,
                                        void* sourceRoot)
 {
@@ -11868,6 +11961,7 @@ BOOL Wh_ModInit()
                                        std::memory_order_release);
     Wh_Log(L"MESH WINDOW TRANSITIONS: ready=%d corners=4 committedGeometry=1 affineFallback=1",
            g_meshWindowTransitionsReady.load(std::memory_order_acquire));
+    InitializeTransitionSnapshotDiagnostics();
     if (!StartWindowEventThread())
     {
         Wh_Log(L"Failed to initialize event thread");
