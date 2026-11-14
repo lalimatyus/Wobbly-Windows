@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.360
+// @version         0.361
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4100,6 +4100,10 @@ struct CoreBackdropCaptureRegion
     ULONGLONG epoch = 0;
     float original[4] = {};
     float scaleX = 0, scaleY = 0;
+    double desktopOffsetX = 0, desktopOffsetY = 0;
+    double drawOriginX = 0, drawOriginY = 0;
+    float capturedViewbox[4] = {};
+    bool translated = false;
     const wchar_t* stage = L"DesktopSource";
     bool active = false, planned = false, applied = false;
 };
@@ -4785,7 +4789,7 @@ struct CoreBackdropLiveSource
     CoreBackdropSizeU size = {}, logicalSize = {};
     CoreMaterialSizeF useful = {};
     bool expanded = false;
-    float originalBounds[4] = {};
+    double desktopOffsetX = 0, desktopOffsetY = 0;
     CoreBackdropAffine sampling = {};
     void* realizedImage = nullptr; // Borrowed through input's native refs, this call only.
     bool initialized = false, ready = false;
@@ -4883,7 +4887,11 @@ static void PrepareCoreBackdropLiveSource(CoreBackdropLiveSource& source, CoreMa
     if (!ReadCoreBackdropUsefulSize(metadata, source.size, source.useful, source.logicalSize) ||
         !BuildCoreBackdropLiveSampling(metadata, source.logicalSize, request.size, target, source.sampling)) return;
     source.expanded = region.applied && region.sourceImage == realizedImage;
-    if (source.expanded) std::memcpy(source.originalBounds, region.original, sizeof(source.originalBounds));
+    if (source.expanded)
+    {
+        source.desktopOffsetX = region.desktopOffsetX;
+        source.desktopOffsetY = region.desktopOffsetY;
+    }
     source.realizedImage = realizedImage;
     source.ready = true;
     source.stage = L"Ready";
@@ -4960,19 +4968,14 @@ static bool ReadCoreBackdropMeshMapping(const CoreBackdropRequest& request, cons
         transform[3] || transform[5] || transform[8] != 1 ||
         draw[1] || draw[2] || draw[3] || draw[4] || draw[6] || draw[7] ||
         draw[8] || draw[9] || draw[11] || draw[14] || draw[10] != 1 || draw[15] != 1 ||
-        std::abs(draw[0] - transform[0]) > 0.0001 || std::abs(draw[5] - transform[4]) > 0.0001 ||
-        std::abs(transform[6] - captured.bounds.left) > 1 ||
-        std::abs(transform[7] - captured.bounds.top) > 1) return false;
+        std::abs(draw[0] - transform[0]) > 0.0001 || std::abs(draw[5] - transform[4]) > 0.0001) return false;
 
-    const double left = draw[12] - frame.columns[1];
-    const double top = draw[13] - frame.rows[1];
-    const double right = left + request.size.width * draw[0];
-    const double bottom = top + request.size.height * draw[5];
-    return left >= captured.bounds.left - 1 && top >= captured.bounds.top - 1 &&
-           right <= captured.bounds.right + 1 && bottom <= captured.bounds.bottom + 1 &&
-           draw[12] >= 0 && draw[13] >= 0 &&
-           right + frame.columns[1] <= frame.columns[kCoreMeshSide - 1] &&
-           bottom + frame.rows[1] <= frame.rows[kCoreMeshSide - 1];
+    // The current draw and its UV grid can advance before the BVI crop does.
+    const double right = draw[12] + request.size.width * static_cast<double>(draw[0]);
+    const double bottom = draw[13] + request.size.height * static_cast<double>(draw[5]);
+    return draw[12] >= frame.columns[1] - 1 && draw[13] >= frame.rows[1] - 1 &&
+           right <= frame.columns[kCoreMeshSide - 2] + 1 &&
+           bottom <= frame.rows[kCoreMeshSide - 2] + 1;
 }
 
 static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreBackdropRequest& request,
@@ -4999,14 +5002,14 @@ static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreBackdropRequ
     warp.stage = L"CoordinateCompatibility";
     const double width = desktop.bounds.right - desktop.bounds.left;
     const double height = desktop.bounds.bottom - desktop.bounds.top;
-    const double capturedWidth = captured.bounds.right - captured.bounds.left;
-    const double capturedHeight = captured.bounds.bottom - captured.bounds.top;
-    const double originalWidth = source.expanded ? source.originalBounds[2] - source.originalBounds[0] : width;
-    const double originalHeight = source.expanded ? source.originalBounds[3] - source.originalBounds[1] : height;
-    const double sourceOffsetX = source.expanded ? source.originalBounds[0] - desktop.bounds.left : 0;
-    const double sourceOffsetY = source.expanded ? source.originalBounds[1] - desktop.bounds.top : 0;
-    if (target.width < 1 || target.height < 1 || target.width > 64 || target.height > 64 ||
-        std::abs(capturedWidth - originalWidth) > 1 || std::abs(capturedHeight - originalHeight) > 1) return;
+    if (target.width < 1 || target.height < 1 || target.width > 64 || target.height > 64) return;
+    if (!source.expanded &&
+        (std::abs(captured.bounds.right - captured.bounds.left - width) > 1 ||
+         std::abs(captured.bounds.bottom - captured.bounds.top - height) > 1 ||
+         std::abs(captured.transform[6] - captured.bounds.left) > 1 ||
+         std::abs(captured.transform[7] - captured.bounds.top) > 1)) return;
+    const double sourceOffsetX = source.expanded ? source.desktopOffsetX - desktop.bounds.left : -captured.bounds.left;
+    const double sourceOffsetY = source.expanded ? source.desktopOffsetY - desktop.bounds.top : -captured.bounds.top;
     const CoreMaterialSizeF pixels = sampledExtent ? *sampledExtent : source.useful;
     if (!pixels.width || !pixels.height) return;
     const double scaleX = pixels.width / width, scaleY = pixels.height / height;
@@ -5023,8 +5026,8 @@ static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreBackdropRequ
             const double cx = (rect.left + rect.right) * 0.5, cy = (rect.top + rect.bottom) * 0.5;
             double x = 0, y = 0, j[4] = {};
             if (!EvaluateCoreMeshFrame(*frame, cx * stepU + draw[12], cy * stepV + draw[13], x, y, j)) return;
-            const double px = (x - captured.bounds.left + sourceOffsetX) * scaleX;
-            const double py = (y - captured.bounds.top + sourceOffsetY) * scaleY;
+            const double px = (x + sourceOffsetX) * scaleX;
+            const double py = (y + sourceOffsetY) * scaleY;
             const double a = j[0] * stepU * scaleX, b = j[2] * stepU * scaleY;
             const double c = j[1] * stepV * scaleX, d = j[3] * stepV * scaleY;
             const double values[] = {a, b, c, d, px - cx * a - cy * c, py - cx * b - cy * d};
@@ -5086,18 +5089,46 @@ static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation
     region.stage = L"DrawMapping";
     if (!ReadCoreBackdropMeshMapping(request, frame, captured, draw)) return false;
     const double width = bounds[2] - bounds[0], height = bounds[3] - bounds[1];
-    const double cw = captured.bounds.right - captured.bounds.left, ch = captured.bounds.bottom - captured.bounds.top;
-    region.stage = L"DesktopExtent";
-    if (std::abs(width - cw) > 1 || std::abs(height - ch) > 1) return false;
+    region.stage = L"DesktopMapping";
+    CoreBackdropCoordinates desktop;
+    if (width <= 0 || height <= 0 || !ReadCoreBackdropCoordinates(candidate, desktop)) return false;
+    const auto* transform = desktop.transform;
+    const bool nativeTranslation = !transform[1] && !transform[2] && !transform[3] && !transform[5] &&
+        transform[8] == 1 && std::abs(transform[0] - draw[0]) <= 0.0001 &&
+        std::abs(transform[4] - draw[5]) <= 0.0001 &&
+        std::abs(transform[6] - bounds[0]) <= 1 && std::abs(transform[7] - bounds[1]) <= 1;
+    const bool matchingCrops = std::abs(width - (captured.bounds.right - captured.bounds.left)) <= 1 &&
+        std::abs(height - (captured.bounds.bottom - captured.bounds.top)) <= 1 &&
+        std::abs(captured.transform[6] - captured.bounds.left) <= 1 &&
+        std::abs(captured.transform[7] - captured.bounds.top) <= 1;
+    if (!nativeTranslation && (!matchingCrops ||
+        draw[12] < captured.bounds.left + frame.columns[1] - 1 ||
+        draw[13] < captured.bounds.top + frame.rows[1] - 1 ||
+        draw[12] + request.size.width * static_cast<double>(draw[0]) > captured.bounds.right + frame.columns[1] + 1 ||
+        draw[13] + request.size.height * static_cast<double>(draw[5]) > captured.bounds.bottom + frame.rows[1] + 1)) return false;
+    const double offsetX = nativeTranslation ? transform[6] - captured.transform[6] : bounds[0] - captured.bounds.left;
+    const double offsetY = nativeTranslation ? transform[7] - captured.transform[7] : bounds[1] - captured.bounds.top;
+    const double drawOriginX = draw[12] - frame.columns[1] + offsetX;
+    const double drawOriginY = draw[13] - frame.rows[1] + offsetY;
     region.stage = L"MeshCoverage";
-    double left = 0, top = 0, right = 0, bottom = 0;
-    auto include = [&](double dx, double dy)
+    double left = std::min<double>(bounds[0], drawOriginX), top = std::min<double>(bounds[1], drawOriginY);
+    double right = std::max<double>(bounds[2], drawOriginX + request.size.width * draw[0]);
+    double bottom = std::max<double>(bounds[3], drawOriginY + request.size.height * draw[5]);
+    auto include = [&](double x, double y)
     {
-        left = std::min(left, dx); right = std::max(right, dx);
-        top = std::min(top, dy); bottom = std::max(bottom, dy);
+        left = std::min(left, x + offsetX); right = std::max(right, x + offsetX);
+        top = std::min(top, y + offsetY); bottom = std::max(bottom, y + offsetY);
     };
-    for (const auto& v : frame.vertices)
-        include(v.x - (v.u - frame.columns[1]), v.y - (v.v - frame.rows[1]));
+    if (matchingCrops)
+    {
+        // Include material displacement over the original crop as well as
+        // the sampled tile bounds, without treating transparent padding as content.
+        for (const auto& v : frame.vertices)
+            include(std::clamp<double>(v.u - frame.columns[1], captured.bounds.left, captured.bounds.right) +
+                    v.x - (v.u - frame.columns[1]),
+                    std::clamp<double>(v.v - frame.rows[1], captured.bounds.top, captured.bounds.bottom) +
+                    v.y - (v.v - frame.rows[1]));
+    }
     // Include the affine tile's extrapolated corners too: a derivative at its
     // center can extend slightly beyond the exact triangle's vertex bounds.
     const double du = request.size.width * draw[0] / kCoreBackdropWarpSide;
@@ -5109,19 +5140,27 @@ static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation
             double px = 0, py = 0, j[4]{};
             if (!EvaluateCoreMeshFrame(frame, u, v, px, py, j)) return false;
             for (double a : {-0.5, 0.5}) for (double b : {-0.5, 0.5})
-                include(px + j[0]*a*du + j[1]*b*dv - (u + a*du - frame.columns[1]),
-                        py + j[2]*a*du + j[3]*b*dv - (v + b*dv - frame.rows[1]));
+                include(px + j[0]*a*du + j[1]*b*dv, py + j[2]*a*du + j[3]*b*dv);
         }
     region.stage = L"CaptureBudget";
     const double margin = std::max(128.0, std::max(width, height) / 32.0);
-    const double expanded[] = {std::floor(bounds[0] + left - margin), std::floor(bounds[1] + top - margin),
-                               std::ceil(bounds[2] + right + margin), std::ceil(bounds[3] + bottom + margin)};
+    const double expanded[] = {std::floor(left - margin), std::floor(top - margin),
+                               std::ceil(right + margin), std::ceil(bottom + margin)};
     for (double value : expanded) if (!std::isfinite(value) || std::abs(value) > 1048576) return false;
     if (expanded[2] - expanded[0] > 8192 || expanded[3] - expanded[1] > 8192 ||
         (expanded[2] - expanded[0]) * (expanded[3] - expanded[1]) > 33554432) return false;
     std::memcpy(region.original, bounds, sizeof(region.original));
     for (unsigned i = 0; i < 4; ++i) bounds[i] = static_cast<float>(expanded[i]);
     region.candidate = candidate;
+    region.desktopOffsetX = offsetX;
+    region.desktopOffsetY = offsetY;
+    region.drawOriginX = drawOriginX;
+    region.drawOriginY = drawOriginY;
+    region.translated = nativeTranslation;
+    region.capturedViewbox[0] = captured.viewbox.left;
+    region.capturedViewbox[1] = captured.viewbox.top;
+    region.capturedViewbox[2] = captured.viewbox.right;
+    region.capturedViewbox[3] = captured.viewbox.bottom;
     region.scaleX = draw[0];
     region.scaleY = draw[5];
     region.planned = true;
@@ -5131,7 +5170,8 @@ static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation
 
 static bool PrepareBackdropRegionMapping(void* input, const CoreMaterialInputMetadata& own,
                                          const CoreMaterialInputMetadata& reference, const void* image,
-                                         const float (&original)[4], float scaleX, float scaleY)
+                                         const float (&original)[4], float scaleX, float scaleY, double originX, double originY,
+                                         const float* capturedViewbox = nullptr)
 {
     CoreBackdropCoordinates actual;
     if (!ReadCoreBackdropCoordinates(image, actual) || !own.readable || !reference.readable ||
@@ -5146,16 +5186,18 @@ static bool PrepareBackdropRegionMapping(void* input, const CoreMaterialInputMet
         static_cast<double>(ref[0]) * ref[4] - static_cast<double>(ref[1]) * ref[3] <= 1e-16) return false;
     const double width = actual.bounds.right - actual.bounds.left, height = actual.bounds.bottom - actual.bounds.top;
     const double oldWidth = original[2] - original[0], oldHeight = original[3] - original[1];
-    if (std::abs(own.bounds[2] - width) > 1 || std::abs(own.bounds[3] - height) > 1 ||
-        std::abs(reference.bounds[2] - reference.bounds[0] - oldWidth) > 1 ||
-        std::abs(reference.bounds[3] - reference.bounds[1] - oldHeight) > 1 ||
+    bool matchesReference = std::abs(reference.bounds[2] - reference.bounds[0] - oldWidth) <= 1 &&
+                            std::abs(reference.bounds[3] - reference.bounds[1] - oldHeight) <= 1;
+    if (!matchesReference && capturedViewbox)
+        matchesReference = std::equal(std::begin(reference.bounds), std::end(reference.bounds), capturedViewbox);
+    if (!matchesReference || std::abs(own.bounds[2] - width) > 1 || std::abs(own.bounds[3] - height) > 1 ||
         actual.bounds.left > original[0] + 1 || actual.bounds.top > original[1] + 1 ||
         actual.bounds.right < original[2] - 1 || actual.bounds.bottom < original[3] - 1) return false;
     const float map[9] = {
         static_cast<float>(scaleX / width), 0, 0,
         0, static_cast<float>(scaleY / height), 0,
-        static_cast<float>((original[0] - actual.bounds.left) / width),
-        static_cast<float>((original[1] - actual.bounds.top) / height), 1,
+        static_cast<float>((originX - actual.bounds.left) / width),
+        static_cast<float>((originY - actual.bounds.top) / height), 1,
     };
     for (float value : map) if (!std::isfinite(value)) return false;
     std::memcpy(static_cast<BYTE*>(input) + 0x30, map, sizeof(map));
@@ -5173,7 +5215,9 @@ static bool PrepareOwnedBackdropMapping(void* input, const void* referenceInput,
     {
         // The owned scope suspends TLS observation while native rendering runs.
         return region->observation && CoreOwnedProbeCurrent(*region->observation) &&
-            PrepareBackdropRegionMapping(input, own, reference, image, region->original, region->scaleX, region->scaleY);
+            PrepareBackdropRegionMapping(input, own, reference, image, region->original,
+                                         region->scaleX, region->scaleY, region->drawOriginX, region->drawOriginY,
+                                         region->translated ? region->capturedViewbox : nullptr);
     }
     if (PrepareCoreOwnedInputMapping(input, referenceInput)) return true;
     if (!reference.readable || (reference.bounds[0] == 0 && reference.bounds[1] == 0)) return false;
@@ -5191,7 +5235,7 @@ static bool PrepareOwnedBackdropMapping(void* input, const void* referenceInput,
                           captured.viewbox.right, captured.viewbox.bottom};
     for (unsigned i = 0; i < 4; ++i)
         if (std::abs(view[i] - reference.bounds[i]) > 0.001f) return false;
-    return PrepareBackdropRegionMapping(input, own, reference, image, bounds, draw[0], draw[5]);
+    return PrepareBackdropRegionMapping(input, own, reference, image, bounds, draw[0], draw[5], bounds[0], bounds[1]);
 }
 
 struct CoreBackdropLinearScope
