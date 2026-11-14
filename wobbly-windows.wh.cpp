@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.358
+// @version         0.359
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -4945,6 +4945,30 @@ struct CoreBackdropWarp
     double centerDx = 0, centerDy = 0;
 };
 
+static bool ReadCoreBackdropMeshMapping(const CoreBackdropRequest& request, const CoreMeshFrame& frame,
+                                        const CoreBackdropCoordinates& captured, float (&draw)[16])
+{
+    if (!ReadCoreBackdropDrawTransform(request.context, draw)) return false;
+    const auto* transform = captured.transform;
+    if (transform[0] <= 0 || transform[4] <= 0 || transform[1] || transform[2] ||
+        transform[3] || transform[5] || transform[8] != 1 ||
+        draw[1] || draw[2] || draw[3] || draw[4] || draw[6] || draw[7] ||
+        draw[8] || draw[9] || draw[11] || draw[14] || draw[10] != 1 || draw[15] != 1 ||
+        std::abs(draw[0] - transform[0]) > 0.0001 || std::abs(draw[5] - transform[4]) > 0.0001 ||
+        std::abs(transform[6] - captured.bounds.left) > 1 ||
+        std::abs(transform[7] - captured.bounds.top) > 1) return false;
+
+    const double left = draw[12] - frame.columns[1];
+    const double top = draw[13] - frame.rows[1];
+    const double right = left + request.size.width * draw[0];
+    const double bottom = top + request.size.height * draw[5];
+    return left >= captured.bounds.left - 1 && top >= captured.bounds.top - 1 &&
+           right <= captured.bounds.right + 1 && bottom <= captured.bounds.bottom + 1 &&
+           draw[12] >= 0 && draw[13] >= 0 &&
+           right + frame.columns[1] <= frame.columns[kCoreMeshSide - 1] &&
+           bottom + frame.rows[1] <= frame.rows[kCoreMeshSide - 1];
+}
+
 static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreBackdropRequest& request,
                                   void* image, const CoreBackdropLiveSource& source, CoreMaterialSizeF target, const CoreMaterialSizeF* sampledExtent = nullptr)
 {
@@ -4957,7 +4981,7 @@ static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreBackdropRequ
     float draw[16] = {};
     if (source.realizedImage == image || !ReadCoreBackdropCoordinates(image, captured) ||
         !ReadCoreBackdropCoordinates(source.realizedImage, desktop) ||
-        !ReadCoreBackdropDrawTransform(request.context, draw)) return;
+        !ReadCoreBackdropMeshMapping(request, *frame, captured, draw)) return;
     // Accept only a proven desktop-path source, never a capture-tree image.
     const auto last = reinterpret_cast<uintptr_t>(ReadPointerMember(source.realizedImage, 0x708));
     const auto first = reinterpret_cast<uintptr_t>(ReadPointerMember(source.realizedImage, 0x700));
@@ -4967,7 +4991,6 @@ static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreBackdropRequ
     if (ReadPointerMember(tree, 0) != g_coreDesktopTreeVtable ||
         ReadPointerMember(tree, 0x40) != ReadPointerMember(source.realizedImage, 0x90)) return;
     warp.stage = L"CoordinateCompatibility";
-    const auto* m = captured.transform;
     const double width = desktop.bounds.right - desktop.bounds.left;
     const double height = desktop.bounds.bottom - desktop.bounds.top;
     const double capturedWidth = captured.bounds.right - captured.bounds.left;
@@ -4977,16 +5000,7 @@ static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreBackdropRequ
     const double sourceOffsetX = source.expanded ? source.originalBounds[0] - desktop.bounds.left : 0;
     const double sourceOffsetY = source.expanded ? source.originalBounds[1] - desktop.bounds.top : 0;
     if (target.width < 1 || target.height < 1 || target.width > 64 || target.height > 64 ||
-        m[0] <= 0 || m[4] <= 0 || m[1] != 0 || m[2] != 0 || m[3] != 0 || m[5] != 0 || m[8] != 1 ||
-        draw[1] != 0 || draw[2] != 0 || draw[3] != 0 || draw[4] != 0 || draw[6] != 0 || draw[7] != 0 ||
-        draw[8] != 0 || draw[9] != 0 || draw[10] != 1 || draw[11] != 0 || draw[14] != 0 || draw[15] != 1 ||
-        std::abs(draw[0] - m[0]) > 0.0001 || std::abs(draw[5] - m[4]) > 0.0001 ||
-        std::abs(capturedWidth - originalWidth) > 1 || std::abs(capturedHeight - originalHeight) > 1 ||
-        std::abs(request.size.width * m[0] - capturedWidth) > 1 ||
-        std::abs(request.size.height * m[4] - capturedHeight) > 1 ||
-        std::abs(m[6] - captured.bounds.left) > 1 || std::abs(m[7] - captured.bounds.top) > 1 ||
-        std::abs(draw[12] - m[6] - frame->columns[1]) > 1 ||
-        std::abs(draw[13] - m[7] - frame->rows[1]) > 1) return;
+        std::abs(capturedWidth - originalWidth) > 1 || std::abs(capturedHeight - originalHeight) > 1) return;
     const CoreMaterialSizeF pixels = sampledExtent ? *sampledExtent : source.useful;
     if (!pixels.width || !pixels.height) return;
     const double scaleX = pixels.width / width, scaleY = pixels.height / height;
@@ -5057,23 +5071,15 @@ static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation
     if (!CoreBackdropCaptureRequested(observation)) return false;
     auto& region = *g_coreBackdropCaptureRegion;
     region.planned = region.applied = false;
+    const auto& request = *g_coreBackdropRequest;
+    const auto& frame = *g_coreMeshFrame;
     CoreBackdropCoordinates captured;
     float draw[16]{};
     if (!ReadCoreBackdropCoordinates(region.capturedImage, captured) ||
-        !ReadCoreBackdropDrawTransform(observation.bridgeContext, draw)) return false;
-    const auto* request = g_coreBackdropRequest;
-    const auto& frame = *g_coreMeshFrame;
-    const auto* m = captured.transform;
+        !ReadCoreBackdropMeshMapping(request, frame, captured, draw)) return false;
     const double width = bounds[2] - bounds[0], height = bounds[3] - bounds[1];
     const double cw = captured.bounds.right - captured.bounds.left, ch = captured.bounds.bottom - captured.bounds.top;
-    if (m[0] <= 0 || m[4] <= 0 || m[1] || m[2] || m[3] || m[5] || m[8] != 1 ||
-        draw[1] || draw[2] || draw[3] || draw[4] || draw[6] || draw[7] ||
-        draw[8] || draw[9] || draw[11] || draw[14] || draw[10] != 1 || draw[15] != 1 ||
-        std::abs(width - cw) > 1 || std::abs(height - ch) > 1 ||
-        std::abs(request->size.width * m[0] - cw) > 1 || std::abs(request->size.height * m[4] - ch) > 1 ||
-        std::abs(draw[0] - m[0]) > 0.0001 || std::abs(draw[5] - m[4]) > 0.0001 ||
-        std::abs(draw[12] - captured.bounds.left - frame.columns[1]) > 1 ||
-        std::abs(draw[13] - captured.bounds.top - frame.rows[1]) > 1) return false;
+    if (std::abs(width - cw) > 1 || std::abs(height - ch) > 1) return false;
     double left = 0, top = 0, right = 0, bottom = 0;
     auto include = [&](double dx, double dy)
     {
@@ -5084,8 +5090,8 @@ static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation
         include(v.x - (v.u - frame.columns[1]), v.y - (v.v - frame.rows[1]));
     // Include the affine tile's extrapolated corners too: a derivative at its
     // center can extend slightly beyond the exact triangle's vertex bounds.
-    const double du = request->size.width * draw[0] / kCoreBackdropWarpSide;
-    const double dv = request->size.height * draw[5] / kCoreBackdropWarpSide;
+    const double du = request.size.width * draw[0] / kCoreBackdropWarpSide;
+    const double dv = request.size.height * draw[5] / kCoreBackdropWarpSide;
     for (unsigned y = 0; y < kCoreBackdropWarpSide; ++y)
         for (unsigned x = 0; x < kCoreBackdropWarpSide; ++x)
         {
@@ -5365,7 +5371,17 @@ static bool RenderCoreMeshBackdrop(CoreMaterialObservation& observation,
     const CoreMaterialSizeF size{std::min(request.size.width, 64.0f), std::min(request.size.height, 64.0f)};
     CoreBackdropLiveSource live;
     PrepareCoreBackdropLiveSource(live, observation, request, image, before, size, hit);
-    if (!live.ready || !IsCurrentCoreBackdropRequest(request, observation)) return false;
+    if (!IsCurrentCoreBackdropRequest(request, observation)) return false;
+    if (!live.ready)
+    {
+        const auto now = GetTickCount64();
+        auto last = g_coreBackdropCoordinatesLogAt.load(std::memory_order_relaxed);
+        if ((!last || now - last >= 1000) &&
+            g_coreBackdropCoordinatesLogAt.compare_exchange_strong(last, now, std::memory_order_relaxed))
+            Wh_Log(L"MESH BACKDROP SOURCE PENDING: stage=%s acquisition=%s ownAttempts=%u size=%.1fx%.1f",
+                   live.stage, live.acquisition, live.ownedAttempts, request.size.width, request.size.height);
+        return false;
+    }
 
     CoreBackdropLinearScope options;
     const bool linear = options.Begin(request.context);
@@ -6651,8 +6667,7 @@ static void MaintainNativeMesh()
             state.height = height;
             state.sourcePadding = padding;
             state.submittedMeshRevision = 0;
-            Wh_Log(L"NATIVE MESH SOURCE RESIZED: HWND=%p size=%dx%d padding=%d",
-                   state.hwnd, width, height, padding);
+
         }
         UpdateNativeVertexMesh(state, &sourceBounds);
     }
@@ -8008,6 +8023,8 @@ static bool SimulateMeshStep(WobbleMesh& mesh, const WobblySettings& settings, d
     double milliseconds = std::min(deltaTime * 1000.0, MAX_PHYSICS_STEP_MS);
     int substeps = static_cast<int>(std::ceil(milliseconds / GetMaximumPhysicsStep(settings, mesh.geometrySprings)));
     double drag = std::clamp(settings.drag / 100.0, 0.01, MAX_VELOCITY_RETENTION);
+    // A geometry change can excite all four anchors simultaneously.
+    if (mesh.geometrySprings) drag *= 0.96;
     if (substeps > 1)
     {
         // Subdivision must not multiply the damping selected by the user.
@@ -8086,13 +8103,31 @@ static bool CommitMeshWindowStateGeometry(WindowAnimationSlot& slot, const RECT&
 {
     if (!ValidMeshWindowRect(current) || !ValidMeshWindowRect(slot.meshWindowRect)) return false;
     auto& mesh = slot.mesh;
-    OffsetMeshPositions(mesh, static_cast<double>(slot.meshWindowRect.left) - current.left,
-                             static_cast<double>(slot.meshWindowRect.top) - current.top);
-    UpdateMeshBaseGrid(mesh, current.right - current.left, current.bottom - current.top);
+    const double width = current.right - current.left;
+    const double height = current.bottom - current.top;
+    const double gain = resizing ? 0.40 : 0.18;
+    const double maxLag = std::min(resizing ? 72.0 : 110.0, std::min(width, height) * 0.25);
+    const double originDeltaX = static_cast<double>(current.left) - slot.meshWindowRect.left;
+    const double originDeltaY = static_cast<double>(current.top) - slot.meshWindowRect.top;
+    // Start from the new rectangle with a fraction of the size change as
+    // spring displacement. Native bounds changes can span an entire monitor.
     for (int y = 0; y < GRID_HEIGHT; ++y)
         for (int x = 0; x < GRID_WIDTH; ++x)
-            mesh.points[GetPointIndex(x,y)].fixed = (x == 0 || x == GRID_WIDTH - 1) &&
-                                                   (y == 0 || y == GRID_HEIGHT - 1);
+        {
+            auto& point = mesh.points[GetPointIndex(x, y)];
+            const Vec2 base{width * x / (GRID_WIDTH - 1), height * y / (GRID_HEIGHT - 1)};
+            const Vec2 lag{
+                point.position.x - point.basePosition.x - gain * (base.x - point.basePosition.x + originDeltaX),
+                point.position.y - point.basePosition.y - gain * (base.y - point.basePosition.y + originDeltaY),
+            };
+            const double magnitude = std::hypot(lag.x, lag.y);
+            const double scale = magnitude > maxLag ? maxLag / magnitude : 1.0;
+            point.basePosition = base;
+            point.position = {base.x + lag.x * scale, base.y + lag.y * scale};
+            point.fixed = (x == 0 || x == GRID_WIDTH - 1) && (y == 0 || y == GRID_HEIGHT - 1);
+        }
+    mesh.width = width;
+    mesh.height = height;
     mesh.geometrySprings = true;
     mesh.resizing = resizing;
     mesh.dragging = resizing && slot.dragging;
