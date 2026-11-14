@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.359
+// @version         0.360
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -41,7 +41,7 @@ initialize instead of using unverified addresses.
 **Mesh Renderer** is an experimental in-process DWM path on the validated 23H2
 build. Other builds use the Affine fallback. It bends a live window image with
 20x20 Bezier interpolation, including its shadow and Mica. Snap, maximize,
-restore and edge resize use corner springs to pull the mesh toward the new
+and restore use corner springs to pull the mesh toward the new
 window bounds. Acrylic backdrop
 sampling follows the deformed mesh, with filtered background sampling to reduce
 shimmer. The desktop crop and local sampling approximation can still limit large
@@ -4100,6 +4100,7 @@ struct CoreBackdropCaptureRegion
     ULONGLONG epoch = 0;
     float original[4] = {};
     float scaleX = 0, scaleY = 0;
+    const wchar_t* stage = L"DesktopSource";
     bool active = false, planned = false, applied = false;
 };
 std::atomic_bool g_coreBackdropExpansionReady = false;
@@ -4213,6 +4214,8 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
                                       void* candidate, void* owner, void* referenceInput,
                                       const void* capturedImage = nullptr)
 {
+    auto* region = g_coreBackdropCaptureRegion;
+    if (region && region->active) region->stage = L"DesktopEligibility";
     if (!CoreOwnedProbeCurrent(observation) || !IsCoreMaterialVisual(owner) ||
         ReadPointerMember(candidate, 0) != g_coreBackdropImageVtable ||
         !IsReadableMemory(static_cast<const BYTE*>(candidate) + 0x7A1, 1)) return false;
@@ -4364,6 +4367,7 @@ static bool RunCoreOwnedBackdropProbe(CoreMaterialObservation& observation,
                 if (expandedCapture && g_coreBackdropCaptureRegion && g_coreBackdropCaptureRegion->candidate == candidate)
                 {
                     g_coreBackdropCaptureRegion->applied = true;
+                    g_coreBackdropCaptureRegion->stage = L"Bound";
                     g_coreBackdropCaptureRegion->sourceImage = scope.image;
                 }
                 ++budget.binds;
@@ -4787,6 +4791,7 @@ struct CoreBackdropLiveSource
     bool initialized = false, ready = false;
     const wchar_t* stage = L"Unavailable";
     const wchar_t* acquisition = L"direct";
+    const wchar_t* captureStage = L"Inactive";
     bool ownedBudget = false;
     unsigned ownedAttempts = 0;
     ~CoreBackdropLiveSource() { if (initialized) g_coreOwnedInputDestroyFunction(input); }
@@ -4848,6 +4853,7 @@ static void PrepareCoreBackdropLiveSource(CoreBackdropLiveSource& source, CoreMa
     void* result = directReady ? g_coreBackdropEffectInputOriginal(image, source.input)
         : AcquireCoreBackdropMaterialInput(&observation, hit, image, source.input);
     source.ownedAttempts = observation.ownedAttempts - attemptsBefore;
+    if (region.active) source.captureStage = region.stage;
     if (result != source.input || !IsCurrentCoreBackdropRequest(request, observation)) return;
     source.stage = L"Input";
     const auto metadata = ReadCoreMaterialInputMetadata(source.input);
@@ -5075,11 +5081,15 @@ static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation
     const auto& frame = *g_coreMeshFrame;
     CoreBackdropCoordinates captured;
     float draw[16]{};
-    if (!ReadCoreBackdropCoordinates(region.capturedImage, captured) ||
-        !ReadCoreBackdropMeshMapping(request, frame, captured, draw)) return false;
+    region.stage = L"CaptureCoordinates";
+    if (!ReadCoreBackdropCoordinates(region.capturedImage, captured)) return false;
+    region.stage = L"DrawMapping";
+    if (!ReadCoreBackdropMeshMapping(request, frame, captured, draw)) return false;
     const double width = bounds[2] - bounds[0], height = bounds[3] - bounds[1];
     const double cw = captured.bounds.right - captured.bounds.left, ch = captured.bounds.bottom - captured.bounds.top;
+    region.stage = L"DesktopExtent";
     if (std::abs(width - cw) > 1 || std::abs(height - ch) > 1) return false;
+    region.stage = L"MeshCoverage";
     double left = 0, top = 0, right = 0, bottom = 0;
     auto include = [&](double dx, double dy)
     {
@@ -5102,6 +5112,7 @@ static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation
                 include(px + j[0]*a*du + j[1]*b*dv - (u + a*du - frame.columns[1]),
                         py + j[2]*a*du + j[3]*b*dv - (v + b*dv - frame.rows[1]));
         }
+    region.stage = L"CaptureBudget";
     const double margin = std::max(128.0, std::max(width, height) / 32.0);
     const double expanded[] = {std::floor(bounds[0] + left - margin), std::floor(bounds[1] + top - margin),
                                std::ceil(bounds[2] + right + margin), std::ceil(bounds[3] + bottom + margin)};
@@ -5114,6 +5125,7 @@ static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation
     region.scaleX = draw[0];
     region.scaleY = draw[5];
     region.planned = true;
+    region.stage = L"Planned";
     return true;
 }
 
@@ -5378,8 +5390,9 @@ static bool RenderCoreMeshBackdrop(CoreMaterialObservation& observation,
         auto last = g_coreBackdropCoordinatesLogAt.load(std::memory_order_relaxed);
         if ((!last || now - last >= 1000) &&
             g_coreBackdropCoordinatesLogAt.compare_exchange_strong(last, now, std::memory_order_relaxed))
-            Wh_Log(L"MESH BACKDROP SOURCE PENDING: stage=%s acquisition=%s ownAttempts=%u size=%.1fx%.1f",
-                   live.stage, live.acquisition, live.ownedAttempts, request.size.width, request.size.height);
+            Wh_Log(L"MESH BACKDROP SOURCE PENDING: stage=%s captureStage=%s acquisition=%s ownAttempts=%u size=%.1fx%.1f",
+                   live.stage, live.captureStage, live.acquisition, live.ownedAttempts,
+                   request.size.width, request.size.height);
         return false;
     }
 
@@ -7709,10 +7722,9 @@ static void ContinuePhysicalMeshDrag(WobbleMesh& mesh, double width, double heig
     UpdateMeshDragOffset(mesh, localMouse);
 }
 
-static void SetMeshResizeMode(WobbleMesh& mesh, bool resizing, bool nativeGeometry = false)
+static void SetMeshResizeMode(WobbleMesh& mesh, bool resizing)
 {
     mesh.resizing = resizing;
-    mesh.geometrySprings = resizing && nativeGeometry;
     // Lock all resize edges; UpdateResizeEdges unlocks the moving ones.
     mesh.canWobbleTop = !resizing;
     mesh.canWobbleLeft = !resizing;
@@ -7755,21 +7767,14 @@ static void ApplyResizeConstraints(WobbleMesh& mesh)
         for (int x = 0; x < GRID_WIDTH; x++)
         {
             WobblePoint& point = mesh.points[GetPointIndex(x, y)];
-            // Geometry springs support only the stationary boundary. The
-            // legacy affine resize keeps its stronger interior constraints.
-            const bool lockLeft = mesh.geometrySprings ? x == 0 : x < GRID_WIDTH - 1;
-            const bool lockRight = mesh.geometrySprings ? x == GRID_WIDTH - 1 : x > 0;
-            const bool lockTop = mesh.geometrySprings ? y == 0 : y < GRID_HEIGHT - 1;
-            const bool lockBottom = mesh.geometrySprings ? y == GRID_HEIGHT - 1 : y > 0;
-            if ((!mesh.canWobbleLeft && lockLeft) || (!mesh.canWobbleRight && lockRight))
+            // Match KWin's edge-locking rules.
+            if ((!mesh.canWobbleLeft && x < GRID_WIDTH - 1) || (!mesh.canWobbleRight && x > 0))
             {
                 point.position.x = point.basePosition.x;
-                if (mesh.geometrySprings) point.velocity.x = 0.0;
             }
-            if ((!mesh.canWobbleTop && lockTop) || (!mesh.canWobbleBottom && lockBottom))
+            if ((!mesh.canWobbleTop && y < GRID_HEIGHT - 1) || (!mesh.canWobbleBottom && y > 0))
             {
                 point.position.y = point.basePosition.y;
-                if (mesh.geometrySprings) point.velocity.y = 0.0;
             }
         }
     }
@@ -8023,8 +8028,6 @@ static bool SimulateMeshStep(WobbleMesh& mesh, const WobblySettings& settings, d
     double milliseconds = std::min(deltaTime * 1000.0, MAX_PHYSICS_STEP_MS);
     int substeps = static_cast<int>(std::ceil(milliseconds / GetMaximumPhysicsStep(settings, mesh.geometrySprings)));
     double drag = std::clamp(settings.drag / 100.0, 0.01, MAX_VELOCITY_RETENTION);
-    // A geometry change can excite all four anchors simultaneously.
-    if (mesh.geometrySprings) drag *= 0.96;
     if (substeps > 1)
     {
         // Subdivision must not multiply the damping selected by the user.
@@ -8058,7 +8061,7 @@ static void BeginDrag(WobbleMesh& mesh, const Vec2& mousePosition)
 
 static void EndDrag(WobbleMesh& mesh)
 {
-    if (!mesh.dragging || (mesh.dragPointIndex < 0 && !mesh.geometrySprings))
+    if (!mesh.dragging || mesh.dragPointIndex < 0)
     {
         return;
     }
@@ -8099,43 +8102,22 @@ static bool PrepareMeshForGrab(WobbleMesh& mesh, double width, double height,
 // their four corner springs target the destination window rectangle.
 
 
-static bool CommitMeshWindowStateGeometry(WindowAnimationSlot& slot, const RECT& current, bool resizing = false)
+static bool CommitMeshWindowStateGeometry(WindowAnimationSlot& slot, const RECT& current)
 {
     if (!ValidMeshWindowRect(current) || !ValidMeshWindowRect(slot.meshWindowRect)) return false;
     auto& mesh = slot.mesh;
-    const double width = current.right - current.left;
-    const double height = current.bottom - current.top;
-    const double gain = resizing ? 0.40 : 0.18;
-    const double maxLag = std::min(resizing ? 72.0 : 110.0, std::min(width, height) * 0.25);
-    const double originDeltaX = static_cast<double>(current.left) - slot.meshWindowRect.left;
-    const double originDeltaY = static_cast<double>(current.top) - slot.meshWindowRect.top;
-    // Start from the new rectangle with a fraction of the size change as
-    // spring displacement. Native bounds changes can span an entire monitor.
+    OffsetMeshPositions(mesh, static_cast<double>(slot.meshWindowRect.left) - current.left,
+                             static_cast<double>(slot.meshWindowRect.top) - current.top);
+    UpdateMeshBaseGrid(mesh, current.right - current.left, current.bottom - current.top);
     for (int y = 0; y < GRID_HEIGHT; ++y)
         for (int x = 0; x < GRID_WIDTH; ++x)
-        {
-            auto& point = mesh.points[GetPointIndex(x, y)];
-            const Vec2 base{width * x / (GRID_WIDTH - 1), height * y / (GRID_HEIGHT - 1)};
-            const Vec2 lag{
-                point.position.x - point.basePosition.x - gain * (base.x - point.basePosition.x + originDeltaX),
-                point.position.y - point.basePosition.y - gain * (base.y - point.basePosition.y + originDeltaY),
-            };
-            const double magnitude = std::hypot(lag.x, lag.y);
-            const double scale = magnitude > maxLag ? maxLag / magnitude : 1.0;
-            point.basePosition = base;
-            point.position = {base.x + lag.x * scale, base.y + lag.y * scale};
-            point.fixed = (x == 0 || x == GRID_WIDTH - 1) && (y == 0 || y == GRID_HEIGHT - 1);
-        }
-    mesh.width = width;
-    mesh.height = height;
+            mesh.points[GetPointIndex(x,y)].fixed = (x == 0 || x == GRID_WIDTH - 1) &&
+                                                   (y == 0 || y == GRID_HEIGHT - 1);
     mesh.geometrySprings = true;
-    mesh.resizing = resizing;
-    mesh.dragging = resizing && slot.dragging;
+    mesh.resizing = mesh.dragging = false;
     mesh.dragPointIndex = -1;
     mesh.dragOffset = {};
-    if (!resizing)
-        mesh.canWobbleTop = mesh.canWobbleLeft = mesh.canWobbleRight = mesh.canWobbleBottom = true;
-    ApplyResizeConstraints(mesh);
+    mesh.canWobbleTop = mesh.canWobbleLeft = mesh.canWobbleRight = mesh.canWobbleBottom = true;
     mesh.active = true;
     slot.meshWindowRect = current;
     slot.freeStepPending = true;
@@ -9401,8 +9383,7 @@ static void HandleMoveSizeStart(HWND hwnd)
     if (dragSlot.active && dragSlot.hwnd == hwnd)
     {
         dragSlot.meshWindowRect = rect;
-        SetMeshResizeMode(dragSlot.mesh, operationTypeKnown && operationResizing,
-                          g_meshWindowTransitionsReady.load(std::memory_order_acquire) && physicalCoordinates);
+        SetMeshResizeMode(dragSlot.mesh, operationTypeKnown && operationResizing);
         // A new move loop may replace the visual transform.
         dragSlot.transformRebindRevision++;
         dragSlot.meshRevision++;
@@ -10229,7 +10210,7 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     const bool nativeGeometry = g_dragUsesPhysicalCoordinates &&
         g_meshWindowTransitionsReady.load(std::memory_order_acquire);
     if (!slot.transformAttached && !slot.meshWindowState &&
-        !(nativeGeometry && (g_realResizing || meshCommittedStateChange)))
+        !(nativeGeometry && meshCommittedStateChange))
     {
         slot.meshWindowRect = rect;
         // Don't accumulate invisible deformation while an existing window's
@@ -10313,12 +10294,6 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         g_waitingForInitialRestore = false;
         startInteractiveStateThrob(InteractiveStateThrobKind::Snap, true,
                                    snapIntentDirection);
-    }
-    else if (g_realResizing && nativeGeometry)
-    {
-        if (!slot.mesh.resizing) SetMeshResizeMode(slot.mesh, true, true);
-        UpdateResizeEdges(slot.mesh, g_realDraggedWindowRect, rect);
-        if (rectChanged) CommitMeshWindowStateGeometry(slot, rect, true);
     }
     else if (g_realResizing)
     {
