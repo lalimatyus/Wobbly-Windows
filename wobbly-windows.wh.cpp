@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.361
+// @version         0.362
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -852,6 +852,7 @@ struct WindowAnimationSlot
     bool freeStepPending;
     bool windowStateThrob;
     bool meshWindowState;
+    ULONGLONG meshPrepareUntil;
     RECT meshWindowRect;
     unsigned int hookUsers;
     ULONGLONG generation;
@@ -4974,8 +4975,7 @@ static bool ReadCoreBackdropMeshMapping(const CoreBackdropRequest& request, cons
     const double right = draw[12] + request.size.width * static_cast<double>(draw[0]);
     const double bottom = draw[13] + request.size.height * static_cast<double>(draw[5]);
     return draw[12] >= frame.columns[1] - 1 && draw[13] >= frame.rows[1] - 1 &&
-           right <= frame.columns[kCoreMeshSide - 2] + 1 &&
-           bottom <= frame.rows[kCoreMeshSide - 2] + 1;
+           right <= frame.columns[kCoreMeshSide - 1] && bottom <= frame.rows[kCoreMeshSide - 1];
 }
 
 static void BuildCoreBackdropWarp(CoreBackdropWarp& warp, const CoreBackdropRequest& request,
@@ -5093,10 +5093,22 @@ static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation
     CoreBackdropCoordinates desktop;
     if (width <= 0 || height <= 0 || !ReadCoreBackdropCoordinates(candidate, desktop)) return false;
     const auto* transform = desktop.transform;
-    const bool nativeTranslation = !transform[1] && !transform[2] && !transform[3] && !transform[5] &&
+    const bool matchingScales = !transform[1] && !transform[2] && !transform[3] && !transform[5] &&
         transform[8] == 1 && std::abs(transform[0] - draw[0]) <= 0.0001 &&
-        std::abs(transform[4] - draw[5]) <= 0.0001 &&
-        std::abs(transform[6] - bounds[0]) <= 1 && std::abs(transform[7] - bounds[1]) <= 1;
+        std::abs(transform[4] - draw[5]) <= 0.0001;
+    // Resolve both crops in one coordinate space before accepting an offset.
+    const double nativeOffsetX = transform[6] - captured.transform[6];
+    const double nativeOffsetY = transform[7] - captured.transform[7];
+    const double nativeLeft = draw[12] - frame.columns[1] + nativeOffsetX;
+    const double nativeTop = draw[13] - frame.rows[1] + nativeOffsetY;
+    const double drawWidth = request.size.width * static_cast<double>(draw[0]);
+    const double drawHeight = request.size.height * static_cast<double>(draw[5]);
+    const bool nativeTranslation = matchingScales &&
+        std::abs(nativeLeft) <= 1048576 && std::abs(nativeTop) <= 1048576 &&
+        std::min<double>(bounds[2], nativeLeft + drawWidth) - std::max<double>(bounds[0], nativeLeft) >=
+            std::min(width, drawWidth) * 0.5 &&
+        std::min<double>(bounds[3], nativeTop + drawHeight) - std::max<double>(bounds[1], nativeTop) >=
+            std::min(height, drawHeight) * 0.5;
     const bool matchingCrops = std::abs(width - (captured.bounds.right - captured.bounds.left)) <= 1 &&
         std::abs(height - (captured.bounds.bottom - captured.bounds.top)) <= 1 &&
         std::abs(captured.transform[6] - captured.bounds.left) <= 1 &&
@@ -5104,10 +5116,14 @@ static bool ExpandCoreBackdropCapture(const CoreMaterialObservation& observation
     if (!nativeTranslation && (!matchingCrops ||
         draw[12] < captured.bounds.left + frame.columns[1] - 1 ||
         draw[13] < captured.bounds.top + frame.rows[1] - 1 ||
-        draw[12] + request.size.width * static_cast<double>(draw[0]) > captured.bounds.right + frame.columns[1] + 1 ||
-        draw[13] + request.size.height * static_cast<double>(draw[5]) > captured.bounds.bottom + frame.rows[1] + 1)) return false;
-    const double offsetX = nativeTranslation ? transform[6] - captured.transform[6] : bounds[0] - captured.bounds.left;
-    const double offsetY = nativeTranslation ? transform[7] - captured.transform[7] : bounds[1] - captured.bounds.top;
+        draw[12] + drawWidth > captured.bounds.right + frame.columns[1] + 1 ||
+        draw[13] + drawHeight > captured.bounds.bottom + frame.rows[1] + 1))
+    {
+        region.stage = matchingScales ? L"DesktopOverlap" : L"DesktopScale";
+        return false;
+    }
+    const double offsetX = nativeTranslation ? nativeOffsetX : bounds[0] - captured.bounds.left;
+    const double offsetY = nativeTranslation ? nativeOffsetY : bounds[1] - captured.bounds.top;
     const double drawOriginX = draw[12] - frame.columns[1] + offsetX;
     const double drawOriginY = draw[13] - frame.rows[1] + offsetY;
     region.stage = L"MeshCoverage";
@@ -7147,7 +7163,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
         AcquireSRWLockExclusive(&g_animationSlotsLock);
         WindowAnimationSlot& slot = g_animationSlots[i];
         const bool affineStateThrob = slot.windowStateThrob && !slot.meshWindowState;
-        const bool capturePending = (slot.dragging || slot.mesh.geometrySprings) &&
+        const bool capturePending = (slot.dragging || slot.mesh.geometrySprings || slot.meshPrepareUntil > now) &&
             slot.settings.rendererMode == RendererMode::Mesh &&
             g_meshWindowTransitionsReady.load(std::memory_order_acquire) &&
             !g_nativeMeshActive.load(std::memory_order_acquire) &&
@@ -8183,6 +8199,7 @@ static bool BeginMeshWindowStateTransition(WindowAnimationSlot& slot, const RECT
         slot.meshWindowRect = source;
     }
     if (!CommitMeshWindowStateGeometry(slot, current)) return false;
+    slot.meshPrepareUntil = 0;
     slot.windowStateThrob = slot.meshWindowState = true;
     ++slot.transformRebindRevision;
     slot.order = ++g_animationOrderCounter;
@@ -9175,6 +9192,7 @@ static bool PrepareAnimationSlotGrab(WindowAnimationSlot& slot, const WobblySett
         !preserveGeometry && (hadStateThrob || (slot.mesh.resizing && !slot.dragging)), physical);
     slot.settings = settings;
     slot.windowStateThrob = slot.meshWindowState = false;
+    slot.meshPrepareUntil = 0;
     if (hadStateThrob)
     {
         slot.boundTransitionVisualProxy = nullptr;
@@ -9271,6 +9289,7 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
     slot.freeStepPending = false;
     slot.windowStateThrob = false;
     slot.meshWindowState = false;
+    slot.meshPrepareUntil = 0;
     slot.hookUsers = 0;
     slot.generation++;
     slot.order = ++g_animationOrderCounter;
@@ -9299,23 +9318,31 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
 
 static void RefreshMeshWindowStateGeometry()
 {
-    struct Pending { HWND hwnd; ULONGLONG generation; } pending[MAX_ANIMATION_SLOTS] = {};
+    struct Pending { HWND hwnd; ULONGLONG generation; RECT previous; bool preparing; } pending[MAX_ANIMATION_SLOTS] = {};
     unsigned count = 0;
     AcquireSRWLockShared(&g_animationSlotsLock);
     for (const auto& slot : g_animationSlots)
-        if (slot.active && slot.meshWindowState) pending[count++] = {slot.hwnd, slot.generation};
+        if (slot.active && (slot.meshWindowState || slot.meshPrepareUntil))
+            pending[count++] = {slot.hwnd, slot.generation, slot.meshWindowRect, slot.meshPrepareUntil != 0};
     ReleaseSRWLockShared(&g_animationSlotsLock);
     bool changed = false;
     for (unsigned i = 0; i < count; ++i)
     {
         RECT current = {};
+        if (pending[i].preparing && IsIconic(pending[i].hwnd)) continue;
         if (!ReadWindowRectForRenderer(pending[i].hwnd, &current) || !ValidMeshWindowRect(current)) continue;
         AcquireSRWLockExclusive(&g_animationSlotsLock);
         for (auto& slot : g_animationSlots)
-            if (slot.active && slot.hwnd == pending[i].hwnd && slot.generation == pending[i].generation && slot.meshWindowState)
+            if (slot.active && slot.hwnd == pending[i].hwnd && slot.generation == pending[i].generation)
             {
                 if (!EqualRect(&slot.meshWindowRect, &current))
-                    changed |= CommitMeshWindowStateGeometry(slot, current);
+                {
+                    if (slot.meshWindowState)
+                        changed |= CommitMeshWindowStateGeometry(slot, current);
+                    else if (slot.meshPrepareUntil > GetTickCount64() &&
+                             EqualRect(&pending[i].previous, &slot.meshWindowRect))
+                        changed |= BeginMeshWindowStateTransition(slot, pending[i].previous, current);
+                }
                 break;
             }
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
@@ -9966,6 +9993,7 @@ static void UpdateAnimationFrame()
             bool proxyCreationPending;
             ULONGLONG generation;
             ULONGLONG nextWindowValidation;
+            ULONGLONG meshPrepareUntil;
             HWND hwnd;
             void* matrixTransformProxy;
         } snapshot = {};
@@ -9981,6 +10009,7 @@ static void UpdateAnimationFrame()
             snapshot.proxyCreationPending = slot.proxyCreationPending;
             snapshot.generation = slot.generation;
             snapshot.nextWindowValidation = slot.nextWindowValidation;
+            snapshot.meshPrepareUntil = slot.meshPrepareUntil;
             snapshot.hwnd = slot.hwnd;
             snapshot.matrixTransformProxy = slot.matrixTransformProxy;
         }
@@ -10001,8 +10030,8 @@ static void UpdateAnimationFrame()
             }
             ReleaseSRWLockExclusive(&g_animationSlotsLock);
         }
-        if (invalidWindow ||
-            (!snapshot.dragging && !snapshot.meshActive && !snapshot.freeStepPending))
+        if (invalidWindow || (!snapshot.dragging && !snapshot.meshActive &&
+                              !snapshot.freeStepPending && snapshot.meshPrepareUntil <= now))
         {
             slotsToRetire[retireCount++] = i;
             continue;
@@ -10741,7 +10770,7 @@ static void CancelWindowStateThrobForWindow(HWND hwnd)
 {
     int slotIndex = FindAnimationSlotMatching(
         [hwnd](const WindowAnimationSlot& slot, int)
-        { return slot.active && slot.hwnd == hwnd && slot.windowStateThrob && !slot.dragging; });
+        { return slot.active && slot.hwnd == hwnd && (slot.windowStateThrob || slot.meshPrepareUntil) && !slot.dragging; });
     if (slotIndex >= 0)
     {
         RetireAnimationSlot(slotIndex);
@@ -10773,6 +10802,33 @@ static bool ShouldSuppressWindowStateThrob(HWND hwnd)
     }
     const ObservedWindowState& observed = g_observedWindows[index];
     return observed.iconic || GetTickCount64() <= observed.suppressStateThrobUntil;
+}
+
+static void PrepareMeshWindowStateTransition(HWND hwnd, const RECT& current)
+{
+    const auto settings = GetSettingsSnapshot();
+    if (settings.rendererMode != RendererMode::Mesh || !settings.windowStateWobbleEnabled ||
+        !g_meshWindowTransitionsReady.load(std::memory_order_acquire) ||
+        !IsEligibleWindowForStateThrob(hwnd) ||
+        !IsWindowVisible(hwnd) || IsIconic(hwnd) || ShouldSuppressWindowStateThrob(hwnd) ||
+        FindAnimationSlotForWindow(hwnd) >= 0) return;
+    const int index = AcquireAnimationSlot(hwnd, settings, current.right - current.left,
+                                           current.bottom - current.top, {});
+    if (index < 0) return;
+    AcquireSRWLockExclusive(&g_animationSlotsLock);
+    auto& slot = g_animationSlots[index];
+    InitializeMesh(slot.mesh, current.right - current.left, current.bottom - current.top);
+    slot.meshWindowRect = current;
+    slot.meshPrepareUntil = GetTickCount64() + 350;
+    slot.dragging = false;
+    ReleaseSRWLockExclusive(&g_animationSlotsLock);
+    if (!EnsureAnimationClockRunning(hwnd))
+    {
+        RetireAnimationSlot(index, hwnd);
+        return;
+    }
+    RequestDwmScenePass();
+    Wh_Log(L"MESH WINDOW TRANSITION PREPARE: HWND=%p", hwnd);
 }
 
 static void HandleMinimizeLifecycle(HWND hwnd, bool minimizing)
@@ -10810,8 +10866,15 @@ static void HandleMinimizeLifecycle(HWND hwnd, bool minimizing)
             observed.snapped = !observed.zoomed && IsApproximatelySnapLayoutTarget(rect);
         }
     }
-    // Cancel only a transition pulse racing taskbar restore.
-    CancelWindowStateThrobForWindow(hwnd);
+    // A settling mesh belongs to the live window, not the taskbar visual.
+    const int meshSlot = minimizing ? FindAnimationSlotMatching([hwnd](const WindowAnimationSlot& slot, int)
+    {
+        return slot.active && slot.hwnd == hwnd && slot.settings.rendererMode == RendererMode::Mesh;
+    }) : -1;
+    if (meshSlot >= 0)
+        RetireAnimationSlot(meshSlot, hwnd);
+    else
+        CancelWindowStateThrobForWindow(hwnd);
     if (!minimizing)
     {
         Wh_Log(L"TASKBAR RESTORE: window-state wobble suppressed "
@@ -10944,9 +11007,15 @@ static void HandleNativeWindowTransitionStart(HWND hwnd, LPARAM transitionFlags)
         // Private notification phases can contain the previous layout, not the
         // destination. Only committed HWND geometry drives the Mesh springs.
         RECT current = {};
-        if (index >= 0 && ReadWindowRectForRenderer(hwnd, &current) && ValidMeshWindowRect(current) &&
-            !EqualRect(&nativeSourceRect, &current))
-            StartWindowStateThrob(hwnd, IsZoomed(hwnd) != FALSE, false, {}, &nativeSourceRect);
+        if (index >= 0 && ReadWindowRectForRenderer(hwnd, &current) && ValidMeshWindowRect(current))
+        {
+            if (!EqualRect(&nativeSourceRect, &current))
+                StartWindowStateThrob(hwnd, IsZoomed(hwnd) != FALSE, false, {}, &nativeSourceRect);
+            else if (transitionFlags & (NATIVE_TRANSITION_TARGET_IS_WORK_AREA |
+                                        NATIVE_TRANSITION_TARGET_IS_SNAP_LAYOUT |
+                                        NATIVE_TRANSITION_SOURCE_IS_WORK_AREA))
+                PrepareMeshWindowStateTransition(hwnd, current);
+        }
         return;
     }
     bool targetIsWorkArea = (transitionFlags & NATIVE_TRANSITION_TARGET_IS_WORK_AREA) != 0;
