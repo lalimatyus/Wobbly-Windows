@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.364
+// @version         0.365
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -6110,22 +6110,34 @@ static bool ReadNativeVisualChildren(void* visual, void**& entries,
 
 using StartTransitionSnapshot_t = void(__cdecl*)(void*, int, int);
 using RemoveTransitionSnapshot_t = void(__cdecl*)(void*);
+using WriteTransitionTile_t = long(__cdecl*)(void*, void*, const void*);
 StartTransitionSnapshot_t g_startTransitionSnapshotOriginal = nullptr;
 RemoveTransitionSnapshot_t g_removeTransitionSnapshotOriginal = nullptr;
+WriteTransitionTile_t g_writeTransitionTileOriginal = nullptr;
 constexpr int kMaximizeSnapSnapshotAnimation = 0x68;
+
+static bool IsSnapshotProbeEnabled()
+{
+    if (g_unloading.load(std::memory_order_acquire) ||
+        !g_meshWindowTransitionsReady.load(std::memory_order_acquire)) return false;
+    const auto settings = GetSettingsSnapshot();
+    return settings.rendererMode == RendererMode::Mesh && settings.windowStateWobbleEnabled;
+}
+
+static HWND GetTransitionSnapshotHwnd(void* owner)
+{
+    if (!IsDwmObjectPointerValid(owner, g_topLevelWindow3DVtable)) return nullptr;
+    return GetHwndFromWindowData(ReadPointerMember(owner, g_topLevelWindow3DWindowDataOffset));
+}
 
 static void LogTransitionSnapshot(void* wrapper, const wchar_t* phase, int animationType)
 {
-    if (animationType != kMaximizeSnapSnapshotAnimation || g_unloading.load(std::memory_order_acquire) ||
-        !g_meshWindowTransitionsReady.load(std::memory_order_acquire)) return;
-    const auto settings = GetSettingsSnapshot();
-    if (settings.rendererMode != RendererMode::Mesh || !settings.windowStateWobbleEnabled) return;
+    if (animationType != kMaximizeSnapSnapshotAnimation || !IsSnapshotProbeEnabled()) return;
 
     const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
     if (ReadPointerMember(wrapper, 0) != base + 0x1199D0) return;
     void* owner = ReadPointerMember(wrapper, 0x30);
-    if (!IsDwmObjectPointerValid(owner, g_topLevelWindow3DVtable)) return;
-    HWND hwnd = GetHwndFromWindowData(ReadPointerMember(owner, g_topLevelWindow3DWindowDataOffset));
+    HWND hwnd = GetTransitionSnapshotHwnd(owner);
     if (!hwnd) return;
 
     auto* snapshot = static_cast<BYTE*>(ReadPointerMember(wrapper, 0x28));
@@ -6141,8 +6153,6 @@ static void LogTransitionSnapshot(void* wrapper, const wchar_t* phase, int anima
 
     unsigned int instructionCount = 0;
     size_t instructionTypes[3] = {};
-    void* brush = nullptr;
-    void* geometry = nullptr;
     if (IsReadableMemory(visual + 0x118, sizeof(instructionCount)))
     {
         std::memcpy(&instructionCount, visual + 0x118, sizeof(instructionCount));
@@ -6151,23 +6161,55 @@ static void LogTransitionSnapshot(void* wrapper, const wchar_t* phase, int anima
         {
             void* instruction = ReadPointerMember(entries, i * sizeof(void*));
             instructionTypes[i] = NativeVisualVtableRva(instruction);
-            if (instructionTypes[i] == 0x114730) // CDrawGeometryInstruction.
-            {
-                brush = ReadPointerMember(instruction, 0x10);
-                geometry = ReadPointerMember(instruction, 0x18);
-            }
         }
     }
     Wh_Log(L"MESH NATIVE SNAPSHOT: phase=%s HWND=%p snapshot=%p "
            L"from=(%ld,%ld,%ld,%ld) to=(%ld,%ld,%ld,%ld) "
-           L"instructions=%u types=(0x%zx,0x%zx,0x%zx) brush=0x%zx nativeBrush=%d "
-           L"geometry=0x%zx meshActive=%d sceneThread=%d",
+           L"instructions=%u types=(0x%zx,0x%zx,0x%zx) meshActive=%d sceneThread=%d",
            phase, hwnd, visual, begin.left, begin.top, begin.right, begin.bottom,
            end.left, end.top, end.right, end.bottom,
            instructionCount, instructionTypes[0], instructionTypes[1], instructionTypes[2],
-           NativeVisualVtableRva(brush), brush && brush == ReadPointerMember(snapshot, 0x250),
-           NativeVisualVtableRva(geometry),
            g_nativeMeshHwnd.load(std::memory_order_acquire) == hwnd, IsOnDwmSceneThread());
+}
+
+static void LogTransitionSnapshotTile(void* instruction, const void* visual, long result)
+{
+    const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
+    if (ReadPointerMember(visual, 0) != base + 0x114F50 || !IsSnapshotProbeEnabled()) return;
+
+    const auto* snapshot = static_cast<const BYTE*>(visual) - 8;
+    if (ReadPointerMember(snapshot, 0) != base + 0x115028 ||
+        !IsReadableMemory(snapshot + 0x2E0, sizeof(int)) ||
+        ReadPointerMember(instruction, 0) != base + 0x114718 ||
+        !IsReadableMemory(instruction, 0x38)) return;
+    int animationType = 0;
+    std::memcpy(&animationType, snapshot + 0x2E0, sizeof(animationType));
+    if (animationType != kMaximizeSnapSnapshotAnimation) return;
+
+    HWND hwnd = GetTransitionSnapshotHwnd(ReadPointerMember(visual, 0x18));
+    if (!hwnd) return;
+    const auto* tile = static_cast<const BYTE*>(instruction);
+    RECT rect = {};
+    POINT origin = {};
+    float scale = 0;
+    std::memcpy(&rect, tile + 0x10, sizeof(rect));
+    std::memcpy(&origin, tile + 0x20, sizeof(origin));
+    std::memcpy(&scale, tile + 0x28, sizeof(scale));
+    void* image = ReadPointerMember(tile, 0x30);
+    Wh_Log(L"MESH NATIVE SNAPSHOT DRAW: HWND=%p snapshot=%p result=0x%08X "
+           L"rect=(%ld,%ld,%ld,%ld) origin=(%ld,%ld) scale=%.4f imageType=0x%zx "
+           L"snapshotImage=%d meshActive=%d sceneThread=%d",
+           hwnd, visual, static_cast<unsigned>(result), rect.left, rect.top, rect.right, rect.bottom,
+           origin.x, origin.y, static_cast<double>(scale), NativeVisualVtableRva(image),
+           image && image == ReadPointerMember(snapshot, 0x248),
+           g_nativeMeshHwnd.load(std::memory_order_acquire) == hwnd, IsOnDwmSceneThread());
+}
+
+static long __cdecl WriteTransitionTileHook(void* instruction, void* builder, const void* visual)
+{
+    const long result = g_writeTransitionTileOriginal(instruction, builder, visual);
+    LogTransitionSnapshotTile(instruction, visual, result);
+    return result;
 }
 
 static void __cdecl StartTransitionSnapshotHook(void* wrapper, int animationType, int flags)
@@ -6203,10 +6245,15 @@ static void InitializeTransitionSnapshotDiagnostics()
     const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
     auto* start = const_cast<BYTE*>(base + 0xEE138);
     auto* remove = const_cast<BYTE*>(base + 0xEDFF0);
+    auto* draw = const_cast<BYTE*>(base + 0x1D390);
     constexpr BYTE startPrefix[] = {0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,
                                     0x57,0x48,0x83,0xEC,0x50,0x41,0x8B,0xF8,0x8B,0xDA};
     constexpr BYTE removePrefix[] = {0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x79,0x3C,0x00,
                                      0x48,0x8B,0xD9,0x74,0x45};
+    constexpr BYTE drawPrefix[] = {0x48,0x83,0xEC,0x58,0x48,0x8B,0x05,0xCD,0xA3,0x12,0x00,
+                                   0x48,0x33,0xC4,0x48,0x89,0x44,0x24,0x48,0x4C,0x8B,0xCA};
+    constexpr BYTE writeDispatch[] = {0x48,0x8B,0x54,0x24,0x60,0x4C,0x8B,0xC3,
+                                      0x48,0x8B,0x40,0x08};
     const bool startReady = IsDwmExecutableAddress(start) && IsReadableMemory(start, sizeof(startPrefix)) &&
         !std::memcmp(start, startPrefix, sizeof(startPrefix)) &&
         WindhawkUtils::SetFunctionHook(reinterpret_cast<StartTransitionSnapshot_t>(start),
@@ -6215,7 +6262,15 @@ static void InitializeTransitionSnapshotDiagnostics()
         IsReadableMemory(remove, sizeof(removePrefix)) && !std::memcmp(remove, removePrefix, sizeof(removePrefix)) &&
         WindhawkUtils::SetFunctionHook(reinterpret_cast<RemoveTransitionSnapshot_t>(remove),
                                       RemoveTransitionSnapshotHook, &g_removeTransitionSnapshotOriginal);
-    Wh_Log(L"MESH NATIVE SNAPSHOT PROBE: start=%d remove=%d readOnly=1", startReady, removeReady);
+    const BYTE* dispatch = base + 0x17B62;
+    const bool drawReady = startReady && IsDwmExecutableAddress(draw) &&
+        IsReadableMemory(draw, sizeof(drawPrefix)) && !std::memcmp(draw, drawPrefix, sizeof(drawPrefix)) &&
+        IsReadableMemory(dispatch, sizeof(writeDispatch)) &&
+        !std::memcmp(dispatch, writeDispatch, sizeof(writeDispatch)) &&
+        WindhawkUtils::SetFunctionHook(reinterpret_cast<WriteTransitionTile_t>(draw),
+                                      WriteTransitionTileHook, &g_writeTransitionTileOriginal);
+    Wh_Log(L"MESH NATIVE SNAPSHOT PROBE: start=%d remove=%d draw=%d readOnly=1",
+           startReady, removeReady, drawReady);
 }
 
 static bool IsNativeBackdropSourceRoot(void* topLevelWindow, void* border,
