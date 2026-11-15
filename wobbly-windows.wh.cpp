@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.367
+// @version         0.368
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -267,6 +267,7 @@ struct WobbleMesh
     bool dragging;
     bool resizing;
     bool geometrySprings;
+    bool geometryTransitionStart;
     bool canWobbleTop;
     bool canWobbleLeft;
     bool canWobbleRight;
@@ -6111,7 +6112,7 @@ static bool ReadNativeVisualChildren(void* visual, void**& entries,
 using ShellAnimationsEnabled_t = bool(__cdecl*)(const void*);
 ShellAnimationsEnabled_t g_shellAnimationsEnabledOriginal = nullptr;
 
-static HWND GetShellMeshTransitionWindow(const void* state)
+static void* GetShellMeshTransitionWindowData(const void* state)
 {
     if (!state) return nullptr;
     const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
@@ -6126,10 +6127,10 @@ static HWND GetShellMeshTransitionWindow(const void* state)
     const auto* snapshotWrapper = static_cast<const BYTE*>(ReadPointerMember(handler, 0x28));
     if (ReadPointerMember(snapshotWrapper, 0) != base + 0x119948 ||
         ReadPointerMember(snapshotWrapper, 0x28) != window) return nullptr;
-    return GetHwndFromWindowData(ReadPointerMember(window, g_topLevelWindow3DWindowDataOffset));
+    return ReadPointerMember(window, g_topLevelWindow3DWindowDataOffset);
 }
 
-static bool IsLiveMeshReadyForShellTransition(HWND hwnd)
+static bool HasPresentedLiveMesh(HWND hwnd)
 {
     if (!g_nativeMeshActive.load(std::memory_order_acquire) ||
         g_nativeMeshStopRequested.load(std::memory_order_acquire) ||
@@ -6137,19 +6138,8 @@ static bool IsLiveMeshReadyForShellTransition(HWND hwnd)
         hwnd != g_nativeMeshHwnd.load(std::memory_order_acquire)) return false;
 
     const auto key = g_coreMaterialReadyKey.load(std::memory_order_acquire);
-    if (!key || hwnd != g_coreMaterialTargetHwnd.load(std::memory_order_acquire) ||
-        key != g_coreMaterialTargetKey.load(std::memory_order_acquire) ||
-        !TryAcquireSRWLockShared(&g_animationSlotsLock)) return false;
-    const bool activeSlot = std::any_of(std::begin(g_animationSlots), std::end(g_animationSlots),
-        [hwnd](const WindowAnimationSlot& slot)
-        {
-            return slot.active && !slot.retiring && slot.hwnd == hwnd &&
-                   slot.settings.rendererMode == RendererMode::Mesh && slot.settings.windowStateWobbleEnabled;
-        });
-    ReleaseSRWLockShared(&g_animationSlotsLock);
-    return activeSlot && key == g_coreMaterialReadyKey.load(std::memory_order_acquire) &&
-           key == g_coreMaterialTargetKey.load(std::memory_order_acquire) &&
-           !g_nativeMeshStopRequested.load(std::memory_order_acquire) && !g_unloading.load(std::memory_order_acquire);
+    return key && hwnd == g_coreMaterialTargetHwnd.load(std::memory_order_acquire) &&
+           key == g_coreMaterialTargetKey.load(std::memory_order_acquire);
 }
 
 static bool __cdecl ShellAnimationsEnabledHook(const void* state)
@@ -6162,7 +6152,8 @@ static bool __cdecl ShellAnimationsEnabledHook(const void* state)
 
     const auto settings = GetSettingsSnapshot();
     if (settings.rendererMode != RendererMode::Mesh || !settings.windowStateWobbleEnabled) return true;
-    const HWND hwnd = GetShellMeshTransitionWindow(state);
+    void* windowData = GetShellMeshTransitionWindowData(state);
+    const HWND hwnd = GetHwndFromWindowData(windowData);
     if (!hwnd)
     {
         Wh_Log(L"MESH SHELL TRANSITION: source=native reason=owner-unverified");
@@ -6170,10 +6161,18 @@ static bool __cdecl ShellAnimationsEnabledHook(const void* state)
     }
     if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || !IsEligibleWindowForStateThrob(hwnd)) return true;
 
-    const bool live = IsLiveMeshReadyForShellTransition(hwnd);
-    Wh_Log(L"MESH SHELL TRANSITION: HWND=%p source=%s", hwnd, live ? L"live-mesh" : L"native-mesh-not-ready");
+    const bool sceneReady = g_eventThreadMessageTarget.load(std::memory_order_acquire) &&
+        g_dwmSceneThreadId.load(std::memory_order_acquire) &&
+        !g_sceneWakeAwaitingNativeTimeline.load(std::memory_order_acquire) &&
+        !g_sceneWakeStalled.load(std::memory_order_acquire);
+    const bool liveReady = HasPresentedLiveMesh(hwnd);
+    const bool canBridge = IsTopLevelWindowForWindowData(
+        ReadPointerMember(windowData, g_windowDataTopLevelWindowOffset), windowData);
+    const bool takeOver = sceneReady && (liveReady || canBridge);
+    Wh_Log(L"MESH SHELL TRANSITION: HWND=%p source=%s", hwnd,
+           takeOver ? (liveReady ? L"live-mesh" : L"live-window-bridge") : L"native-scene-not-ready");
     // Let PostTransition take its own immediate completion and cleanup path.
-    return !live;
+    return !takeOver;
 }
 
 static void InitializeLiveMeshShellTransition()
@@ -6195,7 +6194,7 @@ static void InitializeLiveMeshShellTransition()
         !std::memcmp(base + 0xF816A, completion, sizeof(completion)) &&
         WindhawkUtils::SetFunctionHook(reinterpret_cast<ShellAnimationsEnabled_t>(entry),
                                       ShellAnimationsEnabledHook, &g_shellAnimationsEnabledOriginal);
-    Wh_Log(L"MESH SHELL TRANSITION SUPPORT: ready=%d verifiedSourceRequired=1", ready);
+    Wh_Log(L"MESH SHELL TRANSITION SUPPORT: ready=%d liveWindowBridge=1", ready);
 }
 
 static bool IsNativeBackdropSourceRoot(void* topLevelWindow, void* border,
@@ -7789,6 +7788,7 @@ static void InitializeMesh(WobbleMesh& mesh, double width, double height)
     mesh.dragging = false;
     mesh.resizing = false;
     mesh.geometrySprings = false;
+    mesh.geometryTransitionStart = false;
     mesh.canWobbleTop = true;
     mesh.canWobbleLeft = true;
     mesh.canWobbleRight = true;
@@ -8078,7 +8078,7 @@ static void CalculateMeshForces(WobbleMesh& mesh, const WobblySettings& settings
         {
             int index = GetPointIndex(x, y);
             WobblePoint& point = mesh.points[index];
-            if (point.fixed && !mesh.geometrySprings)
+            if (point.fixed)
             {
                 point.force = {(point.basePosition.x - point.position.x) * stiffness,
                                (point.basePosition.y - point.position.y) * stiffness};
@@ -8102,17 +8102,11 @@ static void CalculateMeshForces(WobbleMesh& mesh, const WobblySettings& settings
                                (neighbor.basePosition.y - point.basePosition.y);
                 neighborCount++;
             }
-            // Corner anchors add a restoring force to the symmetric grid.
-            double forceScale = stiffness / (mesh.geometrySprings ? 4 : std::max(neighborCount, 1));
+            double forceScale = stiffness / std::max(neighborCount, 1);
             point.force = {springSum.x * forceScale, springSum.y * forceScale};
-            if (point.fixed)
-            {
-                point.force.x += (point.basePosition.x - point.position.x) * stiffness;
-                point.force.y += (point.basePosition.y - point.position.y) * stiffness;
-            }
         }
     }
-    if (!mesh.geometrySprings) SmoothMeshField(mesh, false);
+    SmoothMeshField(mesh, false);
 }
 
 static void SimulateMeshSubstep(WobbleMesh& mesh, const WobblySettings& settings,
@@ -8129,7 +8123,7 @@ static void SimulateMeshSubstep(WobbleMesh& mesh, const WobblySettings& settings
         point.velocity.x = acceleration.x * deltaTimeMilliseconds + point.velocity.x * drag;
         point.velocity.y = acceleration.y * deltaTimeMilliseconds + point.velocity.y * drag;
     }
-    if (!mesh.geometrySprings) SmoothMeshField(mesh, true);
+    SmoothMeshField(mesh, true);
     double moveFactor = std::clamp(settings.moveFactor / 100.0, 0.01, 0.25);
     double velocitySum = 0.0;
     for (int i = 0; i < GRID_POINT_COUNT; i++)
@@ -8149,24 +8143,16 @@ static void SimulateMeshSubstep(WobbleMesh& mesh, const WobblySettings& settings
         }
     }
     ApplyResizeConstraints(mesh);
-    const bool displaced = mesh.geometrySprings &&
-        std::any_of(std::begin(mesh.points), std::end(mesh.points), [](const WobblePoint& point)
-        {
-            const double dx = point.position.x - point.basePosition.x;
-            const double dy = point.position.y - point.basePosition.y;
-            return dx * dx + dy * dy > 0.25;
-        });
-    mesh.active = displaced || !(accelerationSum < 0.5 && velocitySum < 0.5);
+    mesh.active = !(accelerationSum < 0.5 && velocitySum < 0.5);
 }
 
-static double GetMaximumPhysicsStep(const WobblySettings& settings, bool geometrySprings)
+static double GetMaximumPhysicsStep(const WobblySettings& settings)
 {
     double stiffness = std::clamp(settings.stiffness / 100.0, 0.01, 1.0);
     double moveFactor = std::clamp(settings.moveFactor / 100.0, 0.01, 0.25);
     double drag = std::clamp(settings.drag / 100.0, 0.01, MAX_VELOCITY_RETENTION);
     // Conservative spring-step bound; all five presets retain the legacy step.
-    const double stability = geometrySprings ? 0.5 : 0.9;
-    return std::min(MAX_PHYSICS_STEP_MS, std::sqrt(stability * (1.0 + drag) / (stiffness * moveFactor)));
+    return std::min(MAX_PHYSICS_STEP_MS, std::sqrt(0.9 * (1.0 + drag) / (stiffness * moveFactor)));
 }
 
 static bool SimulateMeshStep(WobbleMesh& mesh, const WobblySettings& settings, double deltaTime)
@@ -8175,8 +8161,48 @@ static bool SimulateMeshStep(WobbleMesh& mesh, const WobblySettings& settings, d
     {
         return mesh.active;
     }
+    if (mesh.geometrySprings)
+    {
+        const double dt = std::min(deltaTime, 0.025);
+        const double stiffness = std::clamp(settings.stiffness / 100.0, 0.01, 1.0);
+        const double drag = std::clamp(settings.drag / 100.0, 0.01, 1.0);
+        const double moveFactor = std::clamp(settings.moveFactor / 100.0, 0.01, 0.25);
+        const double cornerRate = 16.0 + 6.0 * stiffness + 2.0 * (1.0 - drag);
+        const double velocityScale = 1000.0 * moveFactor;
+        mesh.active = false;
+        for (WobblePoint& point : mesh.points)
+        {
+            if (mesh.geometryTransitionStart) point.velocity = {};
+            const double rate = point.fixed ? cornerRate : cornerRate * (0.94 - 0.5 * moveFactor);
+            const double decay = std::exp(-rate * dt);
+            const auto advance = [&](double target, double& position, double& velocity)
+            {
+                const double distance = position - target;
+                // Bound inherited velocity so a retarget stays on the same side of its destination.
+                const double toward = std::clamp(velocity * velocityScale,
+                    std::min(0.0, -rate * distance), std::max(0.0, -rate * distance));
+                const double slope = toward + rate * distance;
+                const double nextDistance = (distance + slope * dt) * decay;
+                const double nextVelocity = (toward - rate * slope * dt) * decay;
+                if (!std::isfinite(nextDistance) || !std::isfinite(nextVelocity) ||
+                    (std::abs(nextDistance) <= 0.35 && std::abs(nextVelocity) <= 8.0))
+                {
+                    position = target;
+                    velocity = 0.0;
+                    return;
+                }
+                position = target + nextDistance;
+                velocity = nextVelocity / velocityScale;
+                mesh.active = true;
+            };
+            advance(point.basePosition.x, point.position.x, point.velocity.x);
+            advance(point.basePosition.y, point.position.y, point.velocity.y);
+        }
+        mesh.geometryTransitionStart = false;
+        return mesh.active;
+    }
     double milliseconds = std::min(deltaTime * 1000.0, MAX_PHYSICS_STEP_MS);
-    int substeps = static_cast<int>(std::ceil(milliseconds / GetMaximumPhysicsStep(settings, mesh.geometrySprings)));
+    int substeps = static_cast<int>(std::ceil(milliseconds / GetMaximumPhysicsStep(settings)));
     double drag = std::clamp(settings.drag / 100.0, 0.01, MAX_VELOCITY_RETENTION);
     if (substeps > 1)
     {
@@ -8289,6 +8315,7 @@ static bool BeginMeshWindowStateTransition(WindowAnimationSlot& slot, const RECT
         slot.meshWindowRect = source;
     }
     if (!CommitMeshWindowStateGeometry(slot, current)) return false;
+    slot.mesh.geometryTransitionStart = true;
     slot.meshPrepareUntil = 0;
     slot.windowStateThrob = slot.meshWindowState = true;
     ++slot.transformRebindRevision;
@@ -9624,16 +9651,20 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         HWND hwnd;
         void* matrixTransformProxy;
         WobbleMesh mesh;
+        bool geometryBridge;
     } snapshot = {};
     bool identityUpdate = false;
     bool nativeMeshActive = false;
     AcquireSRWLockExclusive(&g_animationSlotsLock);
     WindowAnimationSlot& slot = g_animationSlots[slotIndex];
+    const bool geometryBridge = slot.active && !slot.retiring && slot.mesh.active && slot.mesh.geometrySprings &&
+        !HasPresentedLiveMesh(slot.hwnd);
     // The slot owns its verified proxy until scene-thread retirement.
     if ((slot.active || slot.retiring) && slot.matrixTransformProxy &&
         HasMatrixTransformUpdate() &&
         (slot.retiring || slot.meshIdentityPending ||
          slot.meshRevision != slot.submittedMeshRevision ||
+         (slot.mesh.geometrySprings && (geometryBridge == slot.identityApplied)) ||
          g_unloading.load(std::memory_order_acquire)) &&
         (!identityOnly ||
          ((!slot.identityApplied || slot.meshIdentityPending) &&
@@ -9647,14 +9678,15 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
         nativeMeshActive = slot.settings.rendererMode == RendererMode::Mesh &&
             g_nativeMeshActive.load(std::memory_order_acquire) &&
             g_nativeMeshHwnd.load(std::memory_order_acquire) == slot.hwnd;
-        // The mesh already includes lag and deformation; keep the source transform neutral.
-        identityUpdate = nativeMeshActive || slot.mesh.geometrySprings ||
+        // Keep the source neutral once the native mesh has a usable frame.
+        identityUpdate = (slot.mesh.geometrySprings ? !geometryBridge : nativeMeshActive) ||
                          slot.retiring || slot.meshIdentityPending ||
                          !slot.mesh.active ||
                          g_unloading.load(std::memory_order_acquire);
         if (!identityUpdate)
         {
             snapshot.mesh = slot.mesh;
+            snapshot.geometryBridge = geometryBridge;
         }
         // Pin the slot while calling its proxy outside the lock.
         slot.hookUsers++;
@@ -9710,6 +9742,26 @@ static void ApplyAnimationSlotTransform(int slotIndex, bool identityOnly)
     if (snapshot.mesh.width <= 0.0 || snapshot.mesh.height <= 0.0)
     {
         finishUpdate(E_INVALIDARG, false);
+        return;
+    }
+    if (snapshot.geometryBridge)
+    {
+        // Follow the corner envelope until the live image can render the full mesh.
+        const auto& tl = snapshot.mesh.points[GetPointIndex(0, 0)].position;
+        const auto& tr = snapshot.mesh.points[GetPointIndex(GRID_WIDTH - 1, 0)].position;
+        const auto& bl = snapshot.mesh.points[GetPointIndex(0, GRID_HEIGHT - 1)].position;
+        const auto& br = snapshot.mesh.points[GetPointIndex(GRID_WIDTH - 1, GRID_HEIGHT - 1)].position;
+        const double left = (tl.x + bl.x) * 0.5;
+        const double top = (tl.y + tr.y) * 0.5;
+        const double width = (tr.x + br.x) * 0.5 - left;
+        const double height = (bl.y + br.y) * 0.5 - top;
+        const double sx = width / snapshot.mesh.width, sy = height / snapshot.mesh.height;
+        const bool valid = std::isfinite(left) && std::isfinite(top) &&
+            std::abs(left) <= 16384 && std::abs(top) <= 16384 &&
+            sx >= 0.0625 && sx <= 16.0 && sy >= 0.0625 && sy <= 16.0;
+        const MilMatrix3x2D matrix = valid ? MilMatrix3x2D{sx, 0.0, 0.0, sy, left, top} :
+            MilMatrix3x2D{1.0, 0.0, 0.0, 1.0, 0.0, 0.0};
+        finishUpdate(UpdateMatrixTransformProxy(snapshot.matrixTransformProxy, matrix), !valid);
         return;
     }
     Vec2 renderedCenter = {};
@@ -10020,10 +10072,12 @@ static void UpdateAnimationFrame()
         double remainingMilliseconds = frameMilliseconds;
         bool simulated = false;
         bool freeStepPending = snapshot.freeStepPending;
+        if (simulatedMesh.geometrySprings) remainingMilliseconds = std::min(remainingMilliseconds, 25.0);
         while (remainingMilliseconds > 0.0 &&
                (snapshot.dragging || simulatedMesh.active || freeStepPending))
         {
-            double stepMilliseconds = std::min(remainingMilliseconds, MAX_PHYSICS_STEP_MS);
+            double stepMilliseconds = simulatedMesh.geometrySprings ? remainingMilliseconds :
+                std::min(remainingMilliseconds, MAX_PHYSICS_STEP_MS);
             const bool wobbling = SimulateMeshStep(simulatedMesh, snapshot.settings, stepMilliseconds / 1000.0);
             simulated = true;
             freeStepPending = false;
