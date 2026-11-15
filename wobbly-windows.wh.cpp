@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.365
+// @version         0.366
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -6111,10 +6111,28 @@ static bool ReadNativeVisualChildren(void* visual, void**& entries,
 using StartTransitionSnapshot_t = void(__cdecl*)(void*, int, int);
 using RemoveTransitionSnapshot_t = void(__cdecl*)(void*);
 using WriteTransitionTile_t = long(__cdecl*)(void*, void*, const void*);
+using WriteSnapshotMesh_t = long(__cdecl*)(void*, unsigned int, unsigned int);
 StartTransitionSnapshot_t g_startTransitionSnapshotOriginal = nullptr;
 RemoveTransitionSnapshot_t g_removeTransitionSnapshotOriginal = nullptr;
 WriteTransitionTile_t g_writeTransitionTileOriginal = nullptr;
+WriteSnapshotMesh_t g_writeSnapshotMesh = nullptr;
 constexpr int kMaximizeSnapSnapshotAnimation = 0x68;
+
+struct TransitionSnapshotMesh
+{
+    void* visual = nullptr;
+    void* compositor = nullptr;
+    void* mesh = nullptr;
+    void* group = nullptr;
+    HWND hwnd = nullptr;
+    RECT rect = {};
+    DWORD threadId = 0;
+    bool attempted = false;
+    bool written = false;
+};
+TransitionSnapshotMesh g_snapshotMesh;
+SRWLOCK g_snapshotMeshLock = SRWLOCK_INIT;
+std::atomic_bool g_snapshotMeshPending = false;
 
 static bool IsSnapshotProbeEnabled()
 {
@@ -6172,22 +6190,25 @@ static void LogTransitionSnapshot(void* wrapper, const wchar_t* phase, int anima
            g_nativeMeshHwnd.load(std::memory_order_acquire) == hwnd, IsOnDwmSceneThread());
 }
 
-static void LogTransitionSnapshotTile(void* instruction, const void* visual, long result)
+static bool TryWriteTransitionSnapshotMesh(void* instruction, void* builder, const void* visual, long& result)
 {
     const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
-    if (ReadPointerMember(visual, 0) != base + 0x114F50 || !IsSnapshotProbeEnabled()) return;
+    if (!g_writeSnapshotMesh || !IsOnDwmSceneThread() ||
+        ReadPointerMember(visual, 0) != base + 0x114F50 ||
+        ReadPointerMember(ReadPointerMember(builder, 0), 0x30) != reinterpret_cast<const void*>(g_writeSnapshotMesh) ||
+        !IsSnapshotProbeEnabled()) return false;
 
     const auto* snapshot = static_cast<const BYTE*>(visual) - 8;
     if (ReadPointerMember(snapshot, 0) != base + 0x115028 ||
         !IsReadableMemory(snapshot + 0x2E0, sizeof(int)) ||
         ReadPointerMember(instruction, 0) != base + 0x114718 ||
-        !IsReadableMemory(instruction, 0x38)) return;
+        !IsReadableMemory(instruction, 0x38)) return false;
     int animationType = 0;
     std::memcpy(&animationType, snapshot + 0x2E0, sizeof(animationType));
-    if (animationType != kMaximizeSnapSnapshotAnimation) return;
+    if (animationType != kMaximizeSnapSnapshotAnimation) return false;
 
     HWND hwnd = GetTransitionSnapshotHwnd(ReadPointerMember(visual, 0x18));
-    if (!hwnd) return;
+    if (!hwnd) return false;
     const auto* tile = static_cast<const BYTE*>(instruction);
     RECT rect = {};
     POINT origin = {};
@@ -6196,20 +6217,53 @@ static void LogTransitionSnapshotTile(void* instruction, const void* visual, lon
     std::memcpy(&origin, tile + 0x20, sizeof(origin));
     std::memcpy(&scale, tile + 0x28, sizeof(scale));
     void* image = ReadPointerMember(tile, 0x30);
-    Wh_Log(L"MESH NATIVE SNAPSHOT DRAW: HWND=%p snapshot=%p result=0x%08X "
-           L"rect=(%ld,%ld,%ld,%ld) origin=(%ld,%ld) scale=%.4f imageType=0x%zx "
-           L"snapshotImage=%d meshActive=%d sceneThread=%d",
-           hwnd, visual, static_cast<unsigned>(result), rect.left, rect.top, rect.right, rect.bottom,
-           origin.x, origin.y, static_cast<double>(scale), NativeVisualVtableRva(image),
-           image && image == ReadPointerMember(snapshot, 0x248),
-           g_nativeMeshHwnd.load(std::memory_order_acquire) == hwnd, IsOnDwmSceneThread());
+    RECT begin = {};
+    if (!IsReadableMemory(snapshot + 0x358, sizeof(begin))) return false;
+    std::memcpy(&begin, snapshot + 0x358, sizeof(begin));
+    if (!ValidMeshWindowRect(rect) || !EqualRect(&rect, &begin) || origin.x || origin.y || scale != 1.0f ||
+        NativeVisualVtableRva(image) != 0x114228 || image != ReadPointerMember(snapshot, 0x248)) return false;
+
+    if (!TryAcquireSRWLockExclusive(&g_snapshotMeshLock)) return false;
+    auto& mesh = g_snapshotMesh;
+    const DWORD threadId = GetCurrentThreadId();
+    void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
+    bool written = false;
+    bool queued = false;
+    if (!g_unloading.load(std::memory_order_acquire) && !mesh.visual &&
+        IsDwmObjectPointerValid(compositor, g_compositorVtable) && RetainNativeMeshRoot(const_cast<void*>(visual)))
+    {
+        mesh.visual = const_cast<void*>(visual);
+        mesh.compositor = compositor;
+        mesh.hwnd = hwnd;
+        mesh.rect = rect;
+        mesh.threadId = threadId;
+        g_snapshotMeshPending.store(true, std::memory_order_release);
+        queued = true;
+    }
+    else if (mesh.visual == visual && mesh.threadId == threadId && mesh.compositor == compositor &&
+             mesh.group && EqualRect(&rect, &mesh.rect) && !g_unloading.load(std::memory_order_acquire))
+    {
+        const unsigned int groupId = NativeProxyResourceId(mesh.group);
+        const unsigned int imageId = NativeProxyResourceId(image);
+        if (groupId && imageId)
+        {
+            result = g_writeSnapshotMesh(builder, groupId, imageId);
+            written = result >= 0;
+            if (written && !mesh.written)
+                Wh_Log(L"MESH NATIVE SNAPSHOT MESH: HWND=%p snapshot=%p submitted=1 bend=48", hwnd, visual);
+            mesh.written |= written;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_snapshotMeshLock);
+    if (queued) RequestDwmScenePass();
+    return written;
 }
 
 static long __cdecl WriteTransitionTileHook(void* instruction, void* builder, const void* visual)
 {
-    const long result = g_writeTransitionTileOriginal(instruction, builder, visual);
-    LogTransitionSnapshotTile(instruction, visual, result);
-    return result;
+    long result = E_FAIL;
+    if (TryWriteTransitionSnapshotMesh(instruction, builder, visual, result)) return result;
+    return g_writeTransitionTileOriginal(instruction, builder, visual);
 }
 
 static void __cdecl StartTransitionSnapshotHook(void* wrapper, int animationType, int flags)
@@ -6269,8 +6323,84 @@ static void InitializeTransitionSnapshotDiagnostics()
         !std::memcmp(dispatch, writeDispatch, sizeof(writeDispatch)) &&
         WindhawkUtils::SetFunctionHook(reinterpret_cast<WriteTransitionTile_t>(draw),
                                       WriteTransitionTileHook, &g_writeTransitionTileOriginal);
-    Wh_Log(L"MESH NATIVE SNAPSHOT PROBE: start=%d remove=%d draw=%d readOnly=1",
-           startReady, removeReady, drawReady);
+    const auto* coreDraw = reinterpret_cast<const BYTE*>(g_coreMaterialModuleBase + 0x1F1AB0);
+    constexpr BYTE corePrefix[] = {0x48,0x8B,0xC4,0x48,0x89,0x58,0x08,0x48,0x89,0x68,0x10,
+                                   0x48,0x89,0x70,0x18,0x48,0x89,0x78,0x20,0x41,0x56};
+    if (drawReady && removeReady && g_nativeMeshCreateMesh && g_nativeMeshUpdateMesh &&
+        g_nativeMeshCreateGroup && g_nativeMeshUpdateGroup && g_cBaseObjectRelease &&
+        IsReadableMemory(coreDraw, sizeof(corePrefix)) && !std::memcmp(coreDraw, corePrefix, sizeof(corePrefix)))
+        g_writeSnapshotMesh = reinterpret_cast<WriteSnapshotMesh_t>(g_coreMaterialModuleBase + 0x1F1AB0);
+    Wh_Log(L"MESH NATIVE SNAPSHOT PROBE: start=%d remove=%d draw=%d mesh=%d",
+           startReady, removeReady, drawReady, g_writeSnapshotMesh != nullptr);
+}
+
+static void PrepareTransitionSnapshotGeometry(TransitionSnapshotMesh& state)
+{
+    constexpr unsigned side = 9, count = side * side, indexCount = 6 * (side - 1) * (side - 1);
+    NativeMeshPoint3F positions[count] = {};
+    NativeMeshPoint2D coordinates[count] = {};
+    unsigned int indices[indexCount] = {};
+    const auto& rect = state.rect;
+    unsigned int nextIndex = 0;
+    for (unsigned int y = 0; y < side; ++y)
+    {
+        for (unsigned int x = 0; x < side; ++x)
+        {
+            const unsigned int i = y * side + x;
+            const float u = static_cast<float>(x) / (side - 1);
+            const float v = static_cast<float>(y) / (side - 1);
+            const float sourceX = u * (rect.right - rect.left);
+            const float sourceY = v * (rect.bottom - rect.top);
+            positions[i] = {rect.left + sourceX, rect.top + sourceY - 48.0f * 4.0f * u * (1.0f - u), 0.0f};
+            coordinates[i] = {sourceX, sourceY};
+            if (x + 1 < side && y + 1 < side)
+            {
+                for (auto value : {i, i + side, i + 1, i + 1, i + side, i + side + 1})
+                    indices[nextIndex++] = value;
+            }
+        }
+    }
+    state.attempted = true;
+    long result = g_nativeMeshCreateMesh(state.compositor, &state.mesh);
+    if (result >= 0)
+        result = state.mesh ? g_nativeMeshUpdateMesh(state.mesh, 0, positions, coordinates,
+                                                     count, indices, indexCount) : E_UNEXPECTED;
+    if (result >= 0) result = g_nativeMeshCreateGroup(state.compositor, &state.group);
+    if (result >= 0) result = state.group ? g_nativeMeshUpdateGroup(state.group, state.mesh) : E_UNEXPECTED;
+    if (result < 0)
+    {
+        if (state.group) g_cBaseObjectRelease(state.group);
+        if (state.mesh) g_cBaseObjectRelease(state.mesh);
+        state.group = state.mesh = nullptr;
+    }
+    Wh_Log(L"MESH NATIVE SNAPSHOT GEOMETRY: HWND=%p result=0x%08X ready=%d", state.hwnd,
+           static_cast<unsigned>(result), state.group != nullptr);
+}
+
+static void MaintainTransitionSnapshotMesh()
+{
+    if (!g_snapshotMeshPending.load(std::memory_order_acquire) ||
+        !TryAcquireSRWLockExclusive(&g_snapshotMeshLock)) return;
+    auto& state = g_snapshotMesh;
+    void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
+    if (state.threadId != GetCurrentThreadId() || state.compositor != compositor)
+    {
+        // The former compositor was torn down. Avoid releasing its proxies on this scene.
+        Wh_Log(L"MESH NATIVE SNAPSHOT MESH: discarded after scene ownership change");
+        state = {};
+    }
+    else if (!ReadPointerMember(state.visual, 0x18))
+    {
+        if (state.group) g_cBaseObjectRelease(state.group);
+        if (state.mesh) g_cBaseObjectRelease(state.mesh);
+        g_cBaseObjectRelease(state.visual);
+        state = {};
+    }
+    else if (!state.attempted && !g_unloading.load(std::memory_order_acquire) &&
+             IsDwmObjectPointerValid(compositor, g_compositorVtable))
+        PrepareTransitionSnapshotGeometry(state);
+    g_snapshotMeshPending.store(state.visual != nullptr, std::memory_order_release);
+    ReleaseSRWLockExclusive(&g_snapshotMeshLock);
 }
 
 static bool IsNativeBackdropSourceRoot(void* topLevelWindow, void* border,
@@ -7579,6 +7709,7 @@ static void SubmitPendingWobblySceneWork()
     g_sceneWakePostTimestamp.store(0, std::memory_order_release);
     g_scenePassCounter.fetch_add(1, std::memory_order_release);
     MaintainNativeMesh();
+    MaintainTransitionSnapshotMesh();
     // Restore retiring/quiet windows before discovery, creation or normal rendering.
     RestorePendingAnimationIdentities();
     if (!g_unloading.load(std::memory_order_acquire))
@@ -7608,6 +7739,7 @@ static void SubmitPendingWobblySceneWork()
 static bool HasPendingWobblySceneWork()
 {
     return g_nativeMeshActive.load(std::memory_order_acquire) ||
+           g_snapshotMeshPending.load(std::memory_order_acquire) ||
            g_sceneRequestedSerial.load(std::memory_order_acquire) >
                g_sceneSubmittedSerial.load(std::memory_order_acquire) ||
            g_existingWindowBackfillIndex.load(std::memory_order_acquire) <
@@ -9932,6 +10064,7 @@ static void StopAllAnimations()
     bool sceneCleanupNeeded = false;
     int retireCount = CollectActiveAnimationSlots(slotsToRetire, &sceneCleanupNeeded);
     sceneCleanupNeeded |= g_nativeMeshActive.load(std::memory_order_acquire);
+    sceneCleanupNeeded |= g_snapshotMeshPending.load(std::memory_order_acquire);
     g_nativeMeshStopRequested.store(true, std::memory_order_release);
     for (int i = 0; i < retireCount; i++)
     {
@@ -9966,8 +10099,9 @@ static void StopAllAnimations()
         // Wakes carry only an instance token, not pointers; keep their counter
         // intact for late acknowledgments, but don't mistake them for resources.
         bool wakePending = g_sceneWakeOutstanding.load(std::memory_order_acquire) != 0;
-        bool rectActive = g_nativeMeshActive.load(std::memory_order_acquire);
-        if (!hookUsers && !retainedProxies && !rectActive)
+        bool nativeSceneActive = g_nativeMeshActive.load(std::memory_order_acquire) ||
+                                 g_snapshotMeshPending.load(std::memory_order_acquire);
+        if (!hookUsers && !retainedProxies && !nativeSceneActive)
         {
             break;
         }
@@ -9982,7 +10116,7 @@ static void StopAllAnimations()
             break;
         }
         ULONGLONG lastWakePost = g_sceneWakePostTimestamp.load(std::memory_order_acquire);
-        if ((retainedProxies || rectActive) &&
+        if ((retainedProxies || nativeSceneActive) &&
             (!wakePending || !lastWakePost || now - lastWakePost >= 50))
         {
             PostPendingDwmSceneWake(true);
