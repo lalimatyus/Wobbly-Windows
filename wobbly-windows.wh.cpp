@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.363
+// @version         0.364
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -6134,30 +6134,47 @@ static void LogTransitionSnapshot(void* wrapper, const wchar_t* phase, int anima
     auto* visual = snapshot + 8;
     if (ReadPointerMember(visual, 0x18) != owner) return;
 
-    void** children = nullptr;
-    unsigned int childCount = 0;
-    const bool haveChildren = ReadNativeVisualChildren(visual, children, childCount);
+    RECT begin = {}, end = {};
+    if (!IsReadableMemory(snapshot + 0x358, sizeof(begin) + sizeof(end))) return;
+    std::memcpy(&begin, snapshot + 0x358, sizeof(begin));
+    std::memcpy(&end, snapshot + 0x368, sizeof(end));
+
     unsigned int instructionCount = 0;
-    size_t firstInstructionType = 0;
+    size_t instructionTypes[3] = {};
+    void* brush = nullptr;
+    void* geometry = nullptr;
     if (IsReadableMemory(visual + 0x118, sizeof(instructionCount)))
     {
         std::memcpy(&instructionCount, visual + 0x118, sizeof(instructionCount));
-        if (instructionCount > 0 && instructionCount <= 256)
-            firstInstructionType = NativeVisualVtableRva(ReadPointerMember(ReadPointerMember(visual, 0x100), 0));
+        void* entries = ReadPointerMember(visual, 0x100);
+        for (unsigned int i = 0; i < ARRAYSIZE(instructionTypes) && i < instructionCount; ++i)
+        {
+            void* instruction = ReadPointerMember(entries, i * sizeof(void*));
+            instructionTypes[i] = NativeVisualVtableRva(instruction);
+            if (instructionTypes[i] == 0x114730) // CDrawGeometryInstruction.
+            {
+                brush = ReadPointerMember(instruction, 0x10);
+                geometry = ReadPointerMember(instruction, 0x18);
+            }
+        }
     }
-    Wh_Log(L"MESH NATIVE SNAPSHOT: phase=%s HWND=%p snapshot=%p proxy=%p children=%d "
-           L"firstChildType=0x%zx instructions=%u firstInstructionType=0x%zx meshActive=%d sceneThread=%d",
-           phase, hwnd, visual, ReadPointerMember(visual, 0x10),
-           haveChildren ? static_cast<int>(childCount) : -1,
-           haveChildren && childCount ? NativeVisualVtableRva(children[0]) : 0,
-           instructionCount, firstInstructionType,
+    Wh_Log(L"MESH NATIVE SNAPSHOT: phase=%s HWND=%p snapshot=%p "
+           L"from=(%ld,%ld,%ld,%ld) to=(%ld,%ld,%ld,%ld) "
+           L"instructions=%u types=(0x%zx,0x%zx,0x%zx) brush=0x%zx nativeBrush=%d "
+           L"geometry=0x%zx meshActive=%d sceneThread=%d",
+           phase, hwnd, visual, begin.left, begin.top, begin.right, begin.bottom,
+           end.left, end.top, end.right, end.bottom,
+           instructionCount, instructionTypes[0], instructionTypes[1], instructionTypes[2],
+           NativeVisualVtableRva(brush), brush && brush == ReadPointerMember(snapshot, 0x250),
+           NativeVisualVtableRva(geometry),
            g_nativeMeshHwnd.load(std::memory_order_acquire) == hwnd, IsOnDwmSceneThread());
 }
 
 static void __cdecl StartTransitionSnapshotHook(void* wrapper, int animationType, int flags)
 {
-    LogTransitionSnapshot(wrapper, L"start", animationType);
+    // The native method inserts the snapshot into the tree at the end of the call.
     g_startTransitionSnapshotOriginal(wrapper, animationType, flags);
+    LogTransitionSnapshot(wrapper, L"start", animationType);
 }
 
 static void __cdecl RemoveTransitionSnapshotHook(void* wrapper)
