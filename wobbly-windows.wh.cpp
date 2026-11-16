@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.368
+// @version         0.369
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -372,12 +372,14 @@ static constexpr LPARAM NATIVE_TRANSITION_DIRECTION_LEFT = 0x10;
 static constexpr LPARAM NATIVE_TRANSITION_DIRECTION_RIGHT = 0x20;
 static constexpr LPARAM NATIVE_TRANSITION_DIRECTION_UP = 0x40;
 static constexpr LPARAM NATIVE_TRANSITION_DIRECTION_DOWN = 0x80;
+static constexpr LPARAM NATIVE_TRANSITION_SHELL_CONFIRMED = 0x100;
 std::atomic<HWND> g_pendingInteractiveTransitionWindow = nullptr;
 std::atomic<LPARAM> g_pendingInteractiveTransitionFlags = 0;
 RECT g_realDraggedWindowRect = {};
 RECT g_lastDraggedWindowRect = {};
 bool g_lastDraggedWindowZoomed = false;
 bool g_finalizingMoveSize = false;
+ULONGLONG g_pointerSnapHintUntil = 0;
 std::atomic_bool g_realDragging = false;
 std::atomic<HWND> g_realDraggedWindow = nullptr;
 std::atomic<ULONGLONG> g_nextDragTraceAt = 0;
@@ -853,6 +855,7 @@ struct WindowAnimationSlot
     bool freeStepPending;
     bool windowStateThrob;
     bool meshWindowState;
+    bool meshPointerSnapPending;
     ULONGLONG meshPrepareUntil;
     RECT meshWindowRect;
     unsigned int hookUsers;
@@ -1228,6 +1231,20 @@ static bool NativeMeshGeometryOffset(const RECT& current, const RECT& physicsRec
     offset = {static_cast<double>(physicsRect.left) - current.left,
                static_cast<double>(physicsRect.top) - current.top};
     return true;
+}
+
+static bool WindowExtentChanged(const RECT& source, const RECT& target)
+{
+    return std::abs((target.right - target.left) - (source.right - source.left)) > 2 ||
+           std::abs((target.bottom - target.top) - (source.bottom - source.top)) > 2;
+}
+
+static bool IsCommittedMeshSnap(const RECT& source, const RECT& target, bool zoomed)
+{
+    return ValidMeshWindowRect(source) && ValidMeshWindowRect(target) &&
+           !EqualRect(&source, &target) &&
+           (zoomed || (WindowExtentChanged(source, target) &&
+                       (IsApproximatelyMonitorWorkArea(target) || IsApproximatelySnapLayoutTarget(target))));
 }
 
 static void QueueNativeWindowTransition(HWND hwnd, LPARAM transitionFlags)
@@ -6168,7 +6185,10 @@ static bool __cdecl ShellAnimationsEnabledHook(const void* state)
     const bool liveReady = HasPresentedLiveMesh(hwnd);
     const bool canBridge = IsTopLevelWindowForWindowData(
         ReadPointerMember(windowData, g_windowDataTopLevelWindowOffset), windowData);
-    const bool takeOver = sceneReady && (liveReady || canBridge);
+    const bool takeOver = sceneReady && (liveReady || canBridge) &&
+        PostThreadMessageW(g_eventThreadMessageTarget.load(std::memory_order_acquire),
+                           WM_WOBBLY_NATIVE_WINDOW_TRANSITION, reinterpret_cast<WPARAM>(hwnd),
+                           NATIVE_TRANSITION_SHELL_CONFIRMED);
     Wh_Log(L"MESH SHELL TRANSITION: HWND=%p source=%s", hwnd,
            takeOver ? (liveReady ? L"live-mesh" : L"live-window-bridge") : L"native-scene-not-ready");
     // Let PostTransition take its own immediate completion and cleanup path.
@@ -7213,7 +7233,7 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
     if (capturedRepresentation) ReleaseNativeCapturedSource(capturedRepresentation);
 }
 
-static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
+static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals, bool geometryBridgeOnly = false)
 {
     if (!IsOnDwmSceneThread() || g_unloading.load(std::memory_order_acquire) ||
         !HasAnyAnimationSlots())
@@ -7262,11 +7282,15 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                          slot.transformRebindRevision != slot.submittedTransformRebindRevision;
         bool periodicValidation = validateCurrentVisuals && now >= slot.nextVisualValidation;
         bool forceNativeTransitionRebind = validateCurrentVisuals && affineStateThrob;
+        const bool bindBridge = geometryBridgeOnly && slot.meshWindowState && bindingPending &&
+            !HasPresentedLiveMesh(slot.hwnd);
         if (slot.active && slot.hwnd && slot.matrixTransformProxy &&
-            (bindingPending || capturePending || periodicValidation || forceNativeTransitionRebind))
+            (geometryBridgeOnly ? bindBridge :
+                (bindingPending || capturePending || periodicValidation || forceNativeTransitionRebind)))
         {
             slot.hookUsers++;
-            slot.nextVisualValidation = now + 250;
+            // The native update can replace the root we bind in the early pass.
+            slot.nextVisualValidation = geometryBridgeOnly ? now : now + 250;
             hwnd = slot.hwnd;
             generation = slot.generation;
             rebindRevision = slot.transformRebindRevision;
@@ -7303,7 +7327,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
             // Lazy initialization is needed for already-open/desktop-restored
             // windows, but never force a hidden, minimized or cloaked visual.
             if (!ResolveDwmWindowObjects(windowData, &topLevelWindow, &topLevelWindow3D) &&
-                CanInitializeMissingWindowVisual(hwnd) &&
+                !geometryBridgeOnly && CanInitializeMissingWindowVisual(hwnd) &&
                 g_ensureTopLevelWindowOriginal(windowList, windowData) >= 0)
             {
                 ResolveDwmWindowObjects(windowData, &topLevelWindow, &topLevelWindow3D);
@@ -7326,7 +7350,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals)
                 transitionVisualProxy = GetTransitionVisualProxy(topLevelWindow3D);
             }
         }
-        if (topLevelVisualProxy &&
+        if (!geometryBridgeOnly && topLevelVisualProxy &&
             !g_nativeMeshActive.load(std::memory_order_acquire))
         {
             CreateNativeMeshSource(hwnd, windowData, topLevelWindow, topLevelVisualProxy);
@@ -7491,6 +7515,8 @@ static void BackfillExistingDwmWindowMappings()
     }
 }
 
+static void RefreshMeshWindowStateGeometry(bool preparingOnly = false);
+
 static void SubmitPendingWobblySceneWork()
 {
     if (!IsOnDwmSceneThread())
@@ -7502,6 +7528,7 @@ static void SubmitPendingWobblySceneWork()
     g_sceneWakeScheduled.store(false, std::memory_order_release);
     g_sceneWakePostTimestamp.store(0, std::memory_order_release);
     g_scenePassCounter.fetch_add(1, std::memory_order_release);
+    if (!g_unloading.load(std::memory_order_acquire)) RefreshMeshWindowStateGeometry(true);
     MaintainNativeMesh();
     // Restore retiring/quiet windows before discovery, creation or normal rendering.
     RestorePendingAnimationIdentities();
@@ -7513,6 +7540,8 @@ static void SubmitPendingWobblySceneWork()
         {
             ApplyAnimationSlotTransform(i);
         }
+        // Bind the initialized bridge before the next native scene update.
+        BindPendingAnimationSlotTransforms(false, true);
     }
     FinalizeRetiringSlots();
     g_sceneSubmittedSerial.store(submittedThrough, std::memory_order_release);
@@ -8170,14 +8199,21 @@ static bool SimulateMeshStep(WobbleMesh& mesh, const WobblySettings& settings, d
         const double cornerRate = 16.0 + 6.0 * stiffness + 2.0 * (1.0 - drag);
         const double velocityScale = 1000.0 * moveFactor;
         mesh.active = false;
+        const double lag = 0.10 + 0.30 * moveFactor;
         for (WobblePoint& point : mesh.points)
         {
             if (mesh.geometryTransitionStart) point.velocity = {};
-            const double rate = point.fixed ? cornerRate : cornerRate * (0.94 - 0.5 * moveFactor);
-            const double decay = std::exp(-rate * dt);
-            const auto advance = [&](double target, double& position, double& velocity)
+            const double u = point.basePosition.x / mesh.width;
+            const double v = point.basePosition.y / mesh.height;
+            const auto advance = [&](double target, double along, double across,
+                                     double& position, double& velocity)
             {
                 const double distance = position - target;
+                // Lead with the moving edge and let the other rows and columns follow.
+                const double behind = distance < 0.0 ? 1.0 - along : along;
+                const double rate = cornerRate *
+                    (1.0 - lag * (0.60 * behind + 0.80 * across * (1.0 - across) + 0.10 * across));
+                const double decay = std::exp(-rate * dt);
                 // Bound inherited velocity so a retarget stays on the same side of its destination.
                 const double toward = std::clamp(velocity * velocityScale,
                     std::min(0.0, -rate * distance), std::max(0.0, -rate * distance));
@@ -8195,8 +8231,8 @@ static bool SimulateMeshStep(WobbleMesh& mesh, const WobblySettings& settings, d
                 velocity = nextVelocity / velocityScale;
                 mesh.active = true;
             };
-            advance(point.basePosition.x, point.position.x, point.velocity.x);
-            advance(point.basePosition.y, point.position.y, point.velocity.y);
+            advance(point.basePosition.x, u, v, point.position.x, point.velocity.x);
+            advance(point.basePosition.y, v, u, point.position.y, point.velocity.y);
         }
         mesh.geometryTransitionStart = false;
         return mesh.active;
@@ -8317,6 +8353,7 @@ static bool BeginMeshWindowStateTransition(WindowAnimationSlot& slot, const RECT
     if (!CommitMeshWindowStateGeometry(slot, current)) return false;
     slot.mesh.geometryTransitionStart = true;
     slot.meshPrepareUntil = 0;
+    slot.meshPointerSnapPending = false;
     slot.windowStateThrob = slot.meshWindowState = true;
     ++slot.transformRebindRevision;
     slot.order = ++g_animationOrderCounter;
@@ -8603,6 +8640,7 @@ static void ResetDragInputState()
     g_lastDraggedWindowRect = {};
     g_lastDraggedWindowZoomed = false;
     g_finalizingMoveSize = false;
+    g_pointerSnapHintUntil = 0;
 }
 
 static void DisarmAnimationClock()
@@ -9310,6 +9348,7 @@ static bool PrepareAnimationSlotGrab(WindowAnimationSlot& slot, const WobblySett
     slot.settings = settings;
     slot.windowStateThrob = slot.meshWindowState = false;
     slot.meshPrepareUntil = 0;
+    slot.meshPointerSnapPending = false;
     if (hadStateThrob)
     {
         slot.boundTransitionVisualProxy = nullptr;
@@ -9407,6 +9446,7 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
     slot.windowStateThrob = false;
     slot.meshWindowState = false;
     slot.meshPrepareUntil = 0;
+    slot.meshPointerSnapPending = false;
     slot.hookUsers = 0;
     slot.generation++;
     slot.order = ++g_animationOrderCounter;
@@ -9433,36 +9473,54 @@ static int AcquireAnimationSlot(HWND hwnd, const WobblySettings& settings, doubl
     return slotIndex;
 }
 
-static void RefreshMeshWindowStateGeometry()
+static void RefreshMeshWindowStateGeometry(bool preparingOnly)
 {
-    struct Pending { HWND hwnd; ULONGLONG generation; RECT previous; bool preparing; } pending[MAX_ANIMATION_SLOTS] = {};
+    struct Pending
+    {
+        HWND hwnd;
+        ULONGLONG generation;
+        ULONGLONG prepareUntil;
+        RECT previous;
+        bool pointerSnap;
+    } pending[MAX_ANIMATION_SLOTS] = {};
     unsigned count = 0;
+    const ULONGLONG now = GetTickCount64();
     AcquireSRWLockShared(&g_animationSlotsLock);
     for (const auto& slot : g_animationSlots)
-        if (slot.active && (slot.meshWindowState || slot.meshPrepareUntil))
-            pending[count++] = {slot.hwnd, slot.generation, slot.meshWindowRect, slot.meshPrepareUntil != 0};
+        if (slot.active && ((!preparingOnly && slot.meshWindowState) || slot.meshPrepareUntil > now))
+            pending[count++] = {slot.hwnd, slot.generation, slot.meshPrepareUntil,
+                                slot.meshWindowRect, slot.meshPointerSnapPending};
     ReleaseSRWLockShared(&g_animationSlotsLock);
     bool changed = false;
     for (unsigned i = 0; i < count; ++i)
     {
         RECT current = {};
-        if (pending[i].preparing && IsIconic(pending[i].hwnd)) continue;
-        if (!ReadWindowRectForRenderer(pending[i].hwnd, &current) || !ValidMeshWindowRect(current)) continue;
+        const auto& sample = pending[i];
+        if (sample.prepareUntil && IsIconic(sample.hwnd)) continue;
+        if (!ReadWindowRectForRenderer(sample.hwnd, &current) || !ValidMeshWindowRect(current) ||
+            EqualRect(&sample.previous, &current) ||
+            (sample.pointerSnap && !IsCommittedMeshSnap(sample.previous, current, IsZoomed(sample.hwnd) != FALSE)))
+            continue;
+        bool startedPointerSnap = false;
         AcquireSRWLockExclusive(&g_animationSlotsLock);
         for (auto& slot : g_animationSlots)
-            if (slot.active && slot.hwnd == pending[i].hwnd && slot.generation == pending[i].generation)
+            if (slot.active && slot.hwnd == sample.hwnd && slot.generation == sample.generation &&
+                EqualRect(&slot.meshWindowRect, &sample.previous))
             {
-                if (!EqualRect(&slot.meshWindowRect, &current))
+                if (!preparingOnly && slot.meshWindowState && !slot.dragging)
+                    changed |= CommitMeshWindowStateGeometry(slot, current);
+                else if (slot.meshPrepareUntil > GetTickCount64() &&
+                         slot.meshPrepareUntil == sample.prepareUntil && !slot.dragging)
                 {
-                    if (slot.meshWindowState)
-                        changed |= CommitMeshWindowStateGeometry(slot, current);
-                    else if (slot.meshPrepareUntil > GetTickCount64() &&
-                             EqualRect(&pending[i].previous, &slot.meshWindowRect))
-                        changed |= BeginMeshWindowStateTransition(slot, pending[i].previous, current);
+                    const bool started = BeginMeshWindowStateTransition(slot, sample.previous, current);
+                    startedPointerSnap = sample.pointerSnap && started;
+                    changed |= started;
                 }
                 break;
             }
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
+        if (startedPointerSnap)
+            Wh_Log(L"MESH WINDOW TRANSITION: HWND=%p source=drag-release-late controls=16", sample.hwnd);
     }
     if (changed) RequestDwmScenePass();
 }
@@ -9497,11 +9555,11 @@ static bool StartMeshWindowStateTransition(HWND hwnd, const RECT& current, const
     if (!started)
     { if (acquired) RetireAnimationSlot(index, hwnd); return false; }
     if (!changed) return true;
+    RequestDwmScenePass();
     if (!EnsureAnimationClockRunning(hwnd))
     { RetireAnimationSlot(index, hwnd); return false; }
-    RequestDwmScenePass();
     Wh_Log(L"MESH WINDOW TRANSITION: HWND=%p geometrySource=HWND "
-           L"from=(%ld,%ld,%ld,%ld) to=(%ld,%ld,%ld,%ld) corners=4 affinePulse=0",
+           L"from=(%ld,%ld,%ld,%ld) to=(%ld,%ld,%ld,%ld) controls=16 affinePulse=0",
            hwnd, from.left, from.top, from.right, from.bottom,
            current.left, current.top, current.right, current.bottom);
     return true;
@@ -9571,6 +9629,8 @@ static void HandleMoveSizeStart(HWND hwnd)
     if (dragSlot.active && dragSlot.hwnd == hwnd)
     {
         dragSlot.meshWindowRect = rect;
+        dragSlot.meshPrepareUntil = 0;
+        dragSlot.meshPointerSnapPending = false;
         SetMeshResizeMode(dragSlot.mesh, operationTypeKnown && operationResizing);
         // A new move loop may replace the visual transform.
         dragSlot.transformRebindRevision++;
@@ -9580,6 +9640,7 @@ static void HandleMoveSizeStart(HWND hwnd)
     }
     ReleaseSRWLockExclusive(&g_animationSlotsLock);
     g_dragAnimationSlot = slotIndex;
+    g_pointerSnapHintUntil = 0;
     g_realDraggedWindow = hwnd;
     g_realDraggedWindowRect = rect;
     g_lastDraggedWindowRect = rect;
@@ -10043,6 +10104,7 @@ static void UpdateAnimationFrame()
             bool freeStepPending;
             bool identityApplied;
             ULONGLONG generation;
+            ULONGLONG revision;
             HWND hwnd;
             WobblySettings settings;
             WobbleMesh mesh;
@@ -10056,6 +10118,7 @@ static void UpdateAnimationFrame()
             snapshot.freeStepPending = slot.freeStepPending;
             snapshot.identityApplied = slot.identityApplied;
             snapshot.generation = slot.generation;
+            snapshot.revision = slot.meshRevision;
             snapshot.hwnd = slot.hwnd;
             snapshot.settings = slot.settings;
             snapshot.mesh = slot.mesh;
@@ -10094,7 +10157,8 @@ static void UpdateAnimationFrame()
         }
         AcquireSRWLockExclusive(&g_animationSlotsLock);
         WindowAnimationSlot& currentSlot = g_animationSlots[i];
-        if (currentSlot.active && currentSlot.generation == snapshot.generation)
+        if (currentSlot.active && currentSlot.generation == snapshot.generation &&
+            currentSlot.meshRevision == snapshot.revision)
         {
             bool renderRevisionNeeded =
                 simulatedMesh.active || wasMeshActive != simulatedMesh.active;
@@ -10187,7 +10251,7 @@ static void UpdateAnimationFrame()
                 AcquireSRWLockExclusive(&g_animationSlotsLock);
                 WindowAnimationSlot& currentSlot = g_animationSlots[i];
                 if (currentSlot.active && currentSlot.generation == snapshot.generation &&
-                    !currentSlot.meshIdentityPending)
+                    !currentSlot.mesh.active && !currentSlot.meshIdentityPending)
                 {
                     currentSlot.meshIdentityPending = true;
                     currentSlot.identityApplied = false;
@@ -10294,18 +10358,6 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     }
     bool rectChanged = !EqualRect(&rect, &g_lastDraggedWindowRect);
     bool resizeDetectedThisEvent = false;
-    if (!g_moveTypeKnown && rectChanged)
-    {
-        g_realResizing = !g_dragStartedWindowZoomed &&
-                         (currentWidth != originalWidth || currentHeight != originalHeight);
-        if (g_realResizing)
-        {
-            g_resizeCoordinateScale = g_dragUsesPhysicalCoordinates
-                ? 1.0 : GetResizeVisualCoordinateScale(hwnd, rect);
-            resizeDetectedThisEvent = true;
-        }
-        g_moveTypeKnown = true;
-    }
     POINT mousePosition = {};
     if (!(g_dragUsesPhysicalCoordinates ? GetPhysicalCursorPos(&mousePosition) : GetCursorPos(&mousePosition)))
     {
@@ -10338,9 +10390,29 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         nativeTargetFlags = 0;
         nativeTargetPending = false;
     }
+    const bool nativeGeometry = g_dragUsesPhysicalCoordinates &&
+        g_meshWindowTransitionsReady.load(std::memory_order_acquire);
+    const HMONITOR cursorMonitor = MonitorFromPoint(mousePosition, MONITOR_DEFAULTTONEAREST);
+    const bool monitorChanged = cursorMonitor && cursorMonitor != g_dragCursorMonitor;
+    const bool zoomStateChanged = windowZoomed != g_lastDraggedWindowZoomed;
+    const bool hasSnapHint = nativeTargetPending || g_pointerSnapHintUntil > GetTickCount64();
+    const bool committedSnap = nativeGeometry && !g_realResizing &&
+        (zoomStateChanged || ((!monitorChanged || hasSnapHint) &&
+          IsCommittedMeshSnap(g_lastDraggedWindowRect, rect, windowZoomed)));
     bool sizeChangedFromStart = currentWidth != originalWidth || currentHeight != originalHeight;
+    if (!g_moveTypeKnown && rectChanged)
+    {
+        g_realResizing = !g_dragStartedWindowZoomed && sizeChangedFromStart && !committedSnap;
+        if (g_realResizing)
+        {
+            g_resizeCoordinateScale = g_dragUsesPhysicalCoordinates
+                ? 1.0 : GetResizeVisualCoordinateScale(hwnd, rect);
+            resizeDetectedThisEvent = true;
+        }
+        g_moveTypeKnown = true;
+    }
     if (!g_dragStartedWindowZoomed && g_moveTypeKnown && !g_realResizing &&
-        sizeChangedFromStart &&
+        sizeChangedFromStart && !committedSnap &&
         IsCursorOnResizableFrame(hwnd, mousePosition, rect, true) &&
         MonitorFromPoint(mousePosition, MONITOR_DEFAULTTONEAREST) == g_dragCursorMonitor)
     {
@@ -10381,15 +10453,12 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     int previousWidth = g_lastDraggedWindowRect.right - g_lastDraggedWindowRect.left;
     int previousHeight = g_lastDraggedWindowRect.bottom - g_lastDraggedWindowRect.top;
     bool sizeChanged = currentWidth != previousWidth || currentHeight != previousHeight;
-    bool zoomStateChanged = windowZoomed != g_lastDraggedWindowZoomed;
     if (g_waitingForInitialRestore && !windowZoomed &&
         !IsApproximatelyMonitorWorkArea(rect))
     {
         g_waitingForInitialRestore = false;
     }
     ULONGLONG now = GetTickCount64();
-    HMONITOR cursorMonitor = MonitorFromPoint(mousePosition, MONITOR_DEFAULTTONEAREST);
-    bool monitorChanged = cursorMonitor && cursorMonitor != g_dragCursorMonitor;
     if (monitorChanged)
     {
         g_dragCursorMonitor = cursorMonitor;
@@ -10399,9 +10468,7 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
     bool physicalRoundingChange = g_dragUsesPhysicalCoordinates && sizeChanged &&
         std::abs(currentWidth - previousWidth) <= 1 &&
         std::abs(currentHeight - previousHeight) <= 1;
-    const bool meshCommittedStateChange = g_dragUsesPhysicalCoordinates && sizeChanged && !physicalRoundingChange &&
-        (zoomStateChanged || (!monitorChanged &&
-         (IsApproximatelyMonitorWorkArea(rect) || IsApproximatelySnapLayoutTarget(rect))));
+    const bool meshCommittedStateChange = committedSnap && !physicalRoundingChange;
     bool dpiReflow = !g_realResizing && !meshCommittedStateChange && sizeChanged && !physicalRoundingChange && !zoomStateChanged &&
                      g_interactiveStateThrob == InteractiveStateThrobKind::None;
     if (dpiReflow)
@@ -10424,8 +10491,6 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
         return;
     }
-    const bool nativeGeometry = g_dragUsesPhysicalCoordinates &&
-        g_meshWindowTransitionsReady.load(std::memory_order_acquire);
     if (!slot.transformAttached && !slot.meshWindowState &&
         !(nativeGeometry && meshCommittedStateChange))
     {
@@ -10493,7 +10558,11 @@ static void HandleLocationChange(HWND hwnd, LONG idObject, LONG idChild)
                                   meshCommittedStateChange)))
     {
         BeginMeshWindowStateTransition(slot, g_lastDraggedWindowRect, rect);
-        g_interactiveStateThrob = windowZoomed ? InteractiveStateThrobKind::Maximize : InteractiveStateThrobKind::Restore;
+        if (meshCommittedStateChange)
+            g_interactiveStateThrob = windowZoomed || IsApproximatelyMonitorWorkArea(rect)
+                ? InteractiveStateThrobKind::Maximize
+                : IsApproximatelySnapLayoutTarget(rect) ? InteractiveStateThrobKind::Snap
+                                                        : InteractiveStateThrobKind::Restore;
         g_interactiveStateThrobFromPointerEdge = false;
     }
     else if (canStartInteractiveStateThrob && maximizeIntent &&
@@ -10730,14 +10799,27 @@ static void HandleMoveSizeEnd(HWND hwnd)
     bool wasDragging = slot.mesh.dragging;
     if (slot.settings.rendererMode == RendererMode::Mesh && g_meshWindowTransitionsReady.load(std::memory_order_acquire))
     {
-        if (slot.settings.windowStateWobbleEnabled && !g_realResizing && hasReleaseRect &&
-            (releasedIntoMaximizeTarget || releasedIntoSnapTarget))
+        if (slot.settings.windowStateWobbleEnabled && !g_realResizing && hasReleaseRect)
         {
-            meshTransitionStarted = BeginMeshWindowStateTransition(slot, g_lastDraggedWindowRect, releaseRect);
-            meshReleaseGoal = releaseRect;
+            const RECT source = slot.meshWindowRect;
+            const bool committed = IsCommittedMeshSnap(source, releaseRect, IsZoomed(hwnd) != FALSE);
+            if (committed || slot.meshWindowState)
+            {
+                meshTransitionStarted = BeginMeshWindowStateTransition(slot, source, releaseRect);
+                meshReleaseGoal = releaseRect;
+            }
+            else if (ValidMeshWindowRect(source) &&
+                     (releasedIntoMaximizeTarget || releasedAtMonitorSideEdge || pendingInteractiveSnap ||
+                      releaseSnapBand.side || lastDragSnapBand.side ||
+                      g_pointerSnapHintUntil > GetTickCount64()))
+            {
+                // MOVESIZEEND and the committed snap rectangle can arrive in either order.
+                slot.meshPrepareUntil = GetTickCount64() + 200;
+                slot.meshPointerSnapPending = true;
+            }
         }
         if (slot.mesh.dragging) EndDrag(slot.mesh);
-        animate = (wasDragging || slot.mesh.active || slot.windowStateThrob) &&
+        animate = (wasDragging || slot.mesh.active || slot.windowStateThrob || slot.meshPointerSnapPending) &&
                   (slot.matrixTransformProxy || slot.proxyCreationPending);
     }
     else if (slot.settings.windowStateWobbleEnabled && releasedIntoMaximizeTarget)
@@ -10792,7 +10874,7 @@ static void HandleMoveSizeEnd(HWND hwnd)
     ReleaseSRWLockExclusive(&g_animationSlotsLock);
     if (meshTransitionStarted)
         Wh_Log(L"MESH WINDOW TRANSITION: HWND=%p geometrySource=HWND "
-               L"to=(%ld,%ld,%ld,%ld) corners=4 affinePulse=0 source=drag-release",
+               L"to=(%ld,%ld,%ld,%ld) controls=16 affinePulse=0 source=drag-release",
                hwnd, meshReleaseGoal.left, meshReleaseGoal.top,
                meshReleaseGoal.right, meshReleaseGoal.bottom);
     if (stateTransitionWobble && animate)
@@ -11154,10 +11236,30 @@ static void HandleNativeWindowTransitionStart(HWND hwnd, LPARAM transitionFlags)
         if (index >= 0 && ReadWindowRectForRenderer(hwnd, &current) && ValidMeshWindowRect(current))
         {
             if (!EqualRect(&nativeSourceRect, &current))
-                StartWindowStateThrob(hwnd, IsZoomed(hwnd) != FALSE, false, {}, &nativeSourceRect);
+            {
+                const int slotIndex = FindAnimationSlotForWindow(hwnd);
+                RECT pointerSource = {};
+                if (slotIndex >= 0)
+                {
+                    AcquireSRWLockShared(&g_animationSlotsLock);
+                    const auto& slot = g_animationSlots[slotIndex];
+                    if (slot.active && slot.hwnd == hwnd && slot.meshPointerSnapPending &&
+                        slot.meshPrepareUntil > now)
+                        pointerSource = slot.meshWindowRect;
+                    ReleaseSRWLockShared(&g_animationSlotsLock);
+                }
+                if (ValidMeshWindowRect(pointerSource))
+                {
+                    if (IsCommittedMeshSnap(pointerSource, current, IsZoomed(hwnd) != FALSE))
+                        StartWindowStateThrob(hwnd, IsZoomed(hwnd) != FALSE, true, {}, &pointerSource);
+                }
+                else
+                    StartWindowStateThrob(hwnd, IsZoomed(hwnd) != FALSE, false, {}, &nativeSourceRect);
+            }
             else if (transitionFlags & (NATIVE_TRANSITION_TARGET_IS_WORK_AREA |
                                         NATIVE_TRANSITION_TARGET_IS_SNAP_LAYOUT |
-                                        NATIVE_TRANSITION_SOURCE_IS_WORK_AREA))
+                                        NATIVE_TRANSITION_SOURCE_IS_WORK_AREA |
+                                        NATIVE_TRANSITION_SHELL_CONFIRMED))
                 PrepareMeshWindowStateTransition(hwnd, current);
         }
         return;
@@ -11305,6 +11407,14 @@ static void HandleObservedWindowLocationChange(HWND hwnd, LONG idObject, LONG id
         observed.lastSeen = now;
         return;
     }
+    const auto previousMonitor = observed.snapped && rectChanged
+        ? MonitorFromRect(&previousObservedRect, MONITOR_DEFAULTTONULL) : nullptr;
+    const bool meshSnapRestore = previousMonitor && !realDragging && !zoomed &&
+        ValidMeshWindowRect(previousObservedRect) && ValidMeshWindowRect(rect) &&
+        WindowExtentChanged(previousObservedRect, rect) && !IsApproximatelySnapLayoutTarget(rect) &&
+        previousMonitor == MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) &&
+        g_meshWindowTransitionsReady.load(std::memory_order_acquire) &&
+        GetSettingsSnapshot().rendererMode == RendererMode::Mesh;
     bool snapTargetChanged = false;
     if (hasRect)
     {
@@ -11351,6 +11461,11 @@ static void HandleObservedWindowLocationChange(HWND hwnd, LONG idObject, LONG id
     }
     observed.zoomed = zoomed;
     observed.lastSeen = now;
+    if (meshSnapRestore)
+    {
+        StartWindowStateThrob(hwnd, false, false, {}, &previousObservedRect);
+        return;
+    }
     if (snapTargetChanged)
     {
         if (now >= observed.snapTransitionDeadline)
@@ -11753,6 +11868,8 @@ static DWORD WINAPI WindowEventThreadProc(LPVOID)
                 if (g_realDragging.load(std::memory_order_relaxed) &&
                     g_realDraggedWindow.load(std::memory_order_relaxed) == transitionWindow)
                 {
+                    if (message.lParam == NATIVE_TRANSITION_SHELL_CONFIRMED)
+                        g_pointerSnapHintUntil = GetTickCount64() + 200;
                     HandleLocationChange(transitionWindow, OBJID_WINDOW, CHILDID_SELF);
                 }
                 else
