@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.374
+// @version         0.375
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3573,7 +3573,10 @@ static void InitializeMesh25Preview()
             base + 0xF86A8;
     const bool release = matchesCode(g_cBaseObjectRelease, 0x27380);
     constexpr BYTE childCollection[] = {0x4D, 0x8D, 0x93, 0x90, 0x00, 0x00, 0x00};
+    constexpr BYTE captureTargetLoad[] = {0x48, 0x8B, 0x86, 0xB8, 0x01, 0x00, 0x00,
+                                          0x4C, 0x8B, 0x78, 0x10};
     const auto* containerCode = reinterpret_cast<const BYTE*>(base + 0x273D2);
+    const auto* targetCode = reinterpret_cast<const BYTE*>(base + 0xA9444);
     const bool scene = matchesCode(g_topLevelWindowGetRootVisual, 0x1BB70) &&
         matchesCode(g_nativeMeshGetVisualParent, 0x69330) &&
         matchesCode(g_nativeMeshCreateVisual, 0x3F810) &&
@@ -3585,7 +3588,9 @@ static void InitializeMesh25Preview()
         matchesCode(g_mesh25PreviewSetOffset, 0x294EC) &&
         matchesCode(g_mesh25PreviewSetOpacity, 0x1CFB0) &&
         IsReadableMemory(containerCode, sizeof(childCollection)) &&
-        std::memcmp(containerCode, childCollection, sizeof(childCollection)) == 0;
+        std::memcmp(containerCode, childCollection, sizeof(childCollection)) == 0 &&
+        IsReadableMemory(targetCode, sizeof(captureTargetLoad)) &&
+        std::memcmp(targetCode, captureTargetLoad, sizeof(captureTargetLoad)) == 0;
     g_mesh25PreviewReady = capture && geometry && image && release && scene;
     if (g_mesh25PreviewReady)
         g_nativeMeshRemoveFromParent = RemoveMesh25PreviewFromParent;
@@ -6655,6 +6660,7 @@ static void MaintainMesh25Preview(NativeMeshState& state)
     POINT offset = {};
     if (!ReadMesh25PreviewOffset(state.root, offset) ||
         ReadPointerMember(state.root, 0x10) != state.sourceProxy ||
+        ReadPointerMember(state.capturedRepresentation, 0x18) != state.imageSourceProxy ||
         g_nativeMeshGetVisualParent(state.root) != state.sourceOwner ||
         g_nativeMeshGetVisualParent(state.visual) != state.sourceOwner)
     {
@@ -7135,6 +7141,25 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
     if (capturedRepresentation) ReleaseNativeCapturedSource(capturedRepresentation);
 }
 
+// The capture factory redirects the CTopLevelWindow proxy, including its
+// complete-window child. A sibling of the capture root stays outside that input.
+static const wchar_t* ValidateMesh25CaptureHost(void* completeRoot, void* captureRoot,
+                                                void* captureProxy, int& captureDepth)
+{
+    captureDepth = -1;
+    void* visual = completeRoot;
+    for (int depth = 0; visual && depth < 24; ++depth)
+    {
+        if (!NativeVisualVtableRva(visual)) return L"InvalidAncestor";
+        if (captureDepth >= 0 && ReadPointerMember(visual, 0x10) == captureProxy)
+            return L"CaptureProxyAboveHost";
+        if (visual == captureRoot) captureDepth = depth;
+        visual = g_nativeMeshGetVisualParent(visual);
+    }
+    if (visual) return L"AncestryLimit";
+    return captureDepth < 0 ? L"CaptureRootNotOnPath" : nullptr;
+}
+
 static void RunMesh25Preview(HWND hwnd, ULONGLONG generation, void* windowData,
                             void* topLevelWindow, void* originalProxy)
 {
@@ -7154,44 +7179,50 @@ static void RunMesh25Preview(HWND hwnd, ULONGLONG generation, void* windowData,
     if (!IsDwmObjectPointerValid(compositor, g_compositorVtable)) return;
 
     g_mesh25PreviewAttempted = true;
-    void* root = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
-    void* collection = FindMesh25PreviewCollection(root);
+    void* completeRoot = g_topLevelWindowGetRootVisual(topLevelWindow, 0);
+    if (ReadPointerMember(completeRoot, 0x10) != originalProxy)
+    {
+        Wh_Log(L"MESH 25H2 PREVIEW SKIPPED: HWND=%p stage=CompleteRoot", hwnd);
+        return;
+    }
+    void* captureTarget = ReadPointerMember(topLevelWindow, 0x10);
+    int captureDepth = -1;
+    const wchar_t* hostFailure = IsVisualProxyPointerValid(captureTarget)
+        ? ValidateMesh25CaptureHost(completeRoot, topLevelWindow, captureTarget, captureDepth)
+        : L"CaptureProxyType";
+    if (hostFailure)
+    {
+        Wh_Log(L"MESH 25H2 PREVIEW SKIPPED: HWND=%p stage=%s captureDepth=%d",
+               hwnd, hostFailure, captureDepth);
+        return;
+    }
+    void* collection = FindMesh25PreviewCollection(topLevelWindow);
     POINT offset = {};
     int width = 0, height = 0;
-    if (!collection || ReadPointerMember(root, 0x10) != originalProxy ||
-        !ReadMesh25PreviewOffset(root, offset) ||
+    if (!collection || !ReadMesh25PreviewOffset(topLevelWindow, offset) ||
         !GetNativeMeshWindowSize(hwnd, width, height, nullptr) ||
-        width < 160 || height < 100 || width > 4096 || height > 2304)
+        width < 160 || height < 100 || width > 4096 || height > 2304 ||
+        !RetainNativeMeshRoot(topLevelWindow))
     {
-        Wh_Log(L"MESH 25H2 PREVIEW SKIPPED: HWND=%p stage=Host", hwnd);
+        Wh_Log(L"MESH 25H2 PREVIEW SKIPPED: HWND=%p stage=CaptureHost "
+               L"captureDepth=%d collection=%d size=%dx%d",
+               hwnd, captureDepth, collection != nullptr, width, height);
         return;
     }
-    void* parent = g_nativeMeshGetVisualParent(root);
-    void* captureTarget = ReadPointerMember(topLevelWindow, 0x10);
-    void* ancestor = parent;
-    for (unsigned i = 0; ancestor && i < 24; ++i)
-    {
-        if (!NativeVisualVtableRva(ancestor) || ReadPointerMember(ancestor, 0x10) == captureTarget)
-            break;
-        ancestor = g_nativeMeshGetVisualParent(ancestor);
-    }
-    if (ancestor || !IsVisualProxyPointerValid(captureTarget) || !RetainNativeMeshRoot(root))
-    {
-        Wh_Log(L"MESH 25H2 PREVIEW SKIPPED: HWND=%p stage=CaptureAncestry", hwnd);
-        return;
-    }
+    void* parent = ReadPointerMember(collection, 0);
 
     NativeMeshState pending = {};
     pending.compatibilityPreview = true;
-    pending.root = root;
-    pending.sourceProxy = originalProxy;
+    pending.root = topLevelWindow;
+    pending.sourceProxy = captureTarget;
     pending.sourceOwner = parent;
     pending.hwnd = hwnd;
     pending.meshGeneration = generation;
     const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
     const wchar_t* stage = L"CreateCapture";
     void* representation = nullptr;
-    Wh_Log(L"MESH 25H2 PREVIEW START: HWND=%p size=%dx%d", hwnd, width, height);
+    Wh_Log(L"MESH 25H2 PREVIEW START: HWND=%p size=%dx%d captureDepth=%d",
+           hwnd, width, height, captureDepth);
     long result = g_capturedWindowCreate(windowData, &representation);
     if (ReadPointerMember(representation, 0) == g_capturedWindowVtable)
         pending.capturedRepresentation = representation;
@@ -7203,7 +7234,7 @@ static void RunMesh25Preview(HWND hwnd, ULONGLONG generation, void* windowData,
             ReadPointerMember(representation, 0x58) == windowData)
             pending.imageSourceProxy = ReadPointerMember(representation, 0x18);
         if (!IsVisualProxyPointerValid(pending.imageSourceProxy) ||
-            pending.imageSourceProxy == originalProxy)
+            pending.imageSourceProxy == originalProxy || pending.imageSourceProxy == captureTarget)
             result = E_NOINTERFACE;
     }
     if (result >= 0)
@@ -7289,15 +7320,16 @@ static void RunMesh25Preview(HWND hwnd, ULONGLONG generation, void* windowData,
     if (result >= 0)
     {
         stage = L"InsertSibling";
-        if (FindMesh25PreviewCollection(root) != collection ||
-            g_topLevelWindowGetRootVisual(topLevelWindow, 0) != root || !IsWindow(hwnd) ||
+        if (FindMesh25PreviewCollection(topLevelWindow) != collection ||
+            g_topLevelWindowGetRootVisual(topLevelWindow, 0) != completeRoot ||
+            ReadPointerMember(topLevelWindow, 0x10) != captureTarget || !IsWindow(hwnd) ||
             g_unloading.load(std::memory_order_acquire))
             result = E_UNEXPECTED;
         else
         {
             g_mesh25PreviewSetOffset(pending.visual, &offset);
             g_nativeMeshStopRequested.store(false, std::memory_order_release);
-            result = g_nativeMeshInsertRelative(collection, pending.visual, root, true, false);
+            result = g_nativeMeshInsertRelative(collection, pending.visual, topLevelWindow, true, false);
         }
     }
     void* attachedParent = ReadPointerMember(pending.visual, 0x18);
