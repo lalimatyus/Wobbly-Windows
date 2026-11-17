@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.372
+// @version         0.373
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -528,6 +528,11 @@ using NativeVisualSetOpacity_t = void(__cdecl*)(void*, double);
 NativeCapturedRepresentationCreate_t g_nativeCapturedRepresentationCreate = nullptr;
 NativeCapturedRepresentationMethod_t g_nativeCapturedRepresentationEnsureRoot = nullptr;
 NativeCapturedRepresentationMethod_t g_nativeCapturedRepresentationValidate = nullptr;
+using CapturedWindowCreate_t = long(__cdecl*)(void*, void**);
+CapturedWindowCreate_t g_capturedWindowCreate = nullptr;
+void* g_capturedWindowVtable = nullptr;
+bool g_detachedMeshProbeReady = false;
+bool g_detachedMeshProbeAttempted = false; // DWM scene thread only.
 NativeVisualSetOpacity_t g_nativeVisualSetOpacity = nullptr;
 void* g_nativeCapturedRepresentationVtable = nullptr;
 // Native listener interface with three verified no-op callbacks.
@@ -3040,6 +3045,9 @@ static bool InitializeDwmHooks()
          &g_nativeMeshCreateMesh, nullptr, true},
         {{L"public: long __cdecl CMeshGeometry2dProxy::Update("
            L"int,struct MilPoint3F const *,struct MilPoint2D const *,"
+           L"unsigned int,unsigned int const *,unsigned int)",
+          L"public: long __cdecl CMeshGeometry2dProxy::Update("
+           L"int,struct D2D_POINT_3F const *,struct D2D_POINT_2F const *,"
            L"unsigned int,unsigned int const *,unsigned int)"},
          &g_nativeMeshUpdateMesh, nullptr, true},
         {{L"public: long __cdecl CCompositor::CreateGeometry2dGroupProxy("
@@ -3496,6 +3504,58 @@ static bool InitializeDwmHooks()
         return false;
     }
     return true;
+}
+
+static void InitializeDetachedMeshProbe()
+{
+    const auto* core = ReadDwmImageHeaders(GetModuleHandleW(L"dwmcore.dll"));
+    if (g_dwmModuleLayout.timeDateStamp != 0x240E386A ||
+        g_dwmModuleLayout.sizeOfImage != 0x142000 || !core ||
+        core->FileHeader.TimeDateStamp != 0x9A1AF3BA ||
+        core->OptionalHeader.SizeOfImage != 0x443000)
+        return;
+
+    // This pair is 26100.9278, as shipped in Windows 11 build 26200.9457.
+    const WindhawkUtils::SYMBOL_HOOK udwmDllCaptureHooks[] = {
+        {{L"public: static long __cdecl CapturedWindowRepresentation::Create("
+           L"class CWindowData *,class CapturedWindowRepresentation * *)"},
+         &g_capturedWindowCreate, nullptr, true},
+        {{L"const CapturedWindowRepresentation::`vftable'"},
+         &g_capturedWindowVtable, nullptr, true},
+    };
+    WindhawkUtils::HookSymbols(g_dwmModuleLayout.module, udwmDllCaptureHooks,
+                               ARRAYSIZE(udwmDllCaptureHooks));
+
+    const auto base = reinterpret_cast<uintptr_t>(g_dwmModuleLayout.imageBegin);
+    const auto matchesCode = [base](auto function, uintptr_t rva)
+    {
+        return reinterpret_cast<uintptr_t>(function) == base + rva &&
+               IsDwmExecutableAddress(reinterpret_cast<const void*>(function));
+    };
+    constexpr BYTE captureAllocation[] = {0xB9, 0x60, 0x00, 0x00, 0x00};
+    constexpr BYTE meshEntry[] = {0x48, 0x83, 0xEC, 0x58, 0x48, 0x8B, 0x51, 0x10};
+    const auto* captureCode = reinterpret_cast<const BYTE*>(base + 0xA937B);
+    const auto* meshCode = reinterpret_cast<const BYTE*>(base + 0xA948);
+    const bool capture = matchesCode(g_capturedWindowCreate, 0xA935C) &&
+        reinterpret_cast<uintptr_t>(g_capturedWindowVtable) == base + 0xFBF10 &&
+        reinterpret_cast<uintptr_t>(g_nativeCaptureCriticalSection) == base + 0x123C10 &&
+        IsReadableMemory(g_nativeCaptureCriticalSection, sizeof(CRITICAL_SECTION)) &&
+        IsReadableMemory(captureCode, sizeof(captureAllocation)) &&
+        std::memcmp(captureCode, captureAllocation, sizeof(captureAllocation)) == 0;
+    const bool geometry = matchesCode(g_nativeMeshCreateMesh, 0x73488) &&
+        matchesCode(g_nativeMeshUpdateMesh, 0xA948) &&
+        matchesCode(g_nativeMeshCreateGroup, 0xA9AC) &&
+        matchesCode(g_nativeMeshUpdateGroup, 0xAA7C) &&
+        IsReadableMemory(meshCode, sizeof(meshEntry)) &&
+        std::memcmp(meshCode, meshEntry, sizeof(meshEntry)) == 0;
+    const bool image = matchesCode(g_nativeMeshCreateImage, 0x683A8) &&
+        matchesCode(g_nativeMeshUpdateImageF, 0x3DFDC) && !g_nativeMeshUpdateImageD &&
+        reinterpret_cast<uintptr_t>(g_nativeMeshImageVtable.load(std::memory_order_acquire)) ==
+            base + 0xF86A8;
+    const bool release = matchesCode(g_cBaseObjectRelease, 0x27380);
+    g_detachedMeshProbeReady = capture && geometry && image && release;
+    Wh_Log(L"MESH 25H2 PROBE: ready=%d capture=%d geometry=%d image=%d release=%d",
+           g_detachedMeshProbeReady, capture, geometry, image, release);
 }
 
 static bool NativeMeshAbiVerified()
@@ -5994,8 +6054,10 @@ class NativeCaptureGuard
 {
 public:
     explicit NativeCaptureGuard(bool needed)
-        : section_(needed && g_nativeCapturedSourceReady
-                       ? static_cast<CRITICAL_SECTION*>(g_nativeCaptureCriticalSection) : nullptr),
+        : NativeCaptureGuard(needed, g_nativeCapturedSourceReady
+                                         ? g_nativeCaptureCriticalSection : nullptr) {}
+    NativeCaptureGuard(bool needed, void* section)
+        : section_(needed ? static_cast<CRITICAL_SECTION*>(section) : nullptr),
           acquired_(!needed || (section_ && TryEnterCriticalSection(section_))) {}
     ~NativeCaptureGuard() { if (section_ && acquired_) LeaveCriticalSection(section_); }
     NativeCaptureGuard(const NativeCaptureGuard&) = delete;
@@ -6963,6 +7025,95 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
     if (capturedRepresentation) ReleaseNativeCapturedSource(capturedRepresentation);
 }
 
+static void RunDetachedMeshProbe(HWND hwnd, void* windowData, void* originalProxy)
+{
+    if (!IsOnDwmSceneThread() || !windowData || !IsVisualProxyPointerValid(originalProxy))
+        return;
+    AcquireSRWLockShared(&g_settingsLock);
+    const bool meshRequested = g_settings.rendererMode == RendererMode::Mesh;
+    ReleaseSRWLockShared(&g_settingsLock);
+    if (!meshRequested) return;
+
+    NativeCaptureGuard guard(true, g_nativeCaptureCriticalSection);
+    if (!guard.acquired() || GetHwndFromWindowData(windowData) != hwnd || !IsWindow(hwnd))
+        return;
+    void* compositor = g_dwmCompositor.load(std::memory_order_acquire);
+    if (!IsDwmObjectPointerValid(compositor, g_compositorVtable)) return;
+
+    g_detachedMeshProbeAttempted = true;
+    const wchar_t* stage = L"CreateCapture";
+    void* representation = nullptr;
+    Wh_Log(L"MESH 25H2 DETACHED START: HWND=%p", hwnd);
+    long result = g_capturedWindowCreate(windowData, &representation);
+    const bool ownedCapture = representation &&
+        ReadPointerMember(representation, 0) == g_capturedWindowVtable;
+    void* source = nullptr;
+    if (result >= 0)
+    {
+        stage = L"CaptureProxy";
+        // The native capture manager takes the proxy directly from this field.
+        if (ownedCapture &&
+            ReadPointerMember(representation, 0x10) == hwnd &&
+            ReadPointerMember(representation, 0x58) == windowData)
+            source = ReadPointerMember(representation, 0x18);
+        if (!IsVisualProxyPointerValid(source) || source == originalProxy)
+            result = E_NOINTERFACE;
+    }
+
+    void* image = nullptr;
+    void* mesh = nullptr;
+    void* group = nullptr;
+    constexpr int width = 256;
+    constexpr int height = 160;
+    if (result >= 0)
+    {
+        stage = L"CreateImage";
+        result = g_nativeMeshCreateImage(compositor, &image);
+        if (result >= 0 && ReadPointerMember(image, 0) !=
+            g_nativeMeshImageVtable.load(std::memory_order_acquire))
+            result = E_NOINTERFACE;
+    }
+    if (result >= 0)
+    {
+        stage = L"UpdateImage";
+        result = UpdateNativeMeshSourceImage(image, source, width, height, 0);
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateMesh";
+        result = g_nativeMeshCreateMesh(compositor, &mesh);
+        if (result >= 0 && !mesh) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"UpdateMesh";
+        const NativeMeshPoint3F positions[] = {{0, 0, 0}, {width, 0, 0},
+                                              {0, height, 0}, {width, height, 0}};
+        const NativeMeshPoint2D coordinates[] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
+        constexpr unsigned indices[] = {0, 1, 2, 1, 3, 2};
+        result = g_nativeMeshUpdateMesh(mesh, 0, positions, coordinates, ARRAYSIZE(positions),
+                                         indices, ARRAYSIZE(indices));
+    }
+    if (result >= 0)
+    {
+        stage = L"CreateGroup";
+        result = g_nativeMeshCreateGroup(compositor, &group);
+        if (result >= 0 && !group) result = E_UNEXPECTED;
+    }
+    if (result >= 0)
+    {
+        stage = L"UpdateGroup";
+        result = g_nativeMeshUpdateGroup(group, mesh);
+    }
+
+    if (group) g_cBaseObjectRelease(group);
+    if (mesh) g_cBaseObjectRelease(mesh);
+    if (image) g_cBaseObjectRelease(image);
+    if (ownedCapture) g_cBaseObjectRelease(representation);
+    Wh_Log(L"MESH 25H2 DETACHED: stage=%s result=0x%08X owned=%d separate=%d attached=0",
+           stage, static_cast<unsigned>(result), ownedCapture, source && source != originalProxy);
+}
+
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals, bool geometryBridgeOnly = false)
 {
     if (!IsOnDwmSceneThread() || g_unloading.load(std::memory_order_acquire) ||
@@ -6999,6 +7150,7 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals, bool
         bool previouslyTransitionAttached = false;
         bool windowStateThrob = false;
         bool bindingPending = false;
+        bool runDetachedMeshProbe = false;
         AcquireSRWLockExclusive(&g_animationSlotsLock);
         WindowAnimationSlot& slot = g_animationSlots[i];
         const bool affineStateThrob = slot.windowStateThrob && !slot.meshWindowState;
@@ -7030,6 +7182,8 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals, bool
             previouslyTopLevelAttached = slot.transformAttached;
             previouslyTransitionAttached = slot.transitionTransformAttached;
             windowStateThrob = affineStateThrob;
+            runDetachedMeshProbe = !geometryBridgeOnly && g_detachedMeshProbeReady &&
+                !g_detachedMeshProbeAttempted && slot.dragging && !slot.mesh.resizing;
         }
         ReleaseSRWLockExclusive(&g_animationSlotsLock);
         if (!matrixTransformProxy)
@@ -7080,6 +7234,8 @@ static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals, bool
                 transitionVisualProxy = GetTransitionVisualProxy(topLevelWindow3D);
             }
         }
+        if (runDetachedMeshProbe && topLevelVisualProxy)
+            RunDetachedMeshProbe(hwnd, windowData, topLevelVisualProxy);
         if (!geometryBridgeOnly && topLevelVisualProxy &&
             !g_nativeMeshActive.load(std::memory_order_acquire))
         {
@@ -11697,6 +11853,7 @@ BOOL Wh_ModInit()
         UninitializeDpiSupport();
         return FALSE;
     }
+    InitializeDetachedMeshProbe();
     InitializeCoreMaterialBridge();
     const auto* core = ReadDwmImageHeaders(GetModuleHandleW(L"dwmcore.dll"));
     const bool udwmSupported = g_dwmModuleLayout.timeDateStamp == 0xE19C3234 &&
