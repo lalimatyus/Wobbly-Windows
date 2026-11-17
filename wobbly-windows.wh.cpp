@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.376
+// @version         0.377
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -377,6 +377,16 @@ static constexpr LPARAM NATIVE_TRANSITION_DIRECTION_RIGHT = 0x20;
 static constexpr LPARAM NATIVE_TRANSITION_DIRECTION_UP = 0x40;
 static constexpr LPARAM NATIVE_TRANSITION_DIRECTION_DOWN = 0x80;
 static constexpr LPARAM NATIVE_TRANSITION_SHELL_CONFIRMED = 0x100;
+static constexpr LPARAM NATIVE_TRANSITION_CAPTURED_BOUNDS = 0x200;
+struct Mesh25TransitionStart
+{
+    HWND hwnd;
+    RECT bounds;
+    ULONGLONG expires;
+    bool pending;
+};
+Mesh25TransitionStart g_mesh25TransitionStarts[16] = {};
+SRWLOCK g_mesh25TransitionLock = SRWLOCK_INIT;
 std::atomic<HWND> g_pendingInteractiveTransitionWindow = nullptr;
 std::atomic<LPARAM> g_pendingInteractiveTransitionFlags = 0;
 RECT g_realDraggedWindowRect = {};
@@ -539,6 +549,7 @@ MeshGeometryUpdateFloat_t g_nativeMeshUpdateMeshFloat = nullptr;
 VisualSetOffset_t g_mesh25SetOffset = nullptr;
 NativeVisualSetOpacity_t g_mesh25SetOpacity = nullptr;
 bool g_mesh25Ready = false;
+bool g_mesh25TransitionBoundsReady = false;
 NativeVisualSetOpacity_t g_nativeVisualSetOpacity = nullptr;
 void* g_nativeCapturedRepresentationVtable = nullptr;
 // Native listener interface with three verified no-op callbacks.
@@ -1315,6 +1326,46 @@ static void QueueNativeWindowTransition(HWND hwnd, LPARAM transitionFlags)
     }
 }
 
+static void QueueMesh25TransitionStart(HWND hwnd, const void* windowData)
+{
+    if (!g_mesh25TransitionBoundsReady || !hwnd || !windowData ||
+        g_realDragging.load(std::memory_order_relaxed) ||
+        g_unloading.load(std::memory_order_acquire))
+        return;
+    const DWORD thread = g_eventThreadMessageTarget.load(std::memory_order_acquire);
+    if (!thread) return;
+    const auto* bytes = static_cast<const BYTE*>(windowData);
+    if (!IsReadableMemory(bytes + 0x2E6, 1) || (bytes[0x2E6] & 0x20) == 0 ||
+        !IsReadableMemory(bytes + 0x33C, sizeof(RECT)))
+        return;
+    RECT start = {};
+    std::memcpy(&start, bytes + 0x33C, sizeof(start));
+    if (!ValidMeshWindowRect(start)) return;
+    const auto settings = GetSettingsSnapshot();
+    if (settings.rendererMode != RendererMode::Mesh || !settings.windowStateWobbleEnabled)
+        return;
+
+    const auto now = GetTickCount64();
+    AcquireSRWLockExclusive(&g_mesh25TransitionLock);
+    auto* oldest = &g_mesh25TransitionStarts[0];
+    for (auto& entry : g_mesh25TransitionStarts)
+    {
+        if (entry.hwnd == hwnd)
+        {
+            oldest = &entry;
+            break;
+        }
+        if (entry.expires < oldest->expires) oldest = &entry;
+    }
+    const bool fresh = oldest->hwnd != hwnd || oldest->expires <= now ||
+                       !EqualRect(&oldest->bounds, &start);
+    if (fresh) *oldest = {hwnd, start, now + 350, true};
+    const bool queued = fresh && PostThreadMessageW(thread, WM_WOBBLY_NATIVE_WINDOW_TRANSITION,
+        reinterpret_cast<WPARAM>(hwnd), NATIVE_TRANSITION_CAPTURED_BOUNDS);
+    if (fresh && !queued) *oldest = {};
+    ReleaseSRWLockExclusive(&g_mesh25TransitionLock);
+}
+
 static long __cdecl WindowTransitionChangeHook(void* pThis, void* dwmWindow, int transitionTarget,
                                                const RECT& targetRect, const RECT& rect2,
                                                const RECT& rect3, const RECT& rect4,
@@ -1332,6 +1383,7 @@ static long __cdecl WindowTransitionChangeHook(void* pThis, void* dwmWindow, int
             g_windowDataHwndOffset != SIZE_MAX)
         {
             hwnd = GetHwndFromWindowData(windowData);
+            QueueMesh25TransitionStart(hwnd, windowData);
         }
     }
     // Queue before the native transition timeline starts.
@@ -1382,6 +1434,7 @@ static long __cdecl TopLevelWindow3DStartAnimationHook(void* pThis, int animatio
 {
     HWND hwnd = nullptr;
     void* windowData = RegisterAnimationTopLevelWindow3D(pThis, &hwnd);
+    QueueMesh25TransitionStart(hwnd, windowData);
     long result = g_topLevelWindow3DStartAnimationOriginal(pThis, animationType);
     if (!g_startAnimationForMaximizeSnapTransitionOriginal && result >= 0 && hwnd)
     {
@@ -1410,6 +1463,7 @@ static void __cdecl OnPositionChangeHook(void* pThis, void* pWindowData, bool un
     {
         return;
     }
+    QueueMesh25TransitionStart(hwnd, pWindowData);
     QueueMaximizedStateCheck(hwnd);
 }
 
@@ -1425,6 +1479,7 @@ static void __cdecl CheckForMaximizedChangeHook(void* pThis, void* pWindowData)
         return;
     }
     HWND hwnd = GetHwndFromTrustedWindowData(pWindowData);
+    QueueMesh25TransitionStart(hwnd, pWindowData);
     QueueMaximizedStateCheck(hwnd);
 }
 
@@ -3590,8 +3645,23 @@ static void InitializeMesh25Renderer()
     g_mesh25Ready = capture && geometry && image && release && scene;
     if (g_mesh25Ready)
         g_nativeMeshRemoveFromParent = RemoveMesh25VisualFromParent;
+    constexpr BYTE startRectLoads[] = {
+        0x4C,0x8B,0x81,0x44,0x03,0x00,0x00,0x48,0x8B,0x89,0x3C,0x03,0x00,0x00
+    };
+    constexpr BYTE startRectFlag[] = {
+        0x8A,0x80,0xE6,0x02,0x00,0x00,0xC0,0xE8,0x05,0x24,0x01,0xC3
+    };
+    auto matchesBytes = [base](uintptr_t rva, const auto& expected)
+    {
+        const auto* code = reinterpret_cast<const BYTE*>(base + rva);
+        return IsDwmExecutableAddress(code) && IsReadableMemory(code, sizeof(expected)) &&
+               !std::memcmp(code, expected, sizeof(expected));
+    };
+    g_mesh25TransitionBoundsReady = g_mesh25Ready &&
+        matchesBytes(0x41783, startRectLoads) && matchesBytes(0x417FC, startRectFlag);
     Wh_Log(L"MESH 25H2 RENDERER: ready=%d capture=%d geometry=%d image=%d release=%d scene=%d",
            g_mesh25Ready, capture, geometry, image, release, scene);
+    Wh_Log(L"MESH 25H2 TRANSITION SOURCE: nativeStartBounds=%d", g_mesh25TransitionBoundsReady);
 }
 
 static bool NativeMeshAbiVerified()
@@ -9605,7 +9675,8 @@ static void RefreshMeshWindowStateGeometry(bool preparingOnly)
     if (changed) RequestDwmScenePass();
 }
 
-static bool StartMeshWindowStateTransition(HWND hwnd, const RECT& current, const RECT* previous)
+static bool StartMeshWindowStateTransition(HWND hwnd, const RECT& current, const RECT* previous,
+                                           bool nativeStartBounds = false)
 {
     const auto settings = GetSettingsSnapshot();
     if (settings.rendererMode != RendererMode::Mesh || !g_meshWindowTransitionsReady.load(std::memory_order_acquire) ||
@@ -9625,6 +9696,12 @@ static bool StartMeshWindowStateTransition(HWND hwnd, const RECT& current, const
     auto& slot = g_animationSlots[index];
     if (slot.active && slot.hwnd == hwnd)
     {
+        if (nativeStartBounds && !slot.dragging && !slot.meshWindowState &&
+            EqualRect(&slot.meshWindowRect, &current) && !EqualRect(&source, &current))
+        {
+            InitializeMesh(slot.mesh, source.right - source.left, source.bottom - source.top);
+            slot.meshWindowRect = source;
+        }
         if (ValidMeshWindowRect(slot.meshWindowRect)) from = slot.meshWindowRect;
         const auto revision = slot.meshRevision;
         started = BeginMeshWindowStateTransition(slot, source, current);
@@ -10907,6 +10984,13 @@ static void ForgetObservedWindowState(HWND hwnd)
     {
         g_observedWindows[index] = {};
     }
+    if (g_mesh25TransitionBoundsReady)
+    {
+        AcquireSRWLockExclusive(&g_mesh25TransitionLock);
+        for (auto& entry : g_mesh25TransitionStarts)
+            if (entry.hwnd == hwnd) { entry = {}; break; }
+        ReleaseSRWLockExclusive(&g_mesh25TransitionLock);
+    }
 }
 
 static int RememberObservedWindowState(HWND hwnd)
@@ -11165,6 +11249,41 @@ static void StartWindowStateThrob(HWND hwnd, bool maximizing, bool snapTransitio
     Wh_Log(L"WINDOW STATE THROB HWND=%p State=%s Size=%dx%d", hwnd,
            snapTransition ? L"SNAPPED" : (maximizing ? L"MAXIMIZED" : L"RESTORED"), width,
            height);
+}
+
+static void HandleMesh25TransitionStart(HWND hwnd)
+{
+    if (!hwnd || g_realDragging.load(std::memory_order_relaxed)) return;
+    const auto now = GetTickCount64();
+    RECT from = {};
+    AcquireSRWLockExclusive(&g_mesh25TransitionLock);
+    for (auto& entry : g_mesh25TransitionStarts)
+        if (entry.hwnd == hwnd && entry.pending)
+        {
+            if (now < entry.expires) from = entry.bounds;
+            entry.pending = false;
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_mesh25TransitionLock);
+
+    RECT current = {};
+    if (!ValidMeshWindowRect(from) || !IsEligibleWindowForStateThrob(hwnd) ||
+        !IsWindowVisible(hwnd) || IsIconic(hwnd) || ShouldSuppressWindowStateThrob(hwnd) ||
+        !ReadWindowRectForRenderer(hwnd, &current) || !ValidMeshWindowRect(current))
+        return;
+    if (EqualRect(&from, &current))
+    {
+        PrepareMeshWindowStateTransition(hwnd, from);
+        return;
+    }
+    if (!WindowExtentChanged(from, current) &&
+        !IsApproximatelySnapLayoutTarget(from) && !IsApproximatelySnapLayoutTarget(current))
+        return;
+    if (StartMeshWindowStateTransition(hwnd, current, &from, true))
+        Wh_Log(L"MESH 25H2 TRANSITION: HWND=%p source=native-start-bounds "
+               L"from=(%ld,%ld,%ld,%ld) to=(%ld,%ld,%ld,%ld)",
+               hwnd, from.left, from.top, from.right, from.bottom,
+               current.left, current.top, current.right, current.bottom);
 }
 
 static void HandleNativeWindowTransitionStart(HWND hwnd, LPARAM transitionFlags)
@@ -11817,7 +11936,11 @@ static DWORD WINAPI WindowEventThreadProc(LPVOID)
             if (message.message == WM_WOBBLY_NATIVE_WINDOW_TRANSITION)
             {
                 HWND transitionWindow = reinterpret_cast<HWND>(message.wParam);
-                if (g_realDragging.load(std::memory_order_relaxed) &&
+                if (message.lParam == NATIVE_TRANSITION_CAPTURED_BOUNDS)
+                {
+                    HandleMesh25TransitionStart(transitionWindow);
+                }
+                else if (g_realDragging.load(std::memory_order_relaxed) &&
                     g_realDraggedWindow.load(std::memory_order_relaxed) == transitionWindow)
                 {
                     if (message.lParam == NATIVE_TRANSITION_SHELL_CONFIRMED)
