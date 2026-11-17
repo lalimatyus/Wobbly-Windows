@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.371
+// @version         0.372
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -210,6 +210,11 @@ static constexpr WobblySettings PHYSICS_PRESETS[] = {
 WobblySettings g_settings = {};
 std::atomic_bool g_meshWindowTransitionsReady = false;
 SRWLOCK g_settingsLock = SRWLOCK_INIT;
+
+static constexpr RendererMode ResolveRendererMode(RendererMode requested, bool meshReady)
+{
+    return meshReady ? requested : RendererMode::Affine;
+}
 
 static WobblySettings GetSettingsSnapshot();
 
@@ -1508,29 +1513,32 @@ static bool IsWritableMemory(const void* address, size_t size)
 }
 
 
+static const IMAGE_NT_HEADERS64* ReadDwmImageHeaders(HMODULE module)
+{
+    if (!module || !IsReadableMemory(module, sizeof(IMAGE_DOS_HEADER)))
+        return nullptr;
+
+    const auto* image = reinterpret_cast<const BYTE*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000)
+        return nullptr;
+
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+    if (!IsReadableMemory(nt, sizeof(*nt)) || nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt->OptionalHeader.SizeOfImage < 0x10000)
+        return nullptr;
+    return nt;
+}
+
 static bool InitializeDwmModuleLayout(HMODULE module)
 {
     g_dwmModuleLayout = {};
-    if (!module || !IsReadableMemory(module, sizeof(IMAGE_DOS_HEADER)))
-    {
-        return false;
-    }
-    const BYTE* imageBase = reinterpret_cast<const BYTE*>(module);
-    const IMAGE_DOS_HEADER* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(imageBase);
-    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE || dosHeader->e_lfanew <= 0 ||
-        static_cast<size_t>(dosHeader->e_lfanew) > 0x100000)
-    {
-        return false;
-    }
-    const IMAGE_NT_HEADERS64* ntHeaders =
-        reinterpret_cast<const IMAGE_NT_HEADERS64*>(imageBase + dosHeader->e_lfanew);
-    if (!IsReadableMemory(ntHeaders, sizeof(*ntHeaders)) ||
-        ntHeaders->Signature != IMAGE_NT_SIGNATURE ||
-        ntHeaders->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-        ntHeaders->OptionalHeader.SizeOfImage < 0x10000)
-    {
-        return false;
-    }
+    const auto* ntHeaders = ReadDwmImageHeaders(module);
+    if (!ntHeaders) return false;
+    const auto* imageBase = reinterpret_cast<const BYTE*>(module);
     const BYTE* imageEnd = imageBase + ntHeaders->OptionalHeader.SizeOfImage;
     g_dwmModuleLayout.module = module;
     g_dwmModuleLayout.imageBegin = imageBase;
@@ -5542,15 +5550,8 @@ static long __cdecl CoreImageRealizeHook(void* image, const void* targetInfo, vo
 static void InitializeCoreMaterialBridge()
 {
     HMODULE core = GetModuleHandleW(L"dwmcore.dll");
-    if (sizeof(void*) != 8 || !NativeMeshAbiVerified() ||
-        !IsReadableMemory(core, sizeof(IMAGE_DOS_HEADER)))
-        return;
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(core);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 || dos->e_lfanew > 0x1000)
-        return;
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-        reinterpret_cast<const BYTE*>(core) + dos->e_lfanew);
-    if (!IsReadableMemory(nt, sizeof(*nt)) || nt->Signature != IMAGE_NT_SIGNATURE)
+    const auto* nt = ReadDwmImageHeaders(core);
+    if (!nt || !NativeMeshAbiVerified())
         return;
     if (nt->FileHeader.TimeDateStamp != 0x610B3AB4 || nt->OptionalHeader.SizeOfImage != 0x41A000)
     {
@@ -6624,9 +6625,7 @@ static bool TryAttachNativeMesh(HWND hwnd, void* topLevelWindow, void* root,
                                      int width, int height, int sourcePadding,
                                      void*& capturedRepresentation, void* imageSourceProxy)
 {
-    AcquireSRWLockShared(&g_settingsLock);
-    bool meshSelected = g_settings.rendererMode == RendererMode::Mesh;
-    ReleaseSRWLockShared(&g_settingsLock);
+    const bool meshSelected = GetSettingsSnapshot().rendererMode == RendererMode::Mesh;
     if (!meshSelected || !NativeMeshAbiVerified() ||
         !g_topLevelWindowGetRootVisual ||
         g_nativeMeshActive.load(std::memory_order_acquire) ||
@@ -6853,9 +6852,7 @@ static void CreateNativeMeshSource(HWND hwnd, void* windowData, void* topLevelWi
     {
         return;
     }
-    AcquireSRWLockShared(&g_settingsLock);
-    bool meshSelected = g_settings.rendererMode == RendererMode::Mesh;
-    ReleaseSRWLockShared(&g_settingsLock);
+    const bool meshSelected = GetSettingsSnapshot().rendererMode == RendererMode::Mesh;
     if (!meshSelected || !NativeMeshAbiVerified() ||
         !g_coreMaterialBridgeReady.load(std::memory_order_acquire) ||
         g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
@@ -11542,6 +11539,8 @@ static WobblySettings GetSettingsSnapshot()
     AcquireSRWLockShared(&g_settingsLock);
     WobblySettings settings = g_settings;
     ReleaseSRWLockShared(&g_settingsLock);
+    settings.rendererMode = ResolveRendererMode(
+        settings.rendererMode, g_meshWindowTransitionsReady.load(std::memory_order_acquire));
     return settings;
 }
 
@@ -11560,7 +11559,6 @@ static void LoadSettings()
     std::wstring_view rendererValue(rendererSetting.get());
     settings.rendererMode = rendererValue == L"mesh" || rendererValue.starts_with(L"mesh-")
                                 ? RendererMode::Mesh : RendererMode::Affine;
-    g_coreBackdropEnabled.store(settings.rendererMode == RendererMode::Mesh, std::memory_order_release);
     bool advancedMode = Wh_GetIntSetting(L"AdvancedMode.enable") != 0;
     settings.resizeWobbleEnabled = Wh_GetIntSetting(L"EnableResizeWobble") != 0;
     settings.windowStateWobbleEnabled =
@@ -11580,8 +11578,10 @@ static void LoadSettings()
     AcquireSRWLockExclusive(&g_settingsLock);
     g_settings = settings;
     ReleaseSRWLockExclusive(&g_settingsLock);
-    if (settings.rendererMode != RendererMode::Mesh &&
-        g_nativeMeshActive.load(std::memory_order_acquire))
+    const auto activeRenderer = ResolveRendererMode(
+        settings.rendererMode, g_meshWindowTransitionsReady.load(std::memory_order_acquire));
+    g_coreBackdropEnabled.store(activeRenderer == RendererMode::Mesh, std::memory_order_release);
+    if (activeRenderer != RendererMode::Mesh && g_nativeMeshActive.load(std::memory_order_acquire))
     {
         g_nativeMeshStopRequested.store(true, std::memory_order_release);
         RequestDwmScenePass();
@@ -11589,7 +11589,7 @@ static void LoadSettings()
     Wh_Log(L"Settings: "
            L"WobblinessPreset=%d, "
            L"Advanced=%d, "
-           L"Renderer=%s, "
+           L"RendererRequested=%s, "
            L"ResizeWobble=%d, "
            L"WindowStateWobble=%d, "
            L"Stiffness=%.2f, "
@@ -11698,10 +11698,31 @@ BOOL Wh_ModInit()
         return FALSE;
     }
     InitializeCoreMaterialBridge();
-    g_meshWindowTransitionsReady.store(NativeMeshAbiVerified() && g_coreMaterialBridgeReady.load(std::memory_order_acquire),
-                                       std::memory_order_release);
-    Wh_Log(L"MESH WINDOW TRANSITIONS: ready=%d controls=16 distanceWeighted=1 committedGeometry=1 affineFallback=1",
-           g_meshWindowTransitionsReady.load(std::memory_order_acquire));
+    const auto* core = ReadDwmImageHeaders(GetModuleHandleW(L"dwmcore.dll"));
+    const bool udwmSupported = g_dwmModuleLayout.timeDateStamp == 0xE19C3234 &&
+                               g_dwmModuleLayout.sizeOfImage == 0x16A000;
+    const bool coreSupported = core && core->FileHeader.TimeDateStamp == 0x610B3AB4 &&
+                               core->OptionalHeader.SizeOfImage == 0x41A000;
+    const bool captureReady = g_nativeCapturedSourceReady && g_nativeVisualSetOpacity;
+    const bool materialsReady = g_coreMaterialBridgeReady.load(std::memory_order_acquire) &&
+                                g_coreBackdropRenderReady.load(std::memory_order_acquire) &&
+                                g_coreBackdropExpansionReady.load(std::memory_order_acquire);
+    const bool sourceReady = g_nativeMeshCreateImage && g_nativeMeshImageVtable.load(std::memory_order_acquire) &&
+                             (g_nativeMeshUpdateImageD != nullptr) != (g_nativeMeshUpdateImageF != nullptr) &&
+                             g_nativeMeshCreateMesh && g_nativeMeshUpdateMesh && g_nativeMeshCreateGroup &&
+                             g_nativeMeshUpdateGroup && g_nativeMeshCreateMeshInstruction;
+    const bool meshReady = udwmSupported && coreSupported && captureReady && materialsReady &&
+                           sourceReady && NativeMeshAbiVerified();
+    g_meshWindowTransitionsReady.store(meshReady, std::memory_order_release);
+    const bool usingMesh = GetSettingsSnapshot().rendererMode == RendererMode::Mesh;
+    g_coreBackdropEnabled.store(usingMesh, std::memory_order_release);
+    const wchar_t* stage = !udwmSupported ? L"uDWM-build" : !coreSupported ? L"dwmcore-build" :
+        !captureReady ? L"capture" : !materialsReady ? L"material" :
+        !meshReady ? L"mesh-symbols" : L"ready";
+    Wh_Log(L"MESH COMPATIBILITY: uDWM=%08X/%X dwmcore=%08X/%X stage=%s active=%s",
+           g_dwmModuleLayout.timeDateStamp, g_dwmModuleLayout.sizeOfImage,
+           core ? core->FileHeader.TimeDateStamp : 0u, core ? core->OptionalHeader.SizeOfImage : 0u,
+           stage, usingMesh ? L"mesh" : L"affine");
     InitializeLiveMeshShellTransition();
     if (!StartWindowEventThread())
     {
