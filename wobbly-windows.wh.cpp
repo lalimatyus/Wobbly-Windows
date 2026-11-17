@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.377
+// @version         0.378
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -42,9 +42,9 @@ initialize instead of using unverified addresses.
 Snap, maximize and restore use the spring grid to reach the new window bounds.
 On the validated 23H2 DWM build, filtered Acrylic sampling follows the mesh, and
 the mod restores the original window's opacity when the mesh detaches.
-Windows 11 25H2 build 26200.9457 has an experimental mesh path. Its original
-window remains visible, and the Acrylic and Mica appearance may differ during
-the effect. Other DWM builds use Affine.
+Windows 11 25H2 build 26200.9457 has an experimental mesh path. Original-window
+hiding waits for the independent source's first native bitmap. Acrylic and
+Mica appearance still need visual verification. Other DWM builds use Affine.
 Keep **Affine** selected for normal use.
 
 ## Known Issues
@@ -550,6 +550,10 @@ VisualSetOffset_t g_mesh25SetOffset = nullptr;
 NativeVisualSetOpacity_t g_mesh25SetOpacity = nullptr;
 bool g_mesh25Ready = false;
 bool g_mesh25TransitionBoundsReady = false;
+using Mesh25RedirectSource_t = long(__cdecl*)(void*, void*);
+Mesh25RedirectSource_t g_mesh25RedirectSource = nullptr;
+bool g_mesh25SeparatedCaptureReady = false;
+static bool InitializeMesh25SourceObserver();
 NativeVisualSetOpacity_t g_nativeVisualSetOpacity = nullptr;
 void* g_nativeCapturedRepresentationVtable = nullptr;
 // Native listener interface with three verified no-op callbacks.
@@ -569,6 +573,7 @@ struct NativeMeshState
     void* sourceProxy = nullptr;
     void* imageSourceProxy = nullptr;
     void* capturedRepresentation = nullptr;
+    void* captureRoot = nullptr;
     void* sourceOwner = nullptr;
     ULONGLONG attachedAt = 0;
     std::uint64_t materialKey = 0;
@@ -1326,44 +1331,52 @@ static void QueueNativeWindowTransition(HWND hwnd, LPARAM transitionFlags)
     }
 }
 
-static void QueueMesh25TransitionStart(HWND hwnd, const void* windowData)
+static bool QueueMesh25TransitionBounds(HWND hwnd, const RECT& start, bool shellConfirmed)
 {
-    if (!g_mesh25TransitionBoundsReady || !hwnd || !windowData ||
-        g_realDragging.load(std::memory_order_relaxed) ||
-        g_unloading.load(std::memory_order_acquire))
-        return;
+    if (!g_mesh25TransitionBoundsReady || !hwnd || !ValidMeshWindowRect(start) ||
+        g_unloading.load(std::memory_order_acquire)) return false;
+    const bool dragging = g_realDragging.load(std::memory_order_relaxed);
+    if (dragging && (!shellConfirmed ||
+        g_realDraggedWindow.load(std::memory_order_relaxed) != hwnd)) return false;
     const DWORD thread = g_eventThreadMessageTarget.load(std::memory_order_acquire);
-    if (!thread) return;
-    const auto* bytes = static_cast<const BYTE*>(windowData);
-    if (!IsReadableMemory(bytes + 0x2E6, 1) || (bytes[0x2E6] & 0x20) == 0 ||
-        !IsReadableMemory(bytes + 0x33C, sizeof(RECT)))
-        return;
-    RECT start = {};
-    std::memcpy(&start, bytes + 0x33C, sizeof(start));
-    if (!ValidMeshWindowRect(start)) return;
+    if (!thread) return false;
     const auto settings = GetSettingsSnapshot();
     if (settings.rendererMode != RendererMode::Mesh || !settings.windowStateWobbleEnabled)
-        return;
+        return false;
 
     const auto now = GetTickCount64();
     AcquireSRWLockExclusive(&g_mesh25TransitionLock);
     auto* oldest = &g_mesh25TransitionStarts[0];
     for (auto& entry : g_mesh25TransitionStarts)
     {
-        if (entry.hwnd == hwnd)
-        {
-            oldest = &entry;
-            break;
-        }
+        if (entry.hwnd == hwnd) { oldest = &entry; break; }
         if (entry.expires < oldest->expires) oldest = &entry;
     }
     const bool fresh = oldest->hwnd != hwnd || oldest->expires <= now ||
                        !EqualRect(&oldest->bounds, &start);
+    const auto previous = *oldest;
     if (fresh) *oldest = {hwnd, start, now + 350, true};
-    const bool queued = fresh && PostThreadMessageW(thread, WM_WOBBLY_NATIVE_WINDOW_TRANSITION,
-        reinterpret_cast<WPARAM>(hwnd), NATIVE_TRANSITION_CAPTURED_BOUNDS);
-    if (fresh && !queued) *oldest = {};
+    if (shellConfirmed) oldest->pending = true;
+    const LPARAM flags = NATIVE_TRANSITION_CAPTURED_BOUNDS |
+        (shellConfirmed ? NATIVE_TRANSITION_SHELL_CONFIRMED : 0);
+    const bool queued = (fresh || shellConfirmed) &&
+        PostThreadMessageW(thread, WM_WOBBLY_NATIVE_WINDOW_TRANSITION,
+                           reinterpret_cast<WPARAM>(hwnd), flags);
+    if ((fresh || shellConfirmed) && !queued) *oldest = previous;
     ReleaseSRWLockExclusive(&g_mesh25TransitionLock);
+    return queued;
+}
+
+static void QueueMesh25TransitionStart(HWND hwnd, const void* windowData)
+{
+    if (!g_mesh25TransitionBoundsReady || !hwnd || !windowData ||
+        g_realDragging.load(std::memory_order_relaxed)) return;
+    const auto* bytes = static_cast<const BYTE*>(windowData);
+    if (!IsReadableMemory(bytes + 0x2E6, 1) || (bytes[0x2E6] & 0x20) == 0 ||
+        !IsReadableMemory(bytes + 0x33C, sizeof(RECT))) return;
+    RECT start = {};
+    std::memcpy(&start, bytes + 0x33C, sizeof(start));
+    QueueMesh25TransitionBounds(hwnd, start, false);
 }
 
 static long __cdecl WindowTransitionChangeHook(void* pThis, void* dwmWindow, int transitionTarget,
@@ -3592,6 +3605,8 @@ static void InitializeMesh25Renderer()
          &g_mesh25SetOffset, nullptr, true},
         {{L"public: virtual void __cdecl CVisual::SetOpacity(double)"},
          &g_mesh25SetOpacity, nullptr, true},
+        {{L"public: long __cdecl CRedirectVisualProxy::SetRedirectedVisual(class CVisualProxy *)"},
+         &g_mesh25RedirectSource, nullptr, true},
     };
     WindhawkUtils::HookSymbols(g_dwmModuleLayout.module, udwmDllCaptureHooks,
                                ARRAYSIZE(udwmDllCaptureHooks));
@@ -3659,9 +3674,18 @@ static void InitializeMesh25Renderer()
     };
     g_mesh25TransitionBoundsReady = g_mesh25Ready &&
         matchesBytes(0x41783, startRectLoads) && matchesBytes(0x417FC, startRectFlag);
+    constexpr BYTE opacityField[] = {0xF2,0x0F,0x10,0x51,0x78};
+    constexpr BYTE redirectIds[] = {0x48,0x8B,0x52,0x10,0x44,0x8B,0x42,0x18};
+    g_mesh25SeparatedCaptureReady = g_mesh25Ready &&
+        matchesCode(g_mesh25RedirectSource, 0x40394) &&
+        matchesBytes(0x1CFB4, opacityField) && matchesBytes(0x403A7, redirectIds) &&
+        InitializeMesh25SourceObserver();
+    if (g_mesh25SeparatedCaptureReady) g_nativeVisualSetOpacity = g_mesh25SetOpacity;
     Wh_Log(L"MESH 25H2 RENDERER: ready=%d capture=%d geometry=%d image=%d release=%d scene=%d",
            g_mesh25Ready, capture, geometry, image, release, scene);
     Wh_Log(L"MESH 25H2 TRANSITION SOURCE: nativeStartBounds=%d", g_mesh25TransitionBoundsReady);
+    Wh_Log(L"MESH 25H2 INDEPENDENT SOURCE: ready=%d bitmapGatedHide=1",
+           g_mesh25SeparatedCaptureReady);
 }
 
 static bool NativeMeshAbiVerified()
@@ -3873,10 +3897,10 @@ static void ClearCoreMaterialTarget()
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
 }
 
-static void SetCoreMaterialTarget(void* image, void* sourceProxy, HWND hwnd)
+static void SetCoreMaterialTarget(void* image, void* sourceProxy, HWND hwnd, bool observeOnly = false)
 {
     ClearCoreMaterialTarget();
-    if (!g_coreMaterialBridgeReady.load(std::memory_order_acquire)) return;
+    if (!g_coreMaterialBridgeReady.load(std::memory_order_acquire) && !observeOnly) return;
     const unsigned imageId = NativeProxyResourceId(image), sourceId = NativeProxyResourceId(sourceProxy);
     if (!imageId || !sourceId) return;
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
@@ -5989,6 +6013,85 @@ static void InitializeCoreMaterialBridge()
     Wh_Log(L"MESH MATERIAL BRIDGE: %s hooks=5 leafHooks=0", ready ? L"ready" : L"unavailable; using Affine");
 }
 
+CoreImageUpdate_t g_mesh25ImageUpdateOriginal = nullptr;
+CoreImageRealize_t g_mesh25ImageRealizeOriginal = nullptr;
+void* g_mesh25CachedImageVtable = nullptr;
+
+static long __cdecl Mesh25ImageUpdateHook(void* image, void* table, const void* command)
+{
+    const auto epoch = g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
+    const long result = g_mesh25ImageUpdateOriginal(image, table, command);
+    if (result < 0 || g_unloading.load(std::memory_order_acquire) ||
+        ReadPointerMember(image, 0) != g_mesh25CachedImageVtable ||
+        !IsReadableMemory(command, 0x2C)) return result;
+    unsigned imageId = 0, sourceId = 0;
+    std::memcpy(&imageId, static_cast<const BYTE*>(command) + 4, sizeof(imageId));
+    std::memcpy(&sourceId, static_cast<const BYTE*>(command) + 0x28, sizeof(sourceId));
+    const auto key = (std::uint64_t{sourceId} << 32) | imageId;
+    AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
+    if (imageId && sourceId && key == g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
+        epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed))
+    {
+        void* root = ReadPointerMember(image, 0x88);
+        if (root != g_coreMaterialSourceRoot.load(std::memory_order_relaxed) ||
+            image != g_coreMaterialSourceImage.load(std::memory_order_relaxed))
+            g_coreMaterialReadyKey.store(0, std::memory_order_release);
+        g_coreMaterialSourceRoot.store(root, std::memory_order_release);
+        g_coreMaterialSourceImage.store(root ? image : nullptr, std::memory_order_release);
+    }
+    ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
+    return result;
+}
+
+static long __cdecl Mesh25ImageRealizeHook(void* image, const void* target, void** bitmap)
+{
+    const auto epoch = g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
+    const auto key = g_coreMaterialTargetKey.load(std::memory_order_acquire);
+    const bool observe = key && image == g_coreMaterialSourceImage.load(std::memory_order_acquire);
+    const long result = g_mesh25ImageRealizeOriginal(image, target, bitmap);
+    if (!observe || g_unloading.load(std::memory_order_acquire)) return result;
+    bool changed = false;
+    AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
+    if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed) &&
+        key == g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
+        image == g_coreMaterialSourceImage.load(std::memory_order_relaxed))
+    {
+        const auto ready = result >= 0 && ReadPointerMember(bitmap, 0) ? key : 0;
+        changed = g_coreMaterialReadyKey.exchange(ready, std::memory_order_acq_rel) != ready;
+    }
+    ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
+    if (changed) RequestDwmScenePass();
+    return result;
+}
+
+static bool InitializeMesh25SourceObserver()
+{
+    HMODULE core = GetModuleHandleW(L"dwmcore.dll");
+    const auto base = reinterpret_cast<uintptr_t>(core);
+    CoreImageUpdate_t update = nullptr;
+    CoreImageRealize_t realize = nullptr;
+    const WindhawkUtils::SYMBOL_HOOK dwmcoreDllSourceHooks[] = {
+        {{L"public: long __cdecl CCachedVisualImage::ProcessUpdate("
+           L"class CResourceTable *,struct tagMILCMD_CACHEDVISUALIMAGE const *)"},
+         &update, nullptr, true},
+        {{L"protected: long __cdecl CCachedVisualImage::EnsureRenderTargetBitmap("
+           L"class RenderTargetInfo const &,class IRenderTargetBitmap * *)"},
+         &realize, nullptr, true},
+        {{L"const CCachedVisualImage::`vftable'{for `IBitmapResource'}"},
+         &g_mesh25CachedImageVtable, nullptr, true},
+    };
+    WindhawkUtils::HookSymbols(core, dwmcoreDllSourceHooks, ARRAYSIZE(dwmcoreDllSourceHooks));
+    constexpr BYTE sourceField[] = {0x48,0x89,0x87,0x88,0x00,0x00,0x00};
+    const auto* field = reinterpret_cast<const BYTE*>(base + 0x1FA6C3);
+    const bool ready = reinterpret_cast<uintptr_t>(update) == base + 0x1FA5E0 &&
+        reinterpret_cast<uintptr_t>(realize) == base + 0x13ACE0 &&
+        reinterpret_cast<uintptr_t>(g_mesh25CachedImageVtable) == base + 0x2F5000 &&
+        IsReadableMemory(field, sizeof(sourceField)) && !std::memcmp(field, sourceField, sizeof(sourceField)) &&
+        WindhawkUtils::SetFunctionHook(update, Mesh25ImageUpdateHook, &g_mesh25ImageUpdateOriginal) &&
+        WindhawkUtils::SetFunctionHook(realize, Mesh25ImageRealizeHook, &g_mesh25ImageRealizeOriginal);
+    return ready;
+}
+
 static bool RetainNativeMeshRoot(void* root)
 {
     auto* count = reinterpret_cast<volatile LONG*>(static_cast<BYTE*>(root) + 8);
@@ -6039,6 +6142,74 @@ static bool ReadNativeVisualChildren(void* visual, void**& entries,
 
 using ShellAnimationsEnabled_t = bool(__cdecl*)(const void*);
 ShellAnimationsEnabled_t g_shellAnimationsEnabledOriginal = nullptr;
+uintptr_t g_shellAnimationsReturnRva = 0;
+using Mesh25CaptureTransition_t = void(__cdecl*)(void*, int);
+Mesh25CaptureTransition_t g_mesh25CaptureTransitionOriginal = nullptr;
+
+static void* GetMesh25ShellTransitionWindowData(const void* state)
+{
+    if (!state || !g_mesh25Ready) return nullptr;
+    const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
+    const auto* handler = static_cast<const BYTE*>(state) - 0x18;
+    if (ReadPointerMember(handler, 0) != base + 0xF9E70) return nullptr;
+    // ITopLevelWindow3DWrapper is the implementation's +8 interface.
+    void* wrapper = ReadPointerMember(handler, 0x20);
+    if (ReadPointerMember(wrapper, 0) != base + 0xFAA00) return nullptr;
+    void* window = ReadPointerMember(wrapper, 0x18);
+    if (!IsDwmObjectPointerValid(window, g_topLevelWindow3DVtable)) return nullptr;
+    void* data = ReadPointerMember(window, g_topLevelWindow3DWindowDataOffset);
+    if (!data || ReadPointerMember(data, g_windowDataTopLevelWindow3DOffset) != window)
+        return nullptr;
+    return data;
+}
+
+static bool ReadMesh25ShellTransitionBounds(const void* state, HWND hwnd, RECT& start)
+{
+    const auto* handler = static_cast<const BYTE*>(state) - 0x18;
+    unsigned type = 0;
+    if (!IsReadableMemory(handler + 0x30, sizeof(type))) return false;
+    std::memcpy(&type, handler + 0x30, sizeof(type));
+    // Only maximize/snap CaptureVisuals stores this native source rectangle.
+    float bounds[4] = {};
+    if (type == 2 && IsReadableMemory(handler + 0x4C, sizeof(bounds)))
+    {
+        std::memcpy(bounds, handler + 0x4C, sizeof(bounds));
+        const bool finite = std::all_of(std::begin(bounds), std::end(bounds), [](float value)
+            { return std::isfinite(value) && std::abs(value) <= 131072.0f; });
+        if (finite && bounds[2] > 0 && bounds[3] > 0)
+        {
+            start = {static_cast<LONG>(std::lround(bounds[0])),
+                     static_cast<LONG>(std::lround(bounds[1])),
+                     static_cast<LONG>(std::lround(double(bounds[0]) + bounds[2])),
+                     static_cast<LONG>(std::lround(double(bounds[1]) + bounds[3]))};
+            if (ValidMeshWindowRect(start)) return true;
+        }
+    }
+    const auto now = GetTickCount64();
+    AcquireSRWLockShared(&g_mesh25TransitionLock);
+    for (const auto& entry : g_mesh25TransitionStarts)
+        if (entry.hwnd == hwnd && now < entry.expires)
+        {
+            start = entry.bounds;
+            break;
+        }
+    ReleaseSRWLockShared(&g_mesh25TransitionLock);
+    return ValidMeshWindowRect(start);
+}
+
+static void __cdecl Mesh25CaptureTransitionHook(void* handler, int type)
+{
+    g_mesh25CaptureTransitionOriginal(handler, type);
+    if ((type != 2 && type != 3) || !handler ||
+        g_unloading.load(std::memory_order_acquire)) return;
+    void* data = GetMesh25ShellTransitionWindowData(static_cast<const BYTE*>(handler) + 0x18);
+    const HWND hwnd = GetHwndFromWindowData(data);
+    RECT start = {};
+    if (hwnd && IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
+        IsEligibleWindowForStateThrob(hwnd) &&
+        ReadWindowRectForRenderer(hwnd, &start) && ValidMeshWindowRect(start))
+        QueueMesh25TransitionBounds(hwnd, start, false);
+}
 
 static void* GetShellMeshTransitionWindowData(const void* state)
 {
@@ -6075,13 +6246,15 @@ static bool __cdecl ShellAnimationsEnabledHook(const void* state)
 {
     const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
     const bool nativeAnimations = g_shellAnimationsEnabledOriginal(state);
-    if (!nativeAnimations || __builtin_return_address(0) != base + 0xF7F3B ||
+    if (!nativeAnimations || __builtin_return_address(0) != base + g_shellAnimationsReturnRva ||
         g_unloading.load(std::memory_order_acquire) ||
         !g_meshWindowTransitionsReady.load(std::memory_order_acquire)) return nativeAnimations;
 
     const auto settings = GetSettingsSnapshot();
     if (settings.rendererMode != RendererMode::Mesh || !settings.windowStateWobbleEnabled) return true;
-    void* windowData = GetShellMeshTransitionWindowData(state);
+    RECT capturedBounds = {};
+    void* windowData = g_mesh25Ready ? GetMesh25ShellTransitionWindowData(state) :
+                                     GetShellMeshTransitionWindowData(state);
     const HWND hwnd = GetHwndFromWindowData(windowData);
     if (!hwnd)
     {
@@ -6089,6 +6262,11 @@ static bool __cdecl ShellAnimationsEnabledHook(const void* state)
         return true;
     }
     if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || !IsEligibleWindowForStateThrob(hwnd)) return true;
+    if (g_mesh25Ready && !ReadMesh25ShellTransitionBounds(state, hwnd, capturedBounds))
+    {
+        Wh_Log(L"MESH SHELL TRANSITION: HWND=%p reason=source-bounds-unavailable build=25H2", hwnd);
+        return true;
+    }
 
     const bool sceneReady = g_eventThreadMessageTarget.load(std::memory_order_acquire) &&
         g_dwmSceneThreadId.load(std::memory_order_acquire) &&
@@ -6098,19 +6276,49 @@ static bool __cdecl ShellAnimationsEnabledHook(const void* state)
     const bool canBridge = IsTopLevelWindowForWindowData(
         ReadPointerMember(windowData, g_windowDataTopLevelWindowOffset), windowData);
     const bool takeOver = sceneReady && (liveReady || canBridge) &&
-        PostThreadMessageW(g_eventThreadMessageTarget.load(std::memory_order_acquire),
-                           WM_WOBBLY_NATIVE_WINDOW_TRANSITION, reinterpret_cast<WPARAM>(hwnd),
-                           NATIVE_TRANSITION_SHELL_CONFIRMED);
-    Wh_Log(L"MESH SHELL TRANSITION: HWND=%p source=%s", hwnd,
-           takeOver ? (liveReady ? L"live-mesh" : L"live-window-bridge") : L"native-scene-not-ready");
+        (g_mesh25Ready ? QueueMesh25TransitionBounds(hwnd, capturedBounds, true) :
+         PostThreadMessageW(g_eventThreadMessageTarget.load(std::memory_order_acquire),
+                            WM_WOBBLY_NATIVE_WINDOW_TRANSITION, reinterpret_cast<WPARAM>(hwnd),
+                            NATIVE_TRANSITION_SHELL_CONFIRMED));
+    Wh_Log(L"MESH SHELL TRANSITION: HWND=%p source=%s build=%s", hwnd,
+           takeOver ? (liveReady ? L"live-mesh" : L"live-window-bridge") : L"native-scene-not-ready",
+           g_mesh25Ready ? L"25H2" : L"23H2");
     // Let PostTransition take its own immediate completion and cleanup path.
     return !takeOver;
 }
 
 static void InitializeLiveMeshShellTransition()
 {
-    if (!g_meshWindowTransitionsReady.load(std::memory_order_acquire) ||
-        g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
+    if (!g_meshWindowTransitionsReady.load(std::memory_order_acquire)) return;
+    if (g_mesh25Ready)
+    {
+        const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
+        auto matches = [base](uintptr_t rva, const auto& bytes)
+        {
+            return IsDwmExecutableAddress(base + rva) &&
+                IsReadableMemory(base + rva, sizeof(bytes)) &&
+                !std::memcmp(base + rva, bytes, sizeof(bytes));
+        };
+        constexpr BYTE prefix[] = {0x48,0x83,0xEC,0x48,0x48,0x8B,0x09,0x48,0x8D,0x54,0x24,0x50};
+        constexpr BYTE caller[] = {0x49,0x8D,0x4D,0x18,0xE8,0x26,0xF9,0xFF,0xFF,0x84,0xC0,0x74,0x20};
+        constexpr BYTE completion[] = {0xE8,0xE4,0x02,0x00,0x00};
+        constexpr BYTE captureBounds[] = {0x48,0x8D,0x56,0x4C,0x0F,0x10,0x00,0xF3,0x0F,0x7F,0x02};
+        constexpr BYTE captureEntry[] = {0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18};
+        constexpr BYTE wrapper[] = {0x4D,0x89,0x51,0x20,0x4D,0x85,0xD2};
+        const bool ready = matches(0x147A8, prefix) && matches(0x14E79, caller) &&
+            matches(0x1506B, completion) && matches(0x15EC7, captureBounds) &&
+            matches(0x16AA3, wrapper) && matches(0x15DFC, captureEntry) &&
+            WindhawkUtils::SetFunctionHook(reinterpret_cast<Mesh25CaptureTransition_t>(
+                const_cast<BYTE*>(base + 0x15DFC)), Mesh25CaptureTransitionHook,
+                &g_mesh25CaptureTransitionOriginal) &&
+            WindhawkUtils::SetFunctionHook(reinterpret_cast<ShellAnimationsEnabled_t>(
+                const_cast<BYTE*>(base + 0x147A8)), ShellAnimationsEnabledHook,
+                &g_shellAnimationsEnabledOriginal);
+        if (ready) g_shellAnimationsReturnRva = 0x14E82;
+        Wh_Log(L"MESH 25H2 SHELL TRANSITION SUPPORT: ready=%d capturedStartBounds=1", ready);
+        return;
+    }
+    if (g_dwmModuleLayout.timeDateStamp != 0xE19C3234 ||
         g_dwmModuleLayout.sizeOfImage != 0x16A000 ||
         g_topLevelWindow3DWindowDataOffset != 0x150) return;
 
@@ -6126,6 +6334,7 @@ static void InitializeLiveMeshShellTransition()
         !std::memcmp(base + 0xF816A, completion, sizeof(completion)) &&
         WindhawkUtils::SetFunctionHook(reinterpret_cast<ShellAnimationsEnabled_t>(entry),
                                       ShellAnimationsEnabledHook, &g_shellAnimationsEnabledOriginal);
+    if (ready) g_shellAnimationsReturnRva = 0xF7F3B;
     Wh_Log(L"MESH SHELL TRANSITION SUPPORT: ready=%d liveWindowBridge=1", ready);
 }
 
@@ -6255,10 +6464,10 @@ static bool IsNativeCapturedSourceSeparate(void* capturedRepresentation, void* o
     return separatePath(root, original) && separatePath(original, root);
 }
 
-static bool ReadNativeOpacity(void* visual, double& opacity)
+static bool ReadNativeOpacity(void* visual, double& opacity, size_t offset = 0xC0)
 {
     if (!visual || !NativeVisualVtableRva(visual)) return false;
-    const auto* field = static_cast<const BYTE*>(visual) + 0xC0;
+    const auto* field = static_cast<const BYTE*>(visual) + offset;
     if (!IsReadableMemory(field, sizeof(opacity))) return false;
     std::memcpy(&opacity, field, sizeof(opacity));
     return std::isfinite(opacity) && opacity >= 0.0 && opacity <= 1.0;
@@ -6269,7 +6478,8 @@ static void RestoreNativeOriginal(NativeMeshState& state)
     g_nativeMeshSourcePending.store(false, std::memory_order_release);
     if (!state.originalHidden) return;
     double current = 0.0;
-    const bool owned = ReadNativeOpacity(state.root, current) && current == kNativeOriginalOpacity;
+    const bool owned = ReadNativeOpacity(state.root, current, state.uses25H2Capture ? 0x78 : 0xC0) &&
+                       current == kNativeOriginalOpacity;
     if (owned && g_nativeVisualSetOpacity) g_nativeVisualSetOpacity(state.root, state.originalOpacity);
     state.originalHidden = false;
     Wh_Log(L"MESH ORIGINAL RESTORED: HWND=%p propertyOwned=%d", state.hwnd, owned);
@@ -6280,20 +6490,26 @@ static bool MaintainNativeOriginalHide(NativeMeshState& state)
     const auto key = state.materialKey;
     if (!key || key != g_coreMaterialTargetKey.load(std::memory_order_acquire)) return false;
     double current = 0.0;
+    const size_t opacityOffset = state.uses25H2Capture ? 0x78 : 0xC0;
     if (state.originalHidden)
         return g_coreMaterialReadyKey.load(std::memory_order_acquire) == key &&
-               ReadNativeOpacity(state.root, current) && current == kNativeOriginalOpacity;
+               ReadNativeOpacity(state.root, current, opacityOffset) && current == kNativeOriginalOpacity;
     if (g_coreMaterialReadyKey.load(std::memory_order_acquire) != key)
         return GetTickCount64() - state.attachedAt < 1500;
-    if (!state.capturedRepresentation || !g_nativeVisualSetOpacity ||
-        !IsNativeCapturedSourceSeparate(state.capturedRepresentation, state.root) ||
-        !ReadNativeOpacity(state.root, state.originalOpacity) || state.originalOpacity != 1.0)
+    const bool separate = state.uses25H2Capture ?
+        state.captureRoot && ReadPointerMember(state.captureRoot, 0x18) == state.root &&
+        ReadPointerMember(state.capturedRepresentation, 0x20) == state.imageSourceProxy :
+        IsNativeCapturedSourceSeparate(state.capturedRepresentation, state.root);
+    if (!state.capturedRepresentation || !g_nativeVisualSetOpacity || !separate ||
+        !ReadNativeOpacity(state.root, state.originalOpacity, opacityOffset) || state.originalOpacity != 1.0)
         return false;
     state.originalHidden = true;
     g_nativeVisualSetOpacity(state.root, kNativeOriginalOpacity);
     g_nativeMeshSourcePending.store(false, std::memory_order_release);
-    Wh_Log(L"MESH ORIGINAL SUPPRESSED: HWND=%p opacity=%.8f source=OwnedRepresentation firstFrameMs=%llu",
-           state.hwnd, kNativeOriginalOpacity, GetTickCount64() - state.attachedAt);
+    Wh_Log(L"MESH ORIGINAL SUPPRESSED: HWND=%p opacity=%.8f source=%s firstFrameMs=%llu",
+           state.hwnd, kNativeOriginalOpacity,
+           state.uses25H2Capture ? L"IndependentSubtree25H2" : L"OwnedRepresentation",
+           GetTickCount64() - state.attachedAt);
     return true;
 }// Native capture source end.
 
@@ -6313,6 +6529,7 @@ static void ReleaseNativeMeshState(NativeMeshState& state)
         if (state.uses25H2Capture) g_cBaseObjectRelease(state.capturedRepresentation);
         else ReleaseNativeCapturedSource(state.capturedRepresentation);
     }
+    if (state.captureRoot) g_cBaseObjectRelease(state.captureRoot);
     if (state.root) g_cBaseObjectRelease(state.root);
     state = {};
 }
@@ -6752,7 +6969,8 @@ static bool UpdateMesh25SourcePlacement(const NativeMeshState& state)
     POINT offset = {};
     if (!ReadMesh25VisualOffset(state.root, offset) ||
         ReadPointerMember(state.root, 0x10) != state.sourceProxy ||
-        ReadPointerMember(state.capturedRepresentation, 0x18) != state.imageSourceProxy ||
+        ReadPointerMember(state.capturedRepresentation, state.captureRoot ? 0x20 : 0x18) != state.imageSourceProxy ||
+        (state.captureRoot && ReadPointerMember(state.captureRoot, 0x18) != state.root) ||
         g_nativeMeshGetVisualParent(state.root) != state.sourceOwner ||
         g_nativeMeshGetVisualParent(state.visual) != state.sourceOwner)
         return false;
@@ -6808,7 +7026,7 @@ static void MaintainNativeMesh()
         DetachNativeMesh(L"source-changed");
     else
     {
-        if (!state.uses25H2Capture && !MaintainNativeOriginalHide(state))
+        if ((!state.uses25H2Capture || state.captureRoot) && !MaintainNativeOriginalHide(state))
         {
             DetachNativeMesh(L"source-not-ready-or-native-opacity");
             return;
@@ -7308,6 +7526,34 @@ static void CreateMesh25Source(HWND hwnd, ULONGLONG generation, void* windowData
             pending.imageSourceProxy == originalProxy || pending.imageSourceProxy == captureTarget)
             result = E_NOINTERFACE;
     }
+    if (result >= 0 && g_mesh25SeparatedCaptureReady)
+    {
+        stage = L"IndependentCaptureRoot";
+        void* child = completeRoot;
+        for (unsigned depth = 0; child && depth < 16; ++depth)
+        {
+            if (!NativeVisualVtableRva(child)) { child = nullptr; break; }
+            void* owner = ReadPointerMember(child, 0x18);
+            if (owner == topLevelWindow) break;
+            child = owner == child || owner == parent ? nullptr : owner;
+        }
+        void* redirect = ReadPointerMember(representation, 0x20);
+        void* source = ReadPointerMember(child, 0x10);
+        if (!child || child == topLevelWindow ||
+            ReadPointerMember(child, 0x18) != topLevelWindow ||
+            ReadPointerMember(redirect, 0) != g_redirectVisualProxyVtable.load(std::memory_order_acquire) ||
+            !IsVisualProxyPointerValid(source) || !RetainNativeMeshRoot(child))
+            result = E_NOINTERFACE;
+        else
+        {
+            // Capture this subtree in its own coordinates. The original's
+            // parent opacity then affects its desktop presentation alone.
+            pending.captureRoot = child;
+            stage = L"RedirectIndependentSource";
+            result = g_mesh25RedirectSource(redirect, source);
+            if (result >= 0) pending.imageSourceProxy = redirect;
+        }
+    }
     if (result >= 0)
     {
         stage = L"CreateImage";
@@ -7315,6 +7561,13 @@ static void CreateMesh25Source(HWND hwnd, ULONGLONG generation, void* windowData
         if (result >= 0 && ReadPointerMember(pending.image, 0) !=
             g_nativeMeshImageVtable.load(std::memory_order_acquire))
             result = E_NOINTERFACE;
+    }
+    if (result >= 0 && pending.captureRoot)
+    {
+        stage = L"ObserveIndependentSource";
+        SetCoreMaterialTarget(pending.image, pending.imageSourceProxy, hwnd, true);
+        pending.materialKey = g_coreMaterialTargetKey.load(std::memory_order_acquire);
+        if (!pending.materialKey) result = E_NOINTERFACE;
     }
     if (result >= 0)
     {
@@ -7402,9 +7655,9 @@ static void CreateMesh25Source(HWND hwnd, ULONGLONG generation, void* windowData
         }
     }
     Wh_Log(L"MESH 25H2 ATTACH: HWND=%p stage=%s result=0x%08X attached=%d "
-           L"size=%dx%d padding=%d captureDepth=%d",
+           L"size=%dx%d padding=%d captureDepth=%d independentSource=%d",
            hwnd, stage, static_cast<unsigned>(result), result >= 0 && attachedParent == parent,
-           width, height, padding, captureDepth);
+           width, height, padding, captureDepth, pending.captureRoot != nullptr);
 }
 
 static void BindPendingAnimationSlotTransforms(bool validateCurrentVisuals, bool geometryBridgeOnly = false)
@@ -11936,9 +12189,16 @@ static DWORD WINAPI WindowEventThreadProc(LPVOID)
             if (message.message == WM_WOBBLY_NATIVE_WINDOW_TRANSITION)
             {
                 HWND transitionWindow = reinterpret_cast<HWND>(message.wParam);
-                if (message.lParam == NATIVE_TRANSITION_CAPTURED_BOUNDS)
+                if (message.lParam & NATIVE_TRANSITION_CAPTURED_BOUNDS)
                 {
-                    HandleMesh25TransitionStart(transitionWindow);
+                    if ((message.lParam & NATIVE_TRANSITION_SHELL_CONFIRMED) &&
+                        g_realDragging.load(std::memory_order_relaxed) &&
+                        g_realDraggedWindow.load(std::memory_order_relaxed) == transitionWindow)
+                    {
+                        g_pointerSnapHintUntil = GetTickCount64() + 200;
+                        HandleLocationChange(transitionWindow, OBJID_WINDOW, CHILDID_SELF);
+                    }
+                    else HandleMesh25TransitionStart(transitionWindow);
                 }
                 else if (g_realDragging.load(std::memory_order_relaxed) &&
                     g_realDraggedWindow.load(std::memory_order_relaxed) == transitionWindow)
