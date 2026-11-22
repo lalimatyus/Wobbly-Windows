@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.378
+// @version         0.379
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -554,6 +554,8 @@ using Mesh25RedirectSource_t = long(__cdecl*)(void*, void*);
 Mesh25RedirectSource_t g_mesh25RedirectSource = nullptr;
 bool g_mesh25SeparatedCaptureReady = false;
 static bool InitializeMesh25SourceObserver();
+static bool InitializeMesh25AcrylicBridge();
+bool g_mesh25AcrylicReady = false;
 NativeVisualSetOpacity_t g_nativeVisualSetOpacity = nullptr;
 void* g_nativeCapturedRepresentationVtable = nullptr;
 // Native listener interface with three verified no-op callbacks.
@@ -3681,11 +3683,13 @@ static void InitializeMesh25Renderer()
         matchesBytes(0x1CFB4, opacityField) && matchesBytes(0x403A7, redirectIds) &&
         InitializeMesh25SourceObserver();
     if (g_mesh25SeparatedCaptureReady) g_nativeVisualSetOpacity = g_mesh25SetOpacity;
+    g_mesh25AcrylicReady = g_mesh25SeparatedCaptureReady && InitializeMesh25AcrylicBridge();
     Wh_Log(L"MESH 25H2 RENDERER: ready=%d capture=%d geometry=%d image=%d release=%d scene=%d",
            g_mesh25Ready, capture, geometry, image, release, scene);
     Wh_Log(L"MESH 25H2 TRANSITION SOURCE: nativeStartBounds=%d", g_mesh25TransitionBoundsReady);
     Wh_Log(L"MESH 25H2 INDEPENDENT SOURCE: ready=%d bitmapGatedHide=1",
            g_mesh25SeparatedCaptureReady);
+    Wh_Log(L"MESH 25H2 ACRYLIC SUPPORT: ready=%d nativeInputBytes=112", g_mesh25AcrylicReady);
 }
 
 static bool NativeMeshAbiVerified()
@@ -6016,18 +6020,64 @@ static void InitializeCoreMaterialBridge()
 CoreImageUpdate_t g_mesh25ImageUpdateOriginal = nullptr;
 CoreImageRealize_t g_mesh25ImageRealizeOriginal = nullptr;
 void* g_mesh25CachedImageVtable = nullptr;
+void* g_mesh25CachedResourceVtable = nullptr;
+
+struct Mesh25MaterialScope
+{
+    void* image = nullptr;
+    const void* target = nullptr;
+    void* context = nullptr;
+    ULONGLONG epoch = 0;
+    std::uint64_t key = 0;
+    unsigned attempts = 0;
+    unsigned validations = 0;
+    bool bound = false;
+    const wchar_t* stage = L"Validation";
+};
+thread_local Mesh25MaterialScope* g_mesh25MaterialScope = nullptr;
+thread_local bool g_mesh25MaterialInCall = false;
+std::atomic<ULONGLONG> g_mesh25MaterialLoggedEpoch = 0;
+std::atomic_bool g_mesh25MaterialLoggedBound = false;
+std::atomic<ULONGLONG> g_mesh25MaterialLogAt = 0;
+
+static bool IsMesh25MaterialCurrent(const Mesh25MaterialScope& scope)
+{
+    return scope.key && !g_unloading.load(std::memory_order_acquire) &&
+        scope.key == g_coreMaterialTargetKey.load(std::memory_order_acquire) &&
+        scope.epoch == g_coreMaterialTargetEpoch.load(std::memory_order_acquire) &&
+        scope.image == g_coreMaterialSourceImage.load(std::memory_order_acquire);
+}
+
+static void LogMesh25Material(const Mesh25MaterialScope& scope)
+{
+    if (!IsMesh25MaterialCurrent(scope)) return;
+    const auto now = GetTickCount64();
+    const auto previousEpoch = g_mesh25MaterialLoggedEpoch.exchange(scope.epoch, std::memory_order_relaxed);
+    const auto previousBound = g_mesh25MaterialLoggedBound.exchange(scope.bound, std::memory_order_relaxed);
+    const bool changed = previousEpoch != scope.epoch || previousBound != scope.bound;
+    const auto previous = g_mesh25MaterialLogAt.load(std::memory_order_relaxed);
+    if (changed || !previous || now - previous >= 1000)
+    {
+        g_mesh25MaterialLogAt.store(now, std::memory_order_relaxed);
+        Wh_Log(L"MESH 25H2 ACRYLIC: HWND=%p bound=%d stage=%s attempts=%u validations=%u",
+               g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
+               scope.bound, scope.stage, scope.attempts, scope.validations);
+    }
+}
 
 static long __cdecl Mesh25ImageUpdateHook(void* image, void* table, const void* command)
 {
     const auto epoch = g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
     const long result = g_mesh25ImageUpdateOriginal(image, table, command);
     if (result < 0 || g_unloading.load(std::memory_order_acquire) ||
-        ReadPointerMember(image, 0) != g_mesh25CachedImageVtable ||
+        ReadPointerMember(image, 0) != g_mesh25CachedResourceVtable ||
+        ReadPointerMember(image, 0x48) != g_mesh25CachedImageVtable ||
         !IsReadableMemory(command, 0x2C)) return result;
     unsigned imageId = 0, sourceId = 0;
     std::memcpy(&imageId, static_cast<const BYTE*>(command) + 4, sizeof(imageId));
     std::memcpy(&sourceId, static_cast<const BYTE*>(command) + 0x28, sizeof(sourceId));
     const auto key = (std::uint64_t{sourceId} << 32) | imageId;
+    bool bound = false;
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
     if (imageId && sourceId && key == g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
         epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed))
@@ -6035,11 +6085,16 @@ static long __cdecl Mesh25ImageUpdateHook(void* image, void* table, const void* 
         void* root = ReadPointerMember(image, 0x88);
         if (root != g_coreMaterialSourceRoot.load(std::memory_order_relaxed) ||
             image != g_coreMaterialSourceImage.load(std::memory_order_relaxed))
+        {
             g_coreMaterialReadyKey.store(0, std::memory_order_release);
+            bound = root != nullptr;
+        }
         g_coreMaterialSourceRoot.store(root, std::memory_order_release);
         g_coreMaterialSourceImage.store(root ? image : nullptr, std::memory_order_release);
     }
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
+    if (bound)
+        Wh_Log(L"MESH 25H2 CAPTURE IMAGE: image=%p sourceId=%u imageId=%u primaryResource=1", image, sourceId, imageId);
     return result;
 }
 
@@ -6048,7 +6103,16 @@ static long __cdecl Mesh25ImageRealizeHook(void* image, const void* target, void
     const auto epoch = g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
     const auto key = g_coreMaterialTargetKey.load(std::memory_order_acquire);
     const bool observe = key && image == g_coreMaterialSourceImage.load(std::memory_order_acquire);
+    Mesh25MaterialScope scope;
+    scope.image = image;
+    scope.target = target;
+    scope.epoch = epoch;
+    scope.key = key;
+    auto* previousScope = g_mesh25MaterialScope;
+    g_mesh25MaterialScope = observe && g_mesh25AcrylicReady && !g_mesh25MaterialInCall ? &scope : nullptr;
     const long result = g_mesh25ImageRealizeOriginal(image, target, bitmap);
+    g_mesh25MaterialScope = previousScope;
+    if (scope.validations) LogMesh25Material(scope);
     if (!observe || g_unloading.load(std::memory_order_acquire)) return result;
     bool changed = false;
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
@@ -6060,7 +6124,13 @@ static long __cdecl Mesh25ImageRealizeHook(void* image, const void* target, void
         changed = g_coreMaterialReadyKey.exchange(ready, std::memory_order_acq_rel) != ready;
     }
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
-    if (changed) RequestDwmScenePass();
+    if (changed)
+    {
+        Wh_Log(L"MESH 25H2 CAPTURE READY: HWND=%p ready=%d",
+               g_coreMaterialTargetHwnd.load(std::memory_order_acquire),
+               g_coreMaterialReadyKey.load(std::memory_order_acquire) == key);
+        RequestDwmScenePass();
+    }
     return result;
 }
 
@@ -6079,16 +6149,220 @@ static bool InitializeMesh25SourceObserver()
          &realize, nullptr, true},
         {{L"const CCachedVisualImage::`vftable'{for `IBitmapResource'}"},
          &g_mesh25CachedImageVtable, nullptr, true},
+        {{L"const CCachedVisualImage::`vftable'{for `CResource'}"},
+         &g_mesh25CachedResourceVtable, nullptr, true},
     };
     WindhawkUtils::HookSymbols(core, dwmcoreDllSourceHooks, ARRAYSIZE(dwmcoreDllSourceHooks));
     constexpr BYTE sourceField[] = {0x48,0x89,0x87,0x88,0x00,0x00,0x00};
     const auto* field = reinterpret_cast<const BYTE*>(base + 0x1FA6C3);
+    constexpr BYTE interfaceBase[] = {0x48,0x89,0x01,0x48,0x8D,0x05,0x4D,0xD6,0x2E,0x00,0x48,0x89,0x41,0x48};
+    const auto* constructor = reinterpret_cast<const BYTE*>(base + 0x79A9);
     const bool ready = reinterpret_cast<uintptr_t>(update) == base + 0x1FA5E0 &&
         reinterpret_cast<uintptr_t>(realize) == base + 0x13ACE0 &&
         reinterpret_cast<uintptr_t>(g_mesh25CachedImageVtable) == base + 0x2F5000 &&
+        reinterpret_cast<uintptr_t>(g_mesh25CachedResourceVtable) == base + 0x2F5050 &&
+        IsReadableMemory(constructor, sizeof(interfaceBase)) &&
+        !std::memcmp(constructor, interfaceBase, sizeof(interfaceBase)) &&
         IsReadableMemory(field, sizeof(sourceField)) && !std::memcmp(field, sourceField, sizeof(sourceField)) &&
         WindhawkUtils::SetFunctionHook(update, Mesh25ImageUpdateHook, &g_mesh25ImageUpdateOriginal) &&
         WindhawkUtils::SetFunctionHook(realize, Mesh25ImageRealizeHook, &g_mesh25ImageRealizeOriginal);
+    return ready;
+}
+
+CoreMaterialInput_t g_mesh25BviValidationOriginal = nullptr;
+CoreDrawVisualTree_t g_mesh25DrawVisualTreeOriginal = nullptr;
+CoreBackdropEffectInput_t g_mesh25EffectInputOriginal = nullptr;
+CoreBackdropRealization_t g_mesh25BackdropValid = nullptr;
+CoreFindTreeData_t g_mesh25FindTreeData = nullptr;
+CoreOwnedInputAssign_t g_mesh25InputAssign = nullptr;
+CoreOwnedStorageDestroy_t g_mesh25InputDestroy = nullptr, g_mesh25BitmapDestroy = nullptr;
+void* g_mesh25BackdropResourceVtable = nullptr;
+void* g_mesh25DesktopTreeVtable = nullptr;
+void* g_mesh25DesktopDataVtable = nullptr;
+
+static bool ReadMesh25VisualPath(const void* path, uintptr_t& first, uintptr_t& last)
+{
+    first = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 0));
+    last = reinterpret_cast<uintptr_t>(ReadPointerMember(path, 8));
+    return first && last > first && (last - first) % 16 == 0 &&
+        last - first <= 32 * 16 && IsReadableMemory(reinterpret_cast<void*>(first), last - first);
+}
+
+static void* FindMesh25DesktopBackdrop(void* context, const void* image)
+{
+    uintptr_t first = 0, last = 0, imageFirst = 0, imageLast = 0;
+    const void* path = ReadPointerMember(context, 0x1F20);
+    if (!ReadMesh25VisualPath(path, first, last) ||
+        !ReadMesh25VisualPath(static_cast<const BYTE*>(image) + 0x7F0, imageFirst, imageLast) ||
+        last - first != imageLast - imageFirst ||
+        std::memcmp(reinterpret_cast<void*>(first), reinterpret_cast<void*>(imageFirst), last - first))
+        return nullptr;
+    void* visual = ReadPointerMember(context, 0xC90);
+    if (!visual) return nullptr;
+    const auto* data = static_cast<const BYTE*>(visual) + 0x148;
+    if (ReadPointerMember(data, 0) != g_mesh25DesktopDataVtable) return nullptr;
+    const auto begin = reinterpret_cast<uintptr_t>(ReadPointerMember(data, 0x90));
+    const auto end = reinterpret_cast<uintptr_t>(ReadPointerMember(data, 0x98));
+    if (!begin || end < begin || (end - begin) % sizeof(void*) ||
+        end - begin > 32 * sizeof(void*) ||
+        !IsReadableMemory(reinterpret_cast<void*>(begin), end - begin)) return nullptr;
+    void* selected = nullptr;
+    for (auto entry = begin; entry < end; entry += sizeof(void*))
+    {
+        void* candidate = ReadPointerMember(reinterpret_cast<void*>(entry), 0);
+        if (candidate == image || ReadPointerMember(candidate, 0) != g_mesh25BackdropResourceVtable ||
+            !ReadMesh25VisualPath(static_cast<const BYTE*>(candidate) + 0x7F0, first, last)) continue;
+        void* tree = ReadPointerMember(reinterpret_cast<void*>(last - 8), 0);
+        if (ReadPointerMember(tree, 0) != g_mesh25DesktopTreeVtable ||
+            g_mesh25FindTreeData(visual, tree) != data) continue;
+        if (selected && selected != candidate) return nullptr;
+        selected = candidate;
+    }
+    return selected;
+}
+
+static long __cdecl Mesh25BviValidationHook(void* context, const void* bounds, void* flag)
+{
+    auto* scope = g_mesh25MaterialScope;
+    const bool observe = scope && scope->context == context &&
+        !g_mesh25MaterialInCall && IsMesh25MaterialCurrent(*scope);
+    void* previous = observe ? scope->context : nullptr;
+    if (observe)
+    {
+        ++scope->validations;
+        scope->context = context;
+    }
+    const long result = g_mesh25BviValidationOriginal(context, bounds, flag);
+    if (observe && result < 0)
+    {
+        scope->context = previous;
+        scope->stage = L"NativeValidation";
+    }
+    return result;
+}
+
+static long __cdecl Mesh25DrawVisualTreeHook(void* context, const void* tree, const void* bounds,
+                                            const void* occlusion, int clearMode, bool drawFlag, void* root)
+{
+    auto* scope = g_mesh25MaterialScope;
+    const bool observe = scope && !g_mesh25MaterialInCall && IsMesh25MaterialCurrent(*scope);
+    void* previous = observe ? scope->context : nullptr;
+    if (observe) scope->context = context;
+    const long result = g_mesh25DrawVisualTreeOriginal(context, tree, bounds, occlusion, clearMode, drawFlag, root);
+    if (observe) scope->context = previous;
+    return result;
+}
+
+static void* __cdecl Mesh25EffectInputHook(void* image, void* output)
+{
+    void* result = g_mesh25EffectInputOriginal(image, output);
+    auto* scope = g_mesh25MaterialScope;
+    if (result != output || !output || !scope || !scope->context || g_mesh25MaterialInCall ||
+        !IsMesh25MaterialCurrent(*scope) || ReadPointerMember(image, 0) != g_mesh25BackdropResourceVtable)
+        return result;
+    scope->stage = L"DesktopSource";
+    void* source = FindMesh25DesktopBackdrop(scope->context, image);
+    if (!source || !scope->target) return result;
+    struct NativeInput
+    {
+        alignas(16) BYTE input[0x70] = {};
+        void* bitmap = nullptr;
+        bool constructed = false;
+        bool previous = g_mesh25MaterialInCall;
+        NativeInput() { g_mesh25MaterialInCall = true; }
+        ~NativeInput()
+        {
+            if (constructed) g_mesh25InputDestroy(input);
+            if (bitmap) g_mesh25BitmapDestroy(&bitmap);
+            g_mesh25MaterialInCall = previous;
+        }
+    } native;
+    scope->stage = L"DesktopBitmap";
+    bool valid = g_mesh25BackdropValid(source, scope->target);
+    if (!valid && scope->attempts == 0)
+    {
+        ++scope->attempts;
+        const long realized = g_mesh25ImageRealizeOriginal(source, scope->target, &native.bitmap);
+        valid = realized >= 0 && native.bitmap && g_mesh25BackdropValid(source, scope->target);
+    }
+    if (!valid || !IsMesh25MaterialCurrent(*scope)) return result;
+    void* generated = g_mesh25EffectInputOriginal(source, native.input);
+    native.constructed = true;
+    scope->stage = L"NativeMapping";
+    if (generated != native.input || !IsReadableMemory(output, sizeof(native.input)) ||
+        std::memcmp(native.input + 0x68, static_cast<const BYTE*>(output) + 0x68, 3) ||
+        !PrepareCoreOwnedInputMapping(native.input, output) || !IsMesh25MaterialCurrent(*scope))
+        return result;
+    g_mesh25InputAssign(output, native.input);
+    scope->stage = L"Bound";
+    scope->bound = true;
+    return result;
+}
+
+static bool InitializeMesh25AcrylicBridge()
+{
+    HMODULE core = GetModuleHandleW(L"dwmcore.dll");
+    const auto base = reinterpret_cast<uintptr_t>(core);
+    CoreMaterialInput_t validate = nullptr;
+    CoreDrawVisualTree_t draw = nullptr;
+    CoreBackdropEffectInput_t generate = nullptr;
+    const WindhawkUtils::SYMBOL_HOOK dwmcoreDllAcrylicHooks[] = {
+        {{L"public: long __cdecl CDrawingContext::DrawVisualTree("
+           L"class CVisualTree const *,class TMil3DRect<float,class TMilRect_<float,"
+           L"struct D2D_RECT_F,struct D3D_RECT_F,struct D2D_POINTANDSIZE_F,struct RectUniqueness::NotNeeded>,"
+           L"struct D3D_RECT_F,struct MilPointAndSizeF,struct RectUniqueness::NotNeeded> const &,class COcclusionContext const *,"
+           L"enum ClearMode::Enum,bool,class CVisual *)"}, &draw, nullptr, true},
+        {{L"public: long __cdecl CDrawingContext::ValidateBVIEffectInputForRender("
+           L"class TMilRect_<float,struct D2D_RECT_F,struct D3D_RECT_F,struct D2D_POINTANDSIZE_F,"
+           L"struct RectUniqueness::NotNeeded> const &,bool *)const",
+          L"public: long __cdecl CDrawingContext::ValidateBVIEffectInputForRender("
+           L"class TMilRect_<float,struct D2D_RECT_F,struct D3D_RECT_F,struct D2D_POINTANDSIZE_F,"
+           L"struct RectUniqueness::NotNeeded> const &,bool *)const "}, &validate, nullptr, true},
+        {{L"public: struct EffectInput __cdecl CBackdropVisualImage::GenerateEffectInput(void)"},
+         &generate, nullptr, true},
+        {{L"public: bool __cdecl CBackdropVisualImage::HasValidRenderingRealization("
+           L"class RenderTargetInfo const &)const",
+          L"public: bool __cdecl CBackdropVisualImage::HasValidRenderingRealization("
+           L"class RenderTargetInfo const &)const "}, &g_mesh25BackdropValid, nullptr, true},
+        {{L"public: class CTreeData * __cdecl CVisual::FindTreeData(class CVisualTree const *)const",
+          L"public: class CTreeData * __cdecl CVisual::FindTreeData(class CVisualTree const *)const "},
+         &g_mesh25FindTreeData, nullptr, true},
+        {{L"public: struct EffectInput & __cdecl EffectInput::operator=(struct EffectInput const &)"},
+         &g_mesh25InputAssign, nullptr, true},
+        {{L"public: __cdecl EffectInput::~EffectInput(void)"}, &g_mesh25InputDestroy, nullptr, true},
+        {{L"public: __cdecl wil::com_ptr_t<class IRenderTargetBitmap,struct wil::err_returncode_policy>::"
+           L"~com_ptr_t<class IRenderTargetBitmap,struct wil::err_returncode_policy>(void)"},
+         &g_mesh25BitmapDestroy, nullptr, true},
+        {{L"const CBackdropVisualImage::`vftable'{for `CResource'}"},
+         &g_mesh25BackdropResourceVtable, nullptr, true},
+        {{L"const CDesktopTree::`vftable'"}, &g_mesh25DesktopTreeVtable, nullptr, true},
+        {{L"const CDesktopTreeData::`vftable'"}, &g_mesh25DesktopDataVtable, nullptr, true},
+    };
+    WindhawkUtils::HookSymbols(core, dwmcoreDllAcrylicHooks, ARRAYSIZE(dwmcoreDllAcrylicHooks));
+    const auto matches = [base](uintptr_t rva, const auto& bytes)
+    {
+        const auto* code = reinterpret_cast<const BYTE*>(base + rva);
+        return IsReadableMemory(code, sizeof(bytes)) && !std::memcmp(code, bytes, sizeof(bytes));
+    };
+    constexpr BYTE inputSize[] = {0x44,0x8D,0x42,0x70};
+    constexpr BYTE contextPath[] = {0x4C,0x8B,0xB9,0x20,0x1F,0x00,0x00};
+    constexpr BYTE desktopRegistry[] = {0x49,0x8B,0x93,0x90,0x00,0x00,0x00,0x49,0x8B,0xB3,0x98,0x00,0x00,0x00};
+    const bool ready = matches(0xA441F, inputSize) && matches(0x99A0, contextPath) &&
+        matches(0x99D9, desktopRegistry) &&
+        reinterpret_cast<uintptr_t>(draw) == base + 0x95918 &&
+        reinterpret_cast<uintptr_t>(validate) == base + 0x98F8 &&
+        reinterpret_cast<uintptr_t>(generate) == base + 0xA4224 &&
+        reinterpret_cast<uintptr_t>(g_mesh25BackdropValid) == base + 0xAE38 &&
+        reinterpret_cast<uintptr_t>(g_mesh25FindTreeData) == base + 0x113FC0 &&
+        reinterpret_cast<uintptr_t>(g_mesh25InputAssign) == base + 0xD1C48 &&
+        reinterpret_cast<uintptr_t>(g_mesh25InputDestroy) == base + 0x136E10 &&
+        reinterpret_cast<uintptr_t>(g_mesh25BitmapDestroy) == base + 0x1CC60 &&
+        reinterpret_cast<uintptr_t>(g_mesh25BackdropResourceVtable) == base + 0x2F5420 &&
+        reinterpret_cast<uintptr_t>(g_mesh25DesktopTreeVtable) == base + 0x300D60 &&
+        reinterpret_cast<uintptr_t>(g_mesh25DesktopDataVtable) == base + 0x2F7F08 &&
+        WindhawkUtils::SetFunctionHook(draw, Mesh25DrawVisualTreeHook, &g_mesh25DrawVisualTreeOriginal) &&
+        WindhawkUtils::SetFunctionHook(validate, Mesh25BviValidationHook, &g_mesh25BviValidationOriginal) &&
+        WindhawkUtils::SetFunctionHook(generate, Mesh25EffectInputHook, &g_mesh25EffectInputOriginal);
     return ready;
 }
 
