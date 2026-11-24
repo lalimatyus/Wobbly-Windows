@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.382
+// @version         0.383
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3883,8 +3883,17 @@ struct Mesh25SourceObservation
 {
     unsigned realizations = 0, selectedRealizations = 0, sourceRealizations = 0;
     long queryResult = E_PENDING;
+    unsigned peerAttempts = 0, channelId = 0;
+    const wchar_t* peerStage = L"Client";
+    void* imageVtable = nullptr;
+    void* sourceVtable = nullptr;
 };
 Mesh25SourceObservation g_mesh25SourceObservation;
+std::atomic_bool g_mesh25ClientReady = false;
+std::atomic<unsigned> g_mesh25ClientChannelId = 0;
+std::atomic<ULONGLONG> g_mesh25PeerNextAttempt = 0;
+IUnknown* g_mesh25ServerImage = nullptr;
+IUnknown* g_mesh25ServerSource = nullptr;
 
 static void LogMesh25CaptureObservation(HWND hwnd, std::uint64_t key)
 {
@@ -3895,9 +3904,11 @@ static void LogMesh25CaptureObservation(HWND hwnd, std::uint64_t key)
     ReleaseSRWLockShared(&g_coreMaterialTargetLock);
     if (!current) return;
     Wh_Log(L"MESH 25H2 CAPTURE WAIT: HWND=%p query=0x%08X imageBound=%d "
-           L"realizations=%u selected=%u sourceMatched=%u originalVisible=1",
+           L"realizations=%u selected=%u sourceMatched=%u peerAttempts=%u channel=%u "
+           L"stage=%s imageType=%p sourceType=%p originalVisible=1",
            hwnd, static_cast<unsigned>(sample.queryResult), bound,
-           sample.realizations, sample.selectedRealizations, sample.sourceRealizations);
+           sample.realizations, sample.selectedRealizations, sample.sourceRealizations,
+           sample.peerAttempts, sample.channelId, sample.peerStage, sample.imageVtable, sample.sourceVtable);
 }
 
 static unsigned int NativeProxyResourceId(void* proxy)
@@ -3915,6 +3926,11 @@ static void ClearCoreMaterialTarget()
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
     g_coreMaterialTargetKey.store(0, std::memory_order_release);
     g_mesh25SourceObservation = {};
+    g_mesh25ClientReady.store(false, std::memory_order_release);
+    g_mesh25ClientChannelId.store(0, std::memory_order_relaxed);
+    g_mesh25PeerNextAttempt.store(0, std::memory_order_relaxed);
+    IUnknown* retiredImage = std::exchange(g_mesh25ServerImage, nullptr);
+    IUnknown* retiredSource = std::exchange(g_mesh25ServerSource, nullptr);
     g_coreMaterialReadyKey.store(0, std::memory_order_release);
     g_coreMaterialSourceRoot.store(nullptr, std::memory_order_release);
     g_coreMaterialSourceImage.store(nullptr, std::memory_order_release);
@@ -3926,6 +3942,8 @@ static void ClearCoreMaterialTarget()
     g_coreBackdropCoordinatesLogAt.store(0, std::memory_order_relaxed);
     g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
+    if (retiredImage) retiredImage->Release();
+    if (retiredSource) retiredSource->Release();
 }
 
 static void SetCoreMaterialTarget(void* image, void* sourceProxy, HWND hwnd, bool observeOnly = false)
@@ -6050,9 +6068,15 @@ void* g_mesh25CachedResourceVtable = nullptr;
 using Mesh25QueryResource_t = long(__cdecl*)(void*, unsigned, const GUID&, void**);
 Mesh25QueryResource_t g_mesh25QueryResource = nullptr;
 void* g_mesh25RedirectResourceVtable = nullptr;
-// Native CCachedVisualImage/CResource QueryInterface identity, verified below.
-constexpr GUID kMesh25NativeResourceId = {
-    0x73F2A332,0xABA0,0x4B29,{0x88,0xBC,0x6E,0xE7,0x9B,0x39,0x41,0xBC}};
+void* g_mesh25ClientImageVtable = nullptr;
+void* g_mesh25ClientRedirectVtable = nullptr;
+void* g_mesh25ChannelContextVtable = nullptr;
+using Mesh25GetChannel_t = long(__cdecl*)(void*, unsigned, void**);
+using Mesh25GetResource_t = void*(__cdecl*)(void*, unsigned, unsigned);
+using Mesh25ReleaseChannel_t = void(__cdecl*)(void**);
+Mesh25GetChannel_t g_mesh25GetChannel = nullptr;
+Mesh25GetResource_t g_mesh25GetResource = nullptr;
+Mesh25ReleaseChannel_t g_mesh25ReleaseChannel = nullptr;
 
 struct Mesh25MaterialScope
 {
@@ -6097,34 +6121,6 @@ static void LogMesh25Material(const Mesh25MaterialScope& scope)
     }
 }
 
-static void LogMesh25ResourceType(HWND hwnd, const wchar_t* role, void* resource, long result)
-{
-    void* vtable = ReadPointerMember(resource, 0);
-    HMODULE module = nullptr;
-    wchar_t path[MAX_PATH] = {};
-    const bool found = vtable && GetModuleHandleExW(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCWSTR>(vtable), &module);
-    if (found) GetModuleFileNameW(module, path, ARRAYSIZE(path));
-    const wchar_t* name = wcsrchr(path, L'\\');
-    const auto* headers = found ? ReadDwmImageHeaders(module) : nullptr;
-    Wh_Log(L"MESH 25H2 RESOURCE TYPE: HWND=%p role=%s result=0x%08X object=%p "
-           L"vtable=%p module=%s rva=0x%llX image=%08X/%X",
-           hwnd, role, static_cast<unsigned>(result), resource, vtable, name ? name + 1 : path,
-           found ? static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(vtable) -
-               reinterpret_cast<uintptr_t>(module)) : 0ULL,
-           headers ? headers->FileHeader.TimeDateStamp : 0U,
-           headers ? headers->OptionalHeader.SizeOfImage : 0U);
-}
-
-static bool IsMesh25CaptureResourcePair(const IUnknown* image, const IUnknown* visual)
-{
-    return image && visual &&
-        ReadPointerMember(image, 0) == g_mesh25CachedResourceVtable &&
-        ReadPointerMember(image, 0x48) == g_mesh25CachedImageVtable &&
-        ReadPointerMember(visual, 0) == g_mesh25RedirectResourceVtable;
-}
-
 static bool BindMesh25CaptureResources(NativeMeshState& state)
 {
     if (!state.materialKey || !g_mesh25QueryResource || state.captureImageResource ||
@@ -6132,7 +6128,6 @@ static bool BindMesh25CaptureResources(NativeMeshState& state)
     const auto epoch = g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
     void* imageChannel = ReadPointerMember(ReadPointerMember(state.image, 0x10), 0x10);
     void* sourceChannel = ReadPointerMember(ReadPointerMember(state.imageSourceProxy, 0x10), 0x10);
-    long status = E_NOINTERFACE;
     struct Resources
     {
         IUnknown* image = nullptr;
@@ -6140,43 +6135,24 @@ static bool BindMesh25CaptureResources(NativeMeshState& state)
         ~Resources() { if (image) image->Release(); if (visual) visual->Release(); }
     } owned;
     constexpr GUID unknownId = {0,0,0,{0xC0,0,0,0,0,0,0,0x46}};
-    const bool sameChannel = imageChannel && imageChannel == sourceChannel;
-    const bool channelType = sameChannel &&
+    long status = E_NOINTERFACE;
+    unsigned channelId = 0;
+    const bool channelType = imageChannel && imageChannel == sourceChannel &&
         ReadPointerMember(ReadPointerMember(imageChannel, 0), 0x70) ==
             reinterpret_cast<void*>(g_mesh25QueryResource);
-    if (channelType)
+    if (channelType && IsReadableMemory(static_cast<const BYTE*>(imageChannel) + 0x48, sizeof(channelId)))
     {
-        // The native method locks its channel and returns retained interfaces.
-        // Query our own two handles, without scanning other channels/resources.
+        std::memcpy(&channelId, static_cast<const BYTE*>(imageChannel) + 0x48, sizeof(channelId));
         status = g_mesh25QueryResource(imageChannel, static_cast<unsigned>(state.materialKey),
                                        unknownId, reinterpret_cast<void**>(&owned.image));
         if (status >= 0 && owned.image)
             status = g_mesh25QueryResource(sourceChannel, static_cast<unsigned>(state.materialKey >> 32),
                                            unknownId, reinterpret_cast<void**>(&owned.visual));
     }
-    const long identityStatus = status;
-    bool typed = status >= 0 && IsMesh25CaptureResourcePair(owned.image, owned.visual);
-    if (channelType && !typed)
-    {
-        LogMesh25ResourceType(state.hwnd, L"IUnknownImage", owned.image, identityStatus);
-        LogMesh25ResourceType(state.hwnd, L"IUnknownSource", owned.visual, identityStatus);
-        Resources native;
-        status = g_mesh25QueryResource(imageChannel, static_cast<unsigned>(state.materialKey),
-            kMesh25NativeResourceId, reinterpret_cast<void**>(&native.image));
-        const long imageStatus = status;
-        if (status >= 0 && native.image)
-            status = g_mesh25QueryResource(sourceChannel, static_cast<unsigned>(state.materialKey >> 32),
-                kMesh25NativeResourceId, reinterpret_cast<void**>(&native.visual));
-        LogMesh25ResourceType(state.hwnd, L"NativeImage", native.image, imageStatus);
-        LogMesh25ResourceType(state.hwnd, L"NativeSource", native.visual, status);
-        typed = status >= 0 && IsMesh25CaptureResourcePair(native.image, native.visual);
-        if (typed)
-        {
-            // Exchange owned references; both rejected identities are released.
-            std::swap(owned.image, native.image);
-            std::swap(owned.visual, native.visual);
-        }
-    }
+    // These are client proxies. Resolve their server peer during a native draw.
+    const bool typed = status >= 0 && owned.image && owned.visual &&
+        ReadPointerMember(owned.image, 0) == g_mesh25ClientImageVtable &&
+        ReadPointerMember(owned.visual, 0) == g_mesh25ClientRedirectVtable;
     bool bound = false;
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
     if (state.materialKey == g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
@@ -6184,29 +6160,127 @@ static bool BindMesh25CaptureResources(NativeMeshState& state)
         !g_unloading.load(std::memory_order_acquire))
     {
         g_mesh25SourceObservation.queryResult = status >= 0 && !typed ? E_NOINTERFACE : status;
+        g_mesh25SourceObservation.channelId = channelId;
         if (typed)
         {
-            g_coreMaterialReadyKey.store(0, std::memory_order_release);
-            g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
-            g_coreMaterialSourceRoot.store(owned.visual, std::memory_order_release);
-            g_coreMaterialSourceImage.store(owned.image, std::memory_order_release);
             state.captureImageResource = owned.image;
             state.captureVisualResource = owned.visual;
             owned.image = owned.visual = nullptr;
+            g_mesh25ClientChannelId.store(channelId, std::memory_order_relaxed);
+            g_mesh25ClientReady.store(true, std::memory_order_release);
             bound = true;
         }
     }
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
-    Wh_Log(L"MESH 25H2 CAPTURE RESOURCE: HWND=%p query=0x%08X typed=%d bound=%d "
-           L"image=%p source=%p sameChannel=%d channelType=%d",
-           state.hwnd, static_cast<unsigned>(status), typed, bound,
-           state.captureImageResource, state.captureVisualResource,
-           sameChannel, channelType);
+    Wh_Log(L"MESH 25H2 CLIENT RESOURCE: HWND=%p result=0x%08X typed=%d channel=%u "
+           L"imageId=%u sourceId=%u serverBound=0", state.hwnd, static_cast<unsigned>(status), typed,
+           channelId, static_cast<unsigned>(state.materialKey), static_cast<unsigned>(state.materialKey >> 32));
     return bound;
+}
+
+static void TryBindMesh25CapturePeer(void* currentImage)
+{
+    if (!g_mesh25ClientReady.load(std::memory_order_acquire) ||
+        g_coreMaterialSourceImage.load(std::memory_order_acquire) ||
+        g_unloading.load(std::memory_order_acquire) ||
+        ReadPointerMember(currentImage, 0x48) != g_mesh25CachedImageVtable) return;
+    AcquireSRWLockShared(&g_coreMaterialTargetLock);
+    const auto epoch = g_coreMaterialTargetEpoch.load(std::memory_order_relaxed);
+    const auto key = g_coreMaterialTargetKey.load(std::memory_order_relaxed);
+    const unsigned channelId = g_mesh25ClientChannelId.load(std::memory_order_relaxed);
+    const bool current = g_mesh25ClientReady.load(std::memory_order_relaxed) &&
+        !g_coreMaterialSourceImage.load(std::memory_order_relaxed);
+    ReleaseSRWLockShared(&g_coreMaterialTargetLock);
+    if (!current || !key) return;
+    const auto now = GetTickCount64();
+    auto next = g_mesh25PeerNextAttempt.load(std::memory_order_relaxed);
+    if (now < next || !g_mesh25PeerNextAttempt.compare_exchange_strong(next, now + 16,
+            std::memory_order_relaxed)) return;
+    struct Peer
+    {
+        void* channel = nullptr;
+        IUnknown* image = nullptr;
+        IUnknown* source = nullptr;
+        ~Peer()
+        {
+            if (image) image->Release();
+            if (source) source->Release();
+            if (channel) g_mesh25ReleaseChannel(&channel);
+        }
+    } owned;
+    void* composition = ReadPointerMember(currentImage, 0x18);
+    const wchar_t* stage = L"Channel";
+    long status = composition ? g_mesh25GetChannel(composition, channelId, &owned.channel) : E_POINTER;
+    void* image = nullptr;
+    void* source = nullptr;
+    bool typed = false;
+    unsigned actualChannelId = ~0U;
+    if (status >= 0 && ReadPointerMember(owned.channel, 0) == g_mesh25ChannelContextVtable &&
+        IsReadableMemory(static_cast<const BYTE*>(owned.channel) + 0x18, sizeof(actualChannelId)))
+    {
+        std::memcpy(&actualChannelId, static_cast<const BYTE*>(owned.channel) + 0x18, sizeof(actualChannelId));
+        void* table = actualChannelId == channelId ? ReadPointerMember(owned.channel, 0x30) : nullptr;
+        stage = L"ResourceTable";
+        if (table)
+        {
+            image = g_mesh25GetResource(table, static_cast<unsigned>(key), 0x12);
+            source = g_mesh25GetResource(table, static_cast<unsigned>(key >> 32), 0xB4);
+            stage = L"ResourceTypes";
+            typed = ReadPointerMember(image, 0) == g_mesh25CachedResourceVtable &&
+                ReadPointerMember(image, 0x48) == g_mesh25CachedImageVtable &&
+                ReadPointerMember(source, 0) == g_mesh25RedirectResourceVtable;
+            if (typed)
+            {
+                stage = L"SourceUpdate";
+                typed = ReadPointerMember(image, 0x88) == source;
+                if (typed)
+                {
+                    owned.image = static_cast<IUnknown*>(image);
+                    owned.source = static_cast<IUnknown*>(source);
+                    owned.image->AddRef();
+                    owned.source->AddRef();
+                    stage = L"Bound";
+                }
+            }
+        }
+    }
+    bool bound = false;
+    AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
+    if (key == g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
+        epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed) &&
+        g_mesh25ClientReady.load(std::memory_order_relaxed) &&
+        channelId == g_mesh25ClientChannelId.load(std::memory_order_relaxed) &&
+        !g_coreMaterialSourceImage.load(std::memory_order_relaxed) &&
+        !g_unloading.load(std::memory_order_acquire))
+    {
+        auto& sample = g_mesh25SourceObservation;
+        ++sample.peerAttempts;
+        sample.peerStage = stage;
+        sample.queryResult = status < 0 ? status : (typed ? S_OK : E_PENDING);
+        sample.imageVtable = ReadPointerMember(image, 0);
+        sample.sourceVtable = ReadPointerMember(source, 0);
+        if (typed)
+        {
+            g_mesh25ServerImage = owned.image;
+            g_mesh25ServerSource = owned.source;
+            owned.image = owned.source = nullptr;
+            g_coreMaterialReadyKey.store(0, std::memory_order_release);
+            g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
+            g_coreMaterialSourceRoot.store(source, std::memory_order_release);
+            g_coreMaterialSourceImage.store(image, std::memory_order_release);
+            bound = true;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
+    if (bound)
+        Wh_Log(L"MESH 25H2 CAPTURE PEER: HWND=%p channel=%u image=%p source=%p "
+               L"identity=channel-and-resource-handles",
+               g_coreMaterialTargetHwnd.load(std::memory_order_acquire), channelId, image, source);
 }
 
 static long __cdecl Mesh25ImageRealizeHook(void* image, const void* target, void** bitmap)
 {
+    TryBindMesh25CapturePeer(image);
     const auto epoch = g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
     const auto key = g_coreMaterialTargetKey.load(std::memory_order_acquire);
     const bool selected = key && image == g_coreMaterialSourceImage.load(std::memory_order_acquire);
@@ -6254,7 +6328,25 @@ static bool InitializeMesh25SourceObserver()
     HMODULE core = GetModuleHandleW(L"dwmcore.dll");
     const auto base = reinterpret_cast<uintptr_t>(core);
     CoreImageRealize_t realize = nullptr;
+    HMODULE dcomp = GetModuleHandleW(L"dcomp.dll");
+    const auto* dcompHeaders = ReadDwmImageHeaders(dcomp);
+    if (!dcompHeaders || dcompHeaders->FileHeader.TimeDateStamp != 0x17C7D829 ||
+        dcompHeaders->OptionalHeader.SizeOfImage != 0x225000) return false;
+    const auto clientBase = reinterpret_cast<uintptr_t>(dcomp);
+    const WindhawkUtils::SYMBOL_HOOK dcompDllSourceHooks[] = {
+        {{L"const DirectComposition::CUnknownProxy::`vftable'"}, &g_mesh25ClientImageVtable, nullptr, true},
+        {{L"const Windows::UI::Composition::InteropRedirectVisual::`vftable'"}, &g_mesh25ClientRedirectVtable, nullptr, true},
+    };
+    WindhawkUtils::HookSymbols(dcomp, dcompDllSourceHooks, ARRAYSIZE(dcompDllSourceHooks));
     const WindhawkUtils::SYMBOL_HOOK dwmcoreDllSourceHooks[] = {
+        {{L"public: long __cdecl CComposition::GetAttachedChannel(unsigned int,class CChannelContext * *)"},
+         &g_mesh25GetChannel, nullptr, true},
+        {{L"public: class CResource * __cdecl CResourceTable::GetResource(unsigned int,enum MIL_RESOURCE_TYPE)const",
+          L"public: class CResource * __cdecl CResourceTable::GetResource(unsigned int,enum MIL_RESOURCE_TYPE)const "},
+         &g_mesh25GetResource, nullptr, true},
+        {{L"void __cdecl ReleaseInterface<class CChannelContext>(class CChannelContext * &)"},
+         &g_mesh25ReleaseChannel, nullptr, true},
+        {{L"const CChannelContext::`vftable'"}, &g_mesh25ChannelContextVtable, nullptr, true},
         {{L"public: virtual long __cdecl CChannel::QueryResourceInterface("
            L"unsigned int,struct _GUID const &,void * *)"}, &g_mesh25QueryResource, nullptr, true},
         {{L"const CRedirectVisual::`vftable'"}, &g_mesh25RedirectResourceVtable, nullptr, true},
@@ -6273,9 +6365,18 @@ static bool InitializeMesh25SourceObserver()
     const auto* constructor = reinterpret_cast<const BYTE*>(base + 0x79A9);
     constexpr BYTE channelLookup[] = {0x48,0x8B,0x46,0x10,0x48,0x03,0xC9,0x48,0x8B,0x4C,0xC8,0x08};
     const auto* lookup = reinterpret_cast<const BYTE*>(base + 0x1C72C0);
-    const auto* nativeId = reinterpret_cast<const void*>(base + 0x329798);
-    const bool ready = IsReadableMemory(nativeId, sizeof(kMesh25NativeResourceId)) &&
-        !std::memcmp(nativeId, &kMesh25NativeResourceId, sizeof(kMesh25NativeResourceId)) &&
+    constexpr BYTE channelHandle[] = {0x89,0x47,0x48};
+    constexpr BYTE tableStore[] = {0x48,0x89,0x75,0x30};
+    const auto* handle = reinterpret_cast<const BYTE*>(base + 0x21517F);
+    const auto* table = reinterpret_cast<const BYTE*>(base + 0x1DDA12);
+    const bool ready = reinterpret_cast<uintptr_t>(g_mesh25ClientImageVtable) == clientBase + 0x19DB10 &&
+        reinterpret_cast<uintptr_t>(g_mesh25ClientRedirectVtable) == clientBase + 0x1A57C0 &&
+        reinterpret_cast<uintptr_t>(g_mesh25GetChannel) == base + 0x19AED0 &&
+        reinterpret_cast<uintptr_t>(g_mesh25GetResource) == base + 0x66680 &&
+        reinterpret_cast<uintptr_t>(g_mesh25ReleaseChannel) == base + 0x11F8F0 &&
+        reinterpret_cast<uintptr_t>(g_mesh25ChannelContextVtable) == base + 0x2F8890 &&
+        IsReadableMemory(handle, sizeof(channelHandle)) && !std::memcmp(handle, channelHandle, sizeof(channelHandle)) &&
+        IsReadableMemory(table, sizeof(tableStore)) && !std::memcmp(table, tableStore, sizeof(tableStore)) &&
         reinterpret_cast<uintptr_t>(g_mesh25QueryResource) == base + 0x1C7270 &&
         reinterpret_cast<uintptr_t>(g_mesh25RedirectResourceVtable) == base + 0x2FF978 &&
         IsReadableMemory(lookup, sizeof(channelLookup)) && !std::memcmp(lookup, channelLookup, sizeof(channelLookup)) &&
