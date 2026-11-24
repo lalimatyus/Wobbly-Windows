@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.381
+// @version         0.382
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -144,6 +144,7 @@ the combined mod is not offered under GPLv2.
 #include <regex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <windhawk_utils.h>
@@ -6049,6 +6050,9 @@ void* g_mesh25CachedResourceVtable = nullptr;
 using Mesh25QueryResource_t = long(__cdecl*)(void*, unsigned, const GUID&, void**);
 Mesh25QueryResource_t g_mesh25QueryResource = nullptr;
 void* g_mesh25RedirectResourceVtable = nullptr;
+// Native CCachedVisualImage/CResource QueryInterface identity, verified below.
+constexpr GUID kMesh25NativeResourceId = {
+    0x73F2A332,0xABA0,0x4B29,{0x88,0xBC,0x6E,0xE7,0x9B,0x39,0x41,0xBC}};
 
 struct Mesh25MaterialScope
 {
@@ -6093,6 +6097,34 @@ static void LogMesh25Material(const Mesh25MaterialScope& scope)
     }
 }
 
+static void LogMesh25ResourceType(HWND hwnd, const wchar_t* role, void* resource, long result)
+{
+    void* vtable = ReadPointerMember(resource, 0);
+    HMODULE module = nullptr;
+    wchar_t path[MAX_PATH] = {};
+    const bool found = vtable && GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(vtable), &module);
+    if (found) GetModuleFileNameW(module, path, ARRAYSIZE(path));
+    const wchar_t* name = wcsrchr(path, L'\\');
+    const auto* headers = found ? ReadDwmImageHeaders(module) : nullptr;
+    Wh_Log(L"MESH 25H2 RESOURCE TYPE: HWND=%p role=%s result=0x%08X object=%p "
+           L"vtable=%p module=%s rva=0x%llX image=%08X/%X",
+           hwnd, role, static_cast<unsigned>(result), resource, vtable, name ? name + 1 : path,
+           found ? static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(vtable) -
+               reinterpret_cast<uintptr_t>(module)) : 0ULL,
+           headers ? headers->FileHeader.TimeDateStamp : 0U,
+           headers ? headers->OptionalHeader.SizeOfImage : 0U);
+}
+
+static bool IsMesh25CaptureResourcePair(const IUnknown* image, const IUnknown* visual)
+{
+    return image && visual &&
+        ReadPointerMember(image, 0) == g_mesh25CachedResourceVtable &&
+        ReadPointerMember(image, 0x48) == g_mesh25CachedImageVtable &&
+        ReadPointerMember(visual, 0) == g_mesh25RedirectResourceVtable;
+}
+
 static bool BindMesh25CaptureResources(NativeMeshState& state)
 {
     if (!state.materialKey || !g_mesh25QueryResource || state.captureImageResource ||
@@ -6122,10 +6154,29 @@ static bool BindMesh25CaptureResources(NativeMeshState& state)
             status = g_mesh25QueryResource(sourceChannel, static_cast<unsigned>(state.materialKey >> 32),
                                            unknownId, reinterpret_cast<void**>(&owned.visual));
     }
-    const bool typed = status >= 0 && owned.image && owned.visual &&
-        ReadPointerMember(owned.image, 0) == g_mesh25CachedResourceVtable &&
-        ReadPointerMember(owned.image, 0x48) == g_mesh25CachedImageVtable &&
-        ReadPointerMember(owned.visual, 0) == g_mesh25RedirectResourceVtable;
+    const long identityStatus = status;
+    bool typed = status >= 0 && IsMesh25CaptureResourcePair(owned.image, owned.visual);
+    if (channelType && !typed)
+    {
+        LogMesh25ResourceType(state.hwnd, L"IUnknownImage", owned.image, identityStatus);
+        LogMesh25ResourceType(state.hwnd, L"IUnknownSource", owned.visual, identityStatus);
+        Resources native;
+        status = g_mesh25QueryResource(imageChannel, static_cast<unsigned>(state.materialKey),
+            kMesh25NativeResourceId, reinterpret_cast<void**>(&native.image));
+        const long imageStatus = status;
+        if (status >= 0 && native.image)
+            status = g_mesh25QueryResource(sourceChannel, static_cast<unsigned>(state.materialKey >> 32),
+                kMesh25NativeResourceId, reinterpret_cast<void**>(&native.visual));
+        LogMesh25ResourceType(state.hwnd, L"NativeImage", native.image, imageStatus);
+        LogMesh25ResourceType(state.hwnd, L"NativeSource", native.visual, status);
+        typed = status >= 0 && IsMesh25CaptureResourcePair(native.image, native.visual);
+        if (typed)
+        {
+            // Exchange owned references; both rejected identities are released.
+            std::swap(owned.image, native.image);
+            std::swap(owned.visual, native.visual);
+        }
+    }
     bool bound = false;
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
     if (state.materialKey == g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
@@ -6222,7 +6273,10 @@ static bool InitializeMesh25SourceObserver()
     const auto* constructor = reinterpret_cast<const BYTE*>(base + 0x79A9);
     constexpr BYTE channelLookup[] = {0x48,0x8B,0x46,0x10,0x48,0x03,0xC9,0x48,0x8B,0x4C,0xC8,0x08};
     const auto* lookup = reinterpret_cast<const BYTE*>(base + 0x1C72C0);
-    const bool ready = reinterpret_cast<uintptr_t>(g_mesh25QueryResource) == base + 0x1C7270 &&
+    const auto* nativeId = reinterpret_cast<const void*>(base + 0x329798);
+    const bool ready = IsReadableMemory(nativeId, sizeof(kMesh25NativeResourceId)) &&
+        !std::memcmp(nativeId, &kMesh25NativeResourceId, sizeof(kMesh25NativeResourceId)) &&
+        reinterpret_cast<uintptr_t>(g_mesh25QueryResource) == base + 0x1C7270 &&
         reinterpret_cast<uintptr_t>(g_mesh25RedirectResourceVtable) == base + 0x2FF978 &&
         IsReadableMemory(lookup, sizeof(channelLookup)) && !std::memcmp(lookup, channelLookup, sizeof(channelLookup)) &&
         reinterpret_cast<uintptr_t>(realize) == base + 0x13ACE0 &&
