@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.379
+// @version         0.380
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -581,6 +581,7 @@ struct NativeMeshState
     std::uint64_t materialKey = 0;
     bool originalHidden = false;
     bool uses25H2Capture = false;
+    bool captureWaitLogged = false;
     double originalOpacity = 1.0;
     bool backdropSource = false;
     int sourcePadding = 0;
@@ -3874,6 +3875,55 @@ std::atomic<ULONGLONG> g_coreMaterialTargetEpoch = 0;
 std::atomic<HWND> g_coreMaterialTargetHwnd = nullptr;
 std::atomic<void*> g_coreMaterialSourceRoot = nullptr, g_coreMaterialSourceImage = nullptr, g_coreMaterialSourceTree = nullptr;
 
+// Metadata only; protected by g_coreMaterialTargetLock, reset for each source.
+struct Mesh25SourceObservation
+{
+    unsigned updates = 0, successfulUpdates = 0, packets = 0, matches = 0;
+    unsigned realizations = 0, selectedRealizations = 0;
+    unsigned opcode = 0;
+    std::uint64_t packetKey = 0;
+    long result = S_OK;
+    void* primaryVtable = nullptr;
+    void* bitmapVtable = nullptr;
+};
+Mesh25SourceObservation g_mesh25SourceObservation;
+
+static void LogMesh25CaptureRoute(void* image, void* source, HWND hwnd)
+{
+    void* resource = ReadPointerMember(image, 0x10);
+    void* channel = ReadPointerMember(resource, 0x10);
+    void* entry = ReadPointerMember(ReadPointerMember(channel, 0), 0x1F0);
+    HMODULE module = nullptr;
+    wchar_t path[MAX_PATH] = {};
+    const bool found = entry && GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(entry), &module);
+    if (found) GetModuleFileNameW(module, path, ARRAYSIZE(path));
+    const wchar_t* name = wcsrchr(path, L'\\');
+    Wh_Log(L"MESH 25H2 CAPTURE ROUTE: HWND=%p image=%p source=%p channel=%p "
+           L"update=%p module=%s rva=0x%llX",
+           hwnd, image, source, channel, entry, name ? name + 1 : path,
+           found ? static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(entry) -
+               reinterpret_cast<uintptr_t>(module)) : 0ULL);
+}
+
+static void LogMesh25CaptureObservation(HWND hwnd, std::uint64_t key)
+{
+    AcquireSRWLockShared(&g_coreMaterialTargetLock);
+    const auto sample = g_mesh25SourceObservation;
+    const bool current = key && key == g_coreMaterialTargetKey.load(std::memory_order_relaxed);
+    ReleaseSRWLockShared(&g_coreMaterialTargetLock);
+    if (!current) return;
+    Wh_Log(L"MESH 25H2 CAPTURE WAIT: HWND=%p updates=%u successful=%u packets=%u matches=%u "
+           L"realizations=%u selected=%u expected=(%u,%u) packet=(%u,%u) opcode=0x%X "
+           L"result=0x%08X primary=%p bitmapInterface=%p originalVisible=1",
+           hwnd, sample.updates, sample.successfulUpdates, sample.packets, sample.matches,
+           sample.realizations, sample.selectedRealizations,
+           static_cast<unsigned>(key), static_cast<unsigned>(key >> 32),
+           static_cast<unsigned>(sample.packetKey), static_cast<unsigned>(sample.packetKey >> 32),
+           sample.opcode, static_cast<unsigned>(sample.result), sample.primaryVtable, sample.bitmapVtable);
+}
+
 static unsigned int NativeProxyResourceId(void* proxy)
 {
     const auto* resource = static_cast<const BYTE*>(ReadPointerMember(proxy, 0x10));
@@ -3888,6 +3938,7 @@ static void ClearCoreMaterialTarget()
 {
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
     g_coreMaterialTargetKey.store(0, std::memory_order_release);
+    g_mesh25SourceObservation = {};
     g_coreMaterialReadyKey.store(0, std::memory_order_release);
     g_coreMaterialSourceRoot.store(nullptr, std::memory_order_release);
     g_coreMaterialSourceImage.store(nullptr, std::memory_order_release);
@@ -3911,6 +3962,7 @@ static void SetCoreMaterialTarget(void* image, void* sourceProxy, HWND hwnd, boo
     g_coreMaterialTargetHwnd.store(hwnd, std::memory_order_relaxed);
     g_coreMaterialTargetKey.store((std::uint64_t{sourceId} << 32) | imageId, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
+    if (observeOnly) LogMesh25CaptureRoute(image, sourceProxy, hwnd);
 }
 
 static long __cdecl CoreImageUpdateHook(void* image, void* table, const void* command)
@@ -6068,33 +6120,55 @@ static void LogMesh25Material(const Mesh25MaterialScope& scope)
 static long __cdecl Mesh25ImageUpdateHook(void* image, void* table, const void* command)
 {
     const auto epoch = g_coreMaterialTargetEpoch.load(std::memory_order_acquire);
+    const auto targetKey = g_coreMaterialTargetKey.load(std::memory_order_acquire);
     const long result = g_mesh25ImageUpdateOriginal(image, table, command);
-    if (result < 0 || g_unloading.load(std::memory_order_acquire) ||
-        ReadPointerMember(image, 0) != g_mesh25CachedResourceVtable ||
-        ReadPointerMember(image, 0x48) != g_mesh25CachedImageVtable ||
-        !IsReadableMemory(command, 0x2C)) return result;
-    unsigned imageId = 0, sourceId = 0;
-    std::memcpy(&imageId, static_cast<const BYTE*>(command) + 4, sizeof(imageId));
-    std::memcpy(&sourceId, static_cast<const BYTE*>(command) + 0x28, sizeof(sourceId));
+    if (!targetKey || g_unloading.load(std::memory_order_acquire)) return result;
+    unsigned opcode = 0, imageId = 0, sourceId = 0;
+    const bool packet = IsReadableMemory(command, 0x40);
+    if (packet)
+    {
+        std::memcpy(&opcode, command, sizeof(opcode));
+        std::memcpy(&imageId, static_cast<const BYTE*>(command) + 4, sizeof(imageId));
+        std::memcpy(&sourceId, static_cast<const BYTE*>(command) + 0x28, sizeof(sourceId));
+    }
     const auto key = (std::uint64_t{sourceId} << 32) | imageId;
     bool bound = false;
+    void* primary = nullptr;
+    void* bitmapInterface = nullptr;
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
-    if (imageId && sourceId && key == g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
+    if (targetKey == g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
         epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed))
     {
-        void* root = ReadPointerMember(image, 0x88);
-        if (root != g_coreMaterialSourceRoot.load(std::memory_order_relaxed) ||
-            image != g_coreMaterialSourceImage.load(std::memory_order_relaxed))
+        auto& sample = g_mesh25SourceObservation;
+        ++sample.updates;
+        sample.successfulUpdates += result >= 0;
+        sample.packets += packet;
+        sample.opcode = opcode;
+        sample.packetKey = key;
+        sample.result = result;
+        // The native decoder checks type 0x12 before calling ProcessUpdate.
+        // Match our full command identity; dynamic vtables are diagnostic only.
+        if (result >= 0 && opcode == 0x17 && imageId && sourceId && key == targetKey)
         {
-            g_coreMaterialReadyKey.store(0, std::memory_order_release);
-            bound = root != nullptr;
+            ++sample.matches;
+            primary = sample.primaryVtable = ReadPointerMember(image, 0);
+            bitmapInterface = sample.bitmapVtable = ReadPointerMember(image, 0x48);
+            void* root = ReadPointerMember(image, 0x88);
+            if (root != g_coreMaterialSourceRoot.load(std::memory_order_relaxed) ||
+                image != g_coreMaterialSourceImage.load(std::memory_order_relaxed))
+            {
+                g_coreMaterialReadyKey.store(0, std::memory_order_release);
+                g_coreMaterialTargetEpoch.fetch_add(1, std::memory_order_release);
+                bound = root != nullptr;
+            }
+            g_coreMaterialSourceRoot.store(root, std::memory_order_release);
+            g_coreMaterialSourceImage.store(root ? image : nullptr, std::memory_order_release);
         }
-        g_coreMaterialSourceRoot.store(root, std::memory_order_release);
-        g_coreMaterialSourceImage.store(root ? image : nullptr, std::memory_order_release);
     }
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
     if (bound)
-        Wh_Log(L"MESH 25H2 CAPTURE IMAGE: image=%p sourceId=%u imageId=%u primaryResource=1", image, sourceId, imageId);
+        Wh_Log(L"MESH 25H2 CAPTURE IMAGE: image=%p sourceId=%u imageId=%u "
+               L"primary=%p bitmapInterface=%p", image, sourceId, imageId, primary, bitmapInterface);
     return result;
 }
 
@@ -6113,15 +6187,19 @@ static long __cdecl Mesh25ImageRealizeHook(void* image, const void* target, void
     const long result = g_mesh25ImageRealizeOriginal(image, target, bitmap);
     g_mesh25MaterialScope = previousScope;
     if (scope.validations) LogMesh25Material(scope);
-    if (!observe || g_unloading.load(std::memory_order_acquire)) return result;
+    if (!key || g_unloading.load(std::memory_order_acquire)) return result;
     bool changed = false;
     AcquireSRWLockExclusive(&g_coreMaterialTargetLock);
     if (epoch == g_coreMaterialTargetEpoch.load(std::memory_order_relaxed) &&
-        key == g_coreMaterialTargetKey.load(std::memory_order_relaxed) &&
-        image == g_coreMaterialSourceImage.load(std::memory_order_relaxed))
+        key == g_coreMaterialTargetKey.load(std::memory_order_relaxed))
     {
-        const auto ready = result >= 0 && ReadPointerMember(bitmap, 0) ? key : 0;
-        changed = g_coreMaterialReadyKey.exchange(ready, std::memory_order_acq_rel) != ready;
+        ++g_mesh25SourceObservation.realizations;
+        if (observe && image == g_coreMaterialSourceImage.load(std::memory_order_relaxed))
+        {
+            ++g_mesh25SourceObservation.selectedRealizations;
+            const auto ready = result >= 0 && ReadPointerMember(bitmap, 0) ? key : 0;
+            changed = g_coreMaterialReadyKey.exchange(ready, std::memory_order_acq_rel) != ready;
+        }
     }
     ReleaseSRWLockExclusive(&g_coreMaterialTargetLock);
     if (changed)
@@ -6769,7 +6847,17 @@ static bool MaintainNativeOriginalHide(NativeMeshState& state)
         return g_coreMaterialReadyKey.load(std::memory_order_acquire) == key &&
                ReadNativeOpacity(state.root, current, opacityOffset) && current == kNativeOriginalOpacity;
     if (g_coreMaterialReadyKey.load(std::memory_order_acquire) != key)
-        return GetTickCount64() - state.attachedAt < 1500;
+    {
+        const bool waiting = GetTickCount64() - state.attachedAt < 1500;
+        if (!state.uses25H2Capture) return waiting;
+        // Keep the working sibling while its bitmap observer catches up.
+        if (!waiting && !state.captureWaitLogged)
+        {
+            state.captureWaitLogged = true;
+            LogMesh25CaptureObservation(state.hwnd, key);
+        }
+        return true;
+    }
     const bool separate = state.uses25H2Capture ?
         state.captureRoot && ReadPointerMember(state.captureRoot, 0x18) == state.root &&
         ReadPointerMember(state.capturedRepresentation, 0x20) == state.imageSourceProxy :
