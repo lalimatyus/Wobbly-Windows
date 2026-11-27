@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.384
+// @version         0.385
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -833,30 +833,7 @@ static void* GetTopLevelVisualProxy(void* topLevelWindow,
         }
     }
 
-    if (!g_getCanvasRootVisualProxy)
-    {
-        return nullptr;
-    }
-
-    // Accept only exact PDB-resolved CVisualProxy/base-compatible proxy types.
-    void* proxy = g_getCanvasRootVisualProxy(topLevelWindow);
-    if (!IsVisualProxyPointerValid(proxy))
-    {
-        return nullptr;
-    }
-
-    bool decodedPath = g_canvasVisualOwnerOffset != SIZE_MAX && g_visualProxyOffset != SIZE_MAX;
-    if (decodedPath &&
-        ReadPointerMember(ReadPointerMember(topLevelWindow, g_canvasVisualOwnerOffset),
-                          g_visualProxyOffset) != proxy)
-    {
-        return nullptr;
-    }
-    if (source)
-    {
-        *source = decodedPath ? L"VerifiedCanvasPath" : L"TypedCanvasAccessor";
-    }
-    return proxy;
+    return nullptr;
 }
 
 static void* GetTransitionVisualProxy(void* topLevelWindow3D)
@@ -1917,6 +1894,24 @@ static bool FindVisualProxyAccessPath(void* function, size_t* ownerOffset,
     if (!IsDwmFunctionPointerValid(function))
     {
         return false;
+    }
+    // Newer getters return early for null, with the live load after that return.
+    // Match the entire tiny control-flow shape, including its jump destination.
+    const auto* code = static_cast<const BYTE*>(function);
+    constexpr BYTE head[] = {0x48,0x8B,0x81};
+    constexpr BYTE nullPath[] = {0x48,0x85,0xC0,0x75,0x02,0xC3,0xCC,0x48,0x8B,0x40};
+    if (IsReadableMemory(code, 19) && IsDwmExecutableAddress(code + 18) &&
+        !std::memcmp(code, head, sizeof(head)) &&
+        !std::memcmp(code + 7, nullPath, sizeof(nullPath)) && code[18] == 0xC3)
+    {
+        unsigned owner = 0;
+        std::memcpy(&owner, code + 3, sizeof(owner));
+        const unsigned member = code[17];
+        if (owner < 0x80 || owner > 0x400 || owner % sizeof(void*) ||
+            member > 0x80 || member % sizeof(void*)) return false;
+        *ownerOffset = owner;
+        *proxyOffset = member;
+        return true;
     }
     const std::regex loadPattern(
         R"(^mov (r[a-z0-9]+), (?:qword ptr )?\[(r[a-z0-9]+)\s*\+\s*0x([0-9a-f]{1,8})\]$)",
@@ -3466,12 +3461,13 @@ static bool InitializeDwmHooks()
         return false;
     }
     Wh_Log(L"DWM compatibility: compositor primary vftable verified by PDB");
-    if (!FindVisualProxyAccessPath(reinterpret_cast<void*>(g_getCanvasRootVisualProxy),
+    if (!g_topLevelWindowGetRootVisual ||
+        !FindVisualProxyAccessPath(reinterpret_cast<void*>(g_getCanvasRootVisualProxy),
                                    &g_canvasVisualOwnerOffset,
                                    &g_visualProxyOffset))
     {
-        Wh_Log(L"DWM compatibility: visual accessor path unavailable; "
-               L"using typed accessor validation");
+        Wh_Log(L"DWM compatibility: complete-window proxy member could not be proven");
+        return false;
     }
     g_transitionVisualProxyOffset = FindTransitionVisualProxyOffset(
         g_transitionWrapperGetVisualWeakFunction, g_transitionWrapperGetVisualProxyWeakFunction);
@@ -3591,16 +3587,95 @@ static bool InitializeDwmHooks()
 
 static long RemoveMesh25VisualFromParent(void* visual);
 
+static uintptr_t Mesh25UdwmRva(uintptr_t rva)
+{
+    const auto stamp = g_dwmModuleLayout.timeDateStamp;
+    const auto size = g_dwmModuleLayout.sizeOfImage;
+    if (stamp == 0x240E386A && size == 0x142000) return rva;
+    if (stamp != 0x8A81DB9E || size != 0x150000) return 0;
+    switch (rva)
+    {
+        case 0xA935C: return 0xB432C;
+        case 0xFBF10: return 0x108150;
+        case 0x123C10: return 0x131DA0;
+        case 0xA937B: return 0xB434B;
+        case 0x73488: return 0x7DBA8;
+        case 0xA948: return 0x5E1AC;
+        case 0xA9AC: return 0x5E210;
+        case 0xAA7C: return 0x5E2E0;
+        case 0x683A8: return 0x75F90;
+        case 0x3DFDC: return 0x33D9C;
+        case 0xF86A8: return 0x104008;
+        case 0x27380: return 0xEF30;
+        case 0x1BB70: return 0x367E8;
+        case 0x69330: return 0x36740;
+        case 0x3F810: return 0x29DAC;
+        case 0x25448: return 0x380B4;
+        case 0x40410: return 0x7230;
+        case 0x26AC0: return 0xF180;
+        case 0x252AC: return 0x437E4;
+        case 0xA9B8: return 0x5E21C;
+        case 0x294EC: return 0xB13C;
+        case 0x1CFB0: return 0xED80;
+        case 0x40394: return 0x310E4;
+        case 0xFA3F8: return 0x106350;
+        case 0xF8790: return 0x1041B0;
+        case 0x273D2: return 0xFA46;
+        case 0xA9444: return 0xB4414;
+        case 0x41783: return 0x22C83;
+        case 0x417FC: return 0x22CFC;
+        case 0x1CFB4: return 0xED84;
+        case 0x403A7: return 0x310F7;
+        case 0x147A8: return 0xA118C;
+        case 0x14E79: return 0x47644;
+        case 0x1506B: return 0x4767F;
+        case 0x15EC7: return 0x46BEF;
+        case 0x16AA3: return 0x20E7B;
+        case 0x15DFC: return 0x46B24;
+        case 0x14E82: return 0x4764D;
+        default: return 0;
+    }
+}
+
+static uintptr_t Mesh25CoreRva(uintptr_t rva)
+{
+    const auto* headers = ReadDwmImageHeaders(GetModuleHandleW(L"dwmcore.dll"));
+    if (!headers) return 0;
+    const auto stamp = headers->FileHeader.TimeDateStamp;
+    const auto size = headers->OptionalHeader.SizeOfImage;
+    if (stamp == 0x9A1AF3BA && size == 0x443000) return rva;
+    if (stamp != 0x4270570C || size != 0x484000) return 0;
+    switch (rva)
+    {
+        case 0x19AED0: return 0x1CAAD0;
+        case 0x66680: return 0xA3EB0;
+        case 0x11F8F0: return 0x190340;
+        case 0x2F8890: return 0x32CE48;
+        case 0x1C7270: return 0x1ED170;
+        case 0x2FF978: return 0x3321A0;
+        case 0x13ACE0: return 0x13E1A0;
+        case 0x2F5000: return 0x329468;
+        case 0x2F5050: return 0x3294B8;
+        case 0x1FA6C3: return 0xCE623;
+        case 0x79A9: return 0x10B652;
+        case 0x1C72C0: return 0x1ED1C0;
+        case 0x21517F: return 0x236FF8;
+        case 0x1DDA12: return 0x1C1992;
+        default: return 0;
+    }
+}
+
 static void InitializeMesh25Renderer()
 {
     const auto* core = ReadDwmImageHeaders(GetModuleHandleW(L"dwmcore.dll"));
-    if (g_dwmModuleLayout.timeDateStamp != 0x240E386A ||
-        g_dwmModuleLayout.sizeOfImage != 0x142000 || !core ||
-        core->FileHeader.TimeDateStamp != 0x9A1AF3BA ||
-        core->OptionalHeader.SizeOfImage != 0x443000)
-        return;
+    const bool originalPair = g_dwmModuleLayout.timeDateStamp == 0x240E386A &&
+        g_dwmModuleLayout.sizeOfImage == 0x142000 && core &&
+        core->FileHeader.TimeDateStamp == 0x9A1AF3BA && core->OptionalHeader.SizeOfImage == 0x443000;
+    const bool updatedPair = g_dwmModuleLayout.timeDateStamp == 0x8A81DB9E &&
+        g_dwmModuleLayout.sizeOfImage == 0x150000 && core &&
+        core->FileHeader.TimeDateStamp == 0x4270570C && core->OptionalHeader.SizeOfImage == 0x484000;
+    if (!originalPair && !updatedPair) return;
 
-    // This pair is 26100.9278, as shipped in Windows 11 build 26200.9457.
     const WindhawkUtils::SYMBOL_HOOK udwmDllCaptureHooks[] = {
         {{L"public: static long __cdecl CapturedWindowRepresentation::Create("
            L"class CWindowData *,class CapturedWindowRepresentation * *)"},
@@ -3620,16 +3695,16 @@ static void InitializeMesh25Renderer()
     const auto base = reinterpret_cast<uintptr_t>(g_dwmModuleLayout.imageBegin);
     const auto matchesCode = [base](auto function, uintptr_t rva)
     {
-        return reinterpret_cast<uintptr_t>(function) == base + rva &&
+        return reinterpret_cast<uintptr_t>(function) == base + Mesh25UdwmRva(rva) &&
                IsDwmExecutableAddress(reinterpret_cast<const void*>(function));
     };
     constexpr BYTE captureAllocation[] = {0xB9, 0x60, 0x00, 0x00, 0x00};
     constexpr BYTE meshEntry[] = {0x48, 0x83, 0xEC, 0x58, 0x48, 0x8B, 0x51, 0x10};
-    const auto* captureCode = reinterpret_cast<const BYTE*>(base + 0xA937B);
-    const auto* meshCode = reinterpret_cast<const BYTE*>(base + 0xA948);
+    const auto* captureCode = reinterpret_cast<const BYTE*>(base + Mesh25UdwmRva(0xA937B));
+    const auto* meshCode = reinterpret_cast<const BYTE*>(base + Mesh25UdwmRva(0xA948));
     const bool capture = matchesCode(g_capturedWindowCreate, 0xA935C) &&
-        reinterpret_cast<uintptr_t>(g_capturedWindowVtable) == base + 0xFBF10 &&
-        reinterpret_cast<uintptr_t>(g_nativeCaptureCriticalSection) == base + 0x123C10 &&
+        reinterpret_cast<uintptr_t>(g_capturedWindowVtable) == base + Mesh25UdwmRva(0xFBF10) &&
+        reinterpret_cast<uintptr_t>(g_nativeCaptureCriticalSection) == base + Mesh25UdwmRva(0x123C10) &&
         IsReadableMemory(g_nativeCaptureCriticalSection, sizeof(CRITICAL_SECTION)) &&
         IsReadableMemory(captureCode, sizeof(captureAllocation)) &&
         std::memcmp(captureCode, captureAllocation, sizeof(captureAllocation)) == 0;
@@ -3642,13 +3717,13 @@ static void InitializeMesh25Renderer()
     const bool image = matchesCode(g_nativeMeshCreateImage, 0x683A8) &&
         matchesCode(g_nativeMeshUpdateImageF, 0x3DFDC) && !g_nativeMeshUpdateImageD &&
         reinterpret_cast<uintptr_t>(g_nativeMeshImageVtable.load(std::memory_order_acquire)) ==
-            base + 0xF86A8;
+            base + Mesh25UdwmRva(0xF86A8);
     const bool release = matchesCode(g_cBaseObjectRelease, 0x27380);
     constexpr BYTE childCollection[] = {0x4D, 0x8D, 0x93, 0x90, 0x00, 0x00, 0x00};
     constexpr BYTE captureTargetLoad[] = {0x48, 0x8B, 0x86, 0xB8, 0x01, 0x00, 0x00,
                                           0x4C, 0x8B, 0x78, 0x10};
-    const auto* containerCode = reinterpret_cast<const BYTE*>(base + 0x273D2);
-    const auto* targetCode = reinterpret_cast<const BYTE*>(base + 0xA9444);
+    const auto* containerCode = reinterpret_cast<const BYTE*>(base + Mesh25UdwmRva(0x273D2));
+    const auto* targetCode = reinterpret_cast<const BYTE*>(base + Mesh25UdwmRva(0xA9444));
     const bool scene = matchesCode(g_topLevelWindowGetRootVisual, 0x1BB70) &&
         matchesCode(g_nativeMeshGetVisualParent, 0x69330) &&
         matchesCode(g_nativeMeshCreateVisual, 0x3F810) &&
@@ -3674,11 +3749,11 @@ static void InitializeMesh25Renderer()
     };
     auto matchesBytes = [base](uintptr_t rva, const auto& expected)
     {
-        const auto* code = reinterpret_cast<const BYTE*>(base + rva);
+        const auto* code = reinterpret_cast<const BYTE*>(base + Mesh25UdwmRva(rva));
         return IsDwmExecutableAddress(code) && IsReadableMemory(code, sizeof(expected)) &&
                !std::memcmp(code, expected, sizeof(expected));
     };
-    g_mesh25TransitionBoundsReady = g_mesh25Ready &&
+    g_mesh25TransitionBoundsReady = g_mesh25Ready && originalPair &&
         matchesBytes(0x41783, startRectLoads) && matchesBytes(0x417FC, startRectFlag);
     constexpr BYTE opacityField[] = {0xF2,0x0F,0x10,0x51,0x78};
     constexpr BYTE redirectIds[] = {0x48,0x8B,0x52,0x10,0x44,0x8B,0x42,0x18};
@@ -3687,7 +3762,7 @@ static void InitializeMesh25Renderer()
         matchesBytes(0x1CFB4, opacityField) && matchesBytes(0x403A7, redirectIds) &&
         InitializeMesh25SourceObserver();
     if (g_mesh25SeparatedCaptureReady) g_nativeVisualSetOpacity = g_mesh25SetOpacity;
-    g_mesh25AcrylicReady = g_mesh25SeparatedCaptureReady && InitializeMesh25AcrylicBridge();
+    g_mesh25AcrylicReady = g_mesh25SeparatedCaptureReady && originalPair && InitializeMesh25AcrylicBridge();
     Wh_Log(L"MESH 25H2 RENDERER: ready=%d capture=%d geometry=%d image=%d release=%d scene=%d",
            g_mesh25Ready, capture, geometry, image, release, scene);
     Wh_Log(L"MESH 25H2 TRANSITION SOURCE: nativeStartBounds=%d", g_mesh25TransitionBoundsReady);
@@ -6375,9 +6450,15 @@ static bool InitializeMesh25SourceObserver()
     CoreImageRealize_t realize = nullptr;
     HMODULE dcomp = GetModuleHandleW(L"dcomp.dll");
     const auto* dcompHeaders = ReadDwmImageHeaders(dcomp);
-    if (!dcompHeaders || dcompHeaders->FileHeader.TimeDateStamp != 0x17C7D829 ||
-        dcompHeaders->OptionalHeader.SizeOfImage != 0x225000) return false;
+    if (!dcompHeaders) return false;
     const auto clientBase = reinterpret_cast<uintptr_t>(dcomp);
+    const auto clientEnd = clientBase + dcompHeaders->OptionalHeader.SizeOfImage;
+    const auto clientType = [clientBase, clientEnd](const void* type)
+    {
+        const auto address = reinterpret_cast<uintptr_t>(type);
+        return address >= clientBase && address <= clientEnd - 3 * sizeof(void*) &&
+            IsReadableMemory(type, 3 * sizeof(void*));
+    };
     const WindhawkUtils::SYMBOL_HOOK dcompDllSourceHooks[] = {
         {{L"const DirectComposition::CUnknownProxy::`vftable'"}, &g_mesh25ClientImageVtable, nullptr, true},
         {{L"const Windows::UI::Composition::InteropRedirectVisual::`vftable'"}, &g_mesh25ClientRedirectVtable, nullptr, true},
@@ -6405,33 +6486,42 @@ static bool InitializeMesh25SourceObserver()
     };
     WindhawkUtils::HookSymbols(core, dwmcoreDllSourceHooks, ARRAYSIZE(dwmcoreDllSourceHooks));
     constexpr BYTE sourceField[] = {0x48,0x89,0x87,0x88,0x00,0x00,0x00};
-    const auto* field = reinterpret_cast<const BYTE*>(base + 0x1FA6C3);
-    constexpr BYTE interfaceBase[] = {0x48,0x89,0x01,0x48,0x8D,0x05,0x4D,0xD6,0x2E,0x00,0x48,0x89,0x41,0x48};
-    const auto* constructor = reinterpret_cast<const BYTE*>(base + 0x79A9);
+    const auto* field = reinterpret_cast<const BYTE*>(base + Mesh25CoreRva(0x1FA6C3));
+    constexpr BYTE interfaceBase[] = {0x48,0x89,0x01,0x48,0x8D,0x05};
+    constexpr BYTE interfaceStore[] = {0x48,0x89,0x41,0x48};
+    const auto* constructor = reinterpret_cast<const BYTE*>(base + Mesh25CoreRva(0x79A9));
     constexpr BYTE channelLookup[] = {0x48,0x8B,0x46,0x10,0x48,0x03,0xC9,0x48,0x8B,0x4C,0xC8,0x08};
-    const auto* lookup = reinterpret_cast<const BYTE*>(base + 0x1C72C0);
+    const auto* lookup = reinterpret_cast<const BYTE*>(base + Mesh25CoreRva(0x1C72C0));
     constexpr BYTE channelHandle[] = {0x89,0x47,0x48};
     constexpr BYTE tableStore[] = {0x48,0x89,0x75,0x30};
-    const auto* handle = reinterpret_cast<const BYTE*>(base + 0x21517F);
-    const auto* table = reinterpret_cast<const BYTE*>(base + 0x1DDA12);
-    const bool ready = reinterpret_cast<uintptr_t>(g_mesh25ClientImageVtable) == clientBase + 0x19DB10 &&
-        reinterpret_cast<uintptr_t>(g_mesh25ClientRedirectVtable) == clientBase + 0x1A57C0 &&
-        reinterpret_cast<uintptr_t>(g_mesh25GetChannel) == base + 0x19AED0 &&
-        reinterpret_cast<uintptr_t>(g_mesh25GetResource) == base + 0x66680 &&
-        reinterpret_cast<uintptr_t>(g_mesh25ReleaseChannel) == base + 0x11F8F0 &&
-        reinterpret_cast<uintptr_t>(g_mesh25ChannelContextVtable) == base + 0x2F8890 &&
+    const auto* handle = reinterpret_cast<const BYTE*>(base + Mesh25CoreRva(0x21517F));
+    const auto* table = reinterpret_cast<const BYTE*>(base + Mesh25CoreRva(0x1DDA12));
+    int32_t interfaceDelta = 0;
+    if (!IsReadableMemory(constructor, 14)) return false;
+    std::memcpy(&interfaceDelta, constructor + 6, sizeof(interfaceDelta));
+    const auto bitmapInterface = reinterpret_cast<uintptr_t>(constructor) + 10 + interfaceDelta;
+    const bool ready = clientType(g_mesh25ClientImageVtable) && clientType(g_mesh25ClientRedirectVtable) &&
+        reinterpret_cast<uintptr_t>(g_mesh25GetChannel) == base + Mesh25CoreRva(0x19AED0) &&
+        reinterpret_cast<uintptr_t>(g_mesh25GetResource) == base + Mesh25CoreRva(0x66680) &&
+        reinterpret_cast<uintptr_t>(g_mesh25ReleaseChannel) == base + Mesh25CoreRva(0x11F8F0) &&
+        reinterpret_cast<uintptr_t>(g_mesh25ChannelContextVtable) == base + Mesh25CoreRva(0x2F8890) &&
         IsReadableMemory(handle, sizeof(channelHandle)) && !std::memcmp(handle, channelHandle, sizeof(channelHandle)) &&
         IsReadableMemory(table, sizeof(tableStore)) && !std::memcmp(table, tableStore, sizeof(tableStore)) &&
-        reinterpret_cast<uintptr_t>(g_mesh25QueryResource) == base + 0x1C7270 &&
-        reinterpret_cast<uintptr_t>(g_mesh25RedirectResourceVtable) == base + 0x2FF978 &&
+        reinterpret_cast<uintptr_t>(g_mesh25QueryResource) == base + Mesh25CoreRva(0x1C7270) &&
+        reinterpret_cast<uintptr_t>(g_mesh25RedirectResourceVtable) == base + Mesh25CoreRva(0x2FF978) &&
         IsReadableMemory(lookup, sizeof(channelLookup)) && !std::memcmp(lookup, channelLookup, sizeof(channelLookup)) &&
-        reinterpret_cast<uintptr_t>(realize) == base + 0x13ACE0 &&
-        reinterpret_cast<uintptr_t>(g_mesh25CachedImageVtable) == base + 0x2F5000 &&
-        reinterpret_cast<uintptr_t>(g_mesh25CachedResourceVtable) == base + 0x2F5050 &&
+        reinterpret_cast<uintptr_t>(realize) == base + Mesh25CoreRva(0x13ACE0) &&
+        reinterpret_cast<uintptr_t>(g_mesh25CachedImageVtable) == base + Mesh25CoreRva(0x2F5000) &&
+        reinterpret_cast<uintptr_t>(g_mesh25CachedResourceVtable) == base + Mesh25CoreRva(0x2F5050) &&
         IsReadableMemory(constructor, sizeof(interfaceBase)) &&
         !std::memcmp(constructor, interfaceBase, sizeof(interfaceBase)) &&
+        !std::memcmp(constructor + 10, interfaceStore, sizeof(interfaceStore)) &&
+        bitmapInterface == reinterpret_cast<uintptr_t>(g_mesh25CachedImageVtable) &&
         IsReadableMemory(field, sizeof(sourceField)) && !std::memcmp(field, sourceField, sizeof(sourceField)) &&
         WindhawkUtils::SetFunctionHook(realize, Mesh25ImageRealizeHook, &g_mesh25ImageRealizeOriginal);
+    Wh_Log(L"MESH 25H2 SOURCE OBSERVER: ready=%d client=%08X/%X imageType=%p sourceType=%p",
+           ready, dcompHeaders->FileHeader.TimeDateStamp, dcompHeaders->OptionalHeader.SizeOfImage,
+           g_mesh25ClientImageVtable, g_mesh25ClientRedirectVtable);
     return ready;
 }
 
@@ -6830,6 +6920,11 @@ static bool __cdecl ShellAnimationsEnabledHook(const void* state)
 static void InitializeLiveMeshShellTransition()
 {
     if (!g_meshWindowTransitionsReady.load(std::memory_order_acquire)) return;
+    if (g_mesh25Ready && g_dwmModuleLayout.timeDateStamp == 0x8A81DB9E)
+    {
+        Wh_Log(L"MESH 25H2 SHELL TRANSITION SUPPORT: ready=0 reason=updated-state-layout nativeAnimation=1");
+        return;
+    }
     if (g_mesh25Ready)
     {
         const auto* base = static_cast<const BYTE*>(g_dwmModuleLayout.imageBegin);
@@ -8154,7 +8249,7 @@ static void CreateMesh25Source(HWND hwnd, ULONGLONG generation, void* windowData
         stage = L"CreateInstruction";
         result = g_nativeMeshCreateMeshInstruction(pending.group, pending.image, &pending.instruction);
         if (result >= 0 &&
-            (ReadPointerMember(pending.instruction, 0) != base + 0xFA3F8 ||
+            (ReadPointerMember(pending.instruction, 0) != base + Mesh25UdwmRva(0xFA3F8) ||
              ReadPointerMember(pending.instruction, 0x10) != pending.group ||
              ReadPointerMember(pending.instruction, 0x18) != pending.image))
             result = E_NOINTERFACE;
@@ -8163,7 +8258,7 @@ static void CreateMesh25Source(HWND hwnd, ULONGLONG generation, void* windowData
     {
         stage = L"CreateVisual";
         result = g_nativeMeshCreateVisual(&pending.visual);
-        if (result >= 0 && ReadPointerMember(pending.visual, 0) != base + 0xF8790)
+        if (result >= 0 && ReadPointerMember(pending.visual, 0) != base + Mesh25UdwmRva(0xF8790))
             result = E_NOINTERFACE;
     }
     if (result >= 0)
