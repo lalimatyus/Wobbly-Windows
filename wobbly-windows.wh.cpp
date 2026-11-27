@@ -2,7 +2,7 @@
 // @id              wobbly-windows
 // @name            Wobbly Windows
 // @description     The classic Compiz/KDE Plasma style Wobbly Windows effect for Windows 11!
-// @version         0.383
+// @version         0.384
 // @author          lalimatyus
 // @github          https://github.com/lalimatyus
 // @include         dwm.exe
@@ -3887,6 +3887,12 @@ struct Mesh25SourceObservation
     const wchar_t* peerStage = L"Client";
     void* imageVtable = nullptr;
     void* sourceVtable = nullptr;
+    unsigned clientImageId = 0, tableCount = 0, tableStride = 0, nativeOwnerId = 0;
+    unsigned renderChannelId = ~0U, compositionCount = 0;
+    void* composition = nullptr;
+    void* compositions[4] = {};
+    void* rawImageVtable = nullptr;
+    void* rawSourceVtable = nullptr;
 };
 Mesh25SourceObservation g_mesh25SourceObservation;
 std::atomic_bool g_mesh25ClientReady = false;
@@ -3909,6 +3915,19 @@ static void LogMesh25CaptureObservation(HWND hwnd, std::uint64_t key)
            hwnd, static_cast<unsigned>(sample.queryResult), bound,
            sample.realizations, sample.selectedRealizations, sample.sourceRealizations,
            sample.peerAttempts, sample.channelId, sample.peerStage, sample.imageVtable, sample.sourceVtable);
+    Wh_Log(L"MESH 25H2 RESOURCE NAMESPACE: HWND=%p clientImageId=%u "
+           L"composition=%p compositions=%u renderChannel=%u nativeOwner=%u process=%u "
+           L"tableCount=%u tableStride=%u rawImageType=%p rawSourceType=%p diagnosticOnly=1",
+           hwnd, sample.clientImageId, sample.composition, sample.compositionCount,
+           sample.renderChannelId, sample.nativeOwnerId, GetCurrentProcessId(),
+           sample.tableCount, sample.tableStride, sample.rawImageVtable, sample.rawSourceVtable);
+}
+
+static unsigned ReadMesh25Unsigned(const void* object, size_t offset, unsigned fallback = 0)
+{
+    if (object && IsReadableMemory(static_cast<const BYTE*>(object) + offset, sizeof(fallback)))
+        std::memcpy(&fallback, static_cast<const BYTE*>(object) + offset, sizeof(fallback));
+    return fallback;
 }
 
 static unsigned int NativeProxyResourceId(void* proxy)
@@ -6161,6 +6180,7 @@ static bool BindMesh25CaptureResources(NativeMeshState& state)
     {
         g_mesh25SourceObservation.queryResult = status >= 0 && !typed ? E_NOINTERFACE : status;
         g_mesh25SourceObservation.channelId = channelId;
+        g_mesh25SourceObservation.clientImageId = typed ? ReadMesh25Unsigned(owned.image, 0xC) : 0;
         if (typed)
         {
             state.captureImageResource = owned.image;
@@ -6213,18 +6233,29 @@ static void TryBindMesh25CapturePeer(void* currentImage)
     long status = composition ? g_mesh25GetChannel(composition, channelId, &owned.channel) : E_POINTER;
     void* image = nullptr;
     void* source = nullptr;
+    void* rawImageVtable = nullptr;
+    void* rawSourceVtable = nullptr;
+    unsigned tableCount = 0, tableStride = 0, nativeOwnerId = 0;
     bool typed = false;
     unsigned actualChannelId = ~0U;
     if (status >= 0 && ReadPointerMember(owned.channel, 0) == g_mesh25ChannelContextVtable &&
         IsReadableMemory(static_cast<const BYTE*>(owned.channel) + 0x18, sizeof(actualChannelId)))
     {
         std::memcpy(&actualChannelId, static_cast<const BYTE*>(owned.channel) + 0x18, sizeof(actualChannelId));
+        nativeOwnerId = ReadMesh25Unsigned(owned.channel, 0x1C);
         void* table = actualChannelId == channelId ? ReadPointerMember(owned.channel, 0x30) : nullptr;
         stage = L"ResourceTable";
         if (table)
         {
+            tableCount = ReadMesh25Unsigned(table, 0x1C);
+            tableStride = ReadMesh25Unsigned(table, 0x18);
             image = g_mesh25GetResource(table, static_cast<unsigned>(key), 0x12);
             source = g_mesh25GetResource(table, static_cast<unsigned>(key >> 32), 0xB4);
+            // Native ANY_RESOURCE lookup is diagnostic only; it cannot authorize a bind.
+            rawImageVtable = ReadPointerMember(image ? image :
+                g_mesh25GetResource(table, static_cast<unsigned>(key), 0x85), 0);
+            rawSourceVtable = ReadPointerMember(source ? source :
+                g_mesh25GetResource(table, static_cast<unsigned>(key >> 32), 0x85), 0);
             stage = L"ResourceTypes";
             typed = ReadPointerMember(image, 0) == g_mesh25CachedResourceVtable &&
                 ReadPointerMember(image, 0x48) == g_mesh25CachedImageVtable &&
@@ -6259,6 +6290,13 @@ static void TryBindMesh25CapturePeer(void* currentImage)
         sample.queryResult = status < 0 ? status : (typed ? S_OK : E_PENDING);
         sample.imageVtable = ReadPointerMember(image, 0);
         sample.sourceVtable = ReadPointerMember(source, 0);
+        sample.composition = composition;
+        sample.renderChannelId = ReadMesh25Unsigned(ReadPointerMember(currentImage, 0x38), 0x18, ~0U);
+        sample.nativeOwnerId = nativeOwnerId;
+        sample.tableCount = tableCount;
+        sample.tableStride = tableStride;
+        sample.rawImageVtable = rawImageVtable;
+        sample.rawSourceVtable = rawSourceVtable;
         if (typed)
         {
             g_mesh25ServerImage = owned.image;
@@ -6304,6 +6342,13 @@ static long __cdecl Mesh25ImageRealizeHook(void* image, const void* target, void
         key == g_coreMaterialTargetKey.load(std::memory_order_relaxed))
     {
         ++g_mesh25SourceObservation.realizations;
+        void* composition = ReadPointerMember(image, 0x18);
+        auto& sample = g_mesh25SourceObservation;
+        bool knownComposition = false;
+        for (unsigned i = 0; i < sample.compositionCount; ++i)
+            knownComposition |= sample.compositions[i] == composition;
+        if (composition && !knownComposition && sample.compositionCount < ARRAYSIZE(sample.compositions))
+            sample.compositions[sample.compositionCount++] = composition;
         if (selected && image == g_coreMaterialSourceImage.load(std::memory_order_relaxed))
         {
             ++g_mesh25SourceObservation.selectedRealizations;
